@@ -44,16 +44,18 @@ test "owned values compare allocation contents and distinguish absent and empty 
 
 test "owned values copy nested storage and clean up partial copies" {
     const Choice = union(enum) { none, names: []const []const u8 };
-    const T = struct { choices: [2]Choice, extra: ?[]const u8, absent: ?[]const u8 = null };
-    const original: T = .{ .choices = .{ .none, .{ .names = &.{ "first", "second" } } }, .extra = "extra" };
+    const T = struct { choices: [3]Choice, extra: ?[]const u8, absent: ?[]const u8 = null };
+    const original: T = .{ .choices = .{ .{ .names = &.{"earlier"} }, .none, .{ .names = &.{ "first", "second" } } }, .extra = "extra" };
     var copied = try Owned(T).clone(std.testing.allocator, original);
     defer Owned(T).deinit(&copied, std.testing.allocator);
     try std.testing.expect(Owned(T).eql(original, copied));
     try std.testing.expectEqual(Owned(T).hash(original), Owned(T).hash(copied));
-    try std.testing.expect(original.choices[1].names.ptr != copied.choices[1].names.ptr);
-    try std.testing.expect(original.choices[1].names[0].ptr != copied.choices[1].names[0].ptr);
+    try std.testing.expect(original.choices[0].names.ptr != copied.choices[0].names.ptr);
+    try std.testing.expect(original.choices[0].names[0].ptr != copied.choices[0].names[0].ptr);
+    try std.testing.expect(original.choices[2].names.ptr != copied.choices[2].names.ptr);
+    try std.testing.expect(original.choices[2].names[0].ptr != copied.choices[2].names[0].ptr);
     try std.testing.expect(original.extra.?.ptr != copied.extra.?.ptr);
-    for (0..4) |fail_index| {
+    for (0..6) |fail_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         try std.testing.expectError(error.OutOfMemory, Owned(T).clone(failing.allocator(), original));
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
@@ -87,12 +89,7 @@ fn copy(comptime T: type, allocator: std.mem.Allocator, value: T) std.mem.Alloca
         .optional => |info| return if (value) |present| try copy(info.child, allocator, present) else null,
         .array => |info| {
             var result: T = undefined;
-            var initialized: usize = 0;
-            errdefer for (result[0..initialized]) |*element| free(info.child, allocator, element);
-            for (value, &result) |element, *destination| {
-                destination.* = try copy(info.child, allocator, element);
-                initialized += 1;
-            }
+            try copyElements(info.child, allocator, &value, &result);
             return result;
         },
         .@"struct" => |info| {
@@ -112,20 +109,24 @@ fn copy(comptime T: type, allocator: std.mem.Allocator, value: T) std.mem.Alloca
         },
         .pointer => |info| {
             if (info.size != .slice) @compileError("owned value copying requires slices, not pointers");
+            if (value.len == 0) return &.{};
             if (comptime !ownsStorage(info.child)) return allocator.dupe(info.child, value);
             const result = try allocator.alloc(info.child, value.len);
-            var initialized: usize = 0;
-            errdefer {
-                for (result[0..initialized]) |*element| free(info.child, allocator, element);
-                allocator.free(result);
-            }
-            for (value, result) |element, *destination| {
-                destination.* = try copy(info.child, allocator, element);
-                initialized += 1;
-            }
+            errdefer allocator.free(result);
+            try copyElements(info.child, allocator, value, result);
             return result;
         },
         else => return value,
+    }
+}
+
+fn copyElements(comptime T: type, allocator: std.mem.Allocator, source: []const T, destination: []T) std.mem.Allocator.Error!void {
+    std.debug.assert(source.len == destination.len);
+    var initialized: usize = 0;
+    errdefer for (destination[0..initialized]) |*element| free(T, allocator, element);
+    for (source, destination) |element, *slot| {
+        slot.* = try copy(T, allocator, element);
+        initialized += 1;
     }
 }
 
@@ -176,7 +177,7 @@ pub fn free(comptime T: type, allocator: std.mem.Allocator, value: *T) void {
         .pointer => |info| {
             if (info.size != .slice) @compileError("owned value cleanup requires slices, not pointers");
             if (comptime ownsStorage(info.child)) for (value.*) |*element| free(info.child, allocator, @constCast(element));
-            allocator.free(value.*);
+            if (value.*.len != 0) allocator.free(value.*);
         },
         else => {},
     }

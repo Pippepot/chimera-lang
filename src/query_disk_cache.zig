@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIQRY38";
+const format = "CHIQRY40";
 const max_records = 1_000_000;
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -35,7 +35,7 @@ pub fn restoreInterns(db: *query.Database, allocator: std.mem.Allocator, payload
 }
 
 fn restoreNamedIntern(name: []const u8, db: *query.Database, reader: *codec.Reader, index: usize) !void {
-    inline for (.{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples }) |I| {
+    inline for (.{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings }) |I| {
         if (std.mem.eql(u8, name, @typeName(I))) return restoreIntern(I, db, reader, index);
     }
     return error.InvalidCache;
@@ -137,7 +137,7 @@ fn restoreNamedInput(db: *query.Database, reader: *codec.Reader, check: bool) !?
 fn restoreNamedQueryDependency(db: *query.Database, reader: *codec.Reader, check: bool) !?query.PersistedQueryRef {
     const name = try reader.read([]const u8);
     defer reader.allocator.free(name);
-    inline for (.{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.InferReferenceContract, queries.AnalyzeFunctionInstance }) |Q| {
+    inline for (.{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.ConversionCandidates, queries.InferReferenceContract, queries.AnalyzeFunctionInstance }) |Q| {
         if (std.mem.eql(u8, name, @typeName(Q))) return restoreQueryDependency(Q, db, reader, check);
     }
     return error.InvalidCache;
@@ -269,6 +269,7 @@ fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     }
     if (T == structures.ByteStringId) return (try db.lookupInternedAs(queries.ByteStrings, value)) != null;
     if (T == structures.CompileTimeValueId) return (try db.lookupInternedAs(queries.CompileTimeValues, value)) != null;
+    if (T == structures.CompileTimeBindingsId) return (try db.lookupInternedAs(queries.CompileTimeBindings, value)) != null;
     if (T == structures.CompileTimeValueTupleId) return (try db.lookupInternedAs(queries.CompileTimeValueTuples, value)) != null;
     if (T == structures.InternedTypeId) return (try db.lookupInternedAs(queries.Types, value)) != null;
     if (T == structures.TypeId) {
@@ -326,12 +327,11 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
             .const_storage_cursor => |cursor| {
                 if (try types.storageCursorAccess(cursor.type_id) == null and try types.borrowElement(cursor.type_id) == null) return false;
             },
+            .const_static_string => |constant| if (try types.staticStringBytes(constant.type_id) == null) return false,
             .storage_cursor => |operation| {
                 const cursor = (try types.storageCursorAccess(operation.type_id)) orelse return false;
                 const source_type = body.valueType(operation.source);
-                if (source_type == .static_data) {
-                    if (cursor != .byte) return false;
-                } else if (try types.arrayType(source_type)) |array| {
+                if (try types.arrayType(source_type)) |array| {
                     if (cursor != array.element_type) return false;
                 } else if ((try types.allocationElement(source_type)) != cursor) return false;
             },
@@ -466,6 +466,10 @@ fn validInitializerResult(db: *query.Database, types: anytype, body: structures.
     const result = body.initializer_regions[reference.region].return_type;
     if (reference.type_id == result) return true;
     const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
+    if (try analysis.collectionSequenceElement(reference.type_id)) |element| {
+        const construction = (try analysis.collectionSequenceConstruction(reference.type_id, element)) orelse return false;
+        return construction.type_id == result;
+    }
     const collection = (try analysis.collectionLiteralType(reference.type_id)) orelse return false;
     const array = (try types.arrayType(result)) orelse return false;
     return std.meta.eql(collection, array);
@@ -637,16 +641,17 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         for (terminator.successors()) |successor| if (successor) |target| {
             if (@backingInt(target.*) >= body.blocks.len) return false;
         };
+        for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
+            if (!validBranch(branch.*, body)) return false;
+        };
         const valid = switch (block.terminator) {
-            .branch => |branch| validBranch(branch, body),
-            .predicate_branch => |branch| validBranch(branch.then_branch, body) and validBranch(branch.else_branch, body),
             .fallible_call => |branch| validCall(branch.call, body) and
                 validFallibleTargets(branch.call, branch.success, branch.failure, body),
             .return_value => |use| validUse(use, body) and validOrdinaryValue(use.value, body) and
                 (use.coerce_to orelse body.valueType(use.value)) == body.return_type,
             .return_failure => body.is_fallible,
             .return_unit => body.return_type == .unit,
-            .diverge => true,
+            .branch, .predicate_branch, .diverge => true,
         };
         if (!valid) return false;
     }
@@ -1421,6 +1426,34 @@ test "invalid machine-code cache shapes are rejected" {
     damaged = valid;
     damaged.relocations = &.{.{ .offset = 0, .kind = .call_relative_32, .reference = .{ .function = @fromBackingInt(@intCast(1)) }, .addend = 0 }};
     try std.testing.expect(!validCompiledFunction(damaged));
+    damaged = valid;
+    damaged.referenced_instances = &.{};
+    try std.testing.expect(!validCompiledFunction(damaged));
+    damaged = valid;
+    damaged.code = &.{};
+    try std.testing.expect(!validCompiledFunction(damaged));
+    damaged = valid;
+    damaged.required_alignment = 3;
+    try std.testing.expect(!validCompiledFunction(damaged));
+
+    const data_artifact: structures.CompiledFunction = .{
+        .code = &.{ 0, 0, 0, 0, 0, 0, 0, 0 },
+        .required_alignment = 1,
+        .constant_data = &.{.{ .bytes = "abc" }},
+        .relocations = &.{.{ .offset = 0, .kind = .address_absolute_64, .reference = .{ .data = 0 }, .addend = 3 }},
+    };
+    try std.testing.expect(validCompiledFunction(data_artifact));
+    for ([_]structures.CompiledFunction.Relocation{
+        .{ .offset = 1, .kind = .address_absolute_64, .reference = .{ .data = 0 }, .addend = 0 },
+        .{ .offset = 0, .kind = .address_absolute_64, .reference = .{ .data = 1 }, .addend = 0 },
+        .{ .offset = 0, .kind = .call_relative_32, .reference = .{ .data = 0 }, .addend = 0 },
+        .{ .offset = 0, .kind = .address_absolute_64, .reference = .{ .data = 0 }, .addend = -1 },
+        .{ .offset = 0, .kind = .address_absolute_64, .reference = .{ .data = 0 }, .addend = 4 },
+    }) |relocation| {
+        damaged = data_artifact;
+        damaged.relocations = &.{relocation};
+        try std.testing.expect(!validCompiledFunction(damaged));
+    }
 }
 
 test "cached panic metadata rejects out-of-range sites frames and patches" {
@@ -1523,16 +1556,19 @@ test "cached initializer failures reject invalid ordinary targets and result rep
     defer writer.deinit();
     try writer.write(structures.FunctionBodyAnalysis, original);
     var reader: codec.Reader = .{ .allocator = allocator, .bytes = writer.bytes.items };
-    var body = try reader.read(structures.FunctionBodyAnalysis);
-    defer body.deinit(allocator);
-    try std.testing.expect(validFunctionBody(body));
-    const call = &body.blocks[0].terminator.fallible_call;
+    var restored = try reader.read(structures.FunctionBodyAnalysis);
+    defer restored.deinit(allocator);
+    try std.testing.expect(validFunctionBody(restored));
+    var body = restored;
+    body.blocks = &blocks;
+    body.block_arguments = &arguments;
+    const call = &blocks[0].terminator.fallible_call;
     const success = call.success;
     const failure = call.failure;
     call.success = failure.?;
     try std.testing.expect(!validFunctionBody(body));
     call.success = success;
-    const success_argument = &body.block_arguments[body.blocks[@backingInt(success)].argument_start];
+    const success_argument = &arguments[blocks[@backingInt(success)].argument_start];
     const success_type = success_argument.type_id;
     success_argument.type_id = .bool;
     try std.testing.expect(!validFunctionBody(body));
@@ -1569,16 +1605,25 @@ test "cached nested handles reject changed capture representations" {
     defer writer.deinit();
     try writer.write(structures.FunctionBodyAnalysis, original);
     var reader: codec.Reader = .{ .allocator = allocator, .bytes = writer.bytes.items };
-    var body = try reader.read(structures.FunctionBodyAnalysis);
-    defer body.deinit(allocator);
-    try std.testing.expect(validFunctionBody(body));
-    const region = &body.initializer_regions[0];
-    try std.testing.expectEqual(structures.ValueRepresentation.initializer, region.block_arguments[0].representation);
-    region.block_arguments[0].representation = .storage;
-    region.parameter_modes[0] = .imm;
+    var restored = try reader.read(structures.FunctionBodyAnalysis);
+    defer restored.deinit(allocator);
+    try std.testing.expect(validFunctionBody(restored));
+    const regions = try allocator.dupe(structures.FunctionBodyAnalysis, restored.initializer_regions);
+    defer allocator.free(regions);
+    const arguments = try allocator.dupe(structures.FunctionBlockArgument, regions[0].block_arguments);
+    defer allocator.free(arguments);
+    const modes = try allocator.dupe(structures.ParameterMode, regions[0].parameter_modes);
+    defer allocator.free(modes);
+    regions[0].block_arguments = arguments;
+    regions[0].parameter_modes = modes;
+    var body = restored;
+    body.initializer_regions = regions;
+    try std.testing.expectEqual(structures.ValueRepresentation.initializer, arguments[0].representation);
+    arguments[0].representation = .storage;
+    modes[0] = .imm;
     try std.testing.expect(!validFunctionBody(body));
-    region.block_arguments[0].representation = .initializer;
-    region.parameter_modes[0] = .init;
+    arguments[0].representation = .initializer;
+    modes[0] = .init;
     try std.testing.expect(validFunctionBody(body));
 }
 
@@ -1621,10 +1666,23 @@ test "cached initializers reject changed regions captures and value representati
     const original = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("run").? })).*.?;
     try writer.write(structures.FunctionBodyAnalysis, original);
     var reader: codec.Reader = .{ .allocator = allocator, .bytes = writer.bytes.items };
-    var body = try reader.read(structures.FunctionBodyAnalysis);
-    defer body.deinit(allocator);
-    try std.testing.expect(validFunctionBody(body));
-    const reference = &body.instructions[0].initializer_ref;
+    var restored = try reader.read(structures.FunctionBodyAnalysis);
+    defer restored.deinit(allocator);
+    try std.testing.expect(validFunctionBody(restored));
+    const instructions = try allocator.dupe(structures.FunctionInstruction, restored.instructions);
+    defer allocator.free(instructions);
+    const regions = try allocator.dupe(structures.FunctionBodyAnalysis, restored.initializer_regions);
+    defer allocator.free(regions);
+    const arguments = try allocator.dupe(structures.FunctionBlockArgument, regions[0].block_arguments);
+    defer allocator.free(arguments);
+    const call_arguments = try allocator.dupe(structures.FunctionCallArgument, restored.call_arguments);
+    defer allocator.free(call_arguments);
+    regions[0].block_arguments = arguments;
+    var body = restored;
+    body.instructions = instructions;
+    body.initializer_regions = regions;
+    body.call_arguments = call_arguments;
+    const reference = &instructions[0].initializer_ref;
     const old_region = reference.region;
     reference.region = @intCast(body.initializer_regions.len);
     try std.testing.expect(!validFunctionBody(body));
@@ -1632,14 +1690,14 @@ test "cached initializers reject changed regions captures and value representati
     reference.captures.end += 1;
     try std.testing.expect(!validFunctionBody(body));
     reference.captures.end -= 1;
-    body.initializer_regions[0].return_type = .bool;
+    regions[0].return_type = .bool;
     try std.testing.expect(!validFunctionBody(body));
-    body.initializer_regions[0].return_type = .int;
-    body.initializer_regions[0].block_arguments[0].type_id = .bool;
+    regions[0].return_type = .int;
+    arguments[0].type_id = .bool;
     try std.testing.expect(!validFunctionBody(body));
-    body.initializer_regions[0].block_arguments[0].type_id = .int;
+    arguments[0].type_id = .int;
     try std.testing.expect(validFunctionBody(body));
-    body.call_arguments[0] = .{ .prepared = .{ .value = original.call_arguments[0].valueId() } };
+    call_arguments[0] = .{ .prepared = .{ .value = original.call_arguments[0].valueId() } };
     try std.testing.expect(!validFunctionBody(body));
 }
 
@@ -1805,8 +1863,8 @@ test "text intern restoration rejects malformed bytes IDs and payload types" {
         defer first.deinit();
         const data = try first.intern(queries.ByteStrings, .{ .bytes = if (case_index == 1) "\xff" else "abc" });
         _ = try first.intern(queries.CompileTimeValues, .{ .runtime = .{
-            .type_id = .static_data,
-            .value = if (case_index == 3) .{ .int = 42 } else .{ .static_data = if (case_index == 2) @fromBackingInt(@as(u32, 99)) else data },
+            .type_id = .string_literal,
+            .value = if (case_index == 3) .{ .int = 42 } else .{ .string_literal = if (case_index == 2) @fromBackingInt(@as(u32, 99)) else data },
         } });
         var writer: codec.Writer = .{ .allocator = allocator };
         defer writer.deinit();

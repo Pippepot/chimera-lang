@@ -12,7 +12,7 @@ pub struct Array(T: type, N: int)
     pub func iter(ref self: Array(T, N)) SpanIterator(T)
         var view = self.span()
         return view.iter()
-    pub fallible slice(ref self: Array(T, N), static A: type, static B: type, bounds: Range(A, B)) Span(T)
+    pub fallible slice(ref self: Array(T, N), bounds: Range) Span(T)
         var view = self.span()
         return view.slice?(bounds)
 

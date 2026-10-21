@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Count Zig source and test code.
 set -euo pipefail
 shopt -s nullglob globstar
 

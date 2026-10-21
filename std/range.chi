@@ -1,23 +1,26 @@
 import std.iteration.{End}
+import std.text.{String}
 
-pub struct Range(A: type, B: type)
-    copy = trivial
-    pub first: A
-    pub limit: B
+pub struct Range
+    copy = fieldwise
+    pub first: int | none
+    pub limit: int | none
     inclusive: bool
 
-    pub func iter(self: Range(int, int)) RangeIterator -> self.sequence().iter()
-    pub func reversed(self: Range(int, int)) RangeSequence -> self.sequence().reversed()
-    pub fallible step_by(self: Range(int, int), factor: int) RangeSequence -> self.sequence().step_by?(factor)
+    pub func iter(self: Range) RangeIterator
+        if const sequence = self.sequence() -> return sequence.iter()
+        panic "range iteration requires both endpoints"
+    pub func reversed(self: Range) RangeSequence
+        if const sequence = self.sequence() -> return sequence.reversed()
+        panic "range reversal requires both endpoints"
+    pub fallible step_by(self: Range, factor: int) RangeSequence -> self.sequence?().step_by?(factor)
 
-    pub fallible resolve(self: Range(A, B), length: int) (int, int)
+    pub fallible resolve(self: Range, length: int) (int, int)
         length >= 0
-        const first: int | none = self.first
-        const limit: int | none = self.limit
         var start = 0
-        if const value = first as int -> start = value
+        if const value = self.first as int -> start = value
         var end = length
-        if const value = limit as int
+        if const value = self.limit as int
             value >= 0
             if self.inclusive?
                 start <= value
@@ -32,12 +35,14 @@ pub struct Range(A: type, B: type)
         start <= end
         return (start, end)
 
-    func sequence(self: Range(int, int)) RangeSequence
+    fallible sequence(self: Range) RangeSequence
+        const first = self.first as int
+        const limit = self.limit as int
         if self.inclusive?
-            return RangeSequence{first = self.first, last = self.limit, stride = 1, descending = false, empty = bool(self.first > self.limit)}
-        if self.first >= self.limit
-            return RangeSequence{first = self.first, last = self.first, stride = 1, descending = false, empty = true}
-        return RangeSequence{first = self.first, last = self.limit - 1, stride = 1, descending = false, empty = false}
+            return RangeSequence{first = first, last = limit, stride = 1, descending = false, empty = bool(first > limit)}
+        if first >= limit
+            return RangeSequence{first = first, last = first, stride = 1, descending = false, empty = true}
+        return RangeSequence{first = first, last = limit - 1, stride = 1, descending = false, empty = false}
 
 pub struct RangeSequence
     copy = trivial
@@ -104,11 +109,23 @@ pub struct RangeIterator
         self.started = true
         return self.value
 
-pub func exclusive(static A: type, static B: type, first: A, limit: B) Range(A, B)
-    return Range(A, B){first = first, limit = limit, inclusive = false}
+pub func exclusive(first: int | none, limit: int | none) Range
+    return Range{first = first, limit = limit, inclusive = false}
 
-pub func inclusive(static A: type, static B: type, first: A, limit: B) Range(A, B)
-    return Range(A, B){first = first, limit = limit, inclusive = true}
+pub func inclusive(first: int | none, limit: int | none) Range
+    return Range{first = first, limit = limit, inclusive = true}
+
+pub converter(imm value: Range) String
+    if const result = format_range(value) -> return result^
+    panic "string conversion allocation failed"
+
+fallible format_range(imm value: Range) String
+    var result = String.empty()
+    if const number = value.first as int -> result.append?(String(number))
+    result.append?("..")
+    if value.inclusive? -> result.append?("^")
+    if const number = value.limit as int -> result.append?(String(number))
+    return result^
 
 func not_direction(value: bool) bool
     if value? -> return false

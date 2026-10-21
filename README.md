@@ -92,9 +92,22 @@ For a standalone marked call inside a fallible function, success continues to
 the next statement and failure makes the enclosing function fail too. The `?`
 marks the invocation, not failure propagation; use `if` to handle failure locally.
 
+Top-level code is implicitly fallible, so scripts can use the same operations
+directly:
+
+```chi
+var numbers = List(int).new?(4)
+numbers.append?(10)
+numbers.append?(20)
+print(numbers[0])
+```
+
+Successful fallthrough cleans up and exits with status `0`. Unhandled ordinary
+failure cleans up and exits with status `1`. Local handlers still take precedence.
+
 Use the bare statement `fail` to propagate failure explicitly, including after
-local cleanup. A `fallible` function or deferred initializer can propagate it. An ordinary
-`func` handles fallible expressions with `if` or an expected variant containing
+local cleanup. Top-level code, a `fallible` function, or a deferred initializer
+can propagate it. An ordinary `func` handles fallible expressions with `if` or an expected variant containing
 `none`. Consuming a deferred initializer is always potentially
 fallible, so its construction site must handle or propagate that failure.
 
@@ -114,6 +127,19 @@ const area = square(7)
 
 The same function works in both settings, without a separate compile-time
 version. Types can be built by compile-time functions too.
+
+Collection construction can expand a static shape while evaluating its elements
+at runtime:
+
+```chi
+const evens = [i * 2 static for i in 0..4]
+const combined = [0, ..evens, 8]
+const positives = [x for x in evens if x > 0]
+```
+
+`evens` and `combined` are fixed-size Arrays. The runtime filter makes `positives`
+a List. Use `List(int).collect?([x for x in evens if x > 0])` when allocation
+failure should propagate as ordinary failure.
 
 ## Make change visible
 
@@ -166,8 +192,8 @@ The current target is **Linux x86-64**.
 
 Chimera is experimental. These examples work today, but the language is still
 evolving and the standard library is small. UTF-8 strings and views, byte I/O,
-Arrays, Lists, and borrowed spans work today. Formatting, parsing, iteration,
-and more collections remain ahead. The [roadmap](ROADMAP.md) records upcoming work
+Arrays, Lists, borrowed spans, iteration, and comprehensions work today.
+More collection types and language features remain ahead. The [roadmap](ROADMAP.md) records upcoming work
 and priorities.
 
 ## Go deeper

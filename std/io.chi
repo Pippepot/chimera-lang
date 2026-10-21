@@ -1,5 +1,5 @@
 import std.memory.{List}
-import std.text.{BytesView, StringView}
+import std.text.{BytesView, String, StringView}
 
 pub struct Stream
     copy = trivial
@@ -19,7 +19,8 @@ pub fallible write_all(stream: Stream, imm bytes: BytesView)
         written > 0
         offset += written
 pub fallible write_text(stream: Stream, imm text: StringView) -> write_all?(stream, text.as_bytes())
-pub func print(imm text: StringView)
-    if not write_text(stdout, text) -> panic "standard output write failed"
+pub overload print(print_value)
+func print_value(static T: type, imm value: T)
+    if not write_text(stdout, String(value)) -> panic "standard output write failed"
     if not write_text(stdout, "\n") -> panic "standard output newline write failed"
 pub fallible read_bytes(stream: Stream, mut bytes: List(byte), count: int) int -> bytes.read_bytes?(stream.descriptor, count)

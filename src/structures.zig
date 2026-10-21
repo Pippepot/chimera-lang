@@ -260,6 +260,9 @@ pub const Node = struct {
         selective_import,
         @"pub",
         collection_literal,
+        collection_spread,
+        collection_for,
+        collection_if,
         tuple_literal,
         _,
     };
@@ -289,11 +292,11 @@ pub const Node = struct {
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .fail_expr, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
-            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .reference_type, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub" => .node,
-            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if" => .node_node,
+            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .reference_type, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread => .node,
+            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if", .collection_if => .node_node,
             .struct_field => .field,
             .signature => .signature,
-            .block, .for_loop, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .import, .selective_import, .overload => .ref,
+            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .import, .selective_import, .overload => .ref,
             else => null,
         };
     }
@@ -324,9 +327,9 @@ pub const Node = struct {
 
 pub const Ast = struct {
     file_id: FileId,
-    tokens: []Token = &.{},
-    nodes: []Node = &.{},
-    node_refs: []Node.Index = &.{},
+    tokens: []const Token = &.{},
+    nodes: []const Node = &.{},
+    node_refs: []const Node.Index = &.{},
 
     pub fn nodeList(self: Ast, index: Node.Index) []const Node.Index {
         const node = self.nodes[(index.unwrap() orelse return &.{}).index()];
@@ -402,15 +405,21 @@ pub const Operation = enum {
     @"[]",
     @"[]=",
 
-    pub fn fromName(name: []const u8, operands: ?usize) ?Operation {
-        var fallback: ?Operation = null;
-        inline for (std.enums.values(Operation)) |operation| {
-            if (std.mem.eql(u8, name, operation.spelling())) {
-                if (operands == operation.operandCount()) return operation;
-                if (fallback == null) fallback = operation;
-            }
+    const names = std.StaticStringMap(Operation).initComptime(blk: {
+        var entries: [std.enums.values(Operation).len - 1]struct { []const u8, Operation } = undefined;
+        var index: usize = 0;
+        for (std.enums.values(Operation)) |operation| {
+            if (operation == .unary_minus) continue;
+            entries[index] = .{ operation.spelling(), operation };
+            index += 1;
         }
-        return fallback;
+        break :blk entries;
+    });
+
+    pub fn fromName(name: []const u8, operands: ?usize) ?Operation {
+        const operation = names.get(name) orelse return null;
+        if (operation == .@"-" and operands == 1) return .unary_minus;
+        return operation;
     }
 
     pub fn spelling(self: Operation) []const u8 {
@@ -522,7 +531,7 @@ pub const DiscoveredItem = struct {
 
 pub const ItemTree = struct {
     file_id: FileId,
-    items: []DiscoveredItem,
+    items: []const DiscoveredItem,
 
     pub const eql = value_operations.Owned(@This()).eql;
 
@@ -565,6 +574,7 @@ pub const ModuleScope = struct {
         item_id: ItemId,
         kind: ItemKind,
         is_public: bool = false,
+        is_converter: bool = false,
     };
 
     pub fn resolve(self: ModuleScope, name: []const u8) ?ItemId {
@@ -600,7 +610,7 @@ pub const ModuleScope = struct {
 };
 
 pub const ModuleItemIndex = struct {
-    entries: []Entry,
+    entries: []const Entry,
 
     pub const Entry = struct { item: ItemId, location: ResolvedItem };
 
@@ -629,7 +639,7 @@ pub const ImportName = struct {
 pub const ImportDeclaration = struct {
     path: ImportName,
     alias: ?ImportName,
-    selective: ?[]Selection,
+    selective: ?[]const Selection,
     is_public: bool,
 
     pub const Selection = struct { original: ImportName, bound: ImportName };
@@ -640,7 +650,7 @@ pub const ImportDeclaration = struct {
 };
 
 pub const ImportDeclarations = struct {
-    entries: []ImportDeclaration,
+    entries: []const ImportDeclaration,
 
     pub const eql = value_operations.Owned(@This()).eql;
 
@@ -679,8 +689,8 @@ pub const FileImport = struct {
 
 pub const FileImports = struct {
     // Full unaliased paths permit child navigation; prefix bindings alone do not.
-    modules: []ModuleId,
-    imports: []FileImport,
+    modules: []const ModuleId,
+    imports: []const FileImport,
 
     pub const eql = value_operations.Owned(@This()).eql;
 
@@ -705,7 +715,6 @@ pub const CompileTimeValue = union(enum) {
         int: i32,
         int_literal: i64,
         string_literal: ByteStringId,
-        static_data: ByteStringId,
         storage_cursor: StaticStorageCursor,
         byte: u8,
         bool: bool,
@@ -723,7 +732,6 @@ pub const CompileTimeValue = union(enum) {
                 .int => .int,
                 .int_literal => .int_literal,
                 .string_literal => .string_literal,
-                .static_data => .static_data,
                 .storage_cursor => |cursor| cursor.type_id,
                 .byte => .byte,
                 .bool => .bool,
@@ -743,6 +751,7 @@ pub const CompileTimeValueId = enum(u32) { _ };
 pub const ByteStringId = enum(u32) { _ };
 pub const ByteString = struct { bytes: []const u8 };
 pub const StaticStorageCursor = struct { type_id: TypeId, data: ?ByteStringId = null, offset: u32 = 0 };
+pub const StaticStringConstant = struct { type_id: TypeId, data: ByteStringId };
 
 /// Session-stable identity of one ordered tuple of canonical compile-time
 /// values. Specializations and interpreted calls share this representation.
@@ -791,7 +800,6 @@ pub const TypeId = enum(u32) {
     type,
     int_literal,
     string_literal,
-    static_data,
     _,
 
     const interned_mask: u32 = 1 << 31;
@@ -807,7 +815,7 @@ pub const TypeId = enum(u32) {
     }
 
     pub fn isPrimitive(self: TypeId) bool {
-        return self == .int or self == .bool or self == .unit or self == .none or self == .never or self == .type or self == .byte or self == .int_literal or self == .string_literal or self == .static_data;
+        return @backingInt(self) <= @backingInt(TypeId.string_literal);
     }
 };
 
@@ -878,6 +886,14 @@ pub const TupleType = struct {
     members: []const MemberSpec,
 };
 
+/// Logical result of consuming an init carrier. A projection describes a
+/// construction-only wrapper's reference shape, not runtime wrapper storage.
+pub const InitializerConstruction = struct {
+    type_id: TypeId,
+    projection: ?u32 = null,
+    fallible_allocation: bool = false,
+};
+
 pub const ArrayType = struct {
     element_type: TypeId,
     length: u32,
@@ -911,7 +927,7 @@ pub const StructField = struct {
 };
 
 pub const StructDefinition = struct {
-    fields: []StructField,
+    fields: []const StructField,
     ownership: StructOwnershipProperties = .{},
     is_static: bool = false,
 
@@ -951,7 +967,7 @@ pub const StructOwnershipProperties = struct {
 
 pub const StructLayout = struct {
     layout: TypeLayout,
-    field_offsets: []u32,
+    field_offsets: []const u32,
 
     pub const eql = value_operations.Owned(@This()).eql;
 
@@ -1035,7 +1051,7 @@ pub const FunctionCallArgument = union(enum) {
         return self.valueUse().value;
     }
 
-    pub fn operand(self: *@This()) *FunctionValueId {
+    pub fn operand(self: anytype) OperandPointer(@TypeOf(self)) {
         return switch (self.*) {
             .prepared => |*use| &use.value,
             .deinit, .borrowed, .initializer => |*source| source,
@@ -1081,12 +1097,20 @@ pub const FunctionTerminator = union(enum) {
     return_failure,
     diverge,
 
-    pub fn operands(self: *FunctionTerminator) [2]?*FunctionValueId {
+    pub fn operands(self: anytype) [2]?OperandPointer(@TypeOf(self)) {
         return switch (self.*) {
             .predicate_branch => |*branch| .{ &branch.operands.lhs, &branch.operands.rhs },
             .fallible_call => |*fallible| fallible.call.operands(),
             .return_value => |*use| .{ &use.value, null },
             .branch, .return_unit, .return_failure, .diverge => .{ null, null },
+        };
+    }
+
+    pub fn branches(self: *FunctionTerminator) [2]?*FunctionBranch {
+        return switch (self.*) {
+            .branch => |*branch| .{ branch, null },
+            .predicate_branch => |*branch| .{ &branch.then_branch, &branch.else_branch },
+            .fallible_call, .return_unit, .return_value, .return_failure, .diverge => .{ null, null },
         };
     }
 
@@ -1147,6 +1171,8 @@ pub const CallBehavior = enum {
     list_new,
     list_append,
     list_reserve,
+    collection_append_bounded,
+    collection_append_growing,
 };
 
 pub const FunctionParameterShape = struct {
@@ -1161,6 +1187,15 @@ pub const FunctionShape = struct {
     returns_type: bool = false,
     is_fallible: bool = false,
     parameters: []const FunctionParameterShape,
+    static_names: []const []const u8 = &.{},
+
+    pub fn specializationArgument(self: FunctionShape, arguments: []const CompileTimeValueId, name: []const u8) ?CompileTimeValueId {
+        std.debug.assert(arguments.len <= self.static_names.len);
+        for (self.static_names[0..arguments.len], arguments) |parameter_name, argument| {
+            if (std.mem.eql(u8, parameter_name, name)) return argument;
+        }
+        return null;
+    }
 
     pub const eql = value_operations.Owned(@This()).eql;
 
@@ -1173,7 +1208,7 @@ pub const FunctionCall = struct {
     return_type: TypeId,
     destination: ?FunctionValueId = null,
 
-    pub fn operands(self: *FunctionCall) [2]?*FunctionValueId {
+    pub fn operands(self: anytype) [2]?OperandPointer(@TypeOf(self)) {
         return .{
             switch (self.target) {
                 .indirect => &self.target.indirect,
@@ -1188,10 +1223,11 @@ pub const FunctionCall = struct {
 pub const FunctionReference = struct {
     target: ItemId,
     specialization: ?CompileTimeValueTupleId = null,
+    environment: ?CompileTimeBindingsId = null,
     type_id: TypeId,
 
     pub fn instance(self: FunctionReference) InstanceId {
-        return .{ .item = self.target, .specialization = self.specialization };
+        return .{ .item = self.target, .specialization = self.specialization, .environment = self.environment };
     }
 };
 
@@ -1268,7 +1304,7 @@ pub const FunctionInstruction = union(enum) {
     const_int: i32,
     const_int_literal: i64,
     const_string_literal: ByteStringId,
-    const_data: ByteStringId,
+    const_static_string: StaticStringConstant,
     const_storage_cursor: StaticStorageCursor,
     storage_cursor: BorrowOperation,
     cursor_offset: CursorElement,
@@ -1305,9 +1341,9 @@ pub const FunctionInstruction = union(enum) {
     muli: BinaryOperands,
     divsi: BinaryOperands,
 
-    pub fn operands(self: *FunctionInstruction) [2]?*FunctionValueId {
+    pub fn operands(self: anytype) [2]?OperandPointer(@TypeOf(self)) {
         return switch (self.*) {
-            .const_int, .const_int_literal, .const_string_literal, .const_data, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage => .{ null, null },
+            .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage => .{ null, null },
             .variant_tag, .negi, .byte_to_int => |*operand| .{ operand, null },
             .variant_coerce, .variant_extract, .callable_coerce => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
             .storage_projection => |*operation| .{ &operation.owner, null },
@@ -1331,7 +1367,7 @@ pub const FunctionInstruction = union(enum) {
             .const_int, .variant_tag, .negi, .addi, .subi, .muli, .divsi, .byte_to_int => .int,
             .const_int_literal => .int_literal,
             .const_string_literal => .string_literal,
-            .const_data => .static_data,
+            .const_static_string => |constant| constant.type_id,
             .const_storage_cursor => |cursor| cursor.type_id,
             .storage_cursor => |operation| operation.type_id,
             .cursor_offset, .cursor_element => |operation| operation.type_id,
@@ -1359,11 +1395,8 @@ pub const FunctionInstruction = union(enum) {
     }
 };
 
-/// Owned function control-flow graph. Block arguments, branch operands, call
-/// operands, and instructions use flat arrays while each block owns its ranges
-/// and terminator. Calls retain declaration identities until code emission.
-/// Private paths describe references inside logical values, independently of
-/// the address projections consumed by code generation.
+/// Paths describe references inside logical values, independently of the
+/// address projections consumed by code generation.
 pub const ReferencePathStep = union(enum) {
     field: u32,
     variant: TypeId,
@@ -1407,10 +1440,10 @@ pub const ReferenceExclusion = struct {
 };
 
 pub const ReferenceContract = struct {
-    origins: []ReferenceOriginContract = &.{},
-    requirements: []ReferenceRequirement = &.{},
-    exclusions: []ReferenceExclusion = &.{},
-    paths: []ReferencePathStep = &.{},
+    origins: []const ReferenceOriginContract = &.{},
+    requirements: []const ReferenceRequirement = &.{},
+    exclusions: []const ReferenceExclusion = &.{},
+    paths: []const ReferencePathStep = &.{},
 
     pub const eql = value_operations.Owned(@This()).eql;
     pub const deinit = value_operations.Owned(@This()).deinit;
@@ -1482,18 +1515,18 @@ pub const FunctionBodyAnalysis = struct {
     is_fallible: bool = false,
     /// Region entry arguments are addresses supplied by its private environment.
     is_initializer_region: bool = false,
-    initializer_regions: []FunctionBodyAnalysis = &.{},
-    initializer_captures: []FunctionValueId = &.{},
-    parameter_modes: []ParameterMode = &.{},
-    block_arguments: []FunctionBlockArgument = &.{},
+    initializer_regions: []const FunctionBodyAnalysis = &.{},
+    initializer_captures: []const FunctionValueId = &.{},
+    parameter_modes: []const ParameterMode = &.{},
+    block_arguments: []const FunctionBlockArgument = &.{},
     variant_coercion_tags: []const u32 = &.{},
-    borrow_fields: []BorrowProjection = &.{},
-    branch_arguments: []FunctionValueUse = &.{},
-    call_arguments: []FunctionCallArgument = &.{},
-    instructions: []Instruction = &.{},
-    instruction_spans: []SourceSpan = &.{},
-    terminator_spans: []SourceSpan = &.{},
-    blocks: []Block = &.{},
+    borrow_fields: []const BorrowProjection = &.{},
+    branch_arguments: []const FunctionValueUse = &.{},
+    call_arguments: []const FunctionCallArgument = &.{},
+    instructions: []const Instruction = &.{},
+    instruction_spans: []const SourceSpan = &.{},
+    terminator_spans: []const SourceSpan = &.{},
+    blocks: []const Block = &.{},
     entry: BlockId,
 
     pub const ValueId = FunctionValueId;
@@ -1520,15 +1553,7 @@ pub const FunctionBodyAnalysis = struct {
     /// Visits stored operands in this body, including side tables and destinations.
     /// Parameter targets and nested regions have independent identities.
     pub fn visitValueReferences(self: @This(), context: anytype, comptime visit: anytype) void {
-        for (self.instructions) |*instruction| for (instruction.operands()) |operand| {
-            if (operand) |value| visit(context, value);
-        };
-        for (self.blocks) |*block| for (block.terminator.operands()) |operand| {
-            if (operand) |value| visit(context, value);
-        };
-        for (self.call_arguments) |*argument| visit(context, argument.operand());
-        for (self.branch_arguments) |*argument| visit(context, &argument.value);
-        for (self.initializer_captures) |*capture| visit(context, capture);
+        visitFunctionValueReferences(self, context, visit);
     }
 
     pub fn hasFailureExit(self: @This()) bool {
@@ -1541,22 +1566,69 @@ pub const FunctionBodyAnalysis = struct {
     pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
+pub const FunctionBodyFinalization = struct {
+    instructions: []FunctionInstruction,
+    blocks: []FunctionBlock,
+    call_arguments: []FunctionCallArgument,
+    branch_arguments: []FunctionValueUse,
+    initializer_captures: []FunctionValueId,
+
+    pub fn visitValueReferences(self: @This(), context: anytype, comptime visit: anytype) void {
+        visitFunctionValueReferences(self, context, visit);
+    }
+};
+
+fn OperandPointer(comptime Pointer: type) type {
+    return if (@typeInfo(Pointer).pointer.attrs.@"const") *const FunctionValueId else *FunctionValueId;
+}
+
+fn visitFunctionValueReferences(view: anytype, context: anytype, comptime visit: anytype) void {
+    for (view.instructions) |*instruction| for (instruction.operands()) |operand| {
+        if (operand) |value| visit(context, value);
+    };
+    for (view.blocks) |*block| for (block.terminator.operands()) |operand| {
+        if (operand) |value| visit(context, value);
+    };
+    for (view.call_arguments) |*argument| visit(context, argument.operand());
+    for (view.branch_arguments) |*argument| visit(context, &argument.value);
+    for (view.initializer_captures) |*capture| visit(context, capture);
+}
+
 /// Callable-instance key. Static argument tuples are interned separately so
 /// query keys remain small and pointer-free.
 pub const InstanceId = struct {
     item: ItemId,
     specialization: ?CompileTimeValueTupleId = null,
+    environment: ?CompileTimeBindingsId = null,
+
+    pub fn hash(self: InstanceId) u64 {
+        var identity: u64 = @backingInt(self.item);
+        if (self.specialization) |specialization|
+            identity ^= std.hash.int(@as(u64, @backingInt(specialization)) + 1);
+        if (self.environment) |environment|
+            identity ^= std.math.rotl(u64, std.hash.int(@as(u64, @backingInt(environment)) + 1), 32);
+        return std.hash.int(identity);
+    }
 };
 
-/// Pointer-free identity of a source expression evaluated at compile time. The
-/// owning instance supplies its static environment; the node identifies the
-/// expression in the current parsed source. Runtime lexical captures are not
-/// part of a site identity and are rejected semantically.
+pub const CompileTimeBindingsId = enum(u32) { _ };
+pub const CompileTimeBindings = struct { bindings: []const StaticBinding };
+
+pub const StaticBinding = struct {
+    name: []const u8,
+    /// Null records an unavailable runtime lexical name, without its data.
+    value: ?CompileTimeValueId,
+};
+
+/// Owned identity of a source expression and its lexical static bindings.
+/// Runtime lexical captures are rejected semantically.
 pub const CompileTimeSite = struct {
     owner: InstanceId,
     node: Node.Index,
     expected_type: ?TypeId = null,
     public_annotation: bool = false,
+    bindings: ?CompileTimeBindingsId = null,
+    condition: bool = false,
 };
 
 /// Identity of one concrete compile-time function invocation. Ordinary
@@ -1776,6 +1848,10 @@ pub const Diagnostic = struct {
         box_extraction_requires_direct_move: TypeId,
         value_requires_explicit_drop: TypeId,
         expression_not_supported,
+        invalid_collection_sequence,
+        collection_requires_static_count,
+        collection_size_out_of_range,
+        static_iteration_binding_mode,
         struct_initializer_not_struct: TypeId,
         unknown_struct_field,
         duplicate_struct_initializer_field,

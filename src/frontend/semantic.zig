@@ -1,4 +1,5 @@
 const std = @import("std");
+const profiling = @import("../profiling.zig");
 const text_literal = @import("text_literal.zig");
 const structures = @import("../structures.zig");
 
@@ -143,7 +144,6 @@ pub const UnresolvedBody = struct {
             integer_literal: i64,
             int_literal_value: i64,
             string_literal: structures.ByteStringId,
-            static_data: structures.ByteStringId,
             storage_cursor: structures.StaticStorageCursor,
             integer: i32,
             byte: u8,
@@ -164,7 +164,11 @@ pub const UnresolvedBody = struct {
                 fields: structures.FunctionValueRange,
             },
             array_init: struct { type_id: structures.TypeId, elements: structures.FunctionValueRange },
-            collection_literal: structures.FunctionValueRange,
+            collection_literal: struct { elements: structures.FunctionValueRange, sink: LocalId, sink_reads: structures.FunctionValueRange },
+            collection_spread: struct { source: ValueUse, iteration: ValueUse },
+            collection_comprehension: ValueUse,
+            collection_emit: struct { element: ValueUse, sink: ValueUse },
+            collection_iteration: struct { source: ValueUse, body: ValueUse },
             tuple_literal: structures.FunctionValueRange,
             field_access: struct { operand: ValueUse, name: []const u8 },
             dereference: ValueUse,
@@ -189,7 +193,7 @@ pub const UnresolvedBody = struct {
             },
             loop: BlockId,
             scope: BlockId,
-            iterator: ValueUse,
+            iterator: struct { source: ValueUse, structural_array: bool },
             iterator_item: struct {
                 carrier: LocalId,
                 operand: ValueUse,
@@ -220,6 +224,7 @@ pub const BodySource = union(enum) {
     entry: u32,
     function: struct { declaration: u32, parameters: []const structures.CallableParameter = &.{} },
     comptime_expression: structures.Node.Index,
+    static_iteration: structures.Node.Index,
     where_condition: structures.Node.Index,
 };
 
@@ -227,14 +232,20 @@ pub fn buildUnresolvedBody(
     ast: *const structures.Ast,
     source: []const u8,
     root: BodySource,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(UnresolvedBody) {
-    var builder: ExpressionBuilder(@TypeOf(type_interner)) = .{
+    var phase: profiling.Scope = .{};
+    phase.beginCurrent(.body_build);
+    defer phase.end();
+    var builder: ExpressionBuilder(@TypeOf(analysis_context)) = .{
         .ast = ast,
         .source = source,
-        .parameters = if (root == .function) root.function.parameters else &.{},
-        .type_interner = type_interner,
+        .parameters = switch (root) {
+            .function => |function| function.parameters,
+            else => &.{},
+        },
+        .analysis_context = analysis_context,
         .gpa = gpa,
     };
     defer builder.deinit();
@@ -245,13 +256,45 @@ pub fn buildUnresolvedBody(
     return .{ .success = try builder.finish() };
 }
 
-fn ExpressionBuilder(comptime TypeInterner: type) type {
+pub fn analyzeStaticTypeCall(ast: *const structures.Ast, source: []const u8, expression: structures.Node.Index, analysis_context: anytype, gpa: std.mem.Allocator) !SemanticResult(?structures.InstanceId) {
+    const node = ast.nodes[expression.index()];
+    if (node.tag != .call) return .{ .success = null };
+    const reference = (resolveNamedExpressionWithOperands(ast, source, node.data.node_node.a, analysis_context, ast.nodeList(node.data.node_node.b).len) catch |err| switch (err) {
+        error.QueryCycle => return .{ .unsupported = issueAt(ast, node.data.node_node.a.index(), .declaration_cycle) },
+        error.PublicFieldPrivateType => return .{ .unsupported = issueAt(ast, node.data.node_node.a.index(), .public_field_private_type) },
+        else => return err,
+    }) orelse return .{ .success = null };
+    if (reference != .declaration) return .{ .success = null };
+    const shape = (try analysis_context.functionShape(reference.declaration.item)) orelse return .{ .success = null };
+    if (!shape.returns_type or shape.is_fallible) return .{ .success = null };
+    for (shape.parameters) |parameter| if (parameter.mode != .static) return .{ .success = null };
+    if (try analysis_context.needsInheritedInference(reference.declaration)) return .{ .success = null };
+    if (ast.nodeList(node.data.node_node.b).len != shape.parameters.len) return .{ .success = null };
+    var builder: ExpressionBuilder(@TypeOf(analysis_context)) = .{
+        .ast = ast,
+        .source = source,
+        .parameters = &.{},
+        .analysis_context = analysis_context,
+        .gpa = gpa,
+    };
+    defer builder.deinit();
+    const call = builder.buildCall(expression, false) catch |err| switch (err) {
+        error.SourceRejected => return .{ .unsupported = builder.issue.? },
+        else => return err,
+    };
+    std.debug.assert(call.target == .direct);
+    std.debug.assert(call.arguments.start == call.arguments.end);
+    return .{ .success = call.target.direct };
+}
+
+fn ExpressionBuilder(comptime AnalysisServices: type) type {
     return struct {
         const Self = @This();
         const ValueId = UnresolvedBody.ValueId;
         const Local = union(enum) {
             value: ValueId,
             static_value: structures.CompileTimeValueId,
+            runtime_capture,
             type_value: structures.TypeId,
             place: struct {
                 id: UnresolvedBody.LocalId,
@@ -262,11 +305,14 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         ast: *const structures.Ast,
         source: []const u8,
         parameters: []const structures.CallableParameter,
-        type_interner: TypeInterner,
+        analysis_context: AnalysisServices,
         gpa: std.mem.Allocator,
         where_condition: bool = false,
         static_expression_count: u32 = 0,
         local_count: u32 = 0,
+        static_bindings: std.ArrayList(structures.StaticBinding) = .empty,
+        collection_sink: ?UnresolvedBody.LocalId = null,
+        static_iteration: bool = false,
         locals: std.StringHashMapUnmanaged(Local) = .empty,
         local_names: std.ArrayList([]const u8) = .empty,
         parameter_spans: std.ArrayList(structures.SourceSpan) = .empty,
@@ -286,6 +332,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         issue: ?Issue = null,
 
         fn deinit(self: *Self) void {
+            self.static_bindings.deinit(self.gpa);
             self.locals.deinit(self.gpa);
             self.local_names.deinit(self.gpa);
             self.parameter_spans.deinit(self.gpa);
@@ -307,6 +354,11 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn build(self: *Self, root: BodySource) anyerror!void {
+            for (try self.analysis_context.staticBindings()) |binding| {
+                try self.locals.put(self.gpa, binding.name, if (binding.value) |value| .{ .static_value = value } else .runtime_capture);
+                try self.local_names.append(self.gpa, binding.name);
+                try self.static_bindings.append(self.gpa, binding);
+            }
             switch (root) {
                 .entry => |declaration| try self.buildEntry(declaration),
                 .function => |function| {
@@ -314,6 +366,12 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     try self.buildFunction(function.declaration);
                 },
                 .comptime_expression => |expression| try self.buildComptimeThunk(expression),
+                .static_iteration => |index| {
+                    self.static_iteration = true;
+                    const parts = self.ast.nodeList(index);
+                    const traversal = try self.appendForParts(index, parts[0], parts[1], null);
+                    self.root_block = try self.finishBlock(&.{.{ .discard = .{ .value = traversal, .span = nodeFocusSpan(self.ast, index) } }}, try self.appendExpression(index, .unit), nodeFocusSpan(self.ast, index));
+                },
                 .where_condition => |condition| try self.buildWhereCondition(condition),
             }
         }
@@ -353,6 +411,29 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 isMetaTypeAnnotation(self.ast, self.source, return_type)
             else
                 false;
+            try self.bindFunctionParameters(declaration);
+
+            if (parts.body == .null) {
+                std.debug.assert(isExternalFunction(self.ast, declaration));
+                self.root_block = try self.finishBlock(&.{}, null, tokenSpan(self.ast, function.token_index));
+                return;
+            }
+            const body = self.ast.nodes[parts.body.index()];
+            var body_statements: std.ArrayList(UnresolvedBody.Statement) = .empty;
+            defer body_statements.deinit(self.gpa);
+            if (body.tag == .block) {
+                for (self.ast.node_refs[body.data.ref.start..body.data.ref.end]) |statement| {
+                    try body_statements.append(self.gpa, try self.buildStatement(statement, false));
+                }
+            } else {
+                try body_statements.append(self.gpa, try self.buildStatement(parts.body, false));
+            }
+            self.root_block = try self.finishBlock(body_statements.items, null, tokenSpan(self.ast, function.token_index));
+        }
+
+        fn bindFunctionParameters(self: *Self, declaration: u32) !void {
+            const parts = functionParts(self.ast, declaration);
+            const signature = self.ast.nodes[parts.signature.index()];
             const parameters = self.ast.nodeList(signature.data.signature.parameters);
             var runtime_index: usize = 0;
             for (parameters) |parameter_index| {
@@ -361,8 +442,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 const name = self.source[span.start..span.end];
                 const mode = parameterMode(self.ast, parameter) orelse unreachable;
                 if (mode == .static) {
-                    const value_id = (try self.type_interner.resolveStatic(name)) orelse unreachable;
-                    const value = try self.type_interner.lookupCompileTimeValue(value_id);
+                    const value_id = (try self.analysis_context.resolveStatic(name)) orelse unreachable;
+                    const value = try self.analysis_context.lookupCompileTimeValue(value_id);
                     const local: Local = switch (value) {
                         .type => |type_id| .{ .type_value = type_id },
                         .runtime => .{ .static_value = value_id },
@@ -390,23 +471,6 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             }
             std.debug.assert(runtime_index == self.parameters.len);
             self.static_expression_count = @intCast(self.expressions.items.len);
-
-            if (parts.body == .null) {
-                std.debug.assert(isExternalFunction(self.ast, declaration));
-                self.root_block = try self.finishBlock(&.{}, null, tokenSpan(self.ast, function.token_index));
-                return;
-            }
-            const body = self.ast.nodes[parts.body.index()];
-            var body_statements: std.ArrayList(UnresolvedBody.Statement) = .empty;
-            defer body_statements.deinit(self.gpa);
-            if (body.tag == .block) {
-                for (self.ast.node_refs[body.data.ref.start..body.data.ref.end]) |statement| {
-                    try body_statements.append(self.gpa, try self.buildStatement(statement, false));
-                }
-            } else {
-                try body_statements.append(self.gpa, try self.buildStatement(parts.body, false));
-            }
-            self.root_block = try self.finishBlock(body_statements.items, null, tokenSpan(self.ast, function.token_index));
         }
 
         fn buildStatement(self: *Self, index: structures.Node.Index, result_is_type: bool) !UnresolvedBody.Statement {
@@ -465,7 +529,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn nameIsVisible(self: *Self, name: []const u8) !bool {
-            return self.locals.contains(name) or try self.type_interner.resolveLocalConflict(name) != null;
+            return self.locals.contains(name) or try self.analysis_context.resolveLocalConflict(name) != null;
         }
 
         fn buildBinding(self: *Self, index: structures.Node.Index) anyerror!UnresolvedBody.Statement {
@@ -500,7 +564,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn bindingType(self: *Self, node: structures.Node.Index) !structures.TypeId {
             if (runtimeReference(self.ast, self.source, node, self)) |reference| return self.reject(reference, .value_used_as_type);
-            const result = try analyzeType(self.ast, self.source, node, self.type_interner, self.gpa, .local_type_not_supported);
+            const result = try analyzeType(self.ast, self.source, node, self.analysis_context, self.gpa, .local_type_not_supported);
             switch (result) {
                 .success => |type_id| if (type_id == .type) {
                     self.issue = issueAt(self.ast, node.index(), .local_type_not_supported);
@@ -518,7 +582,6 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .int => |integer| self.appendExpression(index, .{ .integer = integer }),
                 .int_literal => |integer| self.appendExpression(index, .{ .int_literal_value = integer }),
                 .string_literal => |data| self.appendExpression(index, .{ .string_literal = data }),
-                .static_data => |data| self.appendExpression(index, .{ .static_data = data }),
                 .storage_cursor => |cursor| self.appendExpression(index, .{ .storage_cursor = cursor }),
                 .byte => |byte| self.appendExpression(index, .{ .byte = byte }),
                 .bool => |boolean| self.appendExpression(index, .{ .boolean = boolean }),
@@ -526,15 +589,15 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .none => self.appendExpression(index, .none),
                 .function_ref => |reference| self.appendExpression(index, .{ .function_ref = reference }),
                 .structure => |tuple_id| blk: {
-                    if (try self.type_interner.arrayType(runtime.type_id)) |array|
+                    if (try self.analysis_context.arrayType(runtime.type_id)) |array|
                         break :blk try self.appendCompileTimeArray(index, runtime.type_id, array, tuple_id);
-                    const definition = (try self.type_interner.structDefinition(runtime.type_id)) orelse return error.Unavailable;
-                    const values = try self.type_interner.lookupCompileTimeTuple(tuple_id);
+                    const definition = (try self.analysis_context.structDefinition(runtime.type_id)) orelse return error.Unavailable;
+                    const values = try self.analysis_context.lookupCompileTimeTuple(tuple_id);
                     std.debug.assert(values.len == definition.fields.len);
                     var fields: std.ArrayList(UnresolvedBody.StructFieldValue) = .empty;
                     defer fields.deinit(self.gpa);
                     for (definition.fields, values) |field, value_id| {
-                        const value = switch (try self.type_interner.lookupCompileTimeValue(value_id)) {
+                        const value = switch (try self.analysis_context.lookupCompileTimeValue(value_id)) {
                             .runtime => |value| value,
                             .type => unreachable,
                         };
@@ -554,7 +617,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     } });
                 },
                 .variant => |variant| blk: {
-                    const payload = switch (try self.type_interner.lookupCompileTimeValue(variant.payload)) {
+                    const payload = switch (try self.analysis_context.lookupCompileTimeValue(variant.payload)) {
                         .runtime => |value| value,
                         .type => unreachable,
                     };
@@ -579,7 +642,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn appendTypeValue(self: *Self, index: structures.Node.Index) !ValueId {
-            const result = try analyzeType(self.ast, self.source, index, self.type_interner, self.gpa, .type_value_used_as_runtime_value);
+            const result = try analyzeType(self.ast, self.source, index, self.analysis_context, self.gpa, .type_value_used_as_runtime_value);
             return switch (result) {
                 .success => |type_id| self.appendExpression(index, .{ .type_value = type_id }),
                 .unsupported => |issue| {
@@ -590,12 +653,12 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn appendCompileTimeArray(self: *Self, index: structures.Node.Index, type_id: structures.TypeId, array: structures.ArrayType, tuple_id: structures.CompileTimeValueTupleId) anyerror!ValueId {
-            const values = try self.type_interner.lookupCompileTimeTuple(tuple_id);
+            const values = try self.analysis_context.lookupCompileTimeTuple(tuple_id);
             std.debug.assert(values.len == array.length);
             var elements: std.ArrayList(UnresolvedBody.ValueUse) = .empty;
             defer elements.deinit(self.gpa);
             for (values) |value_id| {
-                const value = (try self.type_interner.lookupCompileTimeValue(value_id)).runtime;
+                const value = (try self.analysis_context.lookupCompileTimeValue(value_id)).runtime;
                 std.debug.assert(value.type_id == array.element_type);
                 try elements.append(self.gpa, .{ .value = try self.appendCompileTimeValue(index, value), .span = nodeFocusSpan(self.ast, index) });
             }
@@ -607,14 +670,124 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             } });
         }
 
+        fn collectionExpression(self: *Self, index: structures.Node.Index, elements: structures.FunctionValueRange, sink: UnresolvedBody.LocalId) !ValueId {
+            if (self.ast.nodes[index.index()].tag == .tuple_literal) return self.appendExpression(index, .{ .tuple_literal = elements });
+            const reads: u32 = @intCast(self.call_arguments.items.len);
+            for (elements.start..elements.end) |_| {
+                const read = try self.appendExpression(index, .{ .local_read = sink });
+                try self.call_arguments.append(self.gpa, .{ .value = read, .span = nodeFocusSpan(self.ast, index) });
+            }
+            return self.appendExpression(index, .{ .collection_literal = .{ .elements = elements, .sink = sink, .sink_reads = .{ .start = reads, .end = @intCast(self.call_arguments.items.len) } } });
+        }
+
         fn appendCollectionLiteral(self: *Self, index: structures.Node.Index) !ValueId {
+            const sink = self.newLocal();
+            const previous_sink = self.collection_sink;
+            self.collection_sink = sink;
+            defer self.collection_sink = previous_sink;
             var elements: std.ArrayList(UnresolvedBody.ValueUse) = .empty;
             defer elements.deinit(self.gpa);
-            for (self.ast.nodeList(index)) |element| try elements.append(self.gpa, try self.appendUse(element, false));
+            for (self.ast.nodeList(index)) |element| try self.appendCollectionEntries(element, &elements);
             const start: u32 = @intCast(self.call_arguments.items.len);
             try self.call_arguments.appendSlice(self.gpa, elements.items);
-            const elements_range: structures.FunctionValueRange = .{ .start = start, .end = @intCast(self.call_arguments.items.len) };
-            return self.appendExpression(index, if (self.ast.nodes[index.index()].tag == .tuple_literal) .{ .tuple_literal = elements_range } else .{ .collection_literal = elements_range });
+            return self.collectionExpression(index, .{ .start = start, .end = @intCast(self.call_arguments.items.len) }, sink);
+        }
+
+        fn appendCollectionEntries(self: *Self, index: structures.Node.Index, elements: *std.ArrayList(UnresolvedBody.ValueUse)) anyerror!void {
+            const node = self.ast.nodes[index.index()];
+            if (node.tag == .collection_for and self.ast.tokens[node.token_index].tag == .keyword_static) {
+                const parts = self.ast.nodeList(index);
+                const binding = self.ast.nodes[parts[0].index()];
+                if (binding.data.node_node.a.unwrap()) |access| {
+                    const mode = self.ast.tokens[self.ast.nodes[access.index()].token_index].tag;
+                    if (mode == .keyword_var or mode == .keyword_ref) return self.reject(parts[0], .static_iteration_binding_mode);
+                }
+                const name_span = tokenSpan(self.ast, binding.token_index);
+                const name = self.source[name_span.start..name_span.end];
+                if (!std.mem.eql(u8, name, "_") and try self.nameIsVisible(name)) return self.reject(parts[0], .duplicate_local_binding);
+                var bindings = try self.staticClauseBindings();
+                defer bindings.deinit(self.gpa);
+                const values = (try self.analysis_context.withStaticBindings(bindings.items).staticIteration(index)) orelse return error.Unavailable;
+                const mark = self.local_names.items.len;
+                const static_mark = self.static_bindings.items.len;
+                defer {
+                    self.restoreScope(mark);
+                    self.static_bindings.shrinkRetainingCapacity(static_mark);
+                    self.analysis_context = self.analysis_context.withStaticBindings(self.static_bindings.items);
+                }
+                for (values) |value| {
+                    if (!std.mem.eql(u8, name, "_")) {
+                        try self.locals.put(self.gpa, name, .{ .static_value = value });
+                        try self.local_names.append(self.gpa, name);
+                        try self.static_bindings.append(self.gpa, .{ .name = name, .value = value });
+                        self.analysis_context = self.analysis_context.withStaticBindings(self.static_bindings.items);
+                    }
+                    try self.appendCollectionEntries(parts[2], elements);
+                    self.restoreScope(mark);
+                    self.static_bindings.shrinkRetainingCapacity(static_mark);
+                    self.analysis_context = self.analysis_context.withStaticBindings(self.static_bindings.items);
+                }
+                return;
+            }
+            if (node.tag == .collection_if and self.ast.tokens[node.token_index].tag == .keyword_static) {
+                var bindings = try self.staticClauseBindings();
+                defer bindings.deinit(self.gpa);
+                const selected = (try self.analysis_context.withStaticBindings(bindings.items).staticCondition(node.data.node_node.a)) orelse return error.Unavailable;
+                if (selected) try self.appendCollectionEntries(node.data.node_node.b, elements);
+                return;
+            }
+            const value = switch (node.tag) {
+                .collection_for, .collection_if => try self.appendExpression(index, .{ .collection_comprehension = .{ .value = try self.appendCollectionRuntime(index), .span = nodeFocusSpan(self.ast, index) } }),
+                .collection_spread => try self.appendExpression(index, .{ .collection_spread = .{
+                    .source = try self.appendUse(node.data.node, false),
+                    .iteration = .{ .value = try self.appendForParts(index, null, node.data.node, null), .span = nodeFocusSpan(self.ast, index) },
+                } }),
+                else => try self.append(index, false),
+            };
+            try elements.append(self.gpa, .{ .value = value, .span = nodeFocusSpan(self.ast, index) });
+        }
+
+        fn staticClauseBindings(self: *Self) !std.ArrayList(structures.StaticBinding) {
+            var bindings: std.ArrayList(structures.StaticBinding) = .empty;
+            errdefer bindings.deinit(self.gpa);
+            try bindings.appendSlice(self.gpa, self.static_bindings.items);
+            for (self.local_names.items) |name| {
+                const local = self.locals.get(name).?;
+                if (local == .value or local == .place) try bindings.append(self.gpa, .{ .name = name, .value = null });
+            }
+            return bindings;
+        }
+
+        fn appendCollectionRuntime(self: *Self, index: structures.Node.Index) anyerror!ValueId {
+            const node = self.ast.nodes[index.index()];
+            if (self.ast.tokens[node.token_index].tag != .keyword_static) switch (node.tag) {
+                .collection_for => return self.appendFor(index, false),
+                .collection_if => {
+                    const condition = try self.buildIfCondition(node.data.node_node.a);
+                    const body = try self.appendCollectionRuntime(node.data.node_node.b);
+                    return self.appendExpression(index, .{ .if_else = .{
+                        .condition = condition,
+                        .then_block = try self.finishBlock(&.{.{ .discard = .{ .value = body, .span = nodeFocusSpan(self.ast, index) } }}, try self.appendExpression(index, .unit), nodeFocusSpan(self.ast, index)),
+                        .else_block = try self.buildUnitBranch(index),
+                    } });
+                },
+                else => {},
+            };
+            var elements: std.ArrayList(UnresolvedBody.ValueUse) = .empty;
+            defer elements.deinit(self.gpa);
+            try self.appendCollectionEntries(index, &elements);
+            var statements: std.ArrayList(UnresolvedBody.Statement) = .empty;
+            defer statements.deinit(self.gpa);
+            for (elements.items) |element| {
+                const value_index = @backingInt(element.value);
+                const operation = if (value_index < self.parameters.len) null else self.expressions.items[value_index - self.parameters.len].operation;
+                const value = if (operation != null and (operation.? == .collection_comprehension or operation.? == .collection_spread))
+                    element.value
+                else
+                    try self.appendExpression(index, .{ .collection_emit = .{ .element = element, .sink = .{ .value = try self.appendExpression(index, .{ .local_read = self.collection_sink.? }), .span = element.span } } });
+                try statements.append(self.gpa, .{ .discard = .{ .value = value, .span = element.span } });
+            }
+            return self.appendExpression(index, .{ .scope = try self.finishBlock(statements.items, try self.appendExpression(index, .unit), nodeFocusSpan(self.ast, index)) });
         }
 
         fn append(self: *Self, index: structures.Node.Index, result_is_type: bool) anyerror!ValueId {
@@ -628,12 +801,12 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .type, .implicit_type, .type_func, .type_variant, .type_tuple => return self.appendTypeValue(index),
                 .comptime_expr => {
                     try self.rejectRuntimeCapture(index);
-                    const value_id = self.type_interner.executeComptime(index) catch |err| switch (err) {
+                    const value_id = self.analysis_context.executeComptime(index) catch |err| switch (err) {
                         error.QueryCycle => return self.reject(index, .declaration_cycle),
                         error.Unavailable => return error.Unavailable,
                         else => return err,
                     } orelse return error.Unavailable;
-                    const value = try self.type_interner.lookupCompileTimeValue(value_id);
+                    const value = try self.analysis_context.lookupCompileTimeValue(value_id);
                     return switch (value) {
                         .type => |type_id| self.appendExpression(index, .{ .type_value = type_id }),
                         .runtime => |runtime| blk: {
@@ -647,7 +820,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .collection_literal, .tuple_literal => return self.appendCollectionLiteral(index),
                 .field_access => return self.appendFieldAccess(index),
                 .index_access => return self.appendExpression(index, .{ .call = try self.buildIndexCall(index) }),
-                .@"struct" => return self.appendExpression(index, .{ .type_value = try self.type_interner.generatedStructType(index) }),
+                .@"struct" => return self.appendExpression(index, .{ .type_value = try self.analysis_context.generatedStructType(index) }),
                 .identifier => return self.appendIdentifier(index, result_is_type),
                 .neg => {
                     const operand = self.ast.nodes[node.data.node.index()];
@@ -686,6 +859,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             if (self.locals.get(name)) |local| return switch (local) {
                 .value => |value| value,
                 .static_value => |value| self.appendConstant(index, value),
+                .runtime_capture => self.reject(index, .comptime_runtime_capture),
                 .type_value => |type_id| self.appendExpression(index, .{ .type_value = type_id }),
                 .place => |place| self.appendExpression(index, .{ .local_read = place.id }),
             };
@@ -714,6 +888,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const name = self.source[span.start..span.end];
             const local = self.locals.get(name) orelse return self.reject(root_index, .unknown_value);
             return switch (local) {
+                .runtime_capture => self.reject(root_index, .comptime_runtime_capture),
                 .value, .static_value, .type_value => self.reject(index, .ownership_transfer_requires_owned_place),
                 .place => |place| self.appendExpression(index, if (field_start == self.assignment_fields.items.len)
                     .{ .local_transfer = place.id }
@@ -732,10 +907,10 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             if (runtimeReference(self.ast, self.source, parts[0], self)) |reference| return self.reject(reference, .value_used_as_type);
             const target: UnresolvedBody.StructInitTarget = target_blk: {
                 if (try self.namedExpression(parts[0])) |reference| {
-                    if (reference == .declaration and try self.type_interner.isGenericStruct(reference.declaration.item))
+                    if (reference == .declaration and try self.analysis_context.isGenericStruct(reference.declaration.item))
                         break :target_blk .{ .inferred = reference.declaration };
                 }
-                const type_id = switch (try analyzeType(self.ast, self.source, parts[0], self.type_interner, self.gpa, .local_type_not_supported)) {
+                const type_id = switch (try analyzeType(self.ast, self.source, parts[0], self.analysis_context, self.gpa, .local_type_not_supported)) {
                     .success => |resolved| resolved,
                     .unsupported => |issue| {
                         self.issue = issue;
@@ -777,7 +952,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn namedExpressionWithOperands(self: *Self, index: structures.Node.Index, operands: ?usize) !?structures.NameReference {
             if (runtimeReference(self.ast, self.source, index, self) != null) return null;
-            return resolveNamedExpressionWithOperands(self.ast, self.source, index, self.type_interner, operands) catch |err| switch (err) {
+            return resolveNamedExpressionWithOperands(self.ast, self.source, index, self.analysis_context, operands) catch |err| switch (err) {
                 error.QueryCycle => return self.reject(index, .declaration_cycle),
                 error.PublicFieldPrivateType => return self.reject(index, .public_field_private_type),
                 else => return err,
@@ -786,7 +961,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn runtimeName(self: *Self, name: []const u8) bool {
             const local = self.locals.get(name) orelse return false;
-            return local == .value or local == .place;
+            return local == .value or local == .place or local == .runtime_capture;
         }
 
         fn rejectRuntimeCapture(self: *Self, index: structures.Node.Index) !void {
@@ -804,14 +979,14 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn appendDeclarationReference(self: *Self, index: structures.Node.Index, instance: structures.InstanceId) !ValueId {
-            if (try self.type_interner.functionShape(instance.item)) |shape| {
+            if (try self.analysis_context.functionShape(instance.item)) |shape| {
                 for (shape.parameters) |parameter| {
                     if (parameter.mode == .static) return self.reject(index, .static_parameter_requires_specialization);
                 }
-                const function = (try self.type_interner.functionItemReference(instance)) orelse return self.reject(index, .unknown_value);
+                const function = (try self.analysis_context.functionItemReference(instance)) orelse return self.reject(index, .unknown_value);
                 return self.appendExpression(index, .{ .function_ref = function });
             }
-            const value = (self.type_interner.staticItem(instance) catch |err| switch (err) {
+            const value = (self.analysis_context.staticItem(instance) catch |err| switch (err) {
                 error.QueryCycle => return self.reject(index, .declaration_cycle),
                 else => return err,
             }) orelse return self.reject(index, .unknown_value);
@@ -819,7 +994,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn appendConstant(self: *Self, index: structures.Node.Index, value: structures.CompileTimeValueId) !ValueId {
-            return switch (try self.type_interner.lookupCompileTimeValue(value)) {
+            return switch (try self.analysis_context.lookupCompileTimeValue(value)) {
                 .type => |type_id| self.appendExpression(index, .{ .type_value = type_id }),
                 .runtime => |runtime| self.appendCompileTimeValue(index, runtime),
             };
@@ -851,28 +1026,33 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
         }
 
         fn appendFor(self: *Self, index: structures.Node.Index, result_is_type: bool) !ValueId {
+            _ = result_is_type;
             const parts = self.ast.nodeList(index);
             std.debug.assert(parts.len == 3);
-            const binding = self.ast.nodes[parts[0].index()];
+            return self.appendForParts(index, parts[0], parts[1], parts[2]);
+        }
+
+        fn appendForParts(self: *Self, index: structures.Node.Index, binding_index: ?structures.Node.Index, source_index: structures.Node.Index, body_index: ?structures.Node.Index) !ValueId {
+            const binding = if (binding_index) |item| self.ast.nodes[item.index()] else structures.Node{ .tag = .param, .token_index = self.ast.nodes[index.index()].token_index, .data = .{ .node_node = .{ .a = .null, .b = .null } } };
             std.debug.assert(binding.tag == .param);
             const mode = if (binding.data.node_node.a.unwrap()) |access|
                 self.ast.tokens[self.ast.nodes[access.index()].token_index].tag
             else
                 null;
             const name_span = tokenSpan(self.ast, binding.token_index);
-            const name = self.source[name_span.start..name_span.end];
-            if (!std.mem.eql(u8, name, "_") and try self.nameIsVisible(name)) return self.reject(parts[0], .duplicate_local_binding);
+            const name = if (binding_index != null) self.source[name_span.start..name_span.end] else "$spread";
+            if (!std.mem.eql(u8, name, "_") and try self.nameIsVisible(name)) return self.reject(binding_index.?, .duplicate_local_binding);
             const scope_mark = self.local_names.items.len;
             defer self.restoreScope(scope_mark);
             const span = nodeFocusSpan(self.ast, index);
-            const source = try self.appendUse(parts[1], false);
+            const source = try self.appendUse(source_index, false);
             const source_local = self.newLocal();
             const source_read = try self.appendExpression(index, .{ .local_read = source_local });
-            const cursor = try self.appendExpression(index, .{ .iterator = .{ .value = source_read, .span = source.span } });
+            const cursor = try self.appendExpression(index, .{ .iterator = .{ .source = .{ .value = source_read, .span = source.span }, .structural_array = self.ast.nodes[index.index()].tag == .collection_spread } });
             const cursor_local = self.newLocal();
             const cursor_read = try self.appendExpression(index, .{ .local_read = cursor_local });
             const receiver: UnresolvedBody.ValueUse = .{ .value = cursor_read, .span = source.span };
-            const end_type = try self.type_interner.iterationEndType();
+            const end_type = try self.analysis_context.iterationEndType();
             const next = try self.appendProtocolCall(index, receiver, "next");
             const next_local = self.newLocal();
             const next_read = try self.appendExpression(index, .{ .local_read = next_local });
@@ -902,7 +1082,13 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             }
             self.loop_depth += 1;
             defer self.loop_depth -= 1;
-            const user_body = try self.buildBranch(parts[2], false);
+            const user_body = if (body_index) |body|
+                if (self.ast.nodes[index.index()].tag == .collection_for)
+                    try self.finishBlock(&.{.{ .discard = .{ .value = try self.appendCollectionRuntime(body), .span = span } }}, try self.appendExpression(index, .unit), span)
+                else
+                    try self.buildBranch(body, false)
+            else
+                try self.collectionPollBody(index, item_local, span);
             self.restoreScope(scope_mark);
             const body_value = try self.appendExpression(index, .{ .scope = user_body });
             const success_unit = try self.appendExpression(index, .unit);
@@ -929,8 +1115,25 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .{ .bind_local = .{ .local = source_local, .value = source.value, .span = source.span, .mutable = true, .mode = .inferred } },
                 .{ .bind_local = .{ .local = cursor_local, .value = cursor, .span = source.span, .mutable = true, .mode = .inferred } },
             }, loop_value, span);
-            _ = result_is_type;
-            return self.appendExpression(index, .{ .scope = setup });
+            const setup_value = try self.appendExpression(index, .{ .scope = setup });
+            if (!self.static_iteration and (self.ast.nodes[index.index()].tag == .collection_for or self.ast.nodes[index.index()].tag == .collection_spread))
+                return self.appendExpression(index, .{ .collection_iteration = .{ .source = source, .body = .{ .value = setup_value, .span = span } } });
+            return setup_value;
+        }
+
+        fn collectionPollBody(self: *Self, index: structures.Node.Index, item_local: UnresolvedBody.LocalId, span: structures.SourceSpan) !UnresolvedBody.BlockId {
+            const item = try self.appendExpression(index, .{ .local_read = item_local });
+            var output: ValueId = undefined;
+            if (self.static_iteration) {
+                const capture = (try self.analysis_context.stdMemoryFunction("static_iteration_item")) orelse return error.Unavailable;
+                const start: u32 = @intCast(self.call_arguments.items.len);
+                try self.call_arguments.append(self.gpa, .{ .value = item, .span = span });
+                output = try self.appendExpression(index, .{ .call = .{ .target = .{ .inferred = .{ .item = capture } }, .arguments = .{ .start = start, .end = start + 1 }, .span = span, .implicit_effects = true } });
+            } else {
+                const sink = try self.appendExpression(index, .{ .local_read = self.collection_sink.? });
+                output = try self.appendExpression(index, .{ .collection_emit = .{ .element = .{ .value = item, .span = span }, .sink = .{ .value = sink, .span = span } } });
+            }
+            return self.finishBlock(&.{.{ .discard = .{ .value = output, .span = span } }}, try self.appendExpression(index, .unit), span);
         }
 
         fn newLocal(self: *Self) UnresolvedBody.LocalId {
@@ -954,7 +1157,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             switch (decoded) {
                 .bytes => |bytes| {
                     defer self.gpa.free(bytes);
-                    return self.appendExpression(index, .{ .string_literal = try self.type_interner.internByteString(bytes) });
+                    return self.appendExpression(index, .{ .string_literal = try self.analysis_context.internByteString(bytes) });
                 },
                 .invalid => |issue| {
                     self.issue = .{ .span = .{ .start = span.start + issue.offset, .end = span.start + issue.offset + 1 }, .kind = issue.kind };
@@ -991,13 +1194,13 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
 
         fn appendRange(self: *Self, index: structures.Node.Index) !ValueId {
             const node = self.ast.nodes[index.index()];
-            const constructor = (try self.type_interner.rangeConstructor(node.tag == .range_inclusive)) orelse return error.Unavailable;
+            const constructor = (try self.analysis_context.rangeConstructor(node.tag == .range_inclusive)) orelse return error.Unavailable;
             const first = try self.appendUse(node.data.node_node.a, false);
             const limit = try self.appendUse(node.data.node_node.b, false);
             const start: u32 = @intCast(self.call_arguments.items.len);
             try self.call_arguments.appendSlice(self.gpa, &.{ first, limit });
             return self.appendExpression(index, .{ .call = .{
-                .target = .{ .inferred = .{ .item = constructor } },
+                .target = .{ .direct = .{ .item = constructor } },
                 .arguments = .{ .start = start, .end = start + 2 },
                 .span = nodeFocusSpan(self.ast, index),
             } });
@@ -1008,8 +1211,8 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const message = if (message_node != .null)
                 try self.appendUse(message_node, false)
             else
-                UnresolvedBody.ValueUse{ .value = try self.appendExpression(index, .{ .string_literal = try self.type_interner.internByteString("") }), .span = nodeFocusSpan(self.ast, index) };
-            const target = (try self.type_interner.panicFunction()) orelse return error.Unavailable;
+                UnresolvedBody.ValueUse{ .value = try self.appendExpression(index, .{ .string_literal = try self.analysis_context.internByteString("") }), .span = nodeFocusSpan(self.ast, index) };
+            const target = (try self.analysis_context.panicFunction()) orelse return error.Unavailable;
             const start: u32 = @intCast(self.call_arguments.items.len);
             try self.call_arguments.append(self.gpa, message);
             return self.appendExpression(index, .{ .call = .{
@@ -1082,6 +1285,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const name = self.source[span.start..span.end];
             const local = self.locals.get(name) orelse return self.reject(target_index, .unknown_value);
             const target = switch (local) {
+                .runtime_capture => return self.reject(target_index, .comptime_runtime_capture),
                 .value => return if (field_end != field_start) self.appendReferenceAssignment(index) else self.reject(target_index, .assignment_to_immutable),
                 .static_value, .type_value => return self.reject(target_index, .assignment_to_immutable),
                 .place => |place| if (place.mutable) place.id else return if (field_end != field_start) self.appendReferenceAssignment(index) else self.reject(target_index, .assignment_to_immutable),
@@ -1179,7 +1383,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             const condition = if (value_node.tag == .as)
                 try self.buildVariantMembership(value_node, binding)
             else if (value_node.tag == .call)
-                try self.appendCondition(.{ .call = .{ .target = try self.buildCall(value_index, true), .binding = binding } })
+                try self.buildCallCondition(value_index, binding)
             else if (value_node.tag == .index_access)
                 try self.appendCondition(.{ .call = .{ .target = try self.buildIndexCall(value_index), .binding = binding } })
             else
@@ -1222,7 +1426,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                         .{ .disjunction = .{ .lhs = lhs, .rhs = rhs } });
                 },
                 .not => self.buildNotCondition(index),
-                .call => self.appendCondition(.{ .call = .{ .target = try self.buildCall(index, true) } }),
+                .call => self.buildCallCondition(index, null),
                 .index_access => self.appendCondition(.{ .call = .{ .target = try self.buildIndexCall(index) } }),
                 .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => if (self.ast.nodes[node.data.node_node.a.index()].tag == .index_access) self.buildIndexedAssignmentCondition(index) else self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(index, false) } }),
                 .collection_literal, .struct_init => self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(index, false) } }),
@@ -1250,13 +1454,20 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
             return self.appendCondition(.{ .conjunction = .{ .lhs = before, .rhs = after, .temporary = local } });
         }
 
+        fn buildCallCondition(self: *Self, index: structures.Node.Index, binding: ?UnresolvedBody.ConditionBinding) !UnresolvedBody.ConditionId {
+            const node = self.ast.nodes[index.index()];
+            if (try self.conversionTarget(node.data.node_node.a) != null)
+                return self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(index, false), .binding = binding } });
+            return self.appendCondition(.{ .call = .{ .target = try self.buildCall(index, true), .binding = binding } });
+        }
+
         fn buildNotCondition(self: *Self, index: structures.Node.Index) anyerror!UnresolvedBody.ConditionId {
             const operand = self.ast.nodes[index.index()].data.node;
             return self.appendCondition(.{ .negation = try self.buildCondition(operand) });
         }
 
         fn buildVariantMembership(self: *Self, node: structures.Node, binding: ?UnresolvedBody.ConditionBinding) !UnresolvedBody.ConditionId {
-            const target_type = switch (try analyzeType(self.ast, self.source, node.data.node_node.b, self.type_interner, self.gpa, .inspection_type_not_supported)) {
+            const target_type = switch (try analyzeType(self.ast, self.source, node.data.node_node.b, self.analysis_context, self.gpa, .inspection_type_not_supported)) {
                 .success => |type_id| type_id,
                 .unsupported => |issue| {
                     self.issue = issue;
@@ -1394,11 +1605,11 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .namespace, .overloaded_function => return null,
                 .constant => |value| value,
                 .declaration => |instance| blk: {
-                    if (try self.type_interner.functionShape(instance.item) != null) return null;
-                    break :blk (try self.type_interner.staticItem(instance)) orelse return null;
+                    if (try self.analysis_context.functionShape(instance.item) != null) return null;
+                    break :blk (try self.analysis_context.staticItem(instance)) orelse return null;
                 },
             };
-            const value = try self.type_interner.lookupCompileTimeValue(value_id);
+            const value = try self.analysis_context.lookupCompileTimeValue(value_id);
             return if (value == .type) value.type else null;
         }
 
@@ -1423,7 +1634,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                     if (reference == .overloaded_function)
                         break :target .{ .overloaded = reference.overloaded_function };
                     if (reference == .declaration) {
-                        if (try self.type_interner.functionShape(reference.declaration.item)) |shape|
+                        if (try self.analysis_context.functionShape(reference.declaration.item)) |shape|
                             break :target .{ .direct = .{ .instance = reference.declaration, .shape = shape } };
                     }
                     const value = try self.appendNamedReference(callee_index, reference);
@@ -1447,7 +1658,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .overloaded => unreachable,
             };
             var infer_static = if (pending_target == .direct)
-                try self.type_interner.needsInheritedInference(pending_target.direct.instance)
+                try self.analysis_context.needsInheritedInference(pending_target.direct.instance)
             else
                 false;
             if (parameter_shapes) |parameters| {
@@ -1474,17 +1685,17 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 if (parameter_shapes) |parameters| if (!infer_static and argument_index < parameters.len and parameters[argument_index].mode == .static) {
                     try self.rejectRuntimeCapture(argument);
                     const result = if (parameters[argument_index].is_meta_type)
-                        try analyzeStaticTypeArgument(self.ast, self.source, argument, self.type_interner, self.gpa)
+                        try analyzeStaticTypeArgument(self.ast, self.source, argument, self.analysis_context, self.gpa)
                     else result_blk: {
                         const instance = pending_target.direct.instance;
-                        const expected_type = try self.type_interner.staticParameterType(instance, argument_index, static_arguments.items);
-                        const value_id = self.type_interner.executeComptimeWithType(argument, expected_type) catch |err| switch (err) {
+                        const expected_type = try self.analysis_context.staticParameterType(instance, argument_index, static_arguments.items);
+                        const value_id = self.analysis_context.executeComptimeWithType(argument, expected_type) catch |err| switch (err) {
                             error.QueryCycle => return self.reject(argument, .declaration_cycle),
                             error.Unavailable => return error.Unavailable,
                             else => return err,
                         } orelse return error.Unavailable;
                         break :result_blk SemanticResult(structures.CompileTimeValue){
-                            .success = try self.type_interner.lookupCompileTimeValue(value_id),
+                            .success = try self.analysis_context.lookupCompileTimeValue(value_id),
                         };
                     };
                     const value = switch (result) {
@@ -1495,7 +1706,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                         .runtime => |runtime| if (runtime.value == .function_ref) return self.reject(argument, .static_argument_not_supported),
                         .type => {},
                     }
-                    try static_arguments.append(self.gpa, try self.type_interner.internCompileTimeValue(value));
+                    try static_arguments.append(self.gpa, try self.analysis_context.internCompileTimeValue(value));
                     continue;
                 };
                 const value = try self.append(argument, false);
@@ -1519,7 +1730,7 @@ fn ExpressionBuilder(comptime TypeInterner: type) type {
                 .direct => |direct| if (infer_static)
                     .{ .inferred = direct.instance }
                 else
-                    .{ .direct = try self.type_interner.specializeFunction(direct.instance, static_arguments.items) },
+                    .{ .direct = try self.analysis_context.specializeFunction(direct.instance, static_arguments.items) },
             };
             return .{
                 .target = target,
@@ -1615,10 +1826,10 @@ pub fn analyzeFunctionSignature(
     ast: *const structures.Ast,
     source: []const u8,
     declaration: u32,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SignatureResult {
-    return analyzeFunctionInstanceSignature(ast, source, declaration, &.{}, type_interner, gpa);
+    return analyzeFunctionInstanceSignature(ast, source, declaration, &.{}, analysis_context, gpa);
 }
 
 pub fn analyzeFunctionShape(
@@ -1631,6 +1842,11 @@ pub fn analyzeFunctionShape(
     const signature = ast.nodes[parts.signature.index()];
     var parameters: std.ArrayList(structures.FunctionParameterShape) = .empty;
     defer parameters.deinit(gpa);
+    var static_names: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (static_names.items) |name| gpa.free(name);
+        static_names.deinit(gpa);
+    }
     var names = std.StringHashMap(void).init(gpa);
     defer names.deinit();
     for (ast.nodeList(signature.data.signature.parameters)) |parameter_index| {
@@ -1650,12 +1866,20 @@ pub fn analyzeFunctionShape(
             .mode = mode,
             .is_meta_type = mode == .static and isMetaTypeAnnotation(ast, source, annotation),
         });
+        if (mode == .static) {
+            const owned_name = try gpa.dupe(u8, name);
+            errdefer gpa.free(owned_name);
+            try static_names.append(gpa, owned_name);
+        }
     }
-    return .{ .success = .{
+    var shape: structures.FunctionShape = .{
         .parameters = try parameters.toOwnedSlice(gpa),
         .returns_type = if (signature.data.signature.return_type.unwrap()) |annotation| isMetaTypeAnnotation(ast, source, annotation) else false,
         .is_fallible = declaredFallibility(ast, ast.nodes[parts.function.index()]),
-    } };
+    };
+    errdefer shape.deinit(gpa);
+    shape.static_names = try static_names.toOwnedSlice(gpa);
+    return .{ .success = shape };
 }
 
 pub fn parameterizedStructSite(ast: *const structures.Ast, declaration: u32) ?i64 {
@@ -1713,7 +1937,7 @@ pub fn inferStaticArguments(
     source: []const u8,
     declaration: u32,
     argument_types: []const structures.TypeId,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
     inherited_from: ?u32,
 ) !StaticInference {
@@ -1736,7 +1960,7 @@ pub fn inferStaticArguments(
         const actual_type = argument_types[runtime_index];
         runtime_index += 1;
         const annotation = parameter.data.node_node.b.unwrap().?;
-        if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, type_interner, gpa)) return .conflict;
+        if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, analysis_context, gpa)) return .conflict;
     }
     std.debug.assert(runtime_index == argument_types.len);
     return finishStaticInference(inferred.items, gpa);
@@ -1748,7 +1972,7 @@ pub fn inferStructArguments(
     declaration: u32,
     fields: []const UnresolvedBody.StructFieldValue,
     field_types: []const structures.TypeId,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !StaticInference {
     std.debug.assert(fields.len == field_types.len);
@@ -1760,12 +1984,12 @@ pub fn inferStructArguments(
     try appendInferredStaticParameters(ast, source, parameters, &inferred, gpa);
     for (fields, field_types) |field, actual_type| {
         const annotation = structFactoryFieldAnnotation(ast, source, declaration, field.name) orelse continue;
-        if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, type_interner, gpa)) return .conflict;
+        if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, analysis_context, gpa)) return .conflict;
     }
     return finishStaticInference(inferred.items, gpa);
 }
 
-pub fn validateConverterDeclaration(ast: *const structures.Ast, source: []const u8, declaration: u32, type_interner: anytype) !SemanticResult(void) {
+pub fn validateConverterDeclaration(ast: *const structures.Ast, source: []const u8, declaration: u32, analysis_context: anytype) !SemanticResult(void) {
     const parts = functionParts(ast, declaration);
     const signature = ast.nodes[parts.signature.index()];
     const target = signature.data.signature.return_type.unwrap() orelse return .{ .unsupported = issueAt(ast, declaration, .invalid_converter) };
@@ -1775,14 +1999,14 @@ pub fn validateConverterDeclaration(ast: *const structures.Ast, source: []const 
         const annotation = parameter.data.node_node.b.unwrap() orelse return .{ .unsupported = issueAt(ast, parameter_index.index(), .parameter_type_missing) };
         const mode = parameterMode(ast, parameter).?;
         if (mode == .static and isMetaTypeAnnotation(ast, source, annotation)) continue;
-        const collection_source = try type_interner.isCollectionConverterAnnotation(annotation);
+        const collection_source = try analysis_context.isCollectionConverterAnnotation(annotation);
         if (mode == .init) {
             if (!collection_source or value_annotation != null) return .{ .unsupported = issueAt(ast, parameter_index.index(), .invalid_converter) };
             value_annotation = annotation;
             continue;
         }
         if (collection_source) return .{ .unsupported = issueAt(ast, parameter_index.index(), .invalid_converter) };
-        const static_source = try type_interner.isStaticConverterAnnotation(annotation);
+        const static_source = try analysis_context.isStaticConverterAnnotation(annotation);
         const dependent = converterAnnotationDependsOnStaticParameters(ast, source, declaration, annotation);
         const name_span = tokenSpan(ast, parameter.token_index);
         const inferred_from_target = annotationInfersParameter(ast, source, target, source[name_span.start..name_span.end]);
@@ -1801,8 +2025,8 @@ pub fn validateConverterDeclaration(ast: *const structures.Ast, source: []const 
         if (!annotationInfersParameter(ast, source, value, name) and !annotationInfersParameter(ast, source, target, name))
             return .{ .unsupported = issueAt(ast, parameter_index.index(), .invalid_converter) };
     }
-    const module = try type_interner.currentModule();
-    if (try type_interner.converterAnnotationOwner(value) != module and try type_interner.converterAnnotationOwner(target) != module)
+    const module = try analysis_context.currentModule();
+    if (try analysis_context.converterAnnotationOwner(value) != module and try analysis_context.converterAnnotationOwner(target) != module)
         return .{ .unsupported = issueAt(ast, declaration, .invalid_converter_owner) };
     return .{ .success = {} };
 }
@@ -1842,7 +2066,7 @@ pub fn inferConverterArguments(
     target_type: structures.TypeId,
     source_value: ?structures.CompileTimeValueId,
     collection_length: ?u32,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !StaticInference {
     const parts = functionParts(ast, declaration);
@@ -1858,17 +2082,17 @@ pub fn inferConverterArguments(
         value_count += 1;
         const annotation = parameter.data.node_node.b.unwrap().?;
         if (source_type) |actual_type| {
-            if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, type_interner, gpa)) return .conflict;
+            if (!try bindInferredType(ast, source, inferred.items, annotation, actual_type, analysis_context, gpa)) return .conflict;
         } else if (parameterMode(ast, parameter).? == .init and ast.nodes[annotation.index()].tag == .call) {
             const arguments = ast.nodeList(ast.nodes[annotation.index()].data.node_node.b);
             if (arguments.len == 2) if (inferredParameter(ast, source, inferred.items, arguments[1], false)) |count| {
-                const value = try type_interner.internCompileTimeValue(.{ .runtime = .{ .type_id = .int, .value = .{ .int = @intCast(collection_length.?) } } });
+                const value = try analysis_context.internCompileTimeValue(.{ .runtime = .{ .type_id = .int, .value = .{ .int = @intCast(collection_length.?) } } });
                 if (!count.bind(value)) return .conflict;
             };
         }
     }
     const target = signature.data.signature.return_type.unwrap() orelse return .missing;
-    if (!try bindInferredType(ast, source, inferred.items, target, target_type, type_interner, gpa)) return .conflict;
+    if (!try bindInferredType(ast, source, inferred.items, target, target_type, analysis_context, gpa)) return .conflict;
     if (value_count == 0) {
         const value = source_value orelse return .missing;
         var source_parameter: ?*InferredParameter = null;
@@ -1877,13 +2101,13 @@ pub fn inferConverterArguments(
             const annotation = candidate.data.node_node.b.unwrap().?;
             const span = tokenSpan(ast, candidate.token_index);
             if (parameterMode(ast, candidate).? != .static or isMetaTypeAnnotation(ast, source, annotation)) continue;
-            if (!try type_interner.isStaticConverterAnnotation(annotation) and
+            if (!try analysis_context.isStaticConverterAnnotation(annotation) and
                 (!converterAnnotationDependsOnStaticParameters(ast, source, declaration, annotation) or annotationInfersParameter(ast, source, target, source[span.start..span.end]))) continue;
             if (source_parameter != null) return .missing;
             for (inferred.items) |*parameter| {
                 if (std.mem.eql(u8, source[span.start..span.end], parameter.name)) source_parameter = parameter;
             }
-            if (!try bindInferredType(ast, source, inferred.items, annotation, source_type.?, type_interner, gpa)) return .conflict;
+            if (!try bindInferredType(ast, source, inferred.items, annotation, source_type.?, analysis_context, gpa)) return .conflict;
         }
         const parameter = source_parameter orelse return .missing;
         if (!parameter.bind(value)) return .conflict;
@@ -1896,7 +2120,7 @@ pub fn analyzeIndependentStructFieldType(
     source: []const u8,
     declaration: u32,
     name: []const u8,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(?structures.TypeId) {
     const annotation = structFactoryFieldAnnotation(ast, source, declaration, name) orelse return .{ .success = null };
@@ -1906,7 +2130,7 @@ pub fn analyzeIndependentStructFieldType(
     const static_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = parameters, .static_only = true };
     if (runtimeReference(ast, source, annotation, static_parameters) != null or ast.nodes[annotation.index()].tag == .call)
         return .{ .success = null };
-    return switch (try analyzeType(ast, source, annotation, type_interner, gpa, .struct_field_type_not_supported)) {
+    return switch (try analyzeType(ast, source, annotation, analysis_context, gpa, .struct_field_type_not_supported)) {
         .success => |type_id| .{ .success = type_id },
         .unsupported => |issue| .{ .unsupported = issue },
     };
@@ -1939,30 +2163,30 @@ fn appendInferredStaticParameters(ast: *const structures.Ast, source: []const u8
     }
 }
 
-fn bindInferredType(ast: *const structures.Ast, source: []const u8, inferred: []InferredParameter, annotation: structures.Node.Index, actual_type: structures.TypeId, type_interner: anytype, gpa: std.mem.Allocator) anyerror!bool {
+fn bindInferredType(ast: *const structures.Ast, source: []const u8, inferred: []InferredParameter, annotation: structures.Node.Index, actual_type: structures.TypeId, analysis_context: anytype, gpa: std.mem.Allocator) anyerror!bool {
     const annotated = ast.nodes[annotation.index()];
     if (inferredParameter(ast, source, inferred, annotation, true)) |target| {
-        const value = try type_interner.internCompileTimeValue(.{ .type = actual_type });
+        const value = try analysis_context.internCompileTimeValue(.{ .type = actual_type });
         return target.bind(value);
     }
     if (annotated.tag == .reference_type)
-        return bindInferredType(ast, source, inferred, annotated.data.node, (try type_interner.facts().borrowElement(actual_type)) orelse actual_type, type_interner, gpa);
+        return bindInferredType(ast, source, inferred, annotated.data.node, (try analysis_context.facts().borrowElement(actual_type)) orelse actual_type, analysis_context, gpa);
     if (annotated.tag == .type_tuple) {
-        const actual_members = (try type_interner.facts().tupleMembers(actual_type)) orelse return true;
+        const actual_members = (try analysis_context.facts().tupleMembers(actual_type)) orelse return true;
         const patterns = ast.nodeList(annotation);
         if (patterns.len != actual_members.len) return true;
         for (patterns, actual_members) |pattern, actual| {
             const expected_kind: structures.MemberKind = if (ast.nodes[pattern.index()].tag == .reference_type) .reference else .owned;
             if (expected_kind != actual.kind) return false;
-            if (!try bindInferredType(ast, source, inferred, logicalTypeNode(ast, pattern), actual.type_id, type_interner, gpa)) return false;
+            if (!try bindInferredType(ast, source, inferred, logicalTypeNode(ast, pattern), actual.type_id, analysis_context, gpa)) return false;
         }
         return true;
     }
-    if (annotated.tag == .type_variant) return bindInferredVariant(ast, source, inferred, annotation, actual_type, type_interner, gpa);
+    if (annotated.tag == .type_variant) return bindInferredVariant(ast, source, inferred, annotation, actual_type, analysis_context, gpa);
     if (annotated.tag != .call) return true;
-    const factory = (try resolveNamedExpression(ast, source, annotated.data.node_node.a, type_interner)) orelse return true;
+    const factory = (try resolveNamedExpression(ast, source, annotated.data.node_node.a, analysis_context)) orelse return true;
     if (factory != .declaration) return true;
-    const values = (try type_interner.structFactoryArguments(factory.declaration, actual_type)) orelse return true;
+    const values = (try analysis_context.structFactoryArguments(factory.declaration, actual_type)) orelse return true;
     const factory_arguments = ast.nodeList(annotated.data.node_node.b);
     if (factory_arguments.len != values.len) return true;
     for (factory_arguments, values) |argument, value| {
@@ -1981,7 +2205,7 @@ fn annotationReferencesInferred(ast: *const structures.Ast, source: []const u8, 
     return false;
 }
 
-fn bindInferredVariant(ast: *const structures.Ast, source: []const u8, inferred: []InferredParameter, annotation: structures.Node.Index, actual_type: structures.TypeId, type_interner: anytype, gpa: std.mem.Allocator) !bool {
+fn bindInferredVariant(ast: *const structures.Ast, source: []const u8, inferred: []InferredParameter, annotation: structures.Node.Index, actual_type: structures.TypeId, analysis_context: anytype, gpa: std.mem.Allocator) !bool {
     // Only one dependent arm can receive the unmatched members. With two,
     // partitioning the source would require guessing between type parameters.
     var dependent: ?structures.Node.Index = null;
@@ -1991,18 +2215,18 @@ fn bindInferredVariant(ast: *const structures.Ast, source: []const u8, inferred:
         dependent = member;
     }
     const target = dependent orelse return true;
-    const source_members = (try type_interner.facts().variantMembers(actual_type)) orelse &.{actual_type};
+    const source_members = (try analysis_context.facts().variantMembers(actual_type)) orelse &.{actual_type};
     var remaining: std.ArrayList(structures.TypeId) = .empty;
     defer remaining.deinit(gpa);
     try remaining.appendSlice(gpa, source_members);
     for (ast.nodeList(annotation)) |member| {
         if (member == target) continue;
-        const fixed_logical_type = switch (try analyzeType(ast, source, logicalTypeNode(ast, member), type_interner, gpa, .parameter_type_not_supported)) {
+        const fixed_logical_type = switch (try analyzeType(ast, source, logicalTypeNode(ast, member), analysis_context, gpa, .parameter_type_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => return true,
         };
-        const fixed_type = try type_interner.facts().memberStorageType(.{ .type_id = fixed_logical_type, .kind = if (ast.nodes[member.index()].tag == .reference_type) .reference else .owned });
-        const fixed_members = (try type_interner.facts().variantMembers(fixed_type)) orelse &.{fixed_type};
+        const fixed_type = try analysis_context.facts().memberStorageType(.{ .type_id = fixed_logical_type, .kind = if (ast.nodes[member.index()].tag == .reference_type) .reference else .owned });
+        const fixed_members = (try analysis_context.facts().variantMembers(fixed_type)) orelse &.{fixed_type};
         var index = remaining.items.len;
         while (index > 0) {
             index -= 1;
@@ -2013,11 +2237,11 @@ fn bindInferredVariant(ast: *const structures.Ast, source: []const u8, inferred:
     // A source entirely covered by fixed arms, including bare none, supplies
     // no evidence for the dependent arm. Never likewise supplies no payload.
     if (remaining.items.len == 0 or actual_type == .never) return true;
-    const payload_type = if (remaining.items.len == 1) remaining.items[0] else switch (try type_interner.facts().internVariant(remaining.items)) {
+    const payload_type = if (remaining.items.len == 1) remaining.items[0] else switch (try analysis_context.facts().internVariant(remaining.items)) {
         .type_id => |type_id| type_id,
         .duplicate => unreachable,
     };
-    return bindInferredType(ast, source, inferred, target, payload_type, type_interner, gpa);
+    return bindInferredType(ast, source, inferred, target, payload_type, analysis_context, gpa);
 }
 
 fn finishStaticInference(inferred: []const InferredParameter, gpa: std.mem.Allocator) !StaticInference {
@@ -2048,12 +2272,107 @@ fn inferredParameter(
     return null;
 }
 
+pub const IndependentConverterTypes = struct {
+    input_type: ?structures.TypeId = null,
+    return_type: ?structures.TypeId = null,
+};
+
+/// A conservative source annotation for indexing, without evaluating types.
+/// Init carriers match several source families, so their source stays broad.
+pub fn converterIndexSource(ast: *const structures.Ast, source: []const u8, declaration: u32) ?structures.Node.Index {
+    const parts = functionParts(ast, declaration);
+    const signature = ast.nodes[parts.signature.index()];
+    const parameters = ast.nodeList(signature.data.signature.parameters);
+    for (parameters) |parameter_index| {
+        const parameter = ast.nodes[parameter_index.index()];
+        const mode = parameterMode(ast, parameter) orelse return null;
+        if (mode == .init) return null;
+        if (mode != .static) return parameter.data.node_node.b.unwrap();
+    }
+    var result: ?structures.Node.Index = null;
+    for (parameters) |parameter_index| {
+        const parameter = ast.nodes[parameter_index.index()];
+        const annotation = parameter.data.node_node.b.unwrap() orelse return null;
+        if (isMetaTypeAnnotation(ast, source, annotation)) continue;
+        // Multiple static value parameters need ordinary inference to identify
+        // the converted source; the index must not guess between them.
+        if (result != null) return null;
+        result = annotation;
+    }
+    return result;
+}
+
+pub fn functionReturnTypeNode(ast: *const structures.Ast, declaration: u32) ?structures.Node.Index {
+    const parts = functionParts(ast, declaration);
+    return ast.nodes[parts.signature.index()].data.signature.return_type.unwrap();
+}
+
+pub fn functionHasParameter(ast: *const structures.Ast, source: []const u8, declaration: u32, name: []const u8) bool {
+    const parts = functionParts(ast, declaration);
+    const signature = ast.nodes[parts.signature.index()];
+    for (ast.nodeList(signature.data.signature.parameters)) |parameter_index| {
+        const span = tokenSpan(ast, ast.nodes[parameter_index.index()].token_index);
+        if (std.mem.eql(u8, name, source[span.start..span.end])) return true;
+    }
+    return false;
+}
+
+pub fn analyzeIndependentConverterTypes(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    analysis_context: anytype,
+    gpa: std.mem.Allocator,
+) !IndependentConverterTypes {
+    var result: IndependentConverterTypes = .{
+        .return_type = switch (try analyzeIndependentReturnType(ast, source, declaration, analysis_context, gpa)) {
+            .success => |known| known,
+            .unsupported => null,
+        },
+    };
+    const parts = functionParts(ast, declaration);
+    const parameters = ast.nodeList(ast.nodes[parts.signature.index()].data.signature.parameters);
+    var runtime_count: usize = 0;
+    for (parameters) |parameter_index| {
+        const parameter = ast.nodes[parameter_index.index()];
+        const mode = parameterMode(ast, parameter) orelse return result;
+        if (mode == .static) continue;
+        if (parameter.data.node_node.b.unwrap() == null) return result;
+        runtime_count += 1;
+    }
+    if (runtime_count == 1) result.input_type = switch (try analyzeIndependentParameterType(ast, source, declaration, 0, analysis_context, gpa)) {
+        .success => |known| known,
+        .unsupported => null,
+    };
+    return result;
+}
+
+pub fn analyzeIndependentReturnType(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    analysis_context: anytype,
+    gpa: std.mem.Allocator,
+) !SemanticResult(?structures.TypeId) {
+    const parts = functionParts(ast, declaration);
+    const signature = ast.nodes[parts.signature.index()];
+    const annotation = signature.data.signature.return_type.unwrap() orelse return .{ .success = null };
+    const parameters = ast.nodeList(signature.data.signature.parameters);
+    const static_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = parameters, .static_only = true };
+    if (runtimeReference(ast, source, annotation, static_parameters) != null or ast.nodes[annotation.index()].tag == .call)
+        return .{ .success = null };
+    return switch (try analyzeType(ast, source, annotation, analysis_context, gpa, .return_type_not_supported)) {
+        .success => |type_id| .{ .success = type_id },
+        .unsupported => |issue| .{ .unsupported = issue },
+    };
+}
+
 pub fn analyzeIndependentParameterType(
     ast: *const structures.Ast,
     source: []const u8,
     declaration: u32,
     runtime_index: usize,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(?structures.TypeId) {
     const parts = functionParts(ast, declaration);
@@ -2068,7 +2387,7 @@ pub fn analyzeIndependentParameterType(
             const static_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = parameters, .static_only = true };
             if (runtimeReference(ast, source, annotation, static_parameters) != null) return .{ .success = null };
             if (ast.nodes[annotation.index()].tag == .call) return .{ .success = null };
-            return switch (try analyzeType(ast, source, annotation, type_interner, gpa, .parameter_type_not_supported)) {
+            return switch (try analyzeType(ast, source, annotation, analysis_context, gpa, .parameter_type_not_supported)) {
                 .success => |type_id| .{ .success = type_id },
                 .unsupported => |issue| .{ .unsupported = issue },
             };
@@ -2083,7 +2402,7 @@ pub fn analyzeStaticParameterType(
     source: []const u8,
     declaration: u32,
     parameter_index: usize,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(structures.TypeId) {
     const parts = functionParts(ast, declaration);
@@ -2096,7 +2415,7 @@ pub fn analyzeStaticParameterType(
     const runtime_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = parameters };
     if (runtimeReference(ast, source, annotation, runtime_parameters)) |reference|
         return .{ .unsupported = issueAt(ast, reference.index(), .value_used_as_type) };
-    return analyzeType(ast, source, annotation, type_interner, gpa, .parameter_type_not_supported);
+    return analyzeType(ast, source, annotation, analysis_context, gpa, .parameter_type_not_supported);
 }
 
 pub fn analyzeFunctionInstanceSignature(
@@ -2104,7 +2423,24 @@ pub fn analyzeFunctionInstanceSignature(
     source: []const u8,
     declaration: u32,
     specialization: []const structures.CompileTimeValueId,
-    type_interner: anytype,
+    analysis_context: anytype,
+    gpa: std.mem.Allocator,
+) !SignatureResult {
+    var shape = switch (try analyzeFunctionShape(ast, source, declaration, gpa)) {
+        .success => |shape| shape,
+        .unsupported => |issue| return .{ .unsupported = issue },
+    };
+    defer shape.deinit(gpa);
+    return analyzeShapedFunctionSignature(ast, source, declaration, specialization, shape, analysis_context, gpa);
+}
+
+pub fn analyzeShapedFunctionSignature(
+    ast: *const structures.Ast,
+    source: []const u8,
+    declaration: u32,
+    specialization: []const structures.CompileTimeValueId,
+    shape: structures.FunctionShape,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SignatureResult {
     const binding = ast.nodes[declaration];
@@ -2113,38 +2449,33 @@ pub fn analyzeFunctionInstanceSignature(
 
     var parameters: std.ArrayList(structures.CallableParameter) = .empty;
     defer parameters.deinit(gpa);
-    var names = std.StringHashMap(void).init(gpa);
-    defer names.deinit();
     const runtime_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = ast.nodeList(signature.data.signature.parameters) };
     var specialization_index: usize = 0;
-    for (ast.nodeList(signature.data.signature.parameters)) |parameter_index| {
+    for (ast.nodeList(signature.data.signature.parameters), shape.parameters) |parameter_index, parameter_shape| {
         const parameter = ast.nodes[parameter_index.index()];
         std.debug.assert(parameter.tag == .param);
-        const mode = parameterMode(ast, parameter) orelse
-            return .{ .unsupported = issueAt(ast, parameter.data.node_node.a.unwrap().?.index(), .parameter_mode_not_supported) };
+        const mode = parameter_shape.mode;
         const name_span = tokenSpan(ast, parameter.token_index);
         const name = source[name_span.start..name_span.end];
-        const named = try names.getOrPut(name);
-        if (named.found_existing or try type_interner.resolveLocalConflict(name) != null) {
+        if (try analysis_context.resolveLocalConflict(name) != null) {
             return .{ .unsupported = .{ .span = name_span, .kind = .duplicate_parameter } };
         }
-        const annotation = parameter.data.node_node.b.unwrap() orelse
-            return .{ .unsupported = .{ .span = name_span, .kind = .parameter_type_missing } };
+        const annotation = parameter.data.node_node.b.unwrap().?;
         if (runtimeReference(ast, source, annotation, runtime_parameters)) |reference|
             return .{ .unsupported = issueAt(ast, reference.index(), .value_used_as_type) };
         if (mode == .static) {
             if (specialization_index >= specialization.len) {
                 return .{ .unsupported = .{ .span = name_span, .kind = .static_parameter_requires_specialization } };
             }
-            const argument = try type_interner.lookupCompileTimeValue(specialization[specialization_index]);
+            const argument = try analysis_context.lookupCompileTimeValue(specialization[specialization_index]);
             specialization_index += 1;
-            if (isMetaTypeAnnotation(ast, source, annotation)) {
+            if (parameter_shape.is_meta_type) {
                 if (argument != .type) return .{ .unsupported = .{
                     .span = name_span,
                     .kind = .static_argument_type_mismatch,
                 } };
             } else {
-                const expected = switch (try analyzeType(ast, source, annotation, type_interner, gpa, .parameter_type_not_supported)) {
+                const expected = switch (try analyzeType(ast, source, annotation, analysis_context, gpa, .parameter_type_not_supported)) {
                     .success => |type_id| type_id,
                     .unsupported => |issue| return .{ .unsupported = issue },
                 };
@@ -2163,7 +2494,7 @@ pub fn analyzeFunctionInstanceSignature(
             }
             continue;
         }
-        const parameter_type = switch (try analyzeType(ast, source, annotation, type_interner, gpa, .parameter_type_not_supported)) {
+        const parameter_type = switch (try analyzeType(ast, source, annotation, analysis_context, gpa, .parameter_type_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
@@ -2173,7 +2504,7 @@ pub fn analyzeFunctionInstanceSignature(
     if (specialization_index != specialization.len) unreachable;
 
     for (ast.nodeList(signature.data.signature.where_clauses)) |condition| {
-        if (runtimeReference(ast, source, condition, runtime_parameters)) |reference|
+        if (whereRuntimeReference(ast, source, condition, runtime_parameters)) |reference|
             return .{ .unsupported = issueAt(ast, reference.index(), .comptime_runtime_capture) };
     }
 
@@ -2181,7 +2512,7 @@ pub fn analyzeFunctionInstanceSignature(
     if (runtimeReference(ast, source, return_annotation, runtime_parameters)) |reference|
         return .{ .unsupported = issueAt(ast, reference.index(), .value_used_as_type) };
     const return_type = if (return_annotation.unwrap()) |return_type_index|
-        switch (try analyzeType(ast, source, logicalTypeNode(ast, return_type_index), type_interner, gpa, .return_type_not_supported)) {
+        switch (try analyzeType(ast, source, logicalTypeNode(ast, return_type_index), analysis_context, gpa, .return_type_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         }
@@ -2192,15 +2523,14 @@ pub fn analyzeFunctionInstanceSignature(
     else
         .owned;
 
-    const function = ast.nodes[parts.function.index()];
-    const is_fallible = declaredFallibility(ast, function);
+    const is_fallible = shape.is_fallible;
     const annotation = if (binding.tag == .static_binding) binding.data.node_node.a.unwrap() else null;
     if (annotation) |annotation_index| {
-        const expected = switch (try analyzeType(ast, source, annotation_index, type_interner, gpa, .function_annotation_not_supported)) {
+        const expected = switch (try analyzeType(ast, source, annotation_index, analysis_context, gpa, .function_annotation_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
-        const actual = try type_interner.facts().internCallable(.{
+        const actual = try analysis_context.facts().internCallable(.{
             .parameters = parameters.items,
             .return_type = return_type,
             .result_mode = result_mode,
@@ -2257,6 +2587,17 @@ fn isFallibleExpression(tag: structures.Node.Tag) bool {
     };
 }
 
+fn whereRuntimeReference(ast: *const structures.Ast, source: []const u8, index: structures.Node.Index, scope: anytype) ?structures.Node.Index {
+    const present = index.unwrap() orelse return null;
+    const node = ast.nodes[present.index()];
+    if (node.tag == .identifier or node.tag == .type) return runtimeReference(ast, source, index, scope);
+    var children = node.children(ast.node_refs);
+    for (children.slice()) |child| {
+        if (whereRuntimeReference(ast, source, child, scope)) |reference| return reference;
+    }
+    return null;
+}
+
 fn runtimeReference(ast: *const structures.Ast, source: []const u8, index: structures.Node.Index, scope: anytype) ?structures.Node.Index {
     const present = index.unwrap() orelse return null;
     const node = ast.nodes[present.index()];
@@ -2288,38 +2629,39 @@ const ParameterScope = struct {
     }
 };
 
-pub fn resolveNamedExpression(ast: *const structures.Ast, source: []const u8, index: structures.Node.Index, type_interner: anytype) anyerror!?structures.NameReference {
-    return resolveNamedExpressionWithOperands(ast, source, index, type_interner, null);
+pub fn resolveNamedExpression(ast: *const structures.Ast, source: []const u8, index: structures.Node.Index, analysis_context: anytype) anyerror!?structures.NameReference {
+    return resolveNamedExpressionWithOperands(ast, source, index, analysis_context, null);
 }
 
-fn resolveNamedExpressionWithOperands(ast: *const structures.Ast, source: []const u8, index: structures.Node.Index, type_interner: anytype, operands: ?usize) anyerror!?structures.NameReference {
+fn resolveNamedExpressionWithOperands(ast: *const structures.Ast, source: []const u8, index: structures.Node.Index, analysis_context: anytype, operands: ?usize) anyerror!?structures.NameReference {
     const node = ast.nodes[index.index()];
     const span = tokenSpan(ast, node.token_index);
     switch (node.tag) {
-        .identifier, .type => return annotationReference(try type_interner.resolveName(source[span.start..span.end]), type_interner),
+        .identifier, .type => return annotationReference(try analysis_context.resolveName(source[span.start..span.end]), analysis_context),
+        .@"struct" => return .{ .constant = try analysis_context.internCompileTimeValue(.{ .type = try analysis_context.generatedStructType(index) }) },
         .field_access => {
-            const left = (try resolveNamedExpression(ast, source, node.data.node, type_interner)) orelse return null;
-            return annotationReference(try type_interner.resolveMemberWithOperands(left, source[span.start..span.end], span, operands), type_interner);
+            const left = (try resolveNamedExpression(ast, source, node.data.node, analysis_context)) orelse return null;
+            return annotationReference(try analysis_context.resolveMemberWithOperands(left, source[span.start..span.end], span, operands), analysis_context);
         },
         .call => {
-            const callee = (try resolveNamedExpressionWithOperands(ast, source, node.data.node_node.a, type_interner, ast.nodeList(node.data.node_node.b).len)) orelse return null;
+            const callee = (try resolveNamedExpressionWithOperands(ast, source, node.data.node_node.a, analysis_context, ast.nodeList(node.data.node_node.b).len)) orelse return null;
             if (callee == .overloaded_function) {
-                if (!try type_interner.overloadCallReturnsType(callee.overloaded_function, index)) return null;
+                if (!try analysis_context.overloadCallReturnsType(callee.overloaded_function, index)) return null;
             } else {
                 if (callee != .declaration) return null;
-                const shape = (try type_interner.functionShape(callee.declaration.item)) orelse return null;
+                const shape = (try analysis_context.functionShape(callee.declaration.item)) orelse return null;
                 if (!shape.returns_type) return null;
             }
-            const value = (try type_interner.executeComptime(index)) orelse return error.Unavailable;
+            const value = (try analysis_context.executeComptime(index)) orelse return error.Unavailable;
             return .{ .constant = value };
         },
         else => return null,
     }
 }
 
-fn annotationReference(reference: ?structures.NameReference, type_interner: anytype) !?structures.NameReference {
+fn annotationReference(reference: ?structures.NameReference, analysis_context: anytype) !?structures.NameReference {
     if (reference) |resolved| {
-        if (type_interner.public_annotation and !try type_interner.isPublicAnnotationReference(resolved))
+        if (analysis_context.public_annotation and !try analysis_context.isPublicAnnotationReference(resolved))
             return error.PublicFieldPrivateType;
     }
     return reference;
@@ -2334,7 +2676,7 @@ fn analyzeType(
     ast: *const structures.Ast,
     source: []const u8,
     node_index: structures.Node.Index,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
     unsupported_kind: structures.Diagnostic.Kind,
 ) anyerror!SemanticResult(structures.TypeId) {
@@ -2344,12 +2686,12 @@ fn analyzeType(
     if (node.tag == .unit_literal) return .{ .success = .unit };
     if (node.tag == .none_literal) return .{ .success = .none };
     if (node.tag == .call) {
-        const value_id = type_interner.executeComptime(node_index) catch |err| switch (err) {
+        const value_id = analysis_context.executeComptime(node_index) catch |err| switch (err) {
             error.QueryCycle => return .{ .unsupported = issueAt(ast, node_index.index(), .declaration_cycle) },
             error.Unavailable => return error.Unavailable,
             else => return err,
         } orelse return error.Unavailable;
-        return switch (try type_interner.lookupCompileTimeValue(value_id)) {
+        return switch (try analysis_context.lookupCompileTimeValue(value_id)) {
             .type => |type_id| .{ .success = type_id },
             .runtime => .{ .unsupported = issueAt(ast, node_index.index(), .value_used_as_type) },
         };
@@ -2361,7 +2703,7 @@ fn analyzeType(
         if (std.mem.eql(u8, name, "float")) return .{ .unsupported = .{ .span = span, .kind = .float_type_not_supported } };
     }
     if (node.tag == .type or node.tag == .identifier or node.tag == .field_access) {
-        const reference = resolveNamedExpression(ast, source, node_index, type_interner) catch |err| switch (err) {
+        const reference = resolveNamedExpression(ast, source, node_index, analysis_context) catch |err| switch (err) {
             error.QueryCycle => return .{ .unsupported = issueAt(ast, node_index.index(), .declaration_cycle) },
             error.PublicFieldPrivateType => return .{ .unsupported = issueAt(ast, node_index.index(), .public_field_private_type) },
             else => return err,
@@ -2371,16 +2713,16 @@ fn analyzeType(
             .namespace => return .{ .unsupported = issueAt(ast, node_index.index(), .namespace_used_as_value) },
             .overloaded_function => return .{ .unsupported = issueAt(ast, node_index.index(), .value_used_as_type) },
             .constant => |value| value,
-            .declaration => |item| (type_interner.staticItem(item) catch |err| switch (err) {
+            .declaration => |item| (analysis_context.staticItem(item) catch |err| switch (err) {
                 error.QueryCycle => return .{ .unsupported = issueAt(ast, node_index.index(), .declaration_cycle) },
                 else => return err,
             }) orelse {
-                const shape = try type_interner.functionShape(item.item);
-                if (shape != null and shape.?.returns_type) return .{ .unsupported = issueAt(ast, node_index.index(), if (try type_interner.isGenericStruct(item.item)) .generic_struct_requires_specialization else .type_factory_requires_call) };
+                const shape = try analysis_context.functionShape(item.item);
+                if (shape != null and shape.?.returns_type) return .{ .unsupported = issueAt(ast, node_index.index(), if (try analysis_context.isGenericStruct(item.item)) .generic_struct_requires_specialization else .type_factory_requires_call) };
                 return .{ .unsupported = issueAt(ast, node_index.index(), .value_used_as_type) };
             },
         };
-        return switch (try type_interner.lookupCompileTimeValue(value_id)) {
+        return switch (try analysis_context.lookupCompileTimeValue(value_id)) {
             .type => |type_id| .{ .success = type_id },
             .runtime => .{ .unsupported = issueAt(ast, node_index.index(), .value_used_as_type) },
         };
@@ -2392,18 +2734,18 @@ fn analyzeType(
             const parameter = ast.nodes[parameter_index.index()];
             const explicit_mode = parameter.tag == .param;
             const type_index = if (explicit_mode) parameter.data.node_node.b else parameter_index;
-            const parameter_type = switch (try analyzeType(ast, source, type_index, type_interner, gpa, unsupported_kind)) {
+            const parameter_type = switch (try analyzeType(ast, source, type_index, analysis_context, gpa, unsupported_kind)) {
                 .success => |type_id| type_id,
                 .unsupported => |issue| return .{ .unsupported = issue },
             };
             if (parameter_type == .type) return .{ .unsupported = issueAt(ast, parameter_index.index(), unsupported_kind) };
             try parameters.append(gpa, .{ .mode = if (explicit_mode) parameterMode(ast, parameter).? else .imm, .type_id = parameter_type });
         }
-        const return_type = switch (try analyzeType(ast, source, logicalTypeNode(ast, node.data.node_node.b), type_interner, gpa, unsupported_kind)) {
+        const return_type = switch (try analyzeType(ast, source, logicalTypeNode(ast, node.data.node_node.b), analysis_context, gpa, unsupported_kind)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
-        return .{ .success = try type_interner.facts().internCallable(.{
+        return .{ .success = try analysis_context.facts().internCallable(.{
             .parameters = parameters.items,
             .return_type = return_type,
             .result_mode = if (ast.nodes[node.data.node_node.b.index()].tag == .reference_type) .reference else .owned,
@@ -2416,7 +2758,7 @@ fn analyzeType(
     defer members.deinit(gpa);
     for (ast.nodeList(node_index)) |member_index| {
         const member_node = ast.nodes[member_index.index()];
-        const member_type = switch (try analyzeType(ast, source, logicalTypeNode(ast, member_index), type_interner, gpa, unsupported_kind)) {
+        const member_type = switch (try analyzeType(ast, source, logicalTypeNode(ast, member_index), analysis_context, gpa, unsupported_kind)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
@@ -2427,14 +2769,14 @@ fn analyzeType(
         });
     }
     std.debug.assert(members.items.len >= 2);
-    if (node.tag == .type_tuple) return .{ .success = try type_interner.facts().internTuple(members.items) };
+    if (node.tag == .type_tuple) return .{ .success = try analysis_context.facts().internTuple(members.items) };
 
-    return switch (try type_interner.facts().internVariantMembers(members.items)) {
+    return switch (try analysis_context.facts().internVariantMembers(members.items)) {
         .type_id => |type_id| .{ .success = type_id },
         .duplicate => |duplicate| blk: {
             var seen = false;
             for (ast.nodeList(node_index), members.items) |duplicate_member, member| {
-                if (try type_interner.facts().memberStorageType(member) != duplicate) continue;
+                if (try analysis_context.facts().memberStorageType(member) != duplicate) continue;
                 if (seen) break :blk .{ .unsupported = issueAt(ast, duplicate_member.index(), .duplicate_variant_member_type) };
                 seen = true;
             }
@@ -2452,7 +2794,7 @@ pub fn analyzeStaticDeclaration(
     ast: *const structures.Ast,
     source: []const u8,
     declaration: u32,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(StaticInitializerPlan) {
     const binding = ast.nodes[declaration];
@@ -2460,12 +2802,12 @@ pub fn analyzeStaticDeclaration(
     const initializer = binding.data.node_node.b.unwrap() orelse unreachable;
     const annotation = binding.data.node_node.a.unwrap() orelse return .{ .success = .{ .interpret = null } };
     if (isMetaTypeAnnotation(ast, source, annotation)) {
-        return switch (try analyzeType(ast, source, initializer, type_interner, gpa, .static_initializer_not_supported)) {
+        return switch (try analyzeType(ast, source, initializer, analysis_context, gpa, .static_initializer_not_supported)) {
             .success => |type_id| .{ .success = .{ .type_value = type_id } },
             .unsupported => |issue| .{ .unsupported = issue },
         };
     }
-    const expected = switch (try analyzeType(ast, source, annotation, type_interner, gpa, .static_initializer_not_supported)) {
+    const expected = switch (try analyzeType(ast, source, annotation, analysis_context, gpa, .static_initializer_not_supported)) {
         .success => |type_id| type_id,
         .unsupported => |issue| return .{ .unsupported = issue },
     };
@@ -2480,7 +2822,7 @@ pub fn analyzeStructDefinition(
     source: []const u8,
     item_id: structures.ItemId,
     declaration: u32,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(structures.StructDefinition) {
     const binding = ast.nodes[declaration];
@@ -2491,7 +2833,7 @@ pub fn analyzeStructDefinition(
             return .{ .unsupported = issueAt(ast, annotation.index(), .static_initializer_not_supported) };
         }
     }
-    return analyzeStructMembers(ast, source, initializer, .{ .declared = item_id }, type_interner, gpa);
+    return analyzeStructMembers(ast, source, initializer, .{ .declared = item_id }, analysis_context, gpa);
 }
 
 pub fn analyzeGeneratedStructDefinition(
@@ -2499,10 +2841,10 @@ pub fn analyzeGeneratedStructDefinition(
     source: []const u8,
     struct_index: structures.Node.Index,
     identity: structures.GeneratedStructIdentity,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(structures.StructDefinition) {
-    return analyzeStructMembers(ast, source, struct_index, .{ .generated = identity }, type_interner, gpa);
+    return analyzeStructMembers(ast, source, struct_index, .{ .generated = identity }, analysis_context, gpa);
 }
 
 pub fn validateStructNamespace(ast: *const structures.Ast, source: []const u8, struct_index: structures.Node.Index, gpa: std.mem.Allocator) !?Issue {
@@ -2531,7 +2873,7 @@ fn analyzeStructMembers(
     source: []const u8,
     struct_index: structures.Node.Index,
     identity: structures.StructIdentity,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(structures.StructDefinition) {
     const struct_node = ast.nodes[struct_index.index()];
@@ -2560,21 +2902,21 @@ fn analyzeStructMembers(
             const value_span = tokenSpan(ast, value.token_index);
             const value_name = if (value.tag == .identifier) source[value_span.start..value_span.end] else "";
             if (value.tag == .func) {
-                const self_type = try type_interner.structIdentityType(identity);
+                const self_type = try analysis_context.structIdentityType(identity);
                 const mode: structures.ParameterMode, const return_type: structures.TypeId = switch (operation) {
                     .copy => .{ .imm, self_type },
                     .move => .{ .deinit, self_type },
                     .drop => .{ .deinit, .unit },
                 };
-                const hook = (try type_interner.ownedFunction(identity, property_name)) orelse return error.Unavailable;
-                const actual = (try type_interner.functionSignature(hook)) orelse return error.Unavailable;
+                const hook = (try analysis_context.ownedFunction(identity, property_name)) orelse return error.Unavailable;
+                const actual = (try analysis_context.functionSignature(hook)) orelse return error.Unavailable;
                 const expected_parameter = [_]structures.CallableParameter{.{ .mode = mode, .type_id = self_type }};
-                const expected_type = try type_interner.facts().internCallable(.{
+                const expected_type = try analysis_context.facts().internCallable(.{
                     .parameters = &expected_parameter,
                     .return_type = return_type,
                     .is_fallible = false,
                 });
-                const actual_type = try type_interner.facts().internCallable(.{
+                const actual_type = try analysis_context.facts().internCallable(.{
                     .parameters = actual.parameters,
                     .return_type = actual.return_type,
                     .result_mode = actual.result_mode,
@@ -2636,14 +2978,14 @@ fn analyzeStructMembers(
 
         const name_span = tokenSpan(ast, member.token_index);
         const name = source[name_span.start..name_span.end];
-        var field_interner = type_interner;
+        var field_interner = analysis_context;
         field_interner.public_annotation = item.tag == .@"pub";
         const field_type = switch (try analyzeType(ast, source, member.data.field.type_annotation, field_interner, gpa, .struct_field_type_not_supported)) {
             .success => |type_id| type_id,
             .unsupported => |issue| return .{ .unsupported = issue },
         };
         if (field_type == .type) return .{ .unsupported = issueAt(ast, member.data.field.type_annotation.index(), .struct_field_type_not_supported) };
-        if (item.tag == .@"pub" and !try type_interner.isPublicFieldType(field_type))
+        if (item.tag == .@"pub" and !try analysis_context.isPublicFieldType(field_type))
             return .{ .unsupported = issueAt(ast, member.data.field.type_annotation.index(), .public_field_private_type) };
         try fields.ensureUnusedCapacity(gpa, 1);
         const owned_name = try gpa.dupe(u8, name);
@@ -2692,6 +3034,18 @@ const IntegerLiteralResult = union(enum) {
     unsupported: structures.Diagnostic.Kind,
 };
 
+pub fn integerLiteralValue(ast: *const structures.Ast, source: []const u8, expression: structures.Node.Index) ?i64 {
+    const node = ast.nodes[expression.index()];
+    const negative = node.tag == .neg;
+    const literal = if (negative) ast.nodes[node.data.node.index()] else node;
+    if (literal.tag != .number_literal) return null;
+    const span = tokenSpan(ast, literal.token_index);
+    return switch (parseIntegerLiteral(source[span.start..span.end], negative)) {
+        .value => |value| value,
+        .unsupported => null,
+    };
+}
+
 fn parseIntegerLiteral(literal: []const u8, negative: bool) IntegerLiteralResult {
     const prefix = if (literal.len >= 2) literal[0..2] else "";
     const is_hex = std.ascii.eqlIgnoreCase(prefix, "0x");
@@ -2716,42 +3070,42 @@ pub fn analyzeStaticTypeArgument(
     ast: *const structures.Ast,
     source: []const u8,
     argument: structures.Node.Index,
-    type_interner: anytype,
+    analysis_context: anytype,
     gpa: std.mem.Allocator,
 ) !SemanticResult(structures.CompileTimeValue) {
     const node = ast.nodes[argument.index()];
     if (node.tag == .unit_literal) return .{ .success = .{ .type = .unit } };
     if (node.tag == .none_literal) return .{ .success = .{ .type = .none } };
-    return switch (try analyzeType(ast, source, argument, type_interner, gpa, .static_argument_not_supported)) {
+    return switch (try analyzeType(ast, source, argument, analysis_context, gpa, .static_argument_not_supported)) {
         .success => |type_id| .{ .success = .{ .type = type_id } },
         .unsupported => |issue| .{ .unsupported = issue },
     };
 }
 
-pub fn canWidenTo(type_interner: anytype, actual: structures.TypeId, expected: structures.TypeId) !bool {
+pub fn canWidenTo(analysis_context: anytype, actual: structures.TypeId, expected: structures.TypeId) !bool {
     if (actual == expected or actual == .never) return true;
-    if (try canWidenMember(type_interner, actual, expected)) return true;
-    const expected_members = try type_interner.facts().variantMembers(expected) orelse return false;
-    const actual_members = try type_interner.facts().variantMembers(actual) orelse &.{actual};
+    if (try canWidenMember(analysis_context, actual, expected)) return true;
+    const expected_members = try analysis_context.facts().variantMembers(expected) orelse return false;
+    const actual_members = try analysis_context.facts().variantMembers(actual) orelse &.{actual};
     for (actual_members) |member| {
-        if (try widenedVariantTag(type_interner, member, expected_members) == null) return false;
+        if (try widenedVariantTag(analysis_context, member, expected_members) == null) return false;
     }
     return true;
 }
 
 /// Exact members take precedence over callable widening, regardless of tag order.
-pub fn widenedVariantTag(type_interner: anytype, actual: structures.TypeId, members: []const structures.TypeId) !?u32 {
+pub fn widenedVariantTag(analysis_context: anytype, actual: structures.TypeId, members: []const structures.TypeId) !?u32 {
     if (std.mem.indexOfScalar(structures.TypeId, members, actual)) |index| return @intCast(index);
     for (members, 0..) |member, index| {
-        if (try canWidenMember(type_interner, actual, member)) return @intCast(index);
+        if (try canWidenMember(analysis_context, actual, member)) return @intCast(index);
     }
     return null;
 }
 
-fn canWidenMember(type_interner: anytype, actual: structures.TypeId, expected: structures.TypeId) !bool {
+fn canWidenMember(analysis_context: anytype, actual: structures.TypeId, expected: structures.TypeId) !bool {
     if (actual == expected) return true;
-    const expected_callable = try type_interner.facts().callable(expected) orelse return false;
-    const actual_callable = try type_interner.facts().callable(actual) orelse return false;
+    const expected_callable = try analysis_context.facts().callable(expected) orelse return false;
+    const actual_callable = try analysis_context.facts().callable(actual) orelse return false;
     return actual_callable.return_type == expected_callable.return_type and
         actual_callable.result_mode == expected_callable.result_mode and
         actual_callable.parametersEql(expected_callable) and
@@ -2939,7 +3293,8 @@ pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source:
         }
     }
 
-    _ = try appendItem(gpa, &items, .top_level_entry, ast.file_id, module, .{ .identifier = "$entry" }, 0, false, null, null);
+    const entry = try appendItem(gpa, &items, .top_level_entry, ast.file_id, module, .{ .identifier = "$entry" }, 0, false, null, null);
+    try discoverGeneratedStructItems(gpa, &items, ast, source, module, @fromBackingInt(0), entry);
     return .{ .file_id = ast.file_id, .items = try items.toOwnedSlice(gpa) };
 }
 
@@ -2967,6 +3322,9 @@ fn discoverGeneratedStructItems(gpa: std.mem.Allocator, items: *std.ArrayList(st
     try pending.append(gpa, declaration);
     while (pending.pop()) |index| {
         const node = ast.nodes[index.index()];
+        // Other declarations have their own discovery roots. In particular,
+        // entry traversal must not claim members inside module declarations.
+        if (index != declaration and node.tag == .static_binding) continue;
         if (node.tag == .@"struct") {
             const site = @as(i64, index.index()) - @as(i64, declaration.index());
             try discoverStructItems(gpa, items, ast, source, module, index, parent, site);
@@ -3103,7 +3461,7 @@ test "discard assignment has distinct unresolved statement" {
     const result = try buildUnresolvedBody(parsed, source, .{ .function = .{ .declaration = declaration.index(), .parameters = &.{.{
         .mode = .imm,
         .type_id = .int,
-    }} } }, TestTypeInterner{}, std.testing.allocator);
+    }} } }, TestAnalysisContext{}, std.testing.allocator);
     var unresolved = switch (result) {
         .success => |value| value,
         .unsupported => unreachable,
@@ -3145,7 +3503,7 @@ test "fail has terminal unresolved statements in function and branch bodies" {
         try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
         const parsed = &report.ast.?;
         const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
-        const result = try buildUnresolvedBody(parsed, case.source, .{ .function = .{ .declaration = declaration.index(), .parameters = &.{} } }, TestTypeInterner{}, std.testing.allocator);
+        const result = try buildUnresolvedBody(parsed, case.source, .{ .function = .{ .declaration = declaration.index(), .parameters = &.{} } }, TestAnalysisContext{}, std.testing.allocator);
         var unresolved = switch (result) {
             .success => |value| value,
             .unsupported => unreachable,
@@ -3195,7 +3553,7 @@ test "struct factory independent inference unwraps public fields" {
     const annotation = structFactoryFieldAnnotation(parsed, source, declaration.index(), "value").?;
     const span = tokenSpan(parsed, parsed.nodes[annotation.index()].token_index);
     try std.testing.expectEqualStrings("T", source[span.start..span.end]);
-    const independent = try analyzeIndependentStructFieldType(parsed, source, declaration.index(), "amount", TestTypeInterner{}, std.testing.allocator);
+    const independent = try analyzeIndependentStructFieldType(parsed, source, declaration.index(), "amount", TestAnalysisContext{}, std.testing.allocator);
     switch (independent) {
         .success => |type_id| try std.testing.expectEqual(@as(?structures.TypeId, .int), type_id),
         .unsupported => return error.UnexpectedSemanticIssue,
@@ -3214,7 +3572,7 @@ fn testStructDefinitionAllocations(gpa: std.mem.Allocator) !void {
     defer report.deinit(std.testing.allocator);
     const parsed = &report.ast.?;
     const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
-    const result = try analyzeStructDefinition(parsed, source, @fromBackingInt(@intCast(0)), declaration.index(), TestTypeInterner{}, gpa);
+    const result = try analyzeStructDefinition(parsed, source, @fromBackingInt(@intCast(0)), declaration.index(), TestAnalysisContext{}, gpa);
     switch (result) {
         .success => |definition_value| {
             var definition = definition_value;
@@ -3231,7 +3589,7 @@ fn testFunctionSignatureAllocations(gpa: std.mem.Allocator) !void {
     defer report.deinit(std.testing.allocator);
     const parsed = &report.ast.?;
     const declaration = parsed.node_refs[parsed.nodes[0].data.ref.start];
-    const result = try analyzeFunctionSignature(parsed, source, declaration.index(), TestTypeInterner{}, gpa);
+    const result = try analyzeFunctionSignature(parsed, source, declaration.index(), TestAnalysisContext{}, gpa);
     switch (result) {
         .success => |signature_value| {
             var signature = signature_value;
@@ -3268,7 +3626,7 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
         .{ .mode = .imm, .type_id = .int },
         .{ .mode = .imm, .type_id = .int },
         .{ .mode = .imm, .type_id = .int },
-    } } }, TestTypeInterner{}, gpa);
+    } } }, TestAnalysisContext{}, gpa);
     switch (result) {
         .success => |unresolved_value| {
             var unresolved = unresolved_value;
@@ -3278,7 +3636,23 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
     }
 }
 
-const TestTypeInterner = struct {
+const TestAnalysisContext = struct {
+    pub fn staticBindings(_: @This()) ![]const structures.StaticBinding {
+        return &.{};
+    }
+    pub fn withStaticBindings(self: @This(), _: []const structures.StaticBinding) @This() {
+        return self;
+    }
+    pub fn stdMemoryFunction(_: @This(), _: []const u8) !?structures.ItemId {
+        unreachable;
+    }
+    pub fn staticCondition(_: @This(), _: structures.Node.Index) !?bool {
+        unreachable;
+    }
+    pub fn staticIteration(_: @This(), _: structures.Node.Index) !?[]const structures.CompileTimeValueId {
+        unreachable;
+    }
+
     pub fn panicFunction(_: @This()) !?structures.ItemId {
         unreachable;
     }

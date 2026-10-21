@@ -34,6 +34,22 @@ test "operation indexing Array reads replacements and bounds have parity" {
     , 42);
 }
 
+test "discarded Array calls preserve effects and return storage" {
+    try Fixture.expectParity(
+        \\func produce(mut calls: int) Array(int, 3)
+        \\    calls += 1
+        \\    return [1, 2, 3]
+        \\func produce_empty(mut calls: int) Array(int, 0)
+        \\    calls += 1
+        \\    return []
+        \\func run() int
+        \\    var calls = 40
+        \\    produce(calls)
+        \\    produce_empty(calls)
+        \\    return calls
+    , 42);
+}
+
 test "operation indexing compound assignments and reference assignments have parity" {
     try Fixture.expectParity(
         \\fallible calculate() int

@@ -200,18 +200,25 @@ const ParserState = struct {
 };
 
 fn parseState(gpa: std.mem.Allocator, source: []const u8) !ParserState {
-    var tok = try Tokenizer.init(gpa, source);
-    defer tok.deinit();
+    return parseStateUsingTokens(gpa, source, null);
+}
 
-    const estimated_token_count = source.len / 8;
-    var tokens = try std.ArrayList(Token).initCapacity(gpa, estimated_token_count);
+fn parseStateUsingTokens(gpa: std.mem.Allocator, source: []const u8, tokenized: ?[]const Token) !ParserState {
+    var tokens = if (tokenized) |known|
+        std.ArrayList(Token).fromOwnedSlice(try gpa.dupe(Token, known))
+    else blk: {
+        var tok = try Tokenizer.init(gpa, source);
+        defer tok.deinit();
+        var buffer = try std.ArrayList(Token).initCapacity(gpa, source.len / 8);
+        errdefer buffer.deinit(gpa);
+        while (true) {
+            const token = try tok.next();
+            try buffer.append(gpa, token);
+            if (token.tag == .eof) break;
+        }
+        break :blk buffer;
+    };
     errdefer tokens.deinit(gpa);
-
-    while (true) {
-        const token = try tok.next();
-        try tokens.append(gpa, token);
-        if (token.tag == .eof) break;
-    }
 
     var parser: ParserState = .{
         .gpa = gpa,
@@ -260,8 +267,45 @@ fn parseDocument(parser: *ParserState) ParseError!void {
     _ = try parser.expect(.eof);
 }
 
+pub fn parseEmbedded(comptime source: []const u8) Ast {
+    return comptime blk: {
+        @setEvalBranchQuota(100_000_000);
+        const tokens = Tokenizer.tokenizeComptime(source);
+        var nodes: [tokens.len * 2]Node = undefined;
+        var references: [tokens.len * 4]Node.Index = undefined;
+        var scratch: [tokens.len * 2]Node.Index = undefined;
+        var errors: [1]ParseDiagnostic = undefined;
+        const mask_count = std.math.divCeil(usize, tokens.len, @bitSizeOf(usize)) catch unreachable;
+        var dedents = std.mem.zeroes([mask_count]usize);
+        var parser: ParserState = .{
+            .gpa = std.heap.page_allocator,
+            .source = source,
+            .tokens = @constCast(tokens),
+            .index = 0,
+            .nodes = .initBuffer(&nodes),
+            .node_refs = .initBuffer(&references),
+            .scratch_stack = .initBuffer(&scratch),
+            .errors = .initBuffer(&errors),
+            .continuation_dedents = .{ .bit_length = tokens.len, .masks = &dedents },
+        };
+        parseDocument(&parser) catch |err| @compileError(@errorName(err));
+        const parsed_nodes = parser.nodes.items[0..parser.nodes.items.len].*;
+        const parsed_references = parser.node_refs.items[0..parser.node_refs.items.len].*;
+        break :blk .{
+            .file_id = 0,
+            .tokens = @constCast(tokens),
+            .nodes = @constCast(&parsed_nodes),
+            .node_refs = @constCast(&parsed_references),
+        };
+    };
+}
+
 pub fn parseReport(gpa: std.mem.Allocator, file_id: structures.FileId, source: []const u8) !ParseReport {
-    var parser = try parseState(gpa, source);
+    return parseReportUsingTokens(gpa, file_id, source, null);
+}
+
+pub fn parseReportUsingTokens(gpa: std.mem.Allocator, file_id: structures.FileId, source: []const u8, tokenized: ?[]const Token) !ParseReport {
+    var parser = try parseStateUsingTokens(gpa, source, tokenized);
     defer parser.deinit();
 
     const diagnostics = try parserDiagnostics(gpa, file_id, &parser);
@@ -405,6 +449,13 @@ fn parseLoop(parser: *ParserState) !Node.Index {
 fn parseFor(parser: *ParserState) ParseError!Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.keyword_for);
+    const binding = try parseForBinding(parser);
+    const source = try parseRequiredExpression(parser);
+    const body = try parseBody(parser, token_index);
+    return parser.addNode(.{ .tag = .for_loop, .token_index = token_index, .data = try parser.listToSpan(&.{ binding, source, body }) });
+}
+
+fn parseForBinding(parser: *ParserState) ParseError!Node.Index {
     const mode_index = parser.index;
     const mode = parser.eatAny(&.{ .keyword_const, .keyword_var, .keyword_ref });
     const name_index = parser.index;
@@ -417,9 +468,7 @@ fn parseFor(parser: *ParserState) ParseError!Node.Index {
         .data = .{ .node_node = .{ .a = access, .b = annotation } },
     });
     _ = try parser.expect(.keyword_in);
-    const source = try parseRequiredExpression(parser);
-    const body = try parseBody(parser, token_index);
-    return parser.addNode(.{ .tag = .for_loop, .token_index = token_index, .data = try parser.listToSpan(&.{ binding, source, body }) });
+    return binding;
 }
 
 fn parseComptime(parser: *ParserState) !Node.Index {
@@ -432,7 +481,7 @@ fn parseComptime(parser: *ParserState) !Node.Index {
 fn parseBinding(parser: *ParserState) !Node.Index {
     if (parser.current().tag == .keyword_static and parser.tokens[parser.index + 1].tag == .keyword_struct)
         return parseStruct(parser);
-    const binding_keyword = parser.eat(.keyword_const) orelse parser.eat(.keyword_var) orelse parser.eat(.keyword_ref) orelse parser.eat(.keyword_static) orelse return .null;
+    const binding_keyword = parser.eatAny(&.{ .keyword_const, .keyword_var, .keyword_ref, .keyword_static }) orelse return .null;
     const name = try parseDeclarationName(parser, binding_keyword.tag == .keyword_static);
     const type_annotation = try parseTypeAnnotation(parser);
     _ = try parser.expect(.equal);
@@ -954,13 +1003,62 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
         .keyword_func, .keyword_fallible => try parseFunctionType(parser),
         .keyword_static => try parseStruct(parser),
         .identifier => try parseTokenNode(parser, .identifier, .identifier),
-        .l_bracket => try parseExpressionList(parser, .l_bracket, .r_bracket, .collection_literal),
+        .l_bracket => try parseCollectionLiteral(parser),
         .l_paren => return parseParenthesized(parser, false),
         else => {
             try parser.addError(.{ .invalid_expression = parser.current().tag });
             return error.ParseError;
         },
     };
+}
+
+fn parseCollectionLiteral(parser: *ParserState) ParseError!Node.Index {
+    const token_index = parser.index;
+    const data = try parseDelimitedList(parser, .l_bracket, .r_bracket, &.{}, parseCollectionItem, .{});
+    return parser.addNode(.{ .tag = .collection_literal, .token_index = token_index, .data = data });
+}
+
+fn parseCollectionItem(parser: *ParserState) ParseError!Node.Index {
+    const start = parser.index;
+    const spread = parser.eat(.ellipsis2) != null;
+    var item = try parseExpressionPrecedence(parser, 0);
+    if (spread) item = try parser.addNode(.{ .tag = .collection_spread, .token_index = start, .data = .{ .node = item } });
+    const stack_top = parser.scratch_stack.items.len;
+    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
+    while (true) {
+        parser.skipContinuationIndent();
+        const token_index = parser.index;
+        const is_static = parser.eat(.keyword_static) != null;
+        if (parser.eat(.keyword_for) != null) {
+            const binding = try parseForBinding(parser);
+            const source = try parseExpressionPrecedence(parser, 0);
+            const clause = try parser.addNode(.{ .tag = .collection_for, .token_index = token_index, .data = try parser.listToSpan(&.{ binding, source, .null }) });
+            try parser.scratch_stack.append(parser.gpa, clause);
+        } else if (parser.eat(.keyword_if) != null) {
+            const condition = try parseExpressionPrecedence(parser, 0);
+            const clause = try parser.addNode(.{ .tag = .collection_if, .token_index = token_index, .data = .{ .node_node = .{ .a = condition, .b = .null } } });
+            try parser.scratch_stack.append(parser.gpa, clause);
+        } else {
+            if (is_static) {
+                _ = try parser.expect(.keyword_for);
+                unreachable;
+            }
+            break;
+        }
+    }
+    var end = parser.scratch_stack.items.len;
+    while (end > stack_top) {
+        end -= 1;
+        const clause = parser.scratch_stack.items[end];
+        const node = &parser.nodes.items[clause.index()];
+        switch (node.tag) {
+            .collection_for => parser.node_refs.items[node.data.ref.end - 1] = item,
+            .collection_if => node.data.node_node.b = item,
+            else => unreachable,
+        }
+        item = clause;
+    }
+    return item;
 }
 
 fn parseExpressionList(parser: *ParserState, opening: Token.Tag, closing: Token.Tag, tag: Node.Tag) ParseError!Node.Index {
@@ -973,6 +1071,13 @@ fn parseExpressionList(parser: *ParserState, opening: Token.Tag, closing: Token.
 /// Freeze each list before releasing its scratch range; nested lists share the
 /// stack while retaining their own delimiter and continuation handling.
 fn parseDelimitedList(parser: *ParserState, opening: Token.Tag, closing: Token.Tag, prefix: []const Node.Index, comptime parse_item: anytype, arguments: anytype) ParseError!Node.Data {
+    const ItemArguments = comptime blk: {
+        const argument_types = @typeInfo(@TypeOf(arguments)).@"struct".field_types;
+        var types: [argument_types.len + 1]type = undefined;
+        types[0] = *ParserState;
+        for (argument_types, 1..) |argument_type, index| types[index] = argument_type;
+        break :blk @Tuple(&types);
+    };
     _ = try parser.expect(opening);
     const stack_top = parser.scratch_stack.items.len;
     defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
@@ -980,7 +1085,10 @@ fn parseDelimitedList(parser: *ParserState, opening: Token.Tag, closing: Token.T
     while (true) {
         parser.skipContinuationIndent();
         if (parser.eat(closing) != null) break;
-        const item = try @call(.auto, parse_item, .{parser} ++ arguments);
+        var item_arguments: ItemArguments = undefined;
+        item_arguments[0] = parser;
+        inline for (arguments, 1..) |argument, index| item_arguments[index] = argument;
+        const item = try @call(.auto, parse_item, item_arguments);
         try parser.scratch_stack.append(parser.gpa, item);
         parser.skipContinuationIndent();
         if (parser.eat(.comma) != null) continue;
@@ -2832,4 +2940,40 @@ fn testParsing(source: [:0]const u8, expected: []const u8) !void {
     try std.testing.expect(Ast.eql(ast, ast));
     try renderAst(std.testing.allocator, &ast, source, &buffer.writer);
     try std.testing.expectEqualStrings(expected, std.mem.trimEnd(u8, buffer.writer.buffered(), "\n"));
+}
+
+test "parse collection clauses preserve nesting phase and open range spelling" {
+    const source = "const values = [x static for x in 0..4 static if x > 0 for y in items, (..3), ..tail]";
+    var report = try parseReport(std.testing.allocator, 0, source);
+    defer report.deinit(std.testing.allocator);
+    const parsed = &report.ast.?;
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    const binding = parsed.nodes[parsed.node_refs[parsed.nodes[0].data.ref.start].index()];
+    const items = parsed.nodeList(binding.data.node_node.b);
+    try std.testing.expectEqual(@as(usize, 3), items.len);
+    const outer = parsed.nodes[items[0].index()];
+    try std.testing.expectEqual(Node.Tag.collection_for, outer.tag);
+    try std.testing.expectEqual(Token.Tag.keyword_static, parsed.tokens[outer.token_index].tag);
+    const filter = parsed.nodes[parsed.nodeList(items[0])[2].index()];
+    try std.testing.expectEqual(Node.Tag.collection_if, filter.tag);
+    try std.testing.expectEqual(Token.Tag.keyword_static, parsed.tokens[filter.token_index].tag);
+    const inner = parsed.nodes[filter.data.node_node.b.index()];
+    try std.testing.expectEqual(Node.Tag.collection_for, inner.tag);
+    try std.testing.expectEqual(Token.Tag.keyword_for, parsed.tokens[inner.token_index].tag);
+    try std.testing.expectEqual(Node.Tag.range, parsed.nodes[items[1].index()].tag);
+    try std.testing.expectEqual(Node.Tag.collection_spread, parsed.nodes[items[2].index()].tag);
+}
+
+test "where clauses use ordinary predicates and reject colon requirements" {
+    const valid = "func filled(static T: type) int where T.copy is func(imm T) T -> 42";
+    var accepted = try parseReport(std.testing.allocator, 0, valid);
+    defer accepted.deinit(std.testing.allocator);
+    try std.testing.expect(accepted.ast != null);
+    try std.testing.expectEqual(@as(usize, 0), accepted.diagnostics.len);
+
+    const invalid = "func filled(static T: type) int where T.copy: func(imm T) T -> 42";
+    var rejected = try parseReport(std.testing.allocator, 0, invalid);
+    defer rejected.deinit(std.testing.allocator);
+    try std.testing.expect(rejected.ast == null);
+    try std.testing.expect(rejected.diagnostics.len != 0);
 }

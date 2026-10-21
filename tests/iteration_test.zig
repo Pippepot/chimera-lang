@@ -215,11 +215,12 @@ test "pull for propagates producer failure before item matching" {
         \\    if const unexpected = calculate(calls) -> return 90
         \\    return calls * 14
     , 42);
-    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+    try Fixture.expectSourceExit(declarations ++ "\n" ++
         \\var calls = 0
         \\var cursor = Cursor{position = 0, calls = Ref.from(calls)}
         \\for item in cursor -> _ = item
-    , .fallible_expression_outside_fallible_function);
+        \\exit(99)
+    , 1);
     inline for (.{
         .{ .mode = "func", .failure = "" },
         .{ .mode = "fallible", .failure = "if self.position == 3 -> fail" },
@@ -995,6 +996,49 @@ test "ranges construct ordinary cursors with native and comptime parity" {
         \\    if not (cursor.next() is End) -> return 90
         \\    return result * 3
     , 42);
+}
+
+test "ranges retain one value type while endpoint presence changes at runtime" {
+    try Fixture.expectParity(
+        \\import std.range.{Range}
+        \\func select(first: int | none, limit: int | none) Range -> first..limit
+        \\func run() int
+        \\    var bounds = select(1, 4)
+        \\    var total = 0
+        \\    for value in bounds -> total += value
+        \\    bounds = select(none, 4)
+        \\    if String(bounds) <> "..4" -> return 90
+        \\    bounds.first = 2
+        \\    bounds.limit = none
+        \\    if String(bounds) <> "2.." -> return 91
+        \\    bounds = (..)
+        \\    if String(bounds) <> ".." -> return 92
+        \\    return total + 36
+    , 42);
+}
+
+test "open range stepping fails and infallible traversal panics" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    const ranges = [(..3), (2..), (..)]
+        \\    for bounds in ranges
+        \\        if const sequence = bounds.step_by(1) -> return 90
+        \\    return 42
+    , 42);
+    for ([_][]const u8{ "..3", "2..", ".." }) |bounds| {
+        for ([_][]const u8{ "iter", "reversed" }) |method| {
+            const source = try std.testing.allocator.print("const bounds = {s}\n_ = bounds.{s}()\nexit(90)", .{ bounds, method });
+            defer std.testing.allocator.free(source);
+            const fixture = try Fixture.init(source);
+            defer fixture.deinit();
+            const result = try fixture.runIo("");
+            defer std.testing.allocator.free(result.stdout);
+            defer std.testing.allocator.free(result.stderr);
+            try std.testing.expectEqual(std.process.Child.Term{ .exited = 134 }, result.term);
+            try std.testing.expect(std.mem.indexOf(u8, result.stderr, "requires both endpoints") != null);
+        }
+    }
+    try Fixture.expectAnySourceDiagnostic("static cursor = (..3).iter()\n_ = cursor\nexit(0)", .compile_time_panic);
 }
 
 test "for ranges lower through ordinary loops with parity" {

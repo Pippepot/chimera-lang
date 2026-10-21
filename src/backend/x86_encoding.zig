@@ -39,6 +39,7 @@ const instructions = .{
     .ret = Encoding{ .prefix = &.{0xC3}, .asm_prefix = "ret" },
     .ud2 = Encoding{ .prefix = &.{ 0x0F, 0x0B }, .asm_prefix = "ud2" },
     .zero_edi = Encoding{ .prefix = &.{ 0x31, 0xFF }, .asm_prefix = "xor edi, edi" },
+    .sub_edi_edx = Encoding{ .prefix = &.{ 0x29, 0xD7 }, .asm_prefix = "sub edi, edx" },
     .cdq = Encoding{ .prefix = &.{0x99}, .asm_prefix = "cdq" },
     .idiv_ecx = Encoding{ .prefix = &.{ 0xF7, 0xF9 }, .asm_prefix = "idiv ecx" },
     .neg_eax = Encoding{ .prefix = &.{ 0xF7, 0xD8 }, .asm_prefix = "neg eax" },
@@ -141,8 +142,40 @@ pub fn encoding(operation: Operation) Encoding {
 
 pub fn append(code: *std.ArrayList(u8), allocator: std.mem.Allocator, operation: Operation, bits: u64) !void {
     const pattern = encoding(operation);
-    try code.appendSlice(allocator, pattern.prefix);
-    var encoded: [8]u8 = undefined;
-    std.mem.writeInt(u64, &encoded, bits, .little);
-    try code.appendSlice(allocator, encoded[0 .. pattern.length() - pattern.prefix.len]);
+    const destination = try code.addManyAsSlice(allocator, pattern.length());
+    @memcpy(destination[0..pattern.prefix.len], pattern.prefix);
+    const operand = destination[pattern.prefix.len..];
+    switch (pattern.operand) {
+        .none => {},
+        .i32, .u32, .rel => std.mem.writeInt(u32, operand[0..4], @truncate(bits), .little),
+        .u64 => std.mem.writeInt(u64, operand[0..8], bits, .little),
+    }
+}
+
+test "x86 instruction append preserves prefix and operand bytes" {
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(std.testing.allocator);
+    const bits: u64 = 0x88776655ccbbaa99;
+    const encoded = [_]u8{ 0x99, 0xaa, 0xbb, 0xcc, 0x55, 0x66, 0x77, 0x88 };
+    for (patterns, 0..) |pattern, index| {
+        code.clearRetainingCapacity();
+        try code.append(std.testing.allocator, 0xcc);
+        try append(&code, std.testing.allocator, @fromBackingInt(@intCast(index)), bits);
+        try std.testing.expectEqual(@as(u8, 0xcc), code.items[0]);
+        try std.testing.expectEqual(1 + pattern.length(), code.items.len);
+        try std.testing.expectEqualSlices(u8, pattern.prefix, code.items[1..][0..pattern.prefix.len]);
+        const operand = code.items[1 + pattern.prefix.len ..];
+        try std.testing.expectEqualSlices(u8, encoded[0..operand.len], operand);
+    }
+}
+
+test "x86 instruction append leaves code unchanged on allocation failure" {
+    var code = try std.ArrayList(u8).initCapacity(std.testing.allocator, 1);
+    defer code.deinit(std.testing.allocator);
+    while (code.items.len < code.capacity) code.appendAssumeCapacity(0xcc);
+    const original_len = code.items.len;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0, .resize_fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, append(&code, failing.allocator(), .add_eax, 42));
+    try std.testing.expectEqual(original_len, code.items.len);
+    for (code.items) |byte| try std.testing.expectEqual(@as(u8, 0xcc), byte);
 }

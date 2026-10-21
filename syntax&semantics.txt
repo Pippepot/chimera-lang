@@ -143,8 +143,12 @@ const subtract: func(imm int, imm int) int = int.-
 # literal must be valid UTF-8. Invalid escapes, malformed UTF-8, surrogates, and
 # scalars above U+10FFFF are source errors. Embedded NUL is valid text. Literal
 # decoding belongs to semantic analysis of demanded expressions.
-# Ordinary inferred bindings default a literal to std.text.String. An expected
-# type instead selects an ordinary static-source converter. Literals remain
+# Ordinary inferred bindings default a literal to std.text.String. Under another
+# expected type, a static-source converter from string_literal applies first when
+# one is declared for that target. Otherwise the literal materializes at its use
+# as std.text.StaticString, a copyable view of its permanent decoded bytes, and
+# an ordinary converter from StaticString applies. Materialization is not a
+# converter and creates no per-literal function or specialization. Literals remain
 # string_literal when that type is explicitly expected, including static
 # parameters. The default String uses registered standard-library identity,
 # independently of prelude imports or a locally shadowing name.
@@ -178,9 +182,26 @@ const subtract: func(imm int, imm int) int = int.-
 # copying or allocating text. Each implementation compares borrowed bytes.
 # The named byte_int function widens a byte to int without failure. Numeric
 # runtime types are still not related by converters.
+# Standard String converters format int and byte in decimal, bool as true/false,
+# unit as (), and none as none. StringView converts to an owned copy. Array,
+# List, and Span format their elements recursively as [a, b], without quoting
+# text elements; empty collections produce []. BytesView formats its arbitrary
+# bytes as a decimal collection rather than assuming UTF-8. Box and Ref format
+# their contents as Box(value) and Ref(value). These generic converters require
+# String conversion of an element expression. Range formats omitted bounds with
+# .. or ..^, matching source syntax. Converters borrow their inputs, never copy
+# or consume elements, and panic on allocation failure. They also execute at
+# compile time within the ordinary storage-publication boundary.
+# A collection literal can initialize String directly, as in String([1, 2]);
+# its consuming converter constructs an Array before formatting it. Element
+# failure preserves ordinary initializer propagation and partial cleanup.
 # std.io supplies stdin/stdout/stderr handles, fallible read_bytes, write_once,
-# write_all, and write_text. Infallible print writes text followed by a newline
-# and terminates with panic status 134 on output failure. Handles borrow
+# write_all, and write_text. Infallible print accepts an immutable value of T
+# that converts to String, converts it once, and writes
+# the text followed by a newline. Existing String inputs are borrowed without copying.
+# print is a generic overload export; callable references require a function-type
+# context, which specializes its value type. It terminates with panic status
+# 134 on allocation or output failure. Handles borrow
 # the process's standard descriptors; they do not close or own them. read_bytes
 # appends at most the requested bytes to a List(byte), publishing only the
 # initialized prefix. Positive progress and short reads/writes are success;
@@ -199,8 +220,10 @@ const subtract: func(imm int, imm int) int = int.-
 # print is an ordinary declaration and may be shadowed or used as a callable.
 # Reached compile-time I/O is an unavailable execution operation, even inside a
 # fallible condition; an unexecuted branch performs no I/O and causes no error.
-# Compiler-private static_data represents immutable literal storage. Ref and Span
-# use one private StorageCursor(T) substrate for typed storage access.
+# StaticString represents immutable literal storage. Only literal
+# materialization creates one; its bytes are permanent and readonly, so views of
+# them may outlive every binding. Ref and Span use one private StorageCursor(T)
+# substrate for typed storage access.
 # Only registered storage primitives create/access cursors; cursor and handle
 # permissions cannot be escalated. Neither exposes numeric addresses.
 
@@ -295,6 +318,14 @@ pub import math.{Vec3}
 # Any file may contain executable top-level statements, but only the file
 # passed to the compiler executes them. Imported files never run on import;
 # imports have no runtime side effects.
+# The designated file's top-level body is implicitly fallible. Successful
+# fallthrough cleans up live owners and finishes the generated program with
+# status 0. Unhandled ordinary failure cleans up through the same rules as a
+# fallible function and finishes with status 1. This includes fallible calls,
+# checked access, comparisons, casts, initializer failures, iterator failures,
+# and bare fail. Local failure handlers take precedence. Ordinary functions
+# retain their declared fallibility; compile-time consumers still require
+# successful evaluation. Explicit exit and panic retain their own semantics.
 # Renaming a file within its folder has no effect. Moving a declaration across
 # folders changes its module and identity, including nominal type identity; a
 # re-export preserves the old path but never the old identity.
@@ -647,9 +678,9 @@ const middle = between(1, 42)         # T is int
 # same indentation as the declaration. Clauses are checked in source order
 # when the function instance is specialized, before its body is used; they do
 # not make the function fallible at runtime or change its callable type.
-# Only static parameters, module statics, and declarations reachable from
-# them may be read. Runtime parameters and locals are never allowed in a
-# `where`, including on a `fallible` function. A failed condition rejects the
+# Evaluated predicates may read only static parameters, module statics, and
+# declarations reachable from them. Runtime parameters cannot be captured by
+# a compile-time condition. A failed condition rejects the
 # specialization with a diagnostic at that clause; unhandled failure during
 # compile-time evaluation also rejects it. Undemanded specializations are not
 # checked. The ordinary function body (or `extern` declaration) is still
@@ -660,10 +691,14 @@ const middle = between(1, 42)         # T is int
 # callable types. An absent member tested this way fails the constraint; other
 # invalid names and operations retain their normal diagnostics. Runtime `is`
 # continues to inspect the active member of a variant value.
+# Conditions compose with and/or/not and short-circuit normally. Callable
+# membership uses ordinary `is`, for example `where T.copy is func(imm T) T`.
+# The colon requirement syntax is not supported.
 func bounded(static limit: int) int where limit > 0
 where limit < 10
     return limit
 func accepts(static T: type) type where T is int | none -> T
+func copyable(static T: type) int where T.copy is func(imm T) T -> 1
 
 func add1(mut a: int)
     a += 1
@@ -962,8 +997,8 @@ fallible forward_initializer(static T: type, init item: T) T
 # because it is deferred or consumed through init. Deferral and forwarding
 # preserve the supplied initializer's effect rather than introducing failure.
 # Possible ordinary failure must be handled at the construction site or propagated
-# from a declared fallible function. An ordinary func cannot acquire a hidden
-# failure outcome. A forwarding call still obeys the receiving callable's declared
+# from a fallible function, including the implicit top-level entry. An ordinary
+# func cannot acquire a hidden failure outcome. A forwarding call still obeys the receiving callable's declared
 # fallibility; an infallible argument does not make a declared fallible call ordinary.
 # Keep one init mode, without separate infallible/fallible parameter modifiers.
 # Explicit type-level assertions of initializer infallibility remain unspecified.
@@ -1180,15 +1215,12 @@ fallible forward_initializer(static T: type, init item: T) T
 # of reference-containing elements remains unsupported.
 # List growth allocates replacement storage before disturbing initialized
 # elements; allocation failure leaves the original contents intact. reserve
-# relocates in reverse index order: unsafe_take extracts each item and
-# self.initialized = index records the retained old-List prefix before
-# fallible unsafe_initialize constructs the item in replacement storage.
-# Successful initialization continues relocation. On initialization failure,
-# the completed replacement suffix is destroyed, replacement storage is
-# deallocated, and fail propagates. The original allocation retains a valid
-# initialized prefix, without restoring removed elements. Supported moves are
-# infallible, so the standard move path does not actually fail initialization;
-# the conservative init contract still requires the cleanup path. `get(index)`
+# relocates in reverse index order. unsafe_take extracts the owned value with
+# its contained referent origins, independently of the old slot. Internal slot
+# construction inherits only its initializer's failure; supported moves are
+# infallible, so relocation has no ordinary failure after allocation succeeds.
+# The initialized count remains unchanged, and the old allocation is released
+# after all elements have been relocated. `get(index)`
 # checks 0 <= index < length and returns ref T with permission inherited from
 # the receiver. An empty
 # List has no initialized element, even for an immovable T; append still
@@ -1591,7 +1623,7 @@ reassigned = int_or_float_value
 # imm and static value converters and consuming collection init converters are
 # implemented. ROADMAP.md records implementation limits separately from these rules.
 # A converter declares an implicit conversion from a source type to a target
-# type. It has no name and is not called directly. Its signature has exactly one
+# type. It has no declaration name. Its signature has exactly one
 # value parameter, which receives the converted expression; every other
 # parameter is static and inferred from the source and target types together.
 # A static parameter that neither type determines is an error. The value
@@ -1635,11 +1667,30 @@ pub converter(value: Degrees) Radians -> Radians{value = to_radians(value.value)
 # converter applies only in its declaring module. Imports never add or remove
 # candidates.
 #
+# For a statically known source type T, `T.U` first looks up an ordinary type
+# member. If no member exists, U resolves as a type name in the surrounding
+# scope, including static type parameters and aliases. Exactly one declared
+# converter from T to U yields a callable value with that converter's actual
+# parameter and result types and modes. Generic converters specialize from
+# those types. Lookup checks the selected declaration's constraints without
+# executing its body. Missing or ambiguous conversions and failed constraints
+# make an `is` membership test fail; ordinary uses diagnose them.
+# No identity, widening, or per-member variant adapter is synthesized. An
+# applicable converter with a wider input retains that input in its callable
+# type. A converter whose source parameter is static needs a concrete value
+# and cannot be obtained from its source type alone. Bind a parameterized or
+# qualified target type to an alias or static type parameter before lookup.
+# Existing conversion expressions, including variant composition, keep their
+# normal behavior. To accept identity as well as a declared converter, use:
+func accepts_text(static T: type) int
+where T is String or T.String is func(imm T) String -> 1
+#
 # Conversion applies only where the expected type is already known: bindings,
 # assignments, arguments, returns, struct initializer fields, and the results
 # propagated to them, such as conditional branches. A value whose type equals
-# the expected type is not converted. Otherwise the candidates are the built-in
-# conversions (variant widening, callable widening, and literal defaults), a
+# the expected type is not converted. Built-in variant and callable widening
+# also take precedence over converters, preserving an already compatible value.
+# Otherwise the candidates are the built-in literal defaults, a
 # converter from the source to the expected type, and, for an expected variant,
 # a converter from the source to one member followed by widening. Exactly one
 # candidate must apply; none is a type error and several are an ambiguity error
@@ -1647,6 +1698,15 @@ pub converter(value: Degrees) Radians -> Radians{value = to_radians(value.value)
 # ambiguous. An integer literal whose default type is a member of the expected
 # variant takes that type without considering other candidates. `where`
 # clauses are checked on the selected converter; failure is a source error.
+# If no whole-value conversion applies to a source variant, conversion applies
+# separately to every member. Each member must widen to the expected type or
+# have one applicable converter to that type or one of its members. A missing,
+# ambiguous, or constrained-out member conversion rejects the use.
+# The source is evaluated once; only the active
+# member's conversion executes. Reference alternatives use their referents for
+# conversion unless the expected type already accepts the stored reference.
+# Identity members retain ordinary borrowing and copying rules; converting a
+# variant never implicitly copies a noncopyable member merely to inspect it.
 func draw(angle: Radians)
 draw(degrees)                                # converts
 const angle: Radians = degrees               # converts
@@ -1656,7 +1716,7 @@ const copied = degrees                       # Degrees; no expected type
 
 # Conversion never chains: a converter's result is not converted again, and no
 # built-in conversion precedes a converter. Converters do not take part in
-# static inference, inferred binding types, member or operator lookup, or
+# static inference, inferred binding types, runtime member or operator lookup, or
 # joins. An operation is resolved first; conversion may then satisfy its known
 # parameter types.
 #
@@ -1720,6 +1780,12 @@ const first = repeated.get?(0)
 # never, so [] requires an expected type that determines T. Without an expected
 # type, a collection literal defaults to Array(T, N). The pending literal cannot
 # itself be bound or stored; an owning binding stores the completed collection.
+# A diverging element contributes never to inference. A runtime producer with
+# such an element can complete empty; reaching that element ends its path.
+# If that inferred or contextual Array type fits an expected variant, constructing
+# the Array member takes precedence over converters to other variant members.
+# A unique matching-length Array member supplies element context before those
+# converters. Multiple matching Array element types use ordinary element inference.
 # Elements construct directly into their final destinations, without first
 # building and relocating an intermediate Array or requiring copyable elements.
 #
@@ -1759,6 +1825,56 @@ const numbers: List(int | float) = [1, 2.5]
 const mixed = [1, 2.5] # defaults to Array(int | float, 2)
 if const parsed: List(int) = [parse_number?(text), 42] -> use(parsed)
 else -> handle_failure() # ordinary element failure, not allocation panic
+
+
+# Collection expansion
+# Collection items may spread a sequence with ..source, or append for/if clauses:
+# [1, ..values, 5], [f(x) for x in values if x > 0], and
+# [f(i) static for i in 0..N static if i % 2 == 0]. Clauses nest left to right;
+# the element expression executes after its clauses. Prefix .. in a collection
+# item means spreading; parenthesize an omitted-start range to store the range
+# itself, as in [(..limit)]. A bounded range such as [0..limit] remains one item.
+# Static for evaluates the source and traverses it at compile time. Its bindings
+# are canonical compile-time values; static if uses compile-time condition
+# success to include an item and failure to exclude it. Runtime lexical data
+# cannot control a static clause. Element expressions retain the construction
+# phase and are not evaluated merely to determine shape. A statically excluded
+# item is parsed but is otherwise unanalyzed. A static loop with no iterations
+# likewise does not analyze its body. General statement-level static control is
+# a separate feature.
+# Array spreading uses the Array's structural sequence and length, independently
+# of user iteration methods. Other sequence spreading and runtime for/if clauses
+# use the ordinary iteration and condition contracts. A filter's ordinary failure
+# skips the item; source preparation, polling, and element failures fail the
+# construction. Panic and diagnostics are never filter rejection. Sources are
+# evaluated once, in source order; producers are never replayed to count items.
+# Purely static expansion and Array spreading retain fixed-count literal
+# conversion and Array defaults. Potentially runtime-sized constructions default
+# to List and cannot initialize an expected fixed Array. Any retained runtime
+# for or if clause selects this List construction path, including when it produces no
+# elements; optimizations do not change the result type. Explicit List targets
+# and unique List members of expected variants retain their element context.
+# Empty static expansion needs an expected element type if no retained item or
+# typed spread determines one.
+# Spreading borrows collection elements and copies through ordinary conversion
+# and ownership rules; it does not consume individual source slots. Comprehension
+# bindings use ordinary for modes. Output references retain their source lifetimes
+# and cannot survive invalidating polls. Elements construct in final storage;
+# ordinary failure destroys the completed prefix in reverse order and releases
+# owned sources, cursors, and List storage. Completed side effects are not undone.
+# Growable contiguous results require movable elements. A statically bounded
+# result can reserve its complete static bound before constructing immovable
+# elements. Static for permits bare and const bindings; var and ref are rejected
+# because published static bindings are immutable canonical values.
+# Implicit List allocation failure, including growth, panics. List(T).collect
+# receives init collection_sequence(T), a construction-only carrier for a List(T)
+# expression with recoverable bracket allocation. Its logical value field holds
+# the eventual List's reference shape; the carrier has no ordinary runtime value.
+# Consuming it constructs List(T), and it cannot be bound or stored. The parameter
+# type selects recoverable construction for direct calls, callable values, and
+# other init consumers uniformly. Both fixed and runtime shapes are supported;
+# collect's normal fallible call marker is required in expression contexts.
+# Existing List(T).from remains the fixed-count pending-literal factory.
 
 
 # Fallibility
@@ -1859,8 +1975,9 @@ if const x = foo() -> use(x) # no `?`: the binding condition requires a fallible
 # before invocation according to the callable compatibility rules above.
 
 # Bare fail is a statement that propagates ordinary failure with no value.
-# It is permitted only in a fallible enclosing function or initializer region,
-# including after explicit cleanup. It is not an expression or a separate
+# It is permitted only in a fallible enclosing function (including the implicit
+# top-level entry) or initializer region, including after explicit cleanup.
+# It is not an expression or a separate
 # nonlocal outcome. Initializer regions permit failure, but being a region does
 # not itself add an ordinary failure effect. A possible fail contributes that
 # effect to the initializer. Functions retain their declared fallibility; implicit
@@ -1990,16 +2107,25 @@ loop
 # a..b excludes b; a..^b includes b. Endpoints are evaluated exactly once,
 # left to right. Arithmetic binds more tightly than a
 # range; a range binds more tightly than comparisons. The result is an ordinary
-# reusable std.range.Range(A, B) value, not an active cursor or a collection of
-# items. Its independently inferred endpoint types initially support int and
-# none. Original endpoints and inclusivity are retained rather than normalized.
+# reusable std.range.Range value, not an active cursor or a collection of
+# items. Both endpoint fields have type int | none, so their presence can vary
+# at runtime without changing the range type. Original endpoints and inclusivity
+# are retained rather than normalized.
 # ..b, a.., and .. use none for omitted bounds; explicit none endpoints are
 # equivalent. A trailing .. at the end of a line omits the upper bound.
 # Inclusive syntax requires an upper endpoint. Iteration requires two int
 # endpoints; omitted bounds do not imply an unbounded iteration sequence.
+# Iteration and reversal panic for missing endpoints; step_by fails.
 # These finite integer ranges initially iterate upward. A start greater than
 # the end produces an empty iteration; x..x is empty and x..^x contains exactly x.
 # This does not make reversed bounds valid for slicing.
+#
+# End-relative indices and slice bounds use explicit length arithmetic:
+# values[values.len() - 1], values[values.len() - n..], and
+# values[..values.len() - n]. Standard integer indexing rejects negative indices;
+# there is no dedicated from-end syntax, bound type, or factory. These expressions
+# use ordinary integer arithmetic and the same bounds and failure rules as other
+# indexing and slicing expressions.
 #
 # Array, List, Span, BytesView, and StringView accept slice(bounds). Omitted
 # starts resolve to zero and omitted exclusive ends to initialized length.

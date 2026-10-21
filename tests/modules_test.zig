@@ -11,6 +11,92 @@ const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 
 const Fixture = test_sources.SourceFixture;
 
+test "top-level fallible collection operations fall through successfully" {
+    try Fixture.expectSourceExit(
+        \\var numbers = List(int).new?(2)
+        \\numbers.append?(19)
+        \\numbers.append?(23)
+        \\numbers[0] += 1
+        \\numbers[0] + numbers[1] == 43
+        \\var total = 0
+        \\for number in numbers -> total += number
+        \\total == 43
+    , 0);
+}
+
+test "top-level ordinary failures stop the program with status one" {
+    for ([_][]const u8{
+        "fallible absent() int -> fail\nconst value = absent?()",
+        "const values = [42]\nconst missing = values[1]",
+        "1 == 2",
+        "const value: int | none = none\nconst missing = value as int",
+        "fail",
+        "for value in 0..3 -> fail",
+        "var values = List(int).new?(-1)",
+        "struct Cursor\n    fallible next(mut self: Cursor) int | End -> fail\nvar cursor = Cursor{}\nfor item in cursor -> ()",
+    }) |body| {
+        const source = try testing.allocator.print("{s}\nexit(99)", .{body});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceExit(source, 1);
+    }
+}
+
+test "top-level local handlers capture failure before the entry boundary" {
+    try Fixture.expectSourceExit(
+        \\fallible absent() int -> fail
+        \\if const unexpected = absent() -> exit(99)
+        \\const saved: int | none = absent?()
+        \\saved is none
+        \\const value = if const found = absent() -> found else 42
+        \\value == 42
+    , 0);
+}
+
+test "top-level runtime failure permission does not capture compile-time failure" {
+    try Fixture.expectSourceDiagnostic(
+        \\fallible absent() int -> fail
+        \\const value = comptime -> absent?()
+    , .compile_time_unhandled_failure);
+}
+
+test "top-level failure destroys live owners before exiting" {
+    const fixture = try Fixture.init(
+        \\struct Owner
+        \\    name: StringView
+        \\    drop = func(deinit self: Owner) -> print(self.name)
+        \\fallible reject(imm first: Owner, imm second: Owner) -> fail
+        \\const first = Owner{name = "first"}
+        \\const second = Owner{name = "second"}
+        \\reject?(first, second)
+        \\print("unreachable")
+    );
+    defer fixture.deinit();
+    const result = try fixture.runIo("");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    try testing.expectEqualStrings("second\nfirst\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+}
+
+test "top-level element failure cleans partial list construction" {
+    const fixture = try Fixture.init(
+        \\struct Item
+        \\    name: StringView
+        \\    drop = func(deinit self: Item) -> print(self.name)
+        \\fallible absent() Item -> fail
+        \\const values: List(Item) = [Item{name = "constructed"}, absent?()]
+        \\print("unreachable")
+    );
+    defer fixture.deinit();
+    const result = try fixture.runIo("");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    try testing.expectEqualStrings("constructed\n", result.stdout);
+    try testing.expectEqualStrings("", result.stderr);
+}
+
 test "integer min max select ordered equal negative and extreme values in both engines" {
     try Fixture.expectParity(
         \\import std.math.{min, max}
@@ -431,6 +517,11 @@ test "operation functions primitive division errors retain caller source locatio
 
 test "operation functions primitive signatures invalidate and recover every call form" {
     const cases = [_]struct { valid: []const u8, invalid: []const u8, calls: []const []const u8 }{
+        .{
+            .valid = "pub extern func int.+(imm left: int, imm right: int) int",
+            .invalid = "pub extern func int.+(imm left: int, imm right: int) ref int",
+            .calls = &.{ "return 19 + 23", "return int.+(19, 23)", "const operation = int.+\n    return operation(19, 23)" },
+        },
         .{
             .valid = "pub extern func int.+(imm left: int, imm right: int) int",
             .invalid = "pub extern func int.+(imm left: int, imm right: int, imm extra: int) int",
@@ -966,7 +1057,8 @@ test "fallible call syntax handles marked expressions and unmarked conditions" {
 test "fallible call syntax does not itself handle failure" {
     try Fixture.expectSourceDiagnostic(
         \\fallible number() int -> 42
-        \\exit(number?())
+        \\func run() int -> number?()
+        \\exit(run())
     , .fallible_expression_outside_fallible_function);
 }
 
@@ -1165,6 +1257,45 @@ test "fallible call syntax validates before explicit static argument exits" {
         \\    return 1
         \\if const result = run() -> exit(result) else exit(2)
     , 42);
+}
+
+test "static type calls preserve public annotation diagnostics" {
+    try Fixture.expectSourceDiagnostic(
+        \\func hidden(static T: type) type -> T
+        \\pub struct Visible
+        \\    pub value: hidden(int)
+        \\const item = Visible{value = 42}
+    , .public_field_private_type);
+}
+
+test "static type calls recompute after factory body edits" {
+    const original =
+        \\func factory(static T: type) type -> T
+        \\func take(value: factory(int)) int -> 42
+        \\exit(take(0))
+    ;
+    const fixture = try Fixture.init(original);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const changed = try std.mem.replaceOwned(u8, testing.allocator, original, "type -> T", "type -> bool");
+    defer testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectDiagnostic(0, .call_argument_type_mismatch);
+    try fixture.db.setInput(queries.SourceText, 0, original);
+    try fixture.expectExit(0, 42);
+}
+
+test "static type calls execute factory bodies and preserve compiler control" {
+    const fixture = try Fixture.init(
+        \\func stop(static T: type) type -> exit(42)
+        \\func take(value: stop(int)) int -> 0
+        \\exit(take(0))
+    );
+    defer fixture.deinit();
+    try testing.expect((try fixture.db.get(queries.BuildExecutable, 0)).* == null);
+    const controls = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.CompilerControl, testing.allocator);
+    defer testing.allocator.free(controls);
+    try testing.expectEqualSlices(structures.CompilerControl, &.{.{ .exit = 42 }}, controls);
 }
 
 test "fallible call syntax validates before signature where exits" {
@@ -8032,6 +8163,26 @@ test "host storage layout edits invalidate compiler-owned extern signatures" {
     const allocate = declarations.resolveFunction("allocate_host_storage").?;
     try testing.expect((try db.get(queries.FunctionSignature, allocate)).* != null);
 
+    const original = standard_library.source("memory/host.chi");
+    for ([_][]const u8{ "address_low", "address_high", "byte_size" }) |field| {
+        const owned = try testing.allocator.print("{s}: int", .{field});
+        defer testing.allocator.free(owned);
+        const borrowed = try testing.allocator.print("{s}: ref int", .{field});
+        defer testing.allocator.free(borrowed);
+        const changed = try std.mem.replaceOwned(u8, testing.allocator, original, owned, borrowed);
+        defer testing.allocator.free(changed);
+        try db.setInput(queries.SourceText, host_file, changed);
+        try testing.expect((try db.get(queries.FunctionSignature, allocate)).* == null);
+        try db.setInput(queries.SourceText, host_file, original);
+        try testing.expect((try db.get(queries.FunctionSignature, allocate)).* != null);
+    }
+    const borrowed_result = try std.mem.replaceOwned(u8, testing.allocator, original, ") HostStorage", ") ref HostStorage");
+    defer testing.allocator.free(borrowed_result);
+    try db.setInput(queries.SourceText, host_file, borrowed_result);
+    try testing.expect((try db.get(queries.FunctionSignature, allocate)).* == null);
+    try db.setInput(queries.SourceText, host_file, original);
+    try testing.expect((try db.get(queries.FunctionSignature, allocate)).* != null);
+
     try db.setInput(queries.SourceText, host_file,
         \\struct HostStorage
         \\  address_low: bool
@@ -8069,6 +8220,57 @@ test "host storage layout edits invalidate compiler-owned extern signatures" {
         \\extern func deallocate_host_storage(deinit storage: HostStorage)
     );
     try typed.expectDiagnostic(typed_allocate.file_id, .invalid_external_signature);
+}
+
+test "standard storage shapes reject reference fields and recover after edits" {
+    const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{};
+    defer registry.deinit(testing.allocator);
+    try registry.update(db, testing.allocator,
+        \\import std.memory
+        \\import std.text
+        \\static AllocationType = std.memory.Allocation(int)
+        \\static BoxType = std.memory.Box(int)
+        \\static SpanType = std.memory.Span(int)
+        \\static LiteralType = std.text.StaticString
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const facts: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+    const Shape = enum { allocation, box, span, literal };
+    for ([_]struct { selected: []const u8, field: []const u8, shape: Shape }{
+        .{ .selected = "AllocationType", .field = "storage: HostStorage", .shape = .allocation },
+        .{ .selected = "AllocationType", .field = "count: int", .shape = .allocation },
+        .{ .selected = "BoxType", .field = "allocation: Allocation(T)", .shape = .box },
+        .{ .selected = "SpanType", .field = "address_low: int", .shape = .span },
+        .{ .selected = "SpanType", .field = "address_high: int", .shape = .span },
+        .{ .selected = "SpanType", .field = "data: StorageCursor(T)", .shape = .span },
+        .{ .selected = "SpanType", .field = "size: int", .shape = .span },
+        .{ .selected = "LiteralType", .field = "bytes: Span(byte)", .shape = .literal },
+    }) |case| {
+        const file_name = if (case.shape == .literal) "text.chi" else "memory/allocation.chi";
+        const path = try testing.allocator.print("$std/{s}", .{file_name});
+        defer testing.allocator.free(path);
+        const file = registry.fileId(path).?;
+        const original = if (case.shape == .literal) standard_library.source("text.chi") else standard_library.source("memory/allocation.chi");
+        const borrowed = try std.mem.replaceOwned(u8, testing.allocator, case.field, ": ", ": ref ");
+        defer testing.allocator.free(borrowed);
+        const changed = try std.mem.replaceOwned(u8, testing.allocator, original, case.field, borrowed);
+        defer testing.allocator.free(changed);
+        const selected = scope.resolveStatic(case.selected).?;
+        for ([_]bool{ true, false, true }) |accepted| {
+            try db.setInput(queries.SourceText, file, if (accepted) original else changed);
+            const value = (try db.lookupInterned(queries.CompileTimeValues, (try db.get(queries.ResolveStatic, selected)).*.?)).*;
+            var element: ?structures.TypeId = null;
+            switch (case.shape) {
+                .allocation => element = try facts.allocationElement(value.type),
+                .box => element = try facts.boxElement(value.type),
+                .span => element = try facts.spanAccess(value.type),
+                .literal => element = try facts.staticStringBytes(value.type),
+            }
+            try testing.expectEqual(accepted, element != null);
+        }
+    }
 }
 
 test "invalid external signatures recover after runtime input mode changes" {
@@ -10466,14 +10668,12 @@ test "init lexical rejects caller return through indirect forwarding" {
     , .initializer_exit_outside_boundary);
 }
 
-test "init checkpoint rejects unchecked deferred failure" {
-    const Case = struct { source: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) };
-    const cases = [_]Case{
-        .{ .source = "fallible fail_value() int\n    1 == 0\n    return 0\nfallible materialize(init item: int) int -> return item\nexit(materialize?(fail_value?()))", .diagnostic = .fallible_expression_outside_fallible_function },
-    };
-    for (cases) |case| {
-        try Fixture.expectSourceDiagnostic(case.source, case.diagnostic);
-    }
+test "init checkpoint propagates unchecked deferred failure through top level" {
+    try Fixture.expectSourceExit(
+        \\fallible fail_value() int -> fail
+        \\fallible materialize(init item: int) int -> return item
+        \\exit(materialize?(fail_value?()))
+    , 1);
 }
 
 test "init lexical rejects caller value and unit returns" {

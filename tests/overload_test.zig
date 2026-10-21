@@ -4,6 +4,68 @@ const Fixture = test_sources.SourceFixture;
 const queries = test_sources.queries;
 const structures = test_sources.structures;
 
+test "primitive remainder preserves signed edges in both engines" {
+    try Fixture.expectParity(
+        \\func remainder(left: int, right: int) int -> left % right
+        \\func run() int
+        \\    const minimum = -2147483647 - 1
+        \\    if remainder(minimum, -1) <> 0 -> return 90
+        \\    if remainder(minimum, 3) <> -2 -> return 91
+        \\    if remainder(-17, 5) <> -2 -> return 92
+        \\    if remainder(17, -5) <> 2 -> return 93
+        \\    if minimum % -1 <> 0 -> return 94
+        \\    const operation: func(int, int) int = int.%
+        \\    if operation(minimum, -1) <> 0 -> return 95
+        \\    return 42
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\static invalid = 10 % 0
+        \\print(invalid)
+    , .compile_time_division_by_zero);
+}
+
+test "primitive argument preparation preserves copying and converters" {
+    try Fixture.expectParity(
+        \\func change(mut value: int) int
+        \\    value = 40
+        \\    return 2
+        \\func run() int
+        \\    var value = 1
+        \\    const result = value + change(value)
+        \\    if result == 3 and value == 40 -> return 42
+        \\    return 0
+    , 42);
+    try Fixture.expectParity(
+        \\struct Number
+        \\    value: int
+        \\converter(imm value: Number) int -> value.value
+        \\func run() int -> 40 + Number{value = 2}
+    , 42);
+}
+
+test "primitive predicates preserve argument snapshots converters and indirect calls" {
+    try Fixture.expectParity(
+        \\struct Number
+        \\    value: int
+        \\converter(imm value: Number) int -> value.value
+        \\func change(mut value: int) int
+        \\    value = 40
+        \\    return 2
+        \\func run() int
+        \\    var value = 1
+        \\    if value < change(value) and value == 40
+        \\        if 40 >= Number{value = 41} -> return 90
+        \\        if not bool.==(true, true) -> return 91
+        \\        const less: fallible(int, int) unit = int.<
+        \\        if not less(2, 3) -> return 92
+        \\        const different: fallible(bool, bool) unit = bool.<>
+        \\        if not different(true, false) -> return 93
+        \\        if int.==(1, 2) -> return 94
+        \\        return 42
+        \\    return 95
+    , 42);
+}
+
 test "overload named functions select logical argument types in both engines" {
     try Fixture.expectParity(
         \\func integer(value: int) int -> value

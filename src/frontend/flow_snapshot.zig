@@ -1,216 +1,157 @@
 const std = @import("std");
 
-pub fn Snapshot(comptime Element: type, comptime page_size: usize) type {
+/// Body-local persistent arrays. A snapshot freezes its root; the next write
+/// copies its pointer table and the changed page. All versions borrow the body's
+/// arena; no individual version needs cleanup.
+/// Restoring a snapshot is a root assignment, including all default-valued slots.
+pub fn Buffer(comptime Element: type, comptime initial: Element) type {
     return struct {
         const Self = @This();
-        pub const Page = struct {
-            references: usize,
-            values: [page_size]Element,
-        };
+        const page_size = 16;
+        const Page = struct { writable: bool = true, values: [page_size]Element = @splat(initial) };
+        const Root = struct { writable: bool = true, pages: []?*Page };
 
-        len: usize,
-        storage: union(enum) {
-            borrowed: []Element,
-            contiguous: []Element,
-            paged: []*Page,
-        },
+        len: usize = 0,
+        root: ?*Root = null,
 
-        pub fn borrowed(values: []Element) Self {
-            return .{ .len = values.len, .storage = .{ .borrowed = values } };
+        pub fn init(len: usize) Self {
+            return .{ .len = len };
         }
 
-        pub fn retainedPages(self: Self) []*Page {
-            return switch (self.storage) {
-                .paged => |saved| saved,
-                .borrowed, .contiguous => &.{},
-            };
-        }
-
-        pub fn retainedBytes(self: Self) usize {
-            return switch (self.storage) {
-                .borrowed => 0,
-                .contiguous => |values| std.mem.sliceAsBytes(values).len,
-                .paged => |saved| std.mem.sliceAsBytes(saved).len,
-            };
+        pub fn snapshot(self: Self) Self {
+            if (self.root) |root| root.writable = false;
+            return self;
         }
 
         pub inline fn get(self: Self, index: usize) Element {
             std.debug.assert(index < self.len);
-            return switch (self.storage) {
-                .borrowed, .contiguous => |values| values[index],
-                .paged => |saved| saved[index / page_size].values[index % page_size],
-            };
+            const page = self.leafPage(index) orelse return initial;
+            return page.values[index % page_size];
         }
 
-        pub fn set(self: Self, allocator: std.mem.Allocator, index: usize, value: Element) !void {
+        inline fn leafPage(self: Self, index: usize) ?*Page {
+            return if (self.root) |root| root.pages[index / page_size] else null;
+        }
+
+        fn write(self: *Self, allocator: std.mem.Allocator, index: usize) !*Element {
             std.debug.assert(index < self.len);
-            switch (self.storage) {
-                .borrowed, .contiguous => |values| {
-                    values[index] = value;
-                    return;
-                },
-                .paged => {},
-            }
-            if (std.meta.eql(self.get(index), value)) return;
-            const page_slot = &self.storage.paged[index / page_size];
-            if (page_slot.*.references != 1) {
-                const replacement = try allocator.create(Page);
-                replacement.* = page_slot.*.*;
-                replacement.references = 1;
-                page_slot.*.references -= 1;
-                page_slot.* = replacement;
-            }
-            page_slot.*.values[index % page_size] = value;
-        }
-
-        pub fn clone(self: Self, allocator: std.mem.Allocator) !Self {
-            return self.capture(allocator, null);
-        }
-
-        pub fn capture(self: Self, allocator: std.mem.Allocator, previous: ?Self) !Self {
-            if (self.len <= page_size * 16) {
-                const values = try allocator.alloc(Element, self.len);
-                self.copyTo(values);
-                return .{ .len = self.len, .storage = .{ .contiguous = values } };
-            }
-            const page_count = std.math.divCeil(usize, self.len, page_size) catch unreachable;
-            const pages = try allocator.alloc(*Page, page_count);
-            var initialized: usize = 0;
-            errdefer {
-                for (pages[0..initialized]) |page| release(allocator, page);
-                allocator.free(pages);
-            }
-            for (pages, 0..) |*destination, page_index| {
-                if (self.storage == .paged) {
-                    destination.* = self.storage.paged[page_index];
-                    destination.*.references += 1;
-                } else {
-                    const start = page_index * page_size;
-                    const end = @min(self.len, start + page_size);
-                    const values = switch (self.storage) {
-                        .borrowed, .contiguous => |live| live[start..end],
-                        .paged => unreachable,
+            if (self.root == null or !self.root.?.writable) {
+                const root = try allocator.create(Root);
+                root.* = .{ .pages = try allocator.alloc(?*Page, (self.len + page_size - 1) / page_size) };
+                if (self.root) |previous| {
+                    @memcpy(root.pages, previous.pages);
+                    for (root.pages) |maybe_page| if (maybe_page) |page| {
+                        page.writable = false;
                     };
-                    var shared: ?*Page = null;
-                    if (previous) |old| {
-                        if (old.storage == .paged and old.len >= end and page_index < old.storage.paged.len) {
-                            const candidate = old.storage.paged[page_index];
-                            var equal = true;
-                            for (values, candidate.values[0..values.len]) |current, saved| {
-                                if (!std.meta.eql(current, saved)) {
-                                    equal = false;
-                                    break;
-                                }
-                            }
-                            if (equal) shared = candidate;
-                        }
-                    }
-                    if (shared) |page| {
-                        destination.* = page;
-                        page.references += 1;
-                    } else {
-                        const page = try allocator.create(Page);
-                        page.references = 1;
-                        @memcpy(page.values[0..values.len], values);
-                        destination.* = page;
-                    }
+                } else @memset(root.pages, null);
+                self.root = root;
+            }
+            const slot = &self.root.?.pages[index / page_size];
+            if (slot.* == null or !slot.*.?.writable) {
+                const page = try allocator.create(Page);
+                page.* = if (slot.*) |previous| previous.* else .{};
+                page.writable = true;
+                slot.* = page;
+            }
+            return &slot.*.?.values[index % page_size];
+        }
+
+        pub fn set(self: *Self, allocator: std.mem.Allocator, index: usize, value: Element) !void {
+            if (!std.meta.eql(self.get(index), value)) (try self.write(allocator, index)).* = value;
+        }
+
+        pub fn sharesPage(self: Self, other: Self, index: usize) bool {
+            return index < self.len and index < other.len and self.leafPage(index) == other.leafPage(index);
+        }
+
+        pub fn pageEnd(self: Self, index: usize) usize {
+            return @min(self.len, (index / page_size + 1) * page_size);
+        }
+
+        pub fn eql(self: Self, other: Self) bool {
+            if (self.len != other.len) return false;
+            var index: usize = 0;
+            while (index < self.len) {
+                if (self.sharesPage(other, index)) {
+                    index = self.pageEnd(index);
+                    continue;
                 }
-                initialized += 1;
+                if (!std.meta.eql(self.get(index), other.get(index))) return false;
+                index += 1;
             }
-            return .{ .len = self.len, .storage = .{ .paged = pages } };
+            return true;
         }
 
-        pub fn copyTo(self: Self, destination: []Element) void {
-            std.debug.assert(destination.len == self.len);
-            switch (self.storage) {
-                .borrowed, .contiguous => |values| {
-                    @memcpy(destination, values[0..self.len]);
-                    return;
-                },
-                .paged => {},
-            }
-            for (self.storage.paged, 0..) |page, page_index| {
-                const start = page_index * page_size;
-                const count = @min(page_size, self.len - start);
-                @memcpy(destination[start..][0..count], page.values[0..count]);
+        pub fn merge(self: *Self, allocator: std.mem.Allocator, other: Self, comptime combine: fn (Element, Element) Element) !void {
+            std.debug.assert(self.len == other.len);
+            var index: usize = 0;
+            while (index < self.len) {
+                if (self.sharesPage(other, index)) {
+                    index = self.pageEnd(index);
+                    continue;
+                }
+                try self.set(allocator, index, combine(self.get(index), other.get(index)));
+                index += 1;
             }
         }
 
-        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
-            switch (self.storage) {
-                .borrowed => unreachable,
-                .contiguous => |values| allocator.free(values),
-                .paged => |saved| {
-                    for (saved) |page| release(allocator, page);
-                    allocator.free(saved);
-                },
-            }
-            self.* = undefined;
-        }
-
-        fn release(allocator: std.mem.Allocator, page: *Page) void {
-            std.debug.assert(page.references != 0);
-            page.references -= 1;
-            if (page.references == 0) allocator.destroy(page);
+        pub fn retainedBytes(self: Self, seen: *std.AutoHashMap(usize, void)) !usize {
+            const root = self.root orelse return 0;
+            if ((try seen.getOrPut(@intFromPtr(root))).found_existing) return 0;
+            var bytes = @sizeOf(Root) + std.mem.sliceAsBytes(root.pages).len;
+            for (root.pages) |maybe_page| if (maybe_page) |page| {
+                if (!(try seen.getOrPut(@intFromPtr(page))).found_existing) bytes += @sizeOf(Page);
+            };
+            return bytes;
         }
     };
 }
 
-test "flow snapshots share unchanged pages and isolate writes" {
-    const Values = Snapshot(?u32, 2);
-    const allocator = std.testing.allocator;
-    var live: [33]?u32 = @splat(null);
-    live[0..5].* = .{ 1, 2, 3, null, 5 };
-    live[32] = 9;
-    var first = try Values.borrowed(&live).clone(allocator);
-    defer first.deinit(allocator);
-    live[2] = 9;
-    var second = try Values.borrowed(&live).capture(allocator, first);
-    defer second.deinit(allocator);
-    try std.testing.expect(first.retainedPages()[0] == second.retainedPages()[0]);
-    try std.testing.expect(first.retainedPages()[1] != second.retainedPages()[1]);
-    try std.testing.expect(first.retainedPages()[2] == second.retainedPages()[2]);
-    try second.set(allocator, 0, 7);
+test "persistent flow state isolates writes, restores defaults, and shares untouched pages" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var live = Buffer(?u32, null).init(513);
+    try live.set(allocator, 0, 1);
+    try live.set(allocator, 512, 9);
+    const first = live.snapshot();
+    try live.set(allocator, 32, 7);
+    var second = live.snapshot();
+    try std.testing.expect(first.sharesPage(second, 0));
+    try std.testing.expect(!first.sharesPage(second, 32));
+    try std.testing.expectEqual(@as(?u32, null), first.get(32));
+    live = first.snapshot();
+    try std.testing.expectEqual(@as(?u32, null), live.get(32));
+    try live.set(allocator, 0, 5);
+    try second.set(allocator, 512, 11);
     try std.testing.expectEqual(@as(?u32, 1), first.get(0));
-    try std.testing.expectEqual(@as(?u32, 7), second.get(0));
-    var restored: [33]?u32 = undefined;
-    first.copyTo(&restored);
-    live[2] = 3;
-    try std.testing.expectEqualSlices(?u32, &live, &restored);
+    try std.testing.expectEqual(@as(?u32, 1), second.get(0));
+    try std.testing.expectEqual(@as(?u32, 9), first.get(512));
+    try std.testing.expectEqual(@as(?u32, 9), live.get(512));
+    try std.testing.expectEqual(@as(?u32, 11), second.get(512));
+    var joined = first.snapshot();
+    try joined.merge(allocator, second, struct {
+        fn combine(left: ?u32, right: ?u32) ?u32 {
+            return right orelse left;
+        }
+    }.combine);
+    try std.testing.expect(joined.eql(second));
 }
 
-fn checkSnapshotAllocations(allocator: std.mem.Allocator) !void {
-    const Values = Snapshot(?u32, 2);
-    var live: [33]?u32 = @splat(null);
-    live[0..5].* = .{ 1, 2, 3, null, 5 };
-    live[32] = 9;
-    var first = try Values.borrowed(&live).clone(allocator);
-    defer first.deinit(allocator);
-    var second = try first.clone(allocator);
-    defer second.deinit(allocator);
-    try second.set(allocator, 4, 9);
-    live[2] = 7;
-    var third = try Values.borrowed(&live).capture(allocator, second);
-    defer third.deinit(allocator);
-    try std.testing.expectEqual(@as(?u32, 5), first.get(4));
-}
-
-test "flow snapshots release every failed allocation" {
-    if (!@import("test_options").allocation_failures) return error.SkipZigTest;
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkSnapshotAllocations, .{});
-}
-
-test "small flow snapshots retain independent contiguous storage" {
-    const Values = Snapshot(?u32, 2);
-    const allocator = std.testing.allocator;
-    var live = [_]?u32{ 1, null, 3 };
-    var first = try Values.borrowed(&live).clone(allocator);
-    defer first.deinit(allocator);
-    var second = try first.clone(allocator);
-    defer second.deinit(allocator);
-    try second.set(allocator, 0, 7);
-    try std.testing.expectEqual(@as(?u32, 1), first.get(0));
-    try std.testing.expectEqual(@as(?u32, 7), second.get(0));
-    try std.testing.expect(first.storage == .contiguous);
-    try std.testing.expect(second.storage == .contiguous);
+test "failed persistent writes preserve snapshots and remain retryable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var live = Buffer(u32, 0).init(513);
+    try live.set(allocator, 0, 3);
+    const saved = live.snapshot();
+    for (0..3) |fail_index| {
+        live = saved.snapshot();
+        var failing = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
+        try std.testing.expectError(error.OutOfMemory, live.set(failing.allocator(), 512, 7));
+        try std.testing.expect(live.eql(saved));
+        try live.set(allocator, 512, 7);
+        try std.testing.expectEqual(@as(u32, 0), saved.get(512));
+        try std.testing.expectEqual(@as(u32, 3), live.get(0));
+    }
 }

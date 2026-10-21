@@ -1,0 +1,321 @@
+const std = @import("std");
+const structures = @import("structures.zig");
+const standard_library = @import("standard_library");
+
+pub const Effect = enum { pure, storage, control, io };
+
+pub fn effect(symbol: standard_library.External) Effect {
+    switch (symbol) {
+        .io_read, .io_write => return .io,
+        .exit, .panic_message, .static_iteration_item => return .control,
+        .allocate,
+        .allocate_host_storage,
+        .deallocate,
+        .deallocate_host_storage,
+        .deallocate_box,
+        .allocation_count,
+        .unsafe_own_box,
+        .unsafe_initialize,
+        .initialize_collection,
+        .initialize_collection_element,
+        .unsafe_take,
+        .unsafe_take_box,
+        .unsafe_destroy,
+        .unsafe_destroy_box,
+        .unsafe_borrow,
+        .borrow,
+        .array_borrow,
+        .empty_cursor,
+        .array_cursor,
+        .allocation_cursor,
+        .cursor_offset,
+        .cursor_element,
+        .cursor_attenuate,
+        => return .storage,
+        .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .literal_byte, .byte_int => return .pure,
+    }
+}
+
+pub fn validHostStorage(definition: structures.StructDefinition) bool {
+    if (!ownedFields(definition, &.{ "address_low", "address_high", "byte_size" }) or
+        definition.ownership.drop == null or definition.ownership.drop.?.capability != .explicit or
+        definition.ownership.move != null or definition.ownership.copy != null) return false;
+    for (definition.fields) |field| if (field.type_id != .int) return false;
+    return true;
+}
+
+pub fn validAllocation(definition: structures.StructDefinition, storage_type: structures.TypeId) bool {
+    return ownedFields(definition, &.{ "storage", "count" }) and
+        definition.ownership.move == null and definition.ownership.copy == null and
+        definition.ownership.drop != null and definition.ownership.drop.?.capability == .explicit and
+        definition.fields[0].type_id == storage_type and definition.fields[1].type_id == .int;
+}
+
+pub fn validBox(definition: structures.StructDefinition) bool {
+    return ownedFields(definition, &.{"allocation"}) and
+        definition.ownership.move == null and definition.ownership.copy == null and
+        definition.ownership.drop != null and definition.ownership.drop.?.capability == .custom;
+}
+
+pub fn validSpan(facts: anytype, definition: structures.StructDefinition, element_type: structures.TypeId) !bool {
+    return trivialView(definition, &.{ "data", "size" }) and definition.fields[1].type_id == .int and
+        (try facts.storageCursorAccess(definition.fields[0].type_id)) == element_type;
+}
+
+pub fn validStaticString(facts: anytype, definition: structures.StructDefinition) !bool {
+    return trivialView(definition, &.{"bytes"}) and (try facts.spanAccess(definition.fields[0].type_id)) == .byte;
+}
+
+pub fn validStorageCursor(definition: structures.StructDefinition) bool {
+    return trivialView(definition, &.{ "address_low", "address_high" }) and
+        definition.fields[0].type_id == .int and definition.fields[1].type_id == .int;
+}
+
+fn ownedFields(definition: structures.StructDefinition, names: []const []const u8) bool {
+    if (definition.is_static or definition.fields.len != names.len) return false;
+    for (definition.fields, names) |field, name| {
+        if (field.kind != .owned or !std.mem.eql(u8, field.name, name)) return false;
+    }
+    return true;
+}
+
+fn trivialView(definition: structures.StructDefinition, names: []const []const u8) bool {
+    if (!ownedFields(definition, names) or definition.ownership.move != null or definition.ownership.drop != null or
+        definition.ownership.copy == null or definition.ownership.copy.?.capability != .trivial) return false;
+    for (definition.fields) |field| if (field.is_public) return false;
+    return true;
+}
+
+pub fn hasTypedBody(symbol: standard_library.External) bool {
+    switch (symbol) {
+        .allocate,
+        .allocate_host_storage,
+        .deallocate,
+        .deallocate_box,
+        .deallocate_host_storage,
+        .allocation_count,
+        .io_read,
+        .io_write,
+        .exit,
+        .panic_message,
+        => return false,
+        else => return true,
+    }
+}
+
+pub fn validOperationShape(operation: structures.Operation, signature: structures.FunctionSignature) bool {
+    const index_write = operation == .@"[]=";
+    const count = operation.operandCount();
+    if (signature.parameters.len != count) return false;
+    const receiver = signature.parameters[0];
+    if (!(operation == .@"[]" and receiver.mode == .ref) and receiver.mode != (if (index_write) structures.ParameterMode.mut else .imm)) return false;
+    if (operation != .@"[]" and signature.result_mode != .owned) return false;
+    if (operation.isIndexer()) {
+        if (signature.parameters[1].mode != .imm) return false;
+        if (index_write and (signature.parameters[2].mode != .@"var" or signature.return_type != .unit)) return false;
+        return true;
+    }
+    if (signature.is_fallible != operation.isPredicate()) return false;
+    if (count == 2) {
+        if (signature.parameters[1].mode != .imm) return false;
+        if (!operation.isPredicate() and signature.parameters[1].type_id != receiver.type_id) return false;
+    }
+    return signature.return_type == (if (operation.isPredicate()) structures.TypeId.unit else receiver.type_id);
+}
+
+pub fn signatureIssue(facts: anytype, behavior: structures.CallBehavior, signature: structures.FunctionSignature) !?structures.Diagnostic.Kind {
+    switch (behavior) {
+        .box_new => return boxNewIssue(facts, signature),
+        .box_value => return boxValueIssue(facts, signature),
+        .list_new => return listNewIssue(facts, signature),
+        .collection_append_bounded => return listAppendIssue(facts, signature, false),
+        .list_append, .list_reserve, .collection_append_growing => return listAppendIssue(facts, signature, true),
+        else => return null,
+    }
+}
+
+fn boxNewIssue(facts: anytype, signature: structures.FunctionSignature) !?structures.Diagnostic.Kind {
+    if (signature.parameters.len != 1) return null;
+    const element = signature.parameters[0].type_id;
+    const capabilities = (try facts.ownershipCapabilities(element)) orelse return error.Unavailable;
+    return if (capabilities.requires_explicit_drop) .{ .box_requires_automatic_drop = element } else null;
+}
+
+fn boxValueIssue(facts: anytype, signature: structures.FunctionSignature) !?structures.Diagnostic.Kind {
+    const capabilities = (try facts.ownershipCapabilities(signature.return_type)) orelse return error.Unavailable;
+    return if (!capabilities.isDirectlyMovable()) .{ .box_extraction_requires_direct_move = signature.return_type } else null;
+}
+
+fn listNewIssue(facts: anytype, signature: structures.FunctionSignature) !?structures.Diagnostic.Kind {
+    const element = (try facts.listElement(signature.return_type)) orelse return error.Unavailable;
+    return if (try facts.containsBorrow(element)) .{ .list_cannot_store_borrow_element = element } else null;
+}
+
+fn listAppendIssue(facts: anytype, signature: structures.FunctionSignature, requires_direct_move: bool) !?structures.Diagnostic.Kind {
+    if (signature.parameters.len == 0) return null;
+    const element = (try facts.listElement(signature.parameters[0].type_id)) orelse return null;
+    const capabilities = (try facts.ownershipCapabilities(element)) orelse return error.Unavailable;
+    if (capabilities.requires_explicit_drop) return .{ .list_requires_automatic_drop = element };
+    if (requires_direct_move and !capabilities.isDirectlyMovable()) return .{ .list_requires_direct_move = element };
+    return null;
+}
+
+pub fn validExternalSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
+    const expected_result: structures.ResultMode = switch (symbol) {
+        .array_borrow, .borrow, .unsafe_borrow, .cursor_element => .reference,
+        else => .owned,
+    };
+    if (signature.result_mode != expected_result) return false;
+    switch (symbol) {
+        .primitive_operation => return true,
+        .static_iteration_item => return !signature.is_fallible and signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.return_type == .unit,
+        .copy_value, .move_value => return !signature.is_fallible and signature.parameters.len == 1 and
+            signature.parameters[0].type_id == signature.return_type and
+            signature.parameters[0].mode == (if (symbol == .copy_value) structures.ParameterMode.imm else .deinit),
+        .array_filled => return validArrayFilledSignature(facts, signature),
+        .initialize_collection => return validCollectionInitializerSignature(facts, signature),
+        .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => return validCursorSignature(facts, symbol, signature),
+        .array_from => return validArrayFromSignature(facts, signature),
+        .byte_int => return !signature.is_fallible and signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .byte and signature.return_type == .int,
+        .io_write => return validByteOutputSignature(facts, signature),
+        .io_read => return signature.is_fallible and signature.return_type == .int and signature.parameters.len == 4 and signature.parameters[0].type_id == .int and (try facts.allocationElement(signature.parameters[1].type_id)) == structures.TypeId.byte and signature.parameters[2].type_id == .int and signature.parameters[3].type_id == .int and allImmutable(signature.parameters),
+        .literal_byte => return signature.parameters.len == 0 and signature.return_type == .byte and !signature.is_fallible,
+        .array_borrow => return validArrayBorrowSignature(facts, signature),
+        .exit => return !signature.is_fallible and signature.return_type == .never and
+            signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .int,
+        .panic_message => return !signature.is_fallible and signature.return_type == .never and
+            signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == try facts.panicMessageType(),
+        .allocate_host_storage, .deallocate_host_storage => return validHostStorageSignature(facts, symbol, signature),
+        .allocate, .deallocate => return validAllocationSignature(facts, symbol, signature),
+        .allocation_count => return !signature.is_fallible and signature.return_type == .int and signature.parameters.len == 1 and
+            signature.parameters[0].mode == .imm and (try facts.allocationElement(signature.parameters[0].type_id)) != null,
+        .unsafe_initialize, .initialize_collection_element, .unsafe_take, .unsafe_destroy, .unsafe_borrow => return validAllocationAccessSignature(facts, symbol, signature),
+        .borrow => return !signature.is_fallible and signature.parameters.len == 1 and signature.parameters[0].mode == .ref and
+            signature.result_mode == .reference and (try facts.boxElement(signature.parameters[0].type_id)) == signature.return_type,
+        .unsafe_own_box => return validBoxOwnershipSignature(facts, signature),
+        .unsafe_take_box, .unsafe_destroy_box, .deallocate_box => return validBoxAccessSignature(facts, symbol, signature),
+    }
+}
+
+fn validArrayFromSignature(facts: anytype, signature: structures.FunctionSignature) !bool {
+    if (signature.is_fallible or signature.parameters.len != 1 or signature.parameters[0].mode != .init) return false;
+    const shape = (try facts.collectionLiteralType(signature.parameters[0].type_id)) orelse return false;
+    const array = (try facts.arrayType(signature.return_type)) orelse return false;
+    return std.meta.eql(shape, array);
+}
+
+fn validByteOutputSignature(facts: anytype, signature: structures.FunctionSignature) !bool {
+    if (!signature.is_fallible or signature.return_type != .int or signature.parameters.len != 2 or
+        signature.parameters[0].type_id != .int or !allImmutable(signature.parameters)) return false;
+    return (try facts.spanAccess(signature.parameters[1].type_id)) == structures.TypeId.byte;
+}
+
+fn validHostStorageSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
+    const storage_type = (try facts.hostStorage()) orelse return false;
+    switch (symbol) {
+        .allocate_host_storage => return signature.is_fallible and signature.return_type == storage_type and
+            signature.parameters.len == 1 and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .int,
+        .deallocate_host_storage => return !signature.is_fallible and signature.return_type == .unit and
+            signature.parameters.len == 1 and signature.parameters[0].mode == .deinit and signature.parameters[0].type_id == storage_type,
+        else => unreachable,
+    }
+}
+
+fn validAllocationSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
+    if (signature.parameters.len != 1) return false;
+    const type_id = if (symbol == .allocate) signature.return_type else signature.parameters[0].type_id;
+    if (try facts.allocationElement(type_id) == null) return false;
+    return if (symbol == .allocate)
+        signature.is_fallible and signature.parameters[0].mode == .imm and signature.parameters[0].type_id == .int
+    else
+        !signature.is_fallible and signature.return_type == .unit and signature.parameters[0].mode == .deinit;
+}
+
+fn validAllocationAccessSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
+    if (signature.is_fallible != (symbol == .unsafe_initialize)) return false;
+    if (signature.parameters.len != (if (symbol == .unsafe_initialize or symbol == .initialize_collection_element) @as(usize, 3) else 2)) return false;
+    const allocation = signature.parameters[0];
+    if (allocation.mode != (if (symbol == .unsafe_borrow) structures.ParameterMode.ref else .mut)) return false;
+    const element_type = (try facts.allocationElement(allocation.type_id)) orelse return false;
+    if (symbol == .unsafe_take) {
+        const capabilities = (try facts.ownershipCapabilities(element_type)) orelse return false;
+        if (!capabilities.isDirectlyMovable()) return false;
+    }
+    if (signature.parameters[1].mode != .imm or signature.parameters[1].type_id != .int) return false;
+    switch (symbol) {
+        .unsafe_initialize, .initialize_collection_element => return signature.return_type == .unit and signature.parameters[2].mode == .init and signature.parameters[2].type_id == element_type,
+        .unsafe_take, .unsafe_borrow => return signature.return_type == element_type,
+        .unsafe_destroy => return signature.return_type == .unit,
+        else => unreachable,
+    }
+}
+
+fn validBoxOwnershipSignature(facts: anytype, signature: structures.FunctionSignature) !bool {
+    if (signature.is_fallible or signature.parameters.len != 1 or signature.parameters[0].mode != .deinit) return false;
+    const element_type = (try facts.allocationElement(signature.parameters[0].type_id)) orelse return false;
+    return (try facts.boxElement(signature.return_type)) == element_type;
+}
+
+fn validBoxAccessSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
+    if (signature.is_fallible or signature.parameters.len != 1) return false;
+    const element_type = (try facts.boxElement(signature.parameters[0].type_id)) orelse return false;
+    if (symbol == .deallocate_box) return signature.parameters[0].mode == .deinit and signature.return_type == .unit;
+    if (symbol == .unsafe_destroy_box) return signature.parameters[0].mode == .mut and signature.return_type == .unit;
+    const capabilities = (try facts.ownershipCapabilities(element_type)) orelse return false;
+    return signature.parameters[0].mode == .mut and signature.return_type == element_type and capabilities.isDirectlyMovable();
+}
+
+fn validArrayFilledSignature(facts: anytype, signature: structures.FunctionSignature) !bool {
+    if (signature.is_fallible or signature.parameters.len != 1 or signature.parameters[0].mode != .imm) return false;
+    const array = (try facts.arrayType(signature.return_type)) orelse return false;
+    return signature.parameters[0].type_id == array.element_type;
+}
+
+fn validCursorSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
+    if (signature.is_fallible) return false;
+    if (symbol == .empty_cursor) return signature.parameters.len == 0 and try facts.storageCursorAccess(signature.return_type) != null;
+    if (symbol == .cursor_element) {
+        if (signature.parameters.len != 2 or signature.parameters[0].mode != .ref or signature.parameters[1].mode != .imm or signature.parameters[1].type_id != .int) return false;
+        const source = (try facts.storageCursorAccess(signature.parameters[0].type_id)) orelse return false;
+        return signature.result_mode == .reference and signature.return_type == source;
+    }
+    const target = (try facts.storageCursorAccess(signature.return_type)) orelse return false;
+    if (symbol == .cursor_offset) {
+        return signature.parameters.len == 2 and signature.parameters[0].mode == .ref and signature.parameters[1].mode == .imm and
+            signature.parameters[0].type_id == signature.return_type and signature.parameters[1].type_id == .int;
+    }
+    if (signature.parameters.len != 1) return false;
+    const source = signature.parameters[0];
+    switch (symbol) {
+        .array_cursor => {
+            const array = (try facts.arrayType(source.type_id)) orelse return false;
+            return array.element_type == target and source.mode == .ref;
+        },
+        .allocation_cursor => return (try facts.allocationElement(source.type_id)) == target and source.mode == .ref,
+        .cursor_attenuate => {
+            const access = (try facts.storageCursorAccess(source.type_id)) orelse return false;
+            return source.mode == .imm and access == target;
+        },
+        else => unreachable,
+    }
+}
+
+fn validArrayBorrowSignature(facts: anytype, signature: structures.FunctionSignature) !bool {
+    if (signature.is_fallible or signature.parameters.len != 2 or signature.parameters[0].mode != .ref or
+        signature.parameters[1].mode != .imm or signature.parameters[1].type_id != .int or signature.result_mode != .reference) return false;
+    const array = (try facts.arrayType(signature.parameters[0].type_id)) orelse return false;
+    return signature.return_type == array.element_type;
+}
+
+fn validCollectionInitializerSignature(facts: anytype, signature: structures.FunctionSignature) !bool {
+    if (signature.is_fallible or signature.return_type != .unit or signature.parameters.len != 2) return false;
+    if (signature.parameters[0].mode != .mut or signature.parameters[1].mode != .init) return false;
+    const element = (try facts.allocationElement(signature.parameters[0].type_id)) orelse return false;
+    const collection = (try facts.collectionLiteralType(signature.parameters[1].type_id)) orelse return false;
+    return collection.element_type == element;
+}
+
+fn allImmutable(parameters: []const structures.CallableParameter) bool {
+    for (parameters) |parameter| if (parameter.mode != .imm) return false;
+    return true;
+}

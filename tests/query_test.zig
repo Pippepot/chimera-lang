@@ -385,10 +385,7 @@ fn expectCompiledFunctionResult(
 
     var executable = try codegen.buildExecutable(entry_id, functions.items, testing.allocator);
     defer executable.deinit(testing.allocator);
-    const io = testing.io;
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try testing.expectEqual(expected, runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, expected);
 }
 
 // Inspect the return ABI of eight-byte variants.
@@ -439,10 +436,7 @@ fn expectCompiledVariantWord(
     try appendReferencedArtifacts(db, &functions);
     var executable = try codegen.buildExecutable(entry_id, functions.items, testing.allocator);
     defer executable.deinit(testing.allocator);
-    const io = testing.io;
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try testing.expectEqual(expected, runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, expected);
 }
 
 // Query fixtures expose otherwise-internal lifecycle and recomputation behavior.
@@ -1504,6 +1498,53 @@ test "ParseFile returns public Ast and emits parser diagnostics" {
     try testing.expectEqual(@as(structures.FileId, 2), diagnostics[0].file_id);
 }
 
+test "query profiling counts computations rather than memo hits" {
+    const profile_module = @import("test_sources").profiling;
+    const engine = @import("test_sources").query;
+    const Probe = struct {
+        pub const Input = u32;
+        pub const Output = u32;
+
+        pub fn run(_: anytype, value: Input) !Output {
+            return value + 2;
+        }
+    };
+    var profile: profile_module.Collector = .{ .io = std.testing.io };
+    const db = try engine.Database.init(std.testing.allocator, .{ .worker_count = 1, .profile = &profile });
+    defer db.deinit();
+    try std.testing.expectEqual(@as(u32, 42), (try db.get(Probe, 40)).*);
+    try std.testing.expectEqual(@as(u32, 42), (try db.get(Probe, 40)).*);
+    try std.testing.expectEqual(@as(usize, 1), profile.snapshot().get(.query_other).runs);
+    _ = try db.get(Probe, 41);
+    try std.testing.expectEqual(@as(usize, 2), profile.snapshot().get(.query_other).runs);
+}
+
+test "ParseFile embedded syntax preserves edited diagnostics and recovery" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+
+    const source = @import("standard_library").source("exit.chi");
+    try addSource(db, 1, source);
+    const token_count = (try db.get(queries.ParseFile, 1)).*.?.tokens.len;
+    const changed = try testing.allocator.dupe(u8, source);
+    defer testing.allocator.free(changed);
+    changed[0] = '@';
+    try setSource(db, 1, changed);
+    try testing.expect((try db.get(queries.ParseFile, 1)).* == null);
+    const rejected = try db.transitiveAccumulatorValues(queries.ParseFile, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(rejected);
+    try testing.expect(rejected.len != 0);
+    for (rejected) |diagnostic| try testing.expectEqual(@as(structures.FileId, 1), diagnostic.file_id);
+
+    try setSource(db, 1, source);
+    const restored = (try db.get(queries.ParseFile, 1)).*.?;
+    try testing.expectEqual(@as(structures.FileId, 1), restored.file_id);
+    try testing.expectEqual(token_count, restored.tokens.len);
+    const cleared = try db.transitiveAccumulatorValues(queries.ParseFile, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(cleared);
+    try testing.expectEqual(@as(usize, 0), cleared.len);
+}
+
 test "DiscoverItems owns names across source edits" {
     const db = try testDatabase(2);
     defer db.deinit();
@@ -2316,15 +2357,12 @@ test "ownership effects compose across calls joins scopes and partial aggregates
             .expected = 42,
         },
     };
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     for (cases, 1..) |case, file_id| {
         const db = try testDatabase(1);
         defer db.deinit();
         try addSource(db, file_id, case.source);
         const executable = (try db.get(queries.BuildExecutable, file_id)).*.?;
-        try runtime.writeProgram(io, executable.bytes);
-        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+        try test_sources.expectProgramExit(executable.bytes, case.expected);
     }
 }
 
@@ -2381,11 +2419,8 @@ test "custom hook body edits rebuild executable behavior" {
         if (loc.owner == owner and std.mem.eql(u8, loc.name.text(), "copy")) break item_id;
     } else unreachable;
 
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     var executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 41), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 41));
 
     try setSource(db, 1,
         \\static Box = struct
@@ -2402,8 +2437,7 @@ test "custom hook body edits rebuild executable behavior" {
     const updated_index = (try db.get(queries.IndexItems, 1)).*.?;
     try testing.expect(updated_index.resolve(hook) != null);
     executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "conditional transfer drops the remaining owned path" {
@@ -2439,10 +2473,7 @@ test "last use cleanup runs before a later unrelated exit" {
         \\answer()
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "last-use edits move cleanup and retain equivalent restored output" {
@@ -2466,11 +2497,8 @@ test "last-use edits move cleanup and retain equivalent restored output" {
     const initial_body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer });
     const initial_artifact = try db.get(queries.CompileFunction, instance);
 
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     var executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 
     try setSource(db, 1,
         \\static Resource = struct
@@ -2486,8 +2514,7 @@ test "last-use edits move cleanup and retain equivalent restored output" {
     try testing.expect(initial_body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer }));
     try testing.expect(initial_artifact != try db.get(queries.CompileFunction, instance));
     executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 41), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 41));
 
     try setSource(db, 1, initial);
     const restored_body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer });
@@ -2495,8 +2522,7 @@ test "last-use edits move cleanup and retain equivalent restored output" {
     const restored_code = try testing.allocator.dupe(u8, restored_artifact.*.?.code);
     defer testing.allocator.free(restored_code);
     executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 
     try setSource(db, 1,
         \\static Resource = struct
@@ -2530,10 +2556,7 @@ test "custom drop body edits update linking without changing caller analysis" {
     const reachable = try db.get(queries.CollectReachableInstances, 1);
     const executable = try db.get(queries.BuildExecutable, 1);
 
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.*.?.bytes);
-    try testing.expectEqual(@as(u8, 41), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.*.?.bytes, @as(u8, 41));
 
     try setSource(db, 1,
         \\static Resource = struct
@@ -2546,8 +2569,7 @@ test "custom drop body edits update linking without changing caller analysis" {
     try testing.expectEqual(reachable, try db.get(queries.CollectReachableInstances, 1));
     const updated_executable = try db.get(queries.BuildExecutable, 1);
     try testing.expect(executable != updated_executable);
-    try runtime.writeProgram(io, updated_executable.*.?.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(updated_executable.*.?.bytes, @as(u8, 42));
 }
 
 test "ASAP cleanup follows initialization replacement branches loops and returns" {
@@ -2676,15 +2698,12 @@ test "ASAP cleanup follows initialization replacement branches loops and returns
         },
     };
 
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     for (cases, 1..) |case, file_id| {
         const db = try testDatabase(1);
         defer db.deinit();
         try addSource(db, file_id, case.source);
         const executable = (try db.get(queries.BuildExecutable, file_id)).*.?;
-        try runtime.writeProgram(io, executable.bytes);
-        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+        try test_sources.expectProgramExit(executable.bytes, case.expected);
     }
 }
 
@@ -3602,6 +3621,8 @@ fn checkFieldVisibilityAnnotationEdits(generated: bool) !void {
     try addModuleMembers(db, library, &.{1});
     try addModuleMembers(db, entry, &.{2});
     const answer = (try db.get(queries.BuildModuleScope, 2)).*.?.resolveStatic("answer").?;
+    const selected = (try db.get(queries.BuildModuleScope, 2)).*.?.resolveStatic("Selected").?;
+    const selected_type = try resolvedStaticType(db, selected);
 
     for ([_]struct { field: []const u8, export_hidden: bool = false, accepted: bool }{
         .{ .field = "value: Hidden", .accepted = true },
@@ -3617,6 +3638,12 @@ fn checkFieldVisibilityAnnotationEdits(generated: bool) !void {
         const changed = try std.mem.replaceOwned(u8, testing.allocator, annotation_edit, "static Hidden", if (edit.export_hidden) "pub static Hidden" else "static Hidden");
         defer testing.allocator.free(changed);
         try setSource(db, 1, changed);
+        inline for (.{ queries.RuntimeCapable, queries.BorrowShape }) |Fact| {
+            try testing.expectEqual(edit.accepted, (try db.get(Fact, selected_type)).* != null);
+            const fact_diagnostics = try db.transitiveAccumulatorValues(Fact, selected_type, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(fact_diagnostics);
+            try testing.expectEqual(@as(usize, if (edit.accepted) 0 else 1), fact_diagnostics.len);
+        }
         try testing.expectEqual(edit.accepted, (try db.get(queries.BuildExecutable, 2)).* != null);
         try testing.expectEqual(edit.accepted, (try db.get(queries.ResolveStatic, answer)).* != null);
         const diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, 2, structures.Diagnostic, testing.allocator);
@@ -4846,10 +4873,7 @@ test "generated struct ownership hooks inherit the type specialization" {
     ;
     try addSource(db, 1, initial);
     var executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 
     try setSource(db, 1,
         \\struct Box(T: type)
@@ -4860,8 +4884,7 @@ test "generated struct ownership hooks inherit the type specialization" {
         \\exit(copied.value)
     );
     executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 43), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 43));
 }
 
 test "public parameterized struct hooks execute" {
@@ -5507,12 +5530,9 @@ test "BuildExecutable runs empty entry sources" {
     try addSource(db, 2, "static f = func() int -> return 1");
     try addSource(db, 3, "static value = 1");
 
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     for ([_]structures.FileId{ 1, 2, 3 }) |file_id| {
         const executable = (try db.get(queries.BuildExecutable, file_id)).*.?;
-        try runtime.writeProgram(io, executable.bytes);
-        try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+        try test_sources.expectProgramExit(executable.bytes, @as(u8, 0));
     }
 }
 
@@ -6096,10 +6116,7 @@ test "declared unit functions analyze lower compile and execute as ordinary call
         \\caller()
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 0));
 }
 
 test "a local exit shadows the prelude function" {
@@ -6186,10 +6203,7 @@ test "exit callers recompute when a shadowing declaration changes" {
     try testing.expect((try db.get(queries.CompileFunction, instance)).* != null);
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
 
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 0));
 }
 
 test "unit values are rejected at int boundaries" {
@@ -6236,12 +6250,12 @@ test "function expressions analyze nested arithmetic and calls as one typed valu
     try testing.expectEqual(@as(usize, 11), body.instructions.len);
     try testing.expectEqual(@as(i32, 120), body.instructions[0].const_int);
     try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target.direct.item);
-    try expectPrimitiveCall(db, body, 2, "/", &.{ @fromBackingInt(0), @fromBackingInt(1) });
+    try testing.expectEqualDeep(structures.FunctionInstruction{ .divsi = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1) } }, body.instructions[2]);
     try testing.expectEqual(@as(i32, 2), body.instructions[3].const_int);
     try testing.expectEqual(@as(i32, 3), body.instructions[4].const_int);
-    try expectPrimitiveCall(db, body, 5, "+", &.{ @fromBackingInt(3), @fromBackingInt(4) });
-    try expectPrimitiveCall(db, body, 7, "*", &.{ @fromBackingInt(5), @fromBackingInt(6) });
-    try expectPrimitiveCall(db, body, 8, "-", &.{ @fromBackingInt(2), @fromBackingInt(7) });
+    try testing.expectEqualDeep(structures.FunctionInstruction{ .addi = .{ .lhs = @fromBackingInt(3), .rhs = @fromBackingInt(4) } }, body.instructions[5]);
+    try testing.expectEqualDeep(structures.FunctionInstruction{ .muli = .{ .lhs = @fromBackingInt(5), .rhs = @fromBackingInt(6) } }, body.instructions[7]);
+    try testing.expectEqualDeep(structures.FunctionInstruction{ .subi = .{ .lhs = @fromBackingInt(2), .rhs = @fromBackingInt(7) } }, body.instructions[8]);
     try expectPrimitiveCall(db, body, 9, "-", &.{@fromBackingInt(8)});
     try expectPrimitiveCall(db, body, 10, "-", &.{@fromBackingInt(9)});
     try testing.expectEqual(@as(u32, 10), @backingInt(body.blocks[0].terminator.return_value.value));
@@ -6365,10 +6379,7 @@ test "callable values bind pass return and execute through indirect calls" {
         \\exit(answer())
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "call results can be called directly" {
@@ -6381,10 +6392,7 @@ test "call results can be called directly" {
         \\exit(choose()(41))
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "ordinary callables widen to fallible aliases and calls" {
@@ -6407,10 +6415,7 @@ test "ordinary callables widen to fallible aliases and calls" {
     try testing.expectEqual(.indirect, std.meta.activeTag(entry.blocks[0].terminator.fallible_call.call.target));
 
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "variant coercions map compatible callable members during typing" {
@@ -6475,10 +6480,7 @@ test "variant injection prefers an exact callable member over a fallible widenin
         \\exit(answer())
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "static callable variant annotations preserve the payload representation" {
@@ -6492,10 +6494,7 @@ test "static callable variant annotations preserve the payload representation" {
         \\if const operation = selected as Plain -> exit(operation(42)) else exit(1)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "fallible callables do not narrow to ordinary parameters" {
@@ -6528,10 +6527,7 @@ test "fallible calls preserve success payloads across propagation" {
         \\if answer() -> exit(42) else exit(1)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "fallible call failure propagates without later effects" {
@@ -6549,10 +6545,7 @@ test "fallible call failure propagates without later effects" {
         \\if caller() -> exit(1) else exit(42)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "fallible calls preserve zero-sized and memory-returned payloads" {
@@ -6572,10 +6565,7 @@ test "fallible calls preserve zero-sized and memory-returned payloads" {
         \\if forward() -> exit(42) else exit(1)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "unhandled fallible calls are rejected from ordinary functions" {
@@ -6927,8 +6917,6 @@ test "and and or evaluate their right operand only on the required edge" {
         .{ .body = "if 1 < 2 and stop(63) < 0 -> exit(1) else exit(2)", .expected = 63 },
         .{ .body = "if 2 < 1 or stop(64) < 0 -> exit(1) else exit(2)", .expected = 64 },
     };
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     for (cases) |case| {
         const db = try testDatabase(1);
         defer db.deinit();
@@ -6941,8 +6929,7 @@ test "and and or evaluate their right operand only on the required edge" {
         defer testing.allocator.free(source);
         try addSource(db, 1, source);
         const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-        try runtime.writeProgram(io, executable.bytes);
-        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+        try test_sources.expectProgramExit(executable.bytes, case.expected);
     }
 }
 
@@ -6953,8 +6940,6 @@ test "short-circuit condition edges preserve mutable local state" {
         .{ .condition = "2 < 1 and (if 1 < 2 -> value = 1 else value = 2) < 3", .expected = 5 },
         .{ .condition = "1 < 2 and (if 1 < 2 -> value = 1 else value = 2) < 3", .expected = 1 },
     };
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     for (cases) |case| {
         const db = try testDatabase(1);
         defer db.deinit();
@@ -6966,8 +6951,7 @@ test "short-circuit condition edges preserve mutable local state" {
         defer testing.allocator.free(source);
         try addSource(db, 1, source);
         const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-        try runtime.writeProgram(io, executable.bytes);
-        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+        try test_sources.expectProgramExit(executable.bytes, case.expected);
     }
 }
 
@@ -7341,10 +7325,7 @@ test "top-level conditionals support general scoped statements" {
         \\  exit(99)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "early returns terminate only their reachable paths" {
@@ -7430,8 +7411,8 @@ test "edits that change return reachability update only reachable calls" {
     const answer_id = scope.resolve("answer").?;
     const leaf_id = scope.resolve("leaf").?;
     const reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
-    try testing.expectEqual(@as(usize, 4), reachable.instances.len);
-    try testing.expectEqual(leaf_id, reachable.instances[3].item);
+    try testing.expectEqual(@as(usize, 3), reachable.instances.len);
+    try testing.expectEqual(leaf_id, reachable.instances[2].item);
 
     try setSource(db, 1,
         \\static leaf = func() int -> 42
@@ -7443,7 +7424,7 @@ test "edits that change return reachability update only reachable calls" {
     const updated = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer_id })).*.?;
     try testing.expectEqual(@as(usize, 2), updated.call_arguments.len);
     const updated_reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
-    try testing.expectEqual(@as(usize, 3), updated_reachable.instances.len);
+    try testing.expectEqual(@as(usize, 2), updated_reachable.instances.len);
     try testing.expectEqual(answer_id, updated_reachable.instances[1].item);
 }
 
@@ -7600,10 +7581,7 @@ test "top-level mutable locals execute assignment right-hand sides once" {
         \\exit(status)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "conditional assignments merge mutable outer locals" {
@@ -8494,10 +8472,7 @@ test "trivial copy keeps distinct ownership generations for one SSA value" {
     );
 
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "mutable copy-back preserves its ownership generation" {
@@ -8517,10 +8492,7 @@ test "mutable copy-back preserves its ownership generation" {
     );
 
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "conditional and loop joins reconcile ownership generations" {
@@ -8550,10 +8522,7 @@ test "conditional and loop joins reconcile ownership generations" {
     );
 
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "fallible owned results originate only on success edges" {
@@ -8573,10 +8542,7 @@ test "fallible owned results originate only on success edges" {
     );
 
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "underscore remains ordinary in compound assignments" {
@@ -9401,10 +9367,7 @@ test "entry const bindings name typed values and execute" {
         \\exit(a)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "entry const binding edits retain equal analysis and recover" {
@@ -9765,10 +9728,7 @@ test "BuildExecutable links a direct call while keeping the entry artifact indep
     const initial_bytes = try testing.allocator.dupe(u8, initial_executable.*.?.bytes);
     defer testing.allocator.free(initial_bytes);
 
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, initial_executable.*.?.bytes);
-    try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(initial_executable.*.?.bytes, @as(u8, 0));
 
     // Editing only the callee's return value changes the callee's compiled
     // artifact and the linked executable, but not the caller's own artifact:
@@ -9784,8 +9744,7 @@ test "BuildExecutable links a direct call while keeping the entry artifact indep
     try testing.expect(updated_executable.* != null);
     try testing.expect(!std.mem.eql(u8, initial_bytes, updated_executable.*.?.bytes));
 
-    try runtime.writeProgram(io, updated_executable.*.?.bytes);
-    try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(updated_executable.*.?.bytes, @as(u8, 0));
 }
 
 test "BuildExecutable links and runs transitively reachable calls" {
@@ -9800,10 +9759,7 @@ test "BuildExecutable links and runs transitively reachable calls" {
     const executable = try db.get(queries.BuildExecutable, 1);
     try testing.expect(executable.* != null);
 
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.*.?.bytes);
-    try testing.expectEqual(@as(u8, 0), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.*.?.bytes, @as(u8, 0));
 }
 
 test "CollectReachableInstances publishes stable breadth-first order" {
@@ -9879,10 +9835,7 @@ test "static type and value parameters produce canonical reachable instances" {
     const retained_artifact = try db.get(queries.CompileFunction, retained_instance);
 
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 
     try setSource(db, 1,
         \\static Whole: type = int
@@ -10008,10 +9961,7 @@ test "direct and instance calls infer static parameters from runtime types" {
         \\exit(identity(10) + middle(1, 2, 3) + read(boxed) + item.pick(13))
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "static inference honors independent expected types and existing explicit calls" {
@@ -10025,10 +9975,7 @@ test "static inference honors independent expected types and existing explicit c
         \\exit(read(4, boxed) + read(4, 3, boxed) + 22)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "inferred static calls reuse specialization identities across source edits" {
@@ -10074,10 +10021,7 @@ test "inferred static instance calls retain inherited factory specialization" {
         \\exit(boxed.pick(42))
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "inferred calls preserve runtime argument order and parameter modes" {
@@ -10096,11 +10040,8 @@ test "inferred calls preserve runtime argument order and parameter modes" {
         \\_ = take(answer)
         \\exit(answer)
     );
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     const first = (try db.get(queries.BuildExecutable, 1)).*.?;
-    try runtime.writeProgram(io, first.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(first.bytes, @as(u8, 42));
     try setSource(db, 1,
         \\func stop(code: int) int
         \\  exit(code)
@@ -10109,8 +10050,7 @@ test "inferred calls preserve runtime argument order and parameter modes" {
         \\exit(pair(stop(11), stop(12)))
     );
     const ordered = (try db.get(queries.BuildExecutable, 1)).*.?;
-    try runtime.writeProgram(io, ordered.bytes);
-    try testing.expectEqual(@as(u8, 11), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(ordered.bytes, @as(u8, 11));
 }
 
 test "static inference rejects missing conflicting and non-invertible evidence" {
@@ -10174,10 +10114,7 @@ test "static primitive values dominate every specialized control-flow path" {
         \\exit(choose(42, 0))
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "static type positions disambiguate unit and none type values" {
@@ -10190,10 +10127,7 @@ test "static type positions disambiguate unit and none type values" {
         \\exit(42)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "stale specialization arity is unavailable across edits and recovers" {
@@ -10239,6 +10173,52 @@ test "BuildExecutable collects cyclic reachability without recursive compilation
         \\first()
     );
     try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
+}
+
+test "reference contracts reuse acyclic bodies and recover after recursive edits" {
+    const acyclic =
+        \\func leaf(ref first: int, ref second: int, flag: int) ref int -> first
+        \\func selected(ref first: int, ref second: int, flag: int) ref int -> leaf(first, second, flag)
+    ;
+    const recursive_first =
+        \\func leaf(ref first: int, ref second: int, flag: int) ref int
+        \\  if flag == 0 -> return first
+        \\  return selected(first, second, 0)
+        \\func selected(ref first: int, ref second: int, flag: int) ref int -> leaf(first, second, flag)
+    ;
+    const recursive_second =
+        \\func leaf(ref first: int, ref second: int, flag: int) ref int
+        \\  if flag == 0 -> return second
+        \\  return selected(first, second, 0)
+        \\func selected(ref first: int, ref second: int, flag: int) ref int -> leaf(first, second, flag)
+    ;
+    const revisions = [_]struct { source: []const u8, parameter: u32 }{
+        .{ .source = acyclic, .parameter = 0 },
+        .{ .source = recursive_first, .parameter = 0 },
+        .{ .source = recursive_second, .parameter = 1 },
+        .{ .source = acyclic, .parameter = 0 },
+    };
+    for ([_]usize{ 1, 4 }) |workers| {
+        const db = try testDatabase(workers);
+        defer db.deinit();
+        try addSource(db, 1, acyclic);
+        const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+        const selected: structures.InstanceId = .{ .item = scope.resolve("selected").? };
+        for (revisions, 0..) |revision, index| {
+            if (index != 0) try setSource(db, 1, revision.source);
+            const contract = (try db.get(queries.InferReferenceContract, selected)).*.?;
+            try testing.expectEqual(@as(usize, 1), contract.origins.len);
+            try testing.expectEqual(@as(?u32, revision.parameter), contract.origins[0].parameter);
+            const body = (try db.get(queries.AnalyzeFunctionInstance, selected)).*.?;
+            try testing.expect(structures.ReferenceContract.equivalent(contract, body.reference_contract));
+            if (index == 0) {
+                var entries = db.entries.valueIterator();
+                while (entries.next()) |entry| {
+                    try testing.expect(!std.mem.eql(u8, entry.*.type_identity.name, @typeName(queries.ReferenceCallees)));
+                }
+            }
+        }
+    }
 }
 
 test "BuildExecutable places a shared reachable function once" {
@@ -10729,6 +10709,86 @@ test "recomputation replaces dynamic input dependencies" {
     try SelectedNumber.executions.expect(2);
 }
 
+test "query imports retain equal live results and their computed dependencies" {
+    const Version = struct {
+        pub const Key = void;
+        pub const Value = u32;
+    };
+    const Text = struct {
+        pub const Input = void;
+        pub const Output = ?OwnedOutput;
+
+        pub fn run(ctx: *Context, _: void) !Output {
+            const version = (try ctx.input(Version, {})).*;
+            return .{ .bytes = try ctx.allocator().dupe(u8, if (version == 0) "current" else "updated") };
+        }
+
+        pub fn eqlOutput(left: Output, right: Output) bool {
+            if (left == null or right == null) return left == null and right == null;
+            return std.mem.eql(u8, left.?.bytes, right.?.bytes);
+        }
+    };
+    const db = try Database.init(testing.allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try db.addInput(Version, {}, 0);
+    const retained = try db.get(Text, {});
+    const imported: OwnedOutput = .{ .bytes = try testing.allocator.dupe(u8, "current") };
+    try db.importCompletedQuery(Text, {}, imported, &.{}, &.{});
+    try testing.expectEqual(retained, try db.get(Text, {}));
+    try testing.expectEqualStrings("current", retained.*.?.bytes);
+    const mismatched: OwnedOutput = .{ .bytes = try testing.allocator.dupe(u8, "different") };
+    defer testing.allocator.free(mismatched.bytes);
+    try testing.expectError(error.InvalidCache, db.importCompletedQuery(Text, {}, mismatched, &.{}, &.{}));
+    try db.setInput(Version, {}, 1);
+    try testing.expectEqualStrings("updated", (try db.get(Text, {})).*.?.bytes);
+}
+
+test "query storage releases scratch before retaining published bytes" {
+    const ScratchQuery = struct {
+        pub const Input = u32;
+        pub const Output = OwnedOutput;
+
+        pub fn run(ctx: *Context, _: Input) !Output {
+            const temporary = try ctx.allocator().alloc(u8, 4 * 1024 * 1024);
+            defer ctx.allocator().free(temporary);
+            @memset(temporary, 42);
+            return .{ .bytes = try ctx.allocator().dupe(u8, "ok") };
+        }
+    };
+    var tracking = testing.FailingAllocator.init(testing.allocator, .{});
+    const db = try Database.init(tracking.allocator(), .{ .worker_count = 1 });
+    defer db.deinit();
+    const initial_live = tracking.allocated_bytes - tracking.freed_bytes;
+    const published = try db.get(ScratchQuery, 0);
+    try testing.expectEqualStrings("ok", published.bytes);
+    try testing.expect(published == try db.get(ScratchQuery, 0));
+    try testing.expect(tracking.allocated_bytes - tracking.freed_bytes - initial_live < 1024 * 1024);
+}
+
+test "query storage preserves large aligned identities during recomputation" {
+    const AlignedQuery = struct {
+        pub const Input = struct {
+            key: u32,
+            padding: [64]u8 align(64) = @splat(0),
+        };
+        pub const Output = u32;
+
+        pub fn run(ctx: *Context, input_value: Input) !Output {
+            return (try ctx.input(NumberInput, input_value.key)).*;
+        }
+    };
+    const db = try Database.init(testing.allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try db.addInput(NumberInput, 0, 12);
+    try db.addInput(NumberInput, 1, 99);
+    try testing.expectEqual(12, (try db.get(AlignedQuery, .{ .key = 0 })).*);
+    const retained = try db.get(AlignedQuery, .{ .key = 1 });
+    try db.setInput(NumberInput, 0, 42);
+    try testing.expectEqual(42, (try db.get(AlignedQuery, .{ .key = 0 })).*);
+    try testing.expect(retained == try db.get(AlignedQuery, .{ .key = 1 }));
+    try testing.expectEqual(99, retained.*);
+}
+
 test "owned outputs are retained or replaced exactly once" {
     const db = try testDatabase(1);
     var db_live = true;
@@ -10810,6 +10870,40 @@ test "typed interning canonicalizes concurrent distinct queries" {
     }
 }
 
+test "interned reads remain stable during concurrent storage growth" {
+    const Growth = struct {
+        pub const Input = u32;
+        pub const Output = void;
+
+        pub fn run(ctx: anytype, writer: Input) anyerror!Output {
+            const anchor = try ctx.intern(queries.ItemLocations, .{
+                .origin = .{ .module = @fromBackingInt(100000) },
+                .kind = .function,
+                .name = .{ .identifier = "anchor" },
+            });
+            const retained = try ctx.lookupInterned(queries.ItemLocations, anchor);
+            for (0..1024) |offset| {
+                const module: structures.ModuleId = @fromBackingInt(writer * 1024 + @as(u32, @intCast(offset)));
+                const id = try ctx.intern(queries.ItemLocations, .{
+                    .origin = .{ .module = module },
+                    .kind = .function,
+                    .name = .{ .identifier = "growing" },
+                });
+                const location = try ctx.lookupInterned(queries.ItemLocations, id);
+                try testing.expectEqual(module, location.origin.module);
+                try testing.expectEqualStrings("growing", location.name.text());
+                try testing.expectEqual(retained, try ctx.lookupInterned(queries.ItemLocations, anchor));
+                try testing.expectEqualStrings("anchor", retained.name.text());
+            }
+        }
+    };
+    const db = try testDatabase(4);
+    defer db.deinit();
+    var handles: [4]Handle(Growth) = undefined;
+    for (&handles, 0..) |*handle, writer| handle.* = try db.spawn(Growth, @intCast(writer));
+    for (handles) |handle| _ = try handle.wait();
+}
+
 test "failed interning publishes no partial identity" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     const db = try Database.init(failing.allocator(), .{ .worker_count = 1 });
@@ -10818,13 +10912,22 @@ test "failed interning publishes no partial identity" {
 
     const module: structures.ModuleId = @fromBackingInt(@intCast(0));
     failing.fail_index = failing.alloc_index + 3;
-    const loc: structures.ItemLoc = .{ .origin = .{ .module = module }, .kind = .function, .name = .{ .identifier = "owned" } };
-    try testing.expectError(error.OutOfMemory, db.intern(queries.ItemLocations, loc));
+    var loc: structures.ItemLoc = .{ .origin = .{ .module = module }, .kind = .function, .name = .{ .identifier = "owned" } };
+    var next_identity: u32 = 0;
+    while (true) : (next_identity += 1) {
+        loc.origin = .{ .module = @fromBackingInt(next_identity) };
+        const interned = db.intern(queries.ItemLocations, loc) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            break;
+        };
+        try testing.expectEqual(next_identity, @backingInt(interned));
+    }
     try testing.expect(failing.has_induced_failure);
-    try testing.expectError(error.InvalidInternId, db.lookupInterned(queries.ItemLocations, @fromBackingInt(@intCast(0))));
+    try testing.expectError(error.InvalidInternId, db.lookupInterned(queries.ItemLocations, @fromBackingInt(next_identity)));
 
     failing.fail_index = std.math.maxInt(usize);
     const id = try db.intern(queries.ItemLocations, loc);
+    try testing.expectEqual(next_identity, @backingInt(id));
     try testing.expectEqualStrings("owned", (try db.lookupInterned(queries.ItemLocations, id)).name.text());
 
     db.deinit();
@@ -10906,8 +11009,6 @@ test "expression graph preserves effects across statements arguments and selecte
         .{ .body = "const selected = if 2 < 1 -> stop(41) else if 1 < 2 -> 42 else stop(43)\nexit(selected)", .expected = 42 },
         .{ .body = "const selected = if stop(51) < stop(52) -> stop(53) else stop(54)\nexit(selected)", .expected = 51 },
     };
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     for (cases) |case| {
         const db = try testDatabase(1);
         defer db.deinit();
@@ -10916,8 +11017,7 @@ test "expression graph preserves effects across statements arguments and selecte
         defer testing.allocator.free(source);
         try addSource(db, 1, source);
         const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-        try runtime.writeProgram(io, executable.bytes);
-        try testing.expectEqual(case.expected, try runtime.runProg(io, testing.allocator, &.{}));
+        try test_sources.expectProgramExit(executable.bytes, case.expected);
     }
 }
 
@@ -10940,10 +11040,7 @@ test "indirect calls evaluate the callee before their arguments" {
         \\exit(answer() + compiled - 1)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    const io = testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try runtime.writeProgram(io, executable.bytes);
-    try testing.expectEqual(@as(u8, 1), try runtime.runProg(io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 1));
 }
 
 test "redundant variant binding annotations retain typed and compiled results" {
@@ -11038,7 +11135,8 @@ test "failed dependency registration leaves stale queries idle and retryable" {
 
         pub fn run(ctx: *Context, value: Input) !Output {
             failing.fail_index = failing.alloc_index;
-            return (try ctx.get(CountedQuery, value)).*;
+            for (0..value) |key| _ = try ctx.get(CountedQuery, @intCast(key));
+            return value;
         }
     };
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
@@ -11046,9 +11144,10 @@ test "failed dependency registration leaves stale queries idle and retryable" {
     defer db.deinit();
     Parent.failing = &failing;
     try db.addInput(NumberInput, 0, 1);
-    _ = try db.get(CountedQuery, 42);
+    const dependency_count = 8192;
+    for (0..dependency_count) |key| _ = try db.get(CountedQuery, @intCast(key));
     try db.setInput(NumberInput, 0, 2);
-    try testing.expectError(error.OutOfMemory, db.get(Parent, 42));
+    try testing.expectError(error.OutOfMemory, db.get(Parent, dependency_count));
     failing.fail_index = std.math.maxInt(usize);
     try db.setInput(NumberInput, 0, 3);
     try testing.expectEqual(@as(u32, 42), (try db.get(CountedQuery, 42)).*);
@@ -11137,9 +11236,7 @@ test "whole replacement retains the old generation until replacement preparation
         \\answer()
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
-    try runtime.writeProgram(testing.io, executable.bytes);
-    try testing.expectEqual(@as(u8, 1), try runtime.runProg(testing.io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 1));
 }
 
 test "ownership strategies require bare strategy names" {
@@ -11205,9 +11302,7 @@ test "static aggregate parameters dominate every specialized branch" {
         \\exit(result + choose(Pair{left = 1, right = 21}, 0))
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
-    try runtime.writeProgram(testing.io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(testing.io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "nested generated structs discover each declaration under its own owner" {
@@ -11231,9 +11326,7 @@ test "nested generated structs discover each declaration under its own owner" {
     try testing.expectEqual(@as(?u32, 0), discovered.items[1].parent);
     try testing.expectEqual(@as(?u32, 1), discovered.items[2].parent);
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
-    defer std.Io.Dir.cwd().deleteFile(testing.io, "prog") catch {};
-    try runtime.writeProgram(testing.io, executable.bytes);
-    try testing.expectEqual(@as(u8, 42), try runtime.runProg(testing.io, testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "handled child failures recompute without publishing stale accumulators" {
@@ -11319,4 +11412,43 @@ test "custom query and input keys preserve aliases collisions and incremental de
     try Read.runs.expect(3);
     try testing.expectEqual(@as(u32, 7), (try db.get(Read, other)).*);
     try Read.runs.expect(3);
+
+    const Graph = struct {
+        const Root = struct {
+            pub const Input = u32;
+            pub const Output = u32;
+            pub fn hash(_: Input) u64 {
+                return comptime std.hash.Wyhash.hash(0, @typeName(Read)) ^ std.hash.Wyhash.hash(0, @typeName(@This()));
+            }
+            pub fn run(ctx: *Context, key: Input) !Output {
+                return (try ctx.get(Parent, key)).*;
+            }
+        };
+        const Parent = struct {
+            pub const Input = u32;
+            pub const Output = u32;
+            pub fn run(ctx: *Context, key: Input) !Output {
+                var total: u32 = 0;
+                for (0..96) |index| total += (try ctx.get(Read, .{ .id = @intCast(index), .spelling = 10 })).*;
+                for (0..3) |_| {
+                    if (ctx.get(Root, key)) |_| return error.ExpectedCycle else |err| {
+                        if (err != error.QueryCycle) return err;
+                    }
+                    var repeated: u32 = 0;
+                    for (0..96) |index| repeated += (try ctx.get(Read, .{ .id = @intCast(index), .spelling = 20 })).*;
+                    if (repeated != total) return error.InconsistentDependency;
+                }
+                return total;
+            }
+        };
+    };
+    for (0..96) |index| {
+        if (index == first.id or index == other.id) continue;
+        try db.addInput(Setting, .{ .id = @intCast(index), .spelling = 10 }, @intCast(index));
+    }
+    try testing.expectEqual(@as(u32, 4607), (try db.get(Graph.Root, 0)).*);
+    try Read.runs.expect(97);
+    try db.setInput(Setting, .{ .id = 31, .spelling = 20 }, 1000);
+    try testing.expectEqual(@as(u32, 5576), (try db.get(Graph.Root, 0)).*);
+    try Read.runs.expect(98);
 }

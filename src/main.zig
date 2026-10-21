@@ -120,7 +120,7 @@ fn buildWithStageTimings(db: *query.Database, io: std.Io, timings: *diagnostics.
         _ = try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry });
     timings.mark(io, "analyze entry");
     _ = try db.get(queries.CollectReachableInstances, file_id);
-    timings.mark(io, "compile reachable functions (includes callee analysis)");
+    timings.mark(io, "compile reachable functions");
 }
 
 fn compileAndRun(
@@ -131,6 +131,8 @@ fn compileAndRun(
     errors: *std.Io.Writer,
 ) !RunOutcome {
     var timings: diagnostics.TimingLog = .init(input.started);
+    var profile: @import("profiling.zig").Collector = .{ .io = io };
+    if (input.debug_flags.timing) timings.enableQueryProfiling(&profile);
     timings.mark(io, "load source");
     const use_cache = input.cache_directory != null and !input.debug_flags.ast and
         !input.debug_flags.ssa and !input.debug_flags.@"asm";
@@ -162,6 +164,7 @@ fn compileAndRun(
 
     const database_options: query.Options = .{
         .worker_count = worker_count,
+        .profile = if (input.debug_flags.timing) &profile else null,
     };
     var db = try query.Database.init(gpa, database_options);
     defer db.deinit();
@@ -179,8 +182,8 @@ fn compileAndRun(
             },
             else => return err,
         };
+        timings.mark(io, "restore identities");
     }
-    timings.mark(io, "restore identities");
     try source_registry.update(db, gpa, input.source, input.source_files, input.module_paths);
     timings.mark(io, "add source");
     if (restored_offset) |offset| {
@@ -195,8 +198,8 @@ fn compileAndRun(
             },
             else => return err,
         };
+        timings.mark(io, "restore queries");
     }
-    timings.mark(io, "restore queries");
 
     if (input.debug_flags.timing) try buildWithStageTimings(db, io, &timings);
     const executable_result = try db.get(queries.BuildExecutable, file_id);
@@ -225,10 +228,10 @@ fn compileAndRun(
         render_sources.deinit(gpa);
     }
     try render_sources.append(gpa, .{ .file_id = file_id, .path = input.source_path, .source = input.source });
-    for (input.source_files, 0..) |file, index| {
+    for (input.source_files) |file| {
         const path = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(input.source_path) orelse ".", file.path });
         errdefer gpa.free(path);
-        try render_sources.append(gpa, .{ .file_id = @intCast(index + 1), .path = path, .source = file.source });
+        try render_sources.append(gpa, .{ .file_id = source_registry.fileId(file.path).?, .path = path, .source = file.source });
     }
     for (modules.standard_sources) |source| {
         try render_sources.append(gpa, .{
@@ -255,8 +258,8 @@ fn compileAndRun(
         std.debug.assert(emitted.len != 0);
         try output.flush();
         timings.mark(io, "debug output");
-        const type_interner: queries.TypeFacts(*query.Database) = .{ .ctx = db };
-        try diagnostics.renderDiagnostics(type_interner, errors, render_sources.items, emitted);
+        const analysis_context: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+        try diagnostics.renderDiagnostics(analysis_context, errors, render_sources.items, emitted);
         if (input.debug_flags.timing) try timings.print(io, errors);
         try errors.flush();
         return .rejected;
@@ -270,8 +273,10 @@ fn compileAndRun(
     timings.mark(io, "debug output");
 
     // A cache write failure cannot invalidate a completed compilation.
-    if (snapshot_key) |digest| query_disk_cache.save(io, gpa, input.cache_directory.?, digest, db) catch {};
-    timings.mark(io, "save queries");
+    if (snapshot_key) |digest| {
+        query_disk_cache.save(io, gpa, input.cache_directory.?, digest, db) catch {};
+        timings.mark(io, "save queries");
+    }
     if (cache_key) |digest| cache.save(io, gpa, input.cache_directory.?, digest, executable.bytes) catch {};
 
     return runExecutable(io, gpa, input, executable.bytes, &timings, errors);
@@ -282,7 +287,7 @@ fn runExecutable(io: std.Io, gpa: std.mem.Allocator, input: RunInput, bytes: []c
     defer prepared.deinit(io);
     timings.mark(io, "write program");
     const exit_code = try prepared.run(io, input.program_args);
-    timings.mark(io, "run program");
+    timings.markProgramRun(io);
 
     if (input.debug_flags.timing) {
         try timings.print(io, errors);
@@ -595,12 +600,20 @@ test "CLI core renders debug output and runs the compiled program" {
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "SSA\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "ASM\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "db 0x") == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "timing\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "wall ms  thread ms") != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "database init") != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "parse") != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "validate modules") != null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "analyze entry") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "compile reachable functions (includes callee analysis)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "compile reachable functions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "typing / SSA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "codegen") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "exclusive worker time") == null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "parallel-worker sums") == null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "queries/functions count") == null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "restore identities") == null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "restore queries") == null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "save queries") == null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "analyze bodies") == null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "compile functions") == null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "link executable") != null);
@@ -631,7 +644,7 @@ test "CLI core renders source diagnostics without running" {
         errors.writer.buffered(),
         "broken.chi:1:1: expected 1 call argument, found 0",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "timing\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "wall ms  thread ms") != null);
 }
 
 test "CLI renders bare and message compile-time panic without compiler-control exit" {
@@ -843,8 +856,8 @@ test "diagnostics render with their own file paths" {
 
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    const type_interner: queries.TypeFacts(*query.Database) = .{ .ctx = db };
-    try diagnostics.renderDiagnostics(type_interner, &output.writer, &.{
+    const analysis_context: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+    try diagnostics.renderDiagnostics(analysis_context, &output.writer, &.{
         .{ .file_id = 0, .path = "main.chi", .source = entry_source },
         .{ .file_id = 1, .path = "physics/body.chi", .source = physics_source },
     }, held);
@@ -861,8 +874,8 @@ test "ownership diagnostics describe field transfers" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
 
-    const type_interner: queries.TypeFacts(*query.Database) = .{ .ctx = db };
-    try diagnostics.renderDiagnostics(type_interner, &output.writer, &.{
+    const analysis_context: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+    try diagnostics.renderDiagnostics(analysis_context, &output.writer, &.{
         .{ .file_id = 0, .path = "ownership.chi", .source = "" },
     }, &.{
         .{ .file_id = 0, .span = null, .kind = .ownership_transfer_requires_place },

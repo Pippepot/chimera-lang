@@ -97,6 +97,18 @@ test "prepared program retains its termination signal" {
     try std.testing.expectEqual(std.process.Child.Term{ .signal = .TERM }, try program.run(io, &.{}));
 }
 
+test "prepared program preserves empty and spaced arguments" {
+    const io = std.testing.io;
+    var program = try prepareProgram(
+        io,
+        std.testing.allocator,
+        "#!/bin/sh\ncase \"$#:$1:$2\" in '2:first argument:') exit 42;; esac\nexit 1\n",
+    );
+    defer program.deinit(io);
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, try program.run(io, &.{ "first argument", "" }));
+}
+
 pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8 {
     return switch (try runProgram(io, gpa, "./prog", args)) {
         .exited => |code| code,
@@ -105,12 +117,11 @@ pub fn runProg(io: std.Io, gpa: std.mem.Allocator, args: []const []const u8) !u8
 }
 
 fn runProgram(io: std.Io, gpa: std.mem.Allocator, path: []const u8, args: []const []const u8) !std.process.Child.Term {
-    var argv = try std.ArrayList([]const u8).initCapacity(gpa, 1 + args.len);
-    defer argv.deinit(gpa);
+    const argv = try gpa.alloc([]const u8, 1 + args.len);
+    defer gpa.free(argv);
+    argv[0] = path;
+    @memcpy(argv[1..], args);
 
-    argv.appendAssumeCapacity(path);
-    for (args) |arg| argv.appendAssumeCapacity(arg);
-
-    var child = try std.process.spawn(io, .{ .argv = argv.items });
+    var child = try std.process.spawn(io, .{ .argv = argv });
     return child.wait(io);
 }

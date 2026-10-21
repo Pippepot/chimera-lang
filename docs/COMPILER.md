@@ -19,6 +19,24 @@ zig build run -- --workers=2 program.chi
 zig build run -- --disk-cache program.chi
 ```
 
+`--debug=timing` prints one row per compiler stage, in milliseconds. `wall ms`
+is elapsed time; `thread ms` sums exclusive query time across all workers, so it
+exceeds wall time when workers run in parallel. Stage `%` and bars are shares of
+`compile`, the sum of compiler stages; `run program` and `total` follow it and
+take no share. Stages with more than one kind of query work expand it, sorted
+by time: parsing, declarations, signatures, body analysis, type facts, compile-time
+evaluation, codegen, and other queries. Body analysis expands into expression
+construction, typing/SSA, lifetime analysis/cleanup, IR finalization, and body
+setup. Work `%` is a share of the stage's thread time, and each work row ends
+with `count × average`. Nested queries are charged to their own categories;
+group rows sum their children. Counter-update time is excluded from parent
+categories. Query/function counts exclude memo hits; phase and dependency
+request counts are invocations. `dependency wait` is time a query spends blocked
+on dependencies; it is listed last and excluded from thread time and shares.
+Thread time is elapsed time on each worker, not CPU time. Collection is disabled
+without the flag and adds measurement overhead when enabled. Cache stages appear
+only when those operations occur.
+
 `zig build run` defaults to `debug`, which favors fast compiler builds and keeps
 runtime safety checks, and enables incremental compilation of the compiler.
 Use it for everyday edits. Zig caches the compiler binary,
@@ -28,11 +46,22 @@ so changing only `.chi` files does not rebuild the Zig compiler sources. Add
 To rebuild and rerun when Zig sources change, use
 `zig build run --watch -- program.chi`. Stop watching with Ctrl+C.
 
-`-Doptimize=safe` takes longer to build but runs compiler code and
-allocation checks faster; it is useful for broad test runs.
-`-Doptimize=fast` is for performance measurements. Keep the same mode
+`-Doptimize=safe` uses release mode with runtime safety checks; it is useful for
+broad test runs. `-Doptimize=fast` disables runtime safety checks. Keep the same mode
 between runs to reuse its cache. These modes control the Zig-built compiler,
 not optimization of the generated Chimera program.
+
+`-Doptimize=fast` builds the compiler, benchmarks, and tests with LLVM and its
+optimizations. Every other mode, including the default `debug`, uses Zig's
+self-hosted backend, so everyday and test builds stay fast. There is no separate
+backend option. For example:
+
+```sh
+zig build run -Doptimize=fast -- --debug=timing example.chi
+```
+
+The `-fllvm` and `-fno-llvm` flags belong to direct commands such as
+`zig build-exe`; `zig build` derives the backend from the optimization mode.
 
 `-h` and `--help` print usage and exit successfully when given before the source
 path. Options after the source path are passed to the generated program instead.
@@ -54,7 +83,7 @@ standard-library files do not implicitly import the prelude. An explicit
 designated file's top-level statements execute. Extra arguments after the
 source path are passed to the generated program.
 
-Collection literals default to inline `Array(T, N)` or construct a known expected
+Fixed-count collection literals default to inline `Array(T, N)` or construct a known expected
 target through its consuming converter. `List(T)` is a prelude export; implicit
 List allocation failure terminates with status 134. `List(T).from([elements])`
 is the explicitly fallible alternative. Ordinary element failure cleans partial
@@ -63,18 +92,35 @@ compile time through their ordinary declarations. Evaluation-local storage can
 be passed between nested calls but cannot escape into published values, static
 arguments, or runtime storage; copied or extracted ordinary data can leave evaluation.
 
+Collection literals support Array spreading (`[1, ..values, 5]`) and
+comprehensions (`[x * 2 for x in values if x > 0]`). Static clauses use
+`[f(i) static for i in 0..N static if condition(i)]`: shape and static filtering
+execute during compilation, while element expressions retain their construction
+phase. Static expansion and Array spreads default to fixed Arrays. Runtime
+clauses and other iterable spreads default to Lists; an expected Array requires
+a static count. Parenthesize an open range used as an element: `[(..limit)]`.
+`List(T).collect?([elements or comprehensions])` makes allocation failure
+recoverable for the deferred construction. Implicit List construction retains
+its panic policy. A known static upper bound supports fresh immovable elements;
+unbounded growth requires movable, automatically droppable elements.
+
 `List(T).new`, `reserve`, and `append` provide fallible dynamic growth. Array and
 List expose `span()` over their initialized elements.
 Array, List, and Span expose checked `slice?(bounds)`, for example
 `values.slice?(1..3)`, `values.slice?(..3)`, `values.slice?(2..)`, or
-`values.slice?(..)`. Bounds are reusable `Range(A, B)` values with independent
-integer or omitted (`none`) endpoints; equal exclusive endpoints are empty,
-reversed and out-of-bounds slices fail, and inclusive ends must name elements.
+`values.slice?(..)`. Bounds are reusable `Range` values with two `int | none`
+endpoint fields whose presence can vary at runtime. Equal exclusive endpoints
+are empty, reversed and out-of-bounds slices fail, and inclusive ends must name
+elements.
 The same bounds work in brackets: `values[1..3]`, `values[..3]`,
 `values[2..]`, and `values[..]`. Explicit standard-library index overloads select
 the integer getter or slicing function; no range-specific compiler dispatch is
-involved. There is no public start/size slicing alternative, from-end index
-syntax, or bulk range assignment.
+involved. Positions relative to the end use explicit length arithmetic:
+`values[values.len() - 1]`, `values[values.len() - n..]`, and
+`values[..values.len() - n]`. `..` excludes its upper endpoint and `..^` includes
+it. Standard integer indexing rejects negative indices. There is no dedicated
+from-end syntax, bound type, or factory, public start/size slicing alternative,
+or bulk range assignment.
 `Span(T)` provides borrowed `get`/index access with permission
 captured from the receiver; owned bindings copy elements, and `as_imm()` attenuates
 permission. Copies and mutable bindings cannot upgrade readonly backing. Spans own no storage and
@@ -92,7 +138,8 @@ polls once per step, including `_` bindings, and cleans up the acquired item.
 An alias into an owned poll payload cannot outlive its carrier. Ranges use `a..b` or
 `a..^b`, with ordinary `reversed()` and fallible `step_by?(positive_factor)`
 methods. Inclusive endpoints and composed steps terminate without int overflow.
-Only fully bounded integer ranges iterate. Stepping and reversal return reusable
+Only fully bounded integer ranges iterate. Iteration and reversal panic when
+either endpoint is omitted; `step_by` fails. Stepping and reversal return reusable
 `RangeSequence` traversal values, which cannot be passed as contiguous slice bounds.
 
 UTF-8 literals default to the prelude `String`. Literal-backed strings allocate
@@ -104,7 +151,10 @@ BytesView `get`/index results are readonly `ref byte`; owned bindings copy the b
 named widening operation. `BytesView.validate_utf8` validates arbitrary byte
 input, and text views use the same range-based slicing API, with StringView
 additionally checking codepoint boundaries. String-to-view converters
-borrow their source; literal-to-view converters refer to permanent static bytes.
+borrow their source. A literal used as a runtime value materializes as the prelude
+`StaticString`, a copyable view of permanent bytes; literal views and literal-backed
+Strings refer to those bytes, and one ordinary converter instance per target serves
+every literal.
 `String` and `StringView` support `==` and `<>` with exact byte equality,
 including embedded NUL bytes and either order of owned strings, views, and
 literals. `ref item = items[index]` aliases a checked borrowed element with the
@@ -164,8 +214,11 @@ exit(1)
 
 `std.io` exports `stdin`, `stdout`, and `stderr`, plus fallible `read_bytes`,
 `write_once`, `write_all`, and `write_text`. `print` is an infallible prelude
-export that writes text and a newline, terminating with panic status 134 on
-output failure. Reads append to `List(byte)` and expose only the initialized
+export that converts its argument to String and writes it with a newline. It
+terminates with panic status 134 on allocation or output failure. String inputs
+remain borrowed. Callable references need an explicit
+function-type context, for example `const writer: func(imm int) unit = print`.
+Reads append to `List(byte)` and expose only the initialized
 prefix through `bytes()`. Short
 counts are successful progress; a nonempty read returning zero indicates EOF.
 Failures keep existing initialized contents and earlier I/O effects. Programs
@@ -173,6 +226,35 @@ using output ignore SIGPIPE so a broken pipe becomes ordinary write failure.
 Pure literal/view operations execute at compile time, while reached I/O is
 rejected. Heap-backed text mutation and cloning also execute at compile time,
 subject to the same storage publication boundary.
+
+`String(value)` formats integers and bytes in decimal, booleans as `true`/`false`,
+unit as `()`, and none as `none`. StringView conversion owns a copy. Arrays,
+Lists, and Spans format recursively as `[1, 2]`; text elements appear without
+quotes. BytesView uses decimal byte values, including invalid UTF-8. Box/Ref use
+`Box(value)`/`Ref(value)`, and ranges preserve `..`, `..^`, and omitted bounds.
+Inputs and collection elements remain borrowed. Collection literals also
+initialize String directly, for example `String([1, 2])`. Their element failures
+propagate with ordinary partial-construction cleanup. For example,
+`print([[1, 2], [3, 4]])` writes `[[1, 2], [3, 4]]` followed by a newline. A public
+converter from a user type to String enables the same printing and recursive
+collection support.
+Variants convert when every member supports the expected type; the active member
+selects the conversion at runtime. This also enables mixed collections such as
+`print([10, "Hello", [1, 2, 3]])`, which writes `[10, Hello, [1, 2, 3]]`.
+Float support remains unimplemented.
+
+`where` clauses use ordinary compile-time conditions. Callable membership uses
+`is`, for example `where T.copy is func(imm T) T`. Conditions cannot capture
+runtime parameters. The colon requirement syntax is not supported, and
+converters never chain.
+
+`T.U` exposes a declared converter as a callable, with U resolved as a type name
+in the surrounding scope. Ordinary members take precedence. For example,
+`where T.String is func(imm T) String` checks a declared text converter without
+executing it. Use `T is String or T.String is func(imm T) String` to accept identity
+too. Lookup preserves actual converter signatures; it does not synthesize
+identity or variant adapters. Generic library bodies validate composed conversions
+at their ordinary uses.
 
 The CLI uses two query workers by default on machines with at least two CPUs;
 `--workers=N` selects 1 through 64 workers. `--disk-cache` caches successful
@@ -190,7 +272,14 @@ run the normal queries.
 Concurrent compiler processes can share the cache and working directory; each
 runs its own executable while `./prog` is replaced atomically.
 
-Top-level code is the entry point; a function named `main` is ordinary. The CLI itself exits with 0 after a normal program exit, or 1 on invalid arguments, source-read failure, source rejection, compiler failure, or abnormal program termination. It reports the program's exit status or termination signal separately from compiler failures. A compile-time `exit(code)` is compiler control instead: it produces no executable and becomes the CLI's own process status.
+Top-level code is the implicitly fallible entry point; a function named `main` is ordinary.
+Successful fallthrough cleans up and exits the generated program with status 0;
+unhandled ordinary failure cleans up and exits it with status 1. Local handlers
+retain precedence, and ordinary functions retain their declared fallibility.
+For example, top-level code can use `var items = List(int).new?(4)`,
+`items.append?(42)`, and `print(items[0])` without an enclosing function or guards.
+Compile-time consumers still require successful evaluation.
+The CLI itself exits with 0 after a normal program exit, or 1 on invalid arguments, source-read failure, source rejection, compiler failure, or abnormal program termination. It reports the program's exit status or termination signal separately from compiler failures. A compile-time `exit(code)` is compiler control instead: it produces no executable and becomes the CLI's own process status.
 
 `panic` and `panic "message"` terminate with status 134 after reporting the
 message and source call trace to stderr. Bare panic prints just `panic`.
@@ -268,12 +357,15 @@ zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/converter_test.zig -
 zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/comptime_interpreter_test.zig --summary all
 ```
 
+Run the focused collection-construction suite with
+`zig build test --seed=0 -Dtest-source=tests/collection_test.zig`.
+
 Run the focused overload suite with
 `zig build test --seed=0 -Dtest-source=tests/overload_test.zig`.
 
 These entrypoints supply required module imports. Both suite modes run inline
-tests once through `test_sources.zig` and twelve standalone suites (thirteen default
-roots total): `tests/array_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
+tests once through `test_sources.zig` and thirteen standalone suites (fourteen default
+roots total): `tests/array_test.zig`, `tests/collection_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
 `tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`, `tests/overload_test.zig`,
 `tests/query_disk_cache_test.zig`, `tests/query_test.zig`, `tests/reference_test.zig`,
 `tests/text_test.zig`, `tests/panic_test.zig`, and `tests/iteration_test.zig`.
@@ -292,7 +384,7 @@ caches compilation but reruns tests. The `safe` mode speeds up allocation checks
 with a slower first compile.
 
 For quick test iteration, omit `-Doptimize=safe` and select the affected
-suite with `-Dtest-source`. The full suite builds thirteen separate test binaries;
+suite with `-Dtest-source`. The full suite builds fourteen separate test binaries;
 its compilation cost is different from building the CLI once.
 
 Use focused checks during edits; run the routine suite once for changes spanning
@@ -303,6 +395,70 @@ Check modified Zig files with `zig fmt --check <files>` and run `git diff --chec
 Keep temporary verification files outside the repository.
 
 ## Benchmark
+
+The cold-compilation performance gates build separately in `fast` and `debug`:
+
+```sh
+zig build test-prelude-performance --seed=0
+zig build test-prelude-debug-performance --seed=0
+```
+
+Prelude loading has a 1 ms median budget in `fast` and a 20 ms median budget in
+`debug`. Both modes require every measured compilation sample to finish within
+8 ms for scalar print and the mixed-array example. These are acceptance targets;
+the gates report all cases before failing when a target is exceeded. Debug keeps
+allocator diagnostics and runtime safety checks. Each case uses one unmeasured
+warm-up and nine fresh one-worker databases, with no disk cache or query-result
+reuse between samples. The compiled workloads are `const i = 10` followed by
+`print(i)`, and the four-line mixed-array example embedded in the benchmark.
+CSV output includes median, minimum, maximum, and budget in nanoseconds.
+The gate checks at compile time that its driver and imported compiler use the
+same optimization mode. The `fast` gate therefore uses LLVM and the `debug` gate
+the self-hosted backend. Backend and build mode changes are separate measurements,
+not replacements for the Debug target.
+The timer covers database creation, source registration, analysis, native compilation,
+and linking. Database teardown, CLI file discovery and output writes, and execution
+of the generated program are excluded, so the actual CLI requires separate timing
+verification. The prelude case alone does not exercise reachable function analysis.
+
+Converter discovery and matching have a separate benchmark:
+
+```sh
+zig build conversion-benchmark --seed=0 -Doptimize=fast
+```
+
+It reports median/minimum/maximum nanoseconds over nine fresh one-worker
+in-memory databases after one unmeasured warm-up. Cases cover 1,024 unrelated
+declarations, 128/512 unrelated converters, and 128 distinct source/target pairs.
+`first` includes cold index construction and the first match. `consumers` measures
+256 additional distinct consuming queries, so enclosing-query memoization cannot
+hide repeated resolution. `total` includes database creation, source registration,
+type discovery, and those lookups; it excludes teardown and does not compile a
+program. The prelude gates above measure full compilation separately. Run timed
+benchmarks without concurrent builds or other benchmarks. The checked-in
+`benchmarks/conversion_comparison.csv` records the before/after measurements.
+`--debug=timing` includes a conversion-matching query count and elapsed-time row.
+
+The recorded comparison uses Zig 0.17, the native compiler backend, and an AMD
+Ryzen 9 3900X. With 512 unrelated converters, the first lookup improves from
+13.233 ms to 4.565 ms and the 256 additional consumers from 159.265 ms to
+0.809 ms. Across 128 distinct type pairs, those consumers improve from
+41.290 ms to 5.646 ms. A tiny first lookup grows from 30 to 56 microseconds;
+its 256 additional consumers improve from 2.660 ms to 0.777 ms.
+
+The small full-compilation cases remain similar in `fast`: scalar print changes
+from 17.718 ms to 18.098 ms and the mixed-array example from 36.281 ms to
+36.616 ms. In `debug`, they improve from 22.907/45.544 ms to 20.836/40.812 ms.
+The existing cold-compilation gates exceeded their budgets both before and after
+that change; the budgets have not been adjusted.
+
+With its LLVM backend on the same machine, `zig build test-prelude-performance --seed=0`
+meets every budget: prelude loading takes 0.631 ms median, scalar print 3.176 ms,
+and the mixed-array example 5.574 ms median with a 7.407 ms maximum. Before the
+query-storage, scratch-recycling, and StaticString changes an LLVM build of the
+same gate measured 4.066 ms and 8.077 ms (8.490 ms maximum). Before `fast` switched
+to LLVM, its self-hosted build measured 35.416 ms for the example; the `debug`
+gate still exceeds its budgets at 39.662 ms.
 
 The compile-time execution benchmark reports analysis, execution, publication,
 cached lookup, and incremental recomputation times in CSV form:
@@ -321,20 +477,35 @@ zig build flow-benchmark --seed=0 -Doptimize=fast
 
 Each row is the median of five fresh one-worker databases. Signature resolution
 and unresolved semantic-body construction happen before the timed typing call;
-body teardown and code generation are excluded. Allocation statistics come from
+published-body teardown and code generation are excluded. Typing includes
+workspace compaction and release. Allocation statistics come from
 a separate sixth database, so footprint-accounting work is excluded from the
 timing samples. Typing includes ownership lowering and lifetime planning.
 Owning fixtures keep all generations live, so their dense tables deliberately
 represent a demanding case rather than a promise that sparse storage would help.
 
-Snapshot measurements count retained contiguous value slots or page-pointer
-arrays, each unique shared value page once (including its reference-count
-header), local and field availability, and initializer state. Trailing unbound
-value slots are omitted. Lifetime
-measurements count dense solver tables, not dirty-block flags or other scratch.
-Neither measurement is process RSS or an allocation-traffic counter. Value-page
-sharing reduces copying but does not remove the remaining snapshot-by-slot
-arrays or block-by-generation tables.
+Snapshot measurements count saved state handles, pointer-table roots and their
+page pointers for values, local and field availability, initializer state, and
+definite consumption completion. Each unique root and 16-slot page is counted
+once, including its writable flag and padding. Default pages allocate nothing;
+all components retain their independent logical lengths. Lifetime measurements
+count dense solver tables, not dirty-block flags or other scratch. Neither
+measurement is process RSS or an allocation-traffic counter. Persistent page
+sharing lets joins skip unchanged pages; all versions are reclaimed with the
+body workspace. Dense block-by-generation lifetime tables remain unchanged.
+
+The body-workspace refactor's [ablation data](../benchmarks/flow_ablation.csv)
+was measured on an AMD Ryzen 9 3900X with Zig 0.17's native backend,
+one worker, and three alternating process trials per variant. Each trial uses the sample counts above; the CSV records the median
+of trial medians and their range. `baseline` is the pending source state before
+the refactor; `persistent_flat` measures flow with replaced snapshot storage;
+`workspace` adds the
+shared analysis workspace and is the retained implementation. `unified_calls`
+also removes scalar call preparation; that experiment was rejected because its
+flow workloads regressed against `workspace`. These are compiler timings and
+retained snapshot footprints, with unchanged benchmark sources and lifetime
+tables. Existing cold-compilation budgets remain unmet on this machine in both
+the baseline and the retained implementation.
 
 For cold multi-file worker scaling and warm and edited disk cache reuse against
 uncached runs, build an optimized compiler and run the generated benchmark fixture.

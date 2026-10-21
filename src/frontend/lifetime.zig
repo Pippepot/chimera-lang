@@ -1,92 +1,20 @@
 const std = @import("std");
 const structures = @import("../structures.zig");
 const control_flow = @import("../control_flow.zig");
-pub const GenerationId = enum(u32) { _ };
-pub const BoundaryId = enum(u32) { _ };
-
-pub const Generation = struct {
-    type_id: structures.TypeId,
-    start_order: u32,
-    span: structures.SourceSpan,
-    requires_explicit_drop: bool,
-    cleanup_fields: bool,
-    cleanup_condition: ?structures.FunctionValueId = null,
-    missing_fields: []const []const u32 = &.{},
-};
-
-pub const LifetimeEffect = union(enum) {
-    define: struct {
-        generation: GenerationId,
-        value: structures.FunctionValueId,
-    },
-    use: Use,
-    update: Use,
-    consume: GenerationId,
-
-    const Use = struct {
-        generation: GenerationId,
-        cleanup_value: structures.FunctionValueId,
-        cleanup_condition: ?structures.FunctionValueId = null,
-    };
-};
-
-pub const OwnershipForward = union(enum) {
-    forward: struct {
-        source: GenerationId,
-        destination: GenerationId,
-    },
-    produce: GenerationId,
-    unowned: GenerationId,
-};
-
-pub const OwnershipEdge = struct {
-    predecessor: structures.FunctionBlockId,
-    successor_ordinal: u2,
-    successor: structures.FunctionBlockId,
-    mappings: structures.FunctionValueRange,
-};
-
-pub const CleanupLocation = union(enum) {
-    boundary: BoundaryId,
-    edge: struct {
-        predecessor: structures.FunctionBlockId,
-        successor_ordinal: u2,
-    },
-    block_entry: structures.FunctionBlockId,
-};
-
-pub const PlannedEnding = struct {
-    generation: GenerationId,
-    cleanup_value: structures.FunctionValueId,
-    cleanup_condition: ?structures.FunctionValueId = null,
-    location: CleanupLocation,
-};
-
-pub const Boundary = struct {
-    span: structures.SourceSpan,
-    effects: std.ArrayList(LifetimeEffect) = .empty,
-};
-
-pub const BuildInstruction = struct {
-    id: u31,
-    operation: structures.FunctionInstruction,
-    span: structures.SourceSpan,
-};
-
-pub const BuildItem = union(enum) {
-    instruction: BuildInstruction,
-    boundary: BoundaryId,
-};
-
-pub const BuildBlock = struct {
-    argument_start: u32,
-    argument_end: u32,
-    items: std.ArrayList(BuildItem) = .empty,
-    terminator_effects: std.ArrayList(LifetimeEffect) = .empty,
-    layout_index: ?u32 = null,
-    terminator: ?structures.FunctionTerminator = null,
-    terminator_span: ?structures.SourceSpan = null,
-};
+const body_graph = @import("body_graph.zig");
+pub const GenerationId = body_graph.GenerationId;
+pub const BoundaryId = body_graph.BoundaryId;
+pub const Generation = body_graph.Generation;
+pub const LifetimeEffect = body_graph.LifetimeEffect;
+const Effect = body_graph.Effect;
+pub const OwnershipForward = body_graph.OwnershipForward;
+pub const OwnershipEdge = body_graph.OwnershipEdge;
+pub const CleanupLocation = body_graph.CleanupLocation;
+pub const PlannedEnding = body_graph.PlannedEnding;
+pub const Boundary = body_graph.Boundary;
+pub const BuildInstruction = body_graph.BuildInstruction;
+pub const BuildItem = body_graph.BuildItem;
+pub const BuildBlock = body_graph.BuildBlock;
 
 const GenerationBits = struct {
     fn wordCount(generation_count: usize) usize {
@@ -331,7 +259,7 @@ pub const Solver = struct {
         return true;
     }
 
-    fn scanForward(self: *const Solver, facts: anytype, effects: []const LifetimeEffect, comptime representations: bool) void {
+    fn scanForward(self: *const Solver, facts: anytype, effects: []const Effect, comptime representations: bool) void {
         if (representations) self.scanRepresentationsForward(facts, effects) else self.scanEffectsForward(facts, effects);
     }
 
@@ -340,14 +268,18 @@ pub const Solver = struct {
         self.remapEdgeRepresentations(self.edge_representation_scratch, edge);
         GenerationBits.copy(self.edge_scratch, self.blockSet(self.available_out, edge.predecessor));
         self.remapEdgeAvailability(self.edge_scratch, edge);
-        for (self.edge_representation_scratch, 0..) |representation, generation_index| {
-            if (!GenerationBits.contains(self.edge_scratch, @fromBackingInt(@intCast(generation_index)))) continue;
-            const value = representation orelse continue;
-            if (self.representation_scratch[generation_index]) |existing| {
-                if (self.blockArgumentValue(block_value, @fromBackingInt(@intCast(generation_index))) == null) {
-                    std.debug.assert(existing == value);
-                }
-            } else self.representation_scratch[generation_index] = value;
+        for (self.edge_scratch, 0..) |available_word, word_index| {
+            var remaining_word = available_word;
+            while (remaining_word != 0) {
+                const generation_index = word_index * 64 + @ctz(remaining_word);
+                remaining_word &= remaining_word - 1;
+                const value = self.edge_representation_scratch[generation_index] orelse continue;
+                if (self.representation_scratch[generation_index]) |existing| {
+                    if (self.blockArgumentValue(block_value, @fromBackingInt(@intCast(generation_index))) == null) {
+                        std.debug.assert(existing == value);
+                    }
+                } else self.representation_scratch[generation_index] = value;
+            }
         }
     }
 
@@ -355,13 +287,16 @@ pub const Solver = struct {
         for (self.blocks, 0..) |_, block_index| {
             if (!self.reachable[block_index]) continue;
             const block_id: structures.FunctionBlockId = @fromBackingInt(@intCast(block_index));
-            for (self.generations, 0..) |_, generation_index| {
-                const generation: GenerationId = @fromBackingInt(@intCast(generation_index));
-                if (GenerationBits.contains(self.blockSet(self.available_in, block_id), generation)) {
-                    std.debug.assert(self.blockRepresentations(self.representations_in, block_id)[generation_index] != null);
-                }
-                if (GenerationBits.contains(self.blockSet(self.available_out, block_id), generation)) {
-                    std.debug.assert(self.blockRepresentations(self.representations_out, block_id)[generation_index] != null);
+            const available_sets = [_][]const u64{ self.blockSet(self.available_in, block_id), self.blockSet(self.available_out, block_id) };
+            const representations = [_][]const ?structures.FunctionValueId{ self.blockRepresentations(self.representations_in, block_id), self.blockRepresentations(self.representations_out, block_id) };
+            for (available_sets, representations) |available, values| {
+                for (available, 0..) |available_word, word_index| {
+                    var remaining_word = available_word;
+                    while (remaining_word != 0) {
+                        const generation_index = word_index * 64 + @ctz(remaining_word);
+                        std.debug.assert(values[generation_index] != null);
+                        remaining_word &= remaining_word - 1;
+                    }
                 }
             }
         }
@@ -383,8 +318,8 @@ pub const Solver = struct {
         }
     }
 
-    fn scanRepresentationsForward(_: *const Solver, representations: []?structures.FunctionValueId, effects: []const LifetimeEffect) void {
-        for (effects) |effect| switch (effect) {
+    fn scanRepresentationsForward(_: *const Solver, representations: []?structures.FunctionValueId, effects: []const Effect) void {
+        for (effects) |effect| switch (effect.operation orelse continue) {
             .define => |definition| representations[@backingInt(definition.generation)] = definition.value,
             .use => {},
             .update => |update| representations[@backingInt(update.generation)] = update.cleanup_value,
@@ -428,8 +363,8 @@ pub const Solver = struct {
         };
     }
 
-    fn scanEffectsForward(_: *const Solver, available: []u64, effects: []const LifetimeEffect) void {
-        for (effects) |effect| switch (effect) {
+    fn scanEffectsForward(_: *const Solver, available: []u64, effects: []const Effect) void {
+        for (effects) |effect| switch (effect.operation orelse continue) {
             .define => |definition| GenerationBits.insert(available, definition.generation),
             .use, .update => {},
             .consume => |generation| GenerationBits.remove(available, generation),
@@ -512,18 +447,20 @@ pub const Solver = struct {
                 .predecessor = predecessor,
                 .successor_ordinal = successor_ordinal,
             } };
-            for (self.generations, 0..) |_, generation_index| {
-                const generation: GenerationId = @fromBackingInt(@intCast(generation_index));
-                if (!GenerationBits.contains(available, generation) or
-                    !GenerationBits.contains(demanded_on_some_edge, generation) or
-                    GenerationBits.contains(self.edge_scratch, generation)) continue;
-                try self.recordEnding(
-                    endings,
-                    generation,
-                    representations[generation_index] orelse unreachable,
-                    null,
-                    location,
-                );
+            for (available, demanded_on_some_edge, self.edge_scratch, 0..) |available_word, demanded_word, successor_word, word_index| {
+                var ending_word = available_word & demanded_word & ~successor_word;
+                while (ending_word != 0) {
+                    const generation_index = word_index * 64 + @ctz(ending_word);
+                    const generation: GenerationId = @fromBackingInt(@intCast(generation_index));
+                    try self.recordEnding(
+                        endings,
+                        generation,
+                        representations[generation_index] orelse unreachable,
+                        null,
+                        location,
+                    );
+                    ending_word &= ending_word - 1;
+                }
             }
             for (self.ownership_forwards[edge.mappings.start..edge.mappings.end]) |mapping| switch (mapping) {
                 .produce => |destination| {
@@ -544,7 +481,7 @@ pub const Solver = struct {
     fn planEffectsBackward(
         self: *Solver,
         demand: []u64,
-        effects: []const LifetimeEffect,
+        effects: []const Effect,
         boundary: ?BoundaryId,
         block: structures.FunctionBlockId,
         terminator: structures.FunctionTerminator,
@@ -553,7 +490,7 @@ pub const Solver = struct {
         var effect_index = effects.len;
         while (effect_index > 0) {
             effect_index -= 1;
-            switch (effects[effect_index]) {
+            switch (effects[effect_index].operation orelse continue) {
                 .define => |definition| {
                     if (GenerationBits.contains(demand, definition.generation)) {
                         GenerationBits.remove(demand, definition.generation);
@@ -828,8 +765,7 @@ pub const Solver = struct {
         endings: []const PlannedEnding,
         validate_existing: bool,
     ) void {
-        for (endings) |ending| {
-            if (!std.meta.eql(ending.location, location)) continue;
+        for (endingsAtLocation(location, endings)) |ending| {
             if (validate_existing and (ending.cleanup_condition == null or self.generations[@backingInt(ending.generation)].requires_explicit_drop))
                 std.debug.assert(GenerationBits.contains(open, ending.generation));
             GenerationBits.remove(open, ending.generation);
@@ -837,17 +773,28 @@ pub const Solver = struct {
     }
 
     fn hasEnding(generation: GenerationId, location: CleanupLocation, endings: []const PlannedEnding) bool {
-        for (endings) |ending| {
-            if (ending.generation == generation and std.meta.eql(ending.location, location)) return true;
+        for (endingsAtLocation(location, endings)) |ending| {
+            if (ending.generation == generation) return true;
         }
         return false;
     }
 
-    fn scanEffectsBackward(_: *const Solver, demand: []u64, effects: []const LifetimeEffect) void {
+    fn endingsAtLocation(location: CleanupLocation, endings: []const PlannedEnding) []const PlannedEnding {
+        const Compare = struct {
+            fn order(needle: CleanupLocation, ending: PlannedEnding) std.math.Order {
+                return std.math.order(compareLocations(needle, ending.location), @as(i2, 0));
+            }
+        };
+        const start = std.sort.lowerBound(PlannedEnding, endings, location, Compare.order);
+        const end = start + std.sort.upperBound(PlannedEnding, endings[start..], location, Compare.order);
+        return endings[start..end];
+    }
+
+    fn scanEffectsBackward(_: *const Solver, demand: []u64, effects: []const Effect) void {
         var effect_index = effects.len;
         while (effect_index > 0) {
             effect_index -= 1;
-            switch (effects[effect_index]) {
+            switch (effects[effect_index].operation orelse continue) {
                 .define => |definition| GenerationBits.remove(demand, definition.generation),
                 .use, .update => |use| GenerationBits.insert(demand, use.generation),
                 .consume => |generation| GenerationBits.insert(demand, generation),
@@ -902,7 +849,13 @@ fn testExpectLifetimePlan(
     defer gpa.free(boundaries);
     @memset(boundaries, .{ .span = .{ .start = 0, .end = 0 } });
     defer for (boundaries) |*boundary| boundary.effects.deinit(gpa);
-    for (boundaries, boundary_effects) |*boundary, effects| try boundary.effects.appendSlice(gpa, effects);
+    var next_effect_id: u32 = 0;
+    for (boundaries, boundary_effects) |*boundary, effects| {
+        for (effects) |effect| {
+            try boundary.effects.append(gpa, .{ .id = @fromBackingInt(next_effect_id), .operation = effect });
+            next_effect_id += 1;
+        }
+    }
 
     const blocks = try gpa.alloc(BuildBlock, block_descriptions.len);
     defer gpa.free(blocks);
@@ -921,7 +874,10 @@ fn testExpectLifetimePlan(
     };
     for (blocks, block_descriptions) |*block, description| {
         for (description.boundaries) |boundary| try block.items.append(gpa, .{ .boundary = @fromBackingInt(@intCast(boundary)) });
-        try block.terminator_effects.appendSlice(gpa, description.terminator_effects);
+        for (description.terminator_effects) |effect| {
+            try block.terminator_effects.append(gpa, .{ .id = @fromBackingInt(next_effect_id), .operation = effect });
+            next_effect_id += 1;
+        }
     }
 
     var endings: std.ArrayList(PlannedEnding) = .empty;
@@ -1083,11 +1039,6 @@ fn testExpectOwnershipJoinPlan(gpa: std.mem.Allocator) !void {
 }
 
 test "lifetime solver reaches a fixed point across continue and break" {
-    const generations = [_]Generation{testSolverGeneration(0, false)};
-    const boundaries = [_][]const LifetimeEffect{
-        &.{.{ .define = .{ .generation = @fromBackingInt(@intCast(0)), .value = @fromBackingInt(@intCast(10)) } }},
-        &.{.{ .use = .{ .generation = @fromBackingInt(@intCast(0)), .cleanup_value = @fromBackingInt(@intCast(11)) } }},
-    };
     const blocks = [_]TestSolverBlock{
         .{ .boundaries = &.{0}, .terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(1)), .arguments = .{ .start = 0, .end = 0 } } } },
         .{ .terminator = .{ .predicate_branch = .{
@@ -1105,11 +1056,26 @@ test "lifetime solver reaches a fixed point across continue and break" {
         .{ .predecessor = @fromBackingInt(@intCast(1)), .successor_ordinal = 1, .successor = @fromBackingInt(@intCast(3)), .mappings = .{ .start = 0, .end = 0 } },
         .{ .predecessor = @fromBackingInt(@intCast(2)), .successor_ordinal = 0, .successor = @fromBackingInt(@intCast(1)), .mappings = .{ .start = 0, .end = 0 } },
     };
-    try testExpectLifetimePlan(std.testing.allocator, &generations, &boundaries, &blocks, &.{}, &.{}, &edges, .{ .cleanups = &.{.{
-        .generation = @fromBackingInt(@intCast(0)),
-        .cleanup_value = @fromBackingInt(@intCast(10)),
-        .location = .{ .edge = .{ .predecessor = @fromBackingInt(@intCast(1)), .successor_ordinal = 1 } },
-    }} });
+    for ([_]usize{ 1, 65, 130 }) |count| {
+        var generations: [130]Generation = undefined;
+        var definitions: [130]LifetimeEffect = undefined;
+        var uses: [130]LifetimeEffect = undefined;
+        var cleanups: [130]PlannedEnding = undefined;
+        for (0..count) |index| {
+            const generation: GenerationId = @fromBackingInt(@intCast(index));
+            const value: structures.FunctionValueId = @fromBackingInt(@intCast(index + 10));
+            generations[index] = testSolverGeneration(@intCast(index), false);
+            definitions[index] = .{ .define = .{ .generation = generation, .value = value } };
+            uses[index] = .{ .use = .{ .generation = generation, .cleanup_value = @fromBackingInt(@intCast(index + 1000)) } };
+            cleanups[count - 1 - index] = .{
+                .generation = generation,
+                .cleanup_value = value,
+                .location = .{ .edge = .{ .predecessor = @fromBackingInt(1), .successor_ordinal = 1 } },
+            };
+        }
+        const boundaries = [_][]const LifetimeEffect{ definitions[0..count], uses[0..count] };
+        try testExpectLifetimePlan(std.testing.allocator, generations[0..count], &boundaries, &blocks, &.{}, &.{}, &edges, .{ .cleanups = cleanups[0..count] });
+    }
 }
 
 test "lifetime solver propagates through reordered blocks and ignores unreachable predecessors" {
@@ -1285,6 +1251,39 @@ fn testEndingDeduplication(gpa: std.mem.Allocator) !void {
                 .cleanup_condition = generations[@backingInt(ending.generation)].cleanup_condition,
                 .location = ending.location,
             }, actual);
+            const matches = Solver.endingsAtLocation(ending.location, endings.items);
+            var match_count: usize = 0;
+            var expected_open: u64 = 3;
+            for (endings.items) |candidate| {
+                if (!std.meta.eql(candidate.location, ending.location)) continue;
+                try std.testing.expect(match_count < matches.len);
+                try std.testing.expectEqualDeep(candidate, matches[match_count]);
+                match_count += 1;
+                expected_open &= ~(@as(u64, 1) << @intCast(@backingInt(candidate.generation)));
+            }
+            try std.testing.expectEqual(match_count, matches.len);
+            var open = [_]u64{3};
+            solver.applyEndings(&open, ending.location, endings.items, true);
+            try std.testing.expectEqual(expected_open, open[0]);
+            for (0..generations.len) |generation_index| {
+                const generation: GenerationId = @fromBackingInt(@intCast(generation_index));
+                try std.testing.expectEqual(!GenerationBits.contains(&open, generation), Solver.hasEnding(generation, ending.location, endings.items));
+            }
         }
+        const absent_locations = [_]CleanupLocation{
+            .{ .boundary = @fromBackingInt(2) },
+            .{ .edge = .{ .predecessor = @fromBackingInt(1), .successor_ordinal = 0 } },
+            .{ .block_entry = @fromBackingInt(0) },
+            .{ .block_entry = @fromBackingInt(2) },
+        };
+        for (absent_locations) |location| {
+            try std.testing.expectEqual(0, Solver.endingsAtLocation(location, endings.items).len);
+            try std.testing.expect(!Solver.hasEnding(@fromBackingInt(0), location, endings.items));
+            var open = [_]u64{3};
+            solver.applyEndings(&open, location, endings.items, true);
+            try std.testing.expectEqual(3, open[0]);
+        }
+        try std.testing.expectEqual(0, Solver.endingsAtLocation(expected[0].location, &.{}).len);
+        try std.testing.expectEqual(0, Solver.endingsAtLocation(expected[0].location, endings.items[2..]).len);
     }
 }

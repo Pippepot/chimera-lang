@@ -4,6 +4,374 @@ const testing = std.testing;
 
 const Fixture = sources.SourceFixture;
 
+const ConversionConsumer = struct {
+    pub const Input = struct { consumer: u32, request: sources.queries.ConversionCandidates.Input };
+    pub const Output = usize;
+
+    pub fn run(ctx: anytype, key: Input) !Output {
+        return ((try ctx.get(sources.queries.ConversionCandidates, key.request)).* orelse return error.TestUnexpectedResult).len;
+    }
+};
+
+fn conversionType(db: *sources.query.Database, file: sources.structures.FileId, name: []const u8) !sources.structures.TypeId {
+    const scope = (try db.get(sources.queries.BuildModuleScope, file)).*.?;
+    const value = (try db.get(sources.queries.ResolveStatic, scope.resolveStatic(name).?)).*.?;
+    return (try db.lookupInterned(sources.queries.CompileTimeValues, value)).type;
+}
+
+test "conversion matching shares work and isolates unrelated index and header edits" {
+    const original =
+        \\struct Source
+        \\    value: int
+        \\struct Target
+        \\    value: int
+        \\converter(value: Source) Target where 1 == 1 -> Target{value = value.value}
+    ;
+    var profile: sources.profiling.Collector = .{ .io = testing.io };
+    const db = try sources.query.Database.init(testing.allocator, .{ .worker_count = 2, .profile = &profile });
+    defer db.deinit();
+    try sources.modules.registerSources(db, testing.allocator, original, &.{}, &.{});
+    const request: sources.queries.ConversionCandidates.Input = .{
+        .source = .{ .typed = try conversionType(db, 0, "Source") },
+        .target = try conversionType(db, 0, "Target"),
+        .requester = (try db.input(sources.queries.FileModule, 0)).*,
+    };
+    const before = profile.snapshot().get(.conversion_matching).runs;
+    for (0..16) |consumer| try testing.expectEqual(@as(usize, 1), (try db.get(ConversionConsumer, .{ .consumer = @intCast(consumer), .request = request })).*);
+    try testing.expectEqual(before + 1, profile.snapshot().get(.conversion_matching).runs);
+
+    const unrelated = original ++ "\nstruct Other\n    value: int\nconverter(value: Other) Target -> Target{value = value.value}\nstatic unrelated = 0\n";
+    try db.setInput(sources.queries.SourceText, 0, unrelated);
+    try testing.expectEqual(@as(usize, 1), (try db.get(ConversionConsumer, .{ .consumer = 16, .request = request })).*);
+    try testing.expectEqual(before + 1, profile.snapshot().get(.conversion_matching).runs);
+
+    const body_edit = try std.mem.replaceOwned(u8, testing.allocator, unrelated, "value = value.value}", "value = value.value + 1}");
+    defer testing.allocator.free(body_edit);
+    try db.setInput(sources.queries.SourceText, 0, body_edit);
+    try testing.expectEqual(@as(usize, 1), (try db.get(ConversionConsumer, .{ .consumer = 17, .request = request })).*);
+    try testing.expectEqual(before + 1, profile.snapshot().get(.conversion_matching).runs);
+
+    const constraint_edit = try std.mem.replaceOwned(u8, testing.allocator, body_edit, "where 1 == 1", "where 1 == 2");
+    defer testing.allocator.free(constraint_edit);
+    try db.setInput(sources.queries.SourceText, 0, constraint_edit);
+    try testing.expectEqual(@as(usize, 1), (try db.get(ConversionConsumer, .{ .consumer = 18, .request = request })).*);
+    try testing.expectEqual(before + 1, profile.snapshot().get(.conversion_matching).runs);
+
+    try db.setInput(sources.queries.SourceText, 0, unrelated ++ "\nconverter(value: Source) Target -> Target{value = 42}\n");
+    try testing.expectEqual(@as(usize, 2), (try db.get(ConversionConsumer, .{ .consumer = 19, .request = request })).*);
+    try testing.expectEqual(before + 2, profile.snapshot().get(.conversion_matching).runs);
+    try db.setInput(sources.queries.SourceText, 0, original);
+    try testing.expectEqual(@as(usize, 1), (try db.get(ConversionConsumer, .{ .consumer = 20, .request = request })).*);
+
+    var missing = request;
+    missing.source = .{ .typed = .bool };
+    try testing.expectEqual(@as(usize, 0), (try db.get(ConversionConsumer, .{ .consumer = 21, .request = missing })).*);
+    try db.setInput(sources.queries.SourceText, 0, original ++ "\nconverter(value: bool) Target -> Target{value = 42}\n");
+    try testing.expectEqual(@as(usize, 1), (try db.get(ConversionConsumer, .{ .consumer = 22, .request = missing })).*);
+}
+
+test "conversion caches retain requester visibility and refresh published converters" {
+    const declaration =
+        \\pub struct Source
+        \\    value: int
+        \\pub struct Target
+        \\    value: int
+        \\converter(value: Source) Target -> Target{value = value.value}
+    ;
+    const fixture = try Fixture.initFiles("import lib.{Source, Target}", &.{.{ .path = "lib/types.chi", .module_path = "lib", .source = declaration }});
+    defer fixture.deinit();
+    const db = fixture.db;
+    var request: sources.queries.ConversionCandidates.Input = .{
+        .source = .{ .typed = try conversionType(db, 1, "Source") },
+        .target = try conversionType(db, 1, "Target"),
+        .requester = (try db.input(sources.queries.FileModule, 0)).*,
+    };
+    try testing.expectEqual(@as(usize, 0), (try db.get(sources.queries.ConversionCandidates, request)).*.?.len);
+    request.requester = (try db.input(sources.queries.FileModule, 1)).*;
+    try testing.expectEqual(@as(usize, 1), (try db.get(sources.queries.ConversionCandidates, request)).*.?.len);
+    request.requester = (try db.input(sources.queries.FileModule, 0)).*;
+    const published = try std.mem.replaceOwned(u8, testing.allocator, declaration, "converter(", "pub converter(");
+    defer testing.allocator.free(published);
+    try db.setInput(sources.queries.SourceText, 1, published);
+    try testing.expectEqual(@as(usize, 1), (try db.get(sources.queries.ConversionCandidates, request)).*.?.len);
+    try db.setInput(sources.queries.SourceText, 1, declaration);
+    try testing.expectEqual(@as(usize, 0), (try db.get(sources.queries.ConversionCandidates, request)).*.?.len);
+}
+
+test "static conversion matches specialize by canonical source value" {
+    const fixture = try Fixture.init(
+        \\struct Target
+        \\    value: int
+        \\converter(static value: int_literal) Target -> Target{value = int(value)}
+    );
+    defer fixture.deinit();
+    const db = fixture.db;
+    const target = try conversionType(db, 0, "Target");
+    const module = (try db.input(sources.queries.FileModule, 0)).*;
+    var instances: [2]sources.structures.InstanceId = undefined;
+    for (&instances, 0..) |*instance, index| {
+        const value = try db.intern(sources.queries.CompileTimeValues, .{ .runtime = .{ .type_id = .int_literal, .value = .{ .int_literal = @intCast(index) } } });
+        const candidates = (try db.get(sources.queries.ConversionCandidates, .{ .source = .{ .constant = value }, .target = target, .requester = module })).*.?;
+        try testing.expectEqual(@as(usize, 1), candidates.len);
+        instance.* = candidates[0].instance;
+    }
+    try testing.expect(!std.meta.eql(instances[0], instances[1]));
+}
+
+test "converter indexing leaves unrelated computed annotations unevaluated" {
+    try Fixture.expectParity(
+        \\struct Source
+        \\    value: int
+        \\struct Other
+        \\struct Target
+        \\    value: int
+        \\func computed() type -> panic "index must not evaluate this annotation"
+        \\converter(value: Other) computed() -> panic "unrelated converter"
+        \\converter(value: Source) Target -> Target{value = value.value}
+        \\func run() int -> Target(Source{value = 42}).value
+    , 42);
+    try Fixture.expectParity(
+        \\struct Source
+        \\    value: int
+        \\struct Target
+        \\    value: int
+        \\converter(value: Source) Target | never -> Target{value = value.value}
+        \\func run() int -> Target(Source{value = 42}).value
+    , 42);
+}
+
+test "conversion members expose declared callables without executing bodies" {
+    try Fixture.expectParity(
+        \\struct Source
+        \\    copy = none
+        \\struct Target
+        \\    copy = none
+        \\converter(imm value: Source) Target -> panic "lookup must not execute this body"
+        \\func accepts(static T: type, static U: type) int
+        \\where T.U is func(imm T) U
+        \\where T.copy is func(imm T) T or not (T.copy is func(imm T) T)
+        \\    return 42
+        \\func run() int -> accepts(Source, Target)
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func accepts(imm value: int) int where value > 0 -> 42
+        \\exit(accepts(1))
+    , .comptime_runtime_capture);
+}
+
+test "conversion members are callable values at runtime and compile time" {
+    try Fixture.expectParity(
+        \\struct Source
+        \\    value: int
+        \\struct Target
+        \\    value: int
+        \\converter(imm value: Source) Target -> Target{value = value.value + 1}
+        \\func apply(callback: func(imm Source) Target, imm value: Source) int -> callback(value).value
+        \\static answer = Source.Target(Source{value = 40}).value
+        \\func run() int -> apply(Source.Target, Source{value = answer})
+    , 42);
+}
+
+test "conversion members resolve target aliases and generic specializations" {
+    try Fixture.expectParity(
+        \\struct Source(T: type)
+        \\    value: T
+        \\struct Target(T: type)
+        \\    value: T
+        \\converter(static T: type, imm value: Source(T)) Target(T) -> Target(T){value = value.value}
+        \\static Destination = Target(int)
+        \\func apply(static T: type, static U: type, imm value: T) U
+        \\where T.U is func(imm T) U
+        \\    return T.U(value)
+        \\func run() int -> apply(Source(int), Destination, Source(int){value = 42}).value
+    , 42);
+}
+
+test "conversion member calls retain source borrows and reject escaping results" {
+    const declarations =
+        \\struct Source
+        \\    copy = none
+        \\    value: Ref(int)
+        \\struct Target
+        \\    value: Ref(int)
+        \\converter(imm value: Source) Target -> Target{value = value.value}
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    var value = 42
+        \\    const source = Source{value = Ref.from(value)}
+        \\    const convert: func(imm Source) Target = Source.Target
+        \\    const result = convert(source)
+        \\    return source.value.value + result.value.value - 42
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() Target
+        \\    var value = 42
+        \\    return Source.Target(Source{value = Ref.from(value)})
+        \\exit(invalid().value.value)
+    , .borrow_outlives_source);
+}
+
+test "conversion members preserve initializer parameter modes" {
+    try Fixture.expectParity(
+        \\struct Target
+        \\    value: int
+        \\converter(static N: int, init value: collection_literal(int, N)) Target
+        \\    const values: Array(int, N) = value
+        \\    if const first = values[0] -> return Target{value = first}
+        \\    panic "empty source"
+        \\static Source = collection_literal(int, 1)
+        \\func accepts() int where Source.Target is func(init Source) Target -> 42
+        \\func run() int -> Source.Target([accepts()]).value
+    , 42);
+}
+
+test "conversion members require concrete values for static source specialization" {
+    try Fixture.expectParity(
+        \\static struct Source
+        \\    copy = trivial
+        \\    value: int
+        \\struct Target
+        \\    value: int
+        \\converter(static value: Source) Target -> Target{value = value.value}
+        \\func accepts() int where not (Source.Target is func(imm Source) Target) -> 42
+        \\func run() int -> Target(Source{value = accepts()}).value
+    , 42);
+}
+
+test "ordinary members take precedence over conversion target names" {
+    try Fixture.expectParity(
+        \\struct Target
+        \\    value: int
+        \\static Destination = Target
+        \\struct Source
+        \\    value: int
+        \\    func Target(imm value: Source) int -> 7
+        \\converter(imm value: Source) Target -> Target{value = value.value}
+        \\func run() int
+        \\    const value = Source{value = 35}
+        \\    return Source.Target(value) + Source.Destination(value).value
+    , 42);
+}
+
+test "conversion members retain actual parameter types and do not synthesize adapters" {
+    try Fixture.expectParity(
+        \\struct Source
+        \\struct Other
+        \\struct Target
+        \\converter(imm value: Source | Other) Target -> Target{}
+        \\static Inputs = Source | Other
+        \\static Destination = Target | none
+        \\func accepts() int
+        \\where Source.Target is func(imm Source | Other) Target
+        \\where Inputs.Target is func(imm Inputs) Target
+        \\where not (Source.Target is func(imm Source) Target)
+        \\where not (Source.Destination is func(imm Source) Destination)
+        \\where not (int.int is func(imm int) int)
+        \\where not (String.String is func(imm String) String)
+        \\    return 42
+        \\func run() int -> accepts()
+    , 42);
+}
+
+test "conversion member constraints fail without running bodies" {
+    try Fixture.expectParity(
+        \\struct Source
+        \\struct Target
+        \\converter(imm value: Source) Target where 1 == 2 -> panic "body must not run"
+        \\func accepts() int where not (Source.Target is func(imm Source) Target) -> 42
+        \\func run() int -> accepts()
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Source
+        \\struct Target
+        \\converter(imm value: Source) Target where 1 == 2 -> Target{}
+        \\func accepts(static T: type) int where T.Target is func(imm T) Target -> 42
+        \\exit(accepts(Source))
+    , .where_condition_failed);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Source
+        \\struct Target
+        \\converter(imm value: Source) Target where 1 == 2 -> Target{}
+        \\_ = Source.Target
+    , .where_condition_failed);
+    try Fixture.expectAnySourceDiagnostic(
+        \\struct Source
+        \\struct Target
+        \\func valid() int -> panic "invalid converter constraint"
+        \\converter(imm value: Source) Target where valid() > 0 -> Target{}
+        \\func accepts() int where not (Source.Target is func(imm Source) Target) -> 42
+        \\exit(accepts())
+    , .compile_time_panic);
+}
+
+test "conversion members reject ambiguity and do not chain converters" {
+    const declarations =
+        \\struct Source
+        \\struct Middle
+        \\struct Target
+        \\converter(imm value: Source) Middle -> Middle{}
+        \\converter(imm value: Middle) Target -> Target{}
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func accepts() int where not (Source.Target is func(imm Source) Target) -> 42
+        \\func run() int -> accepts()
+    , 42);
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\converter(imm value: Source) Target -> Target{}
+        \\converter(imm value: Source) Target -> Target{}
+        \\func accepts() int where not (Source.Target is func(imm Source) Target) -> 42
+        \\func run() int -> accepts()
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\converter(imm value: Source) Target -> Target{}
+        \\converter(imm value: Source) Target -> Target{}
+        \\exit(Source.Target(Source{}).Middle)
+    , .ambiguous_conversion);
+}
+
+test "where predicates still execute ordinary value conversions" {
+    try Fixture.expectParity(
+        \\func accepts() int where int(42) > 0 -> 42
+        \\func run() int -> accepts()
+    , 42);
+}
+
+test "conversion members follow owner visibility and incremental edits" {
+    const definition =
+        \\import std.text.{String}
+        \\pub struct Source
+        \\    copy = none
+        \\pub converter(imm value: Source) String where 1 == 1 -> "source"
+    ;
+    const fixture = try Fixture.initFiles(
+        \\import library.{Source}
+        \\func check(static T: type) int where T.String is func(imm T) String -> 42
+        \\exit(check(Source))
+    , &.{.{ .path = "library/source.chi", .module_path = "library", .source = definition }});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const rejected = try std.mem.replaceOwned(u8, testing.allocator, definition, "where 1 == 1", "where 1 == 2");
+    defer testing.allocator.free(rejected);
+    try fixture.db.setInput(sources.queries.SourceText, 1, rejected);
+    try fixture.expectDiagnostic(0, .where_condition_failed);
+    const private = try std.mem.replaceOwned(u8, testing.allocator, definition, "pub converter", "converter");
+    defer testing.allocator.free(private);
+    try fixture.db.setInput(sources.queries.SourceText, 1, private);
+    try fixture.expectDiagnostic(0, .where_condition_failed);
+    try fixture.db.setInput(sources.queries.SourceText, 1, definition);
+    try fixture.expectExit(0, 42);
+}
+
+test "conversion members diagnose circular constraints" {
+    try Fixture.expectAnySourceDiagnostic(
+        \\struct Source
+        \\converter(imm value: Source) String where Source.String is func(imm Source) String -> "source"
+        \\func accepts() int where Source.String is func(imm Source) String -> 42
+        \\exit(accepts())
+    , .declaration_cycle);
+}
+
 test "converter inputs preserve captured authority and results retain borrowed origins" {
     const install =
         \\struct Install
@@ -540,7 +908,171 @@ test "converter where is demanded only after selection" {
     , .where_condition_failed);
 }
 
-test "conversion does not chain or preconvert source variants" {
+test "variant conversion checks requirements and dispatches every member in both engines" {
+    try Fixture.expectParity(
+        \\struct First
+        \\    move = none
+        \\    copy = none
+        \\    value: int
+        \\struct Second
+        \\    copy = trivial
+        \\    value: int
+        \\converter(imm value: First) int -> value.value
+        \\converter(imm value: Second) int -> value.value
+        \\func number(static T: type, imm value: T) int -> int(value)
+        \\func first() First | Second | int -> First{value = 10}
+        \\func second() First | Second | int -> Second{value = 12}
+        \\func integer() First | Second | int -> 20
+        \\func run() int -> number(first()) + number(second()) + number(integer())
+    , 42);
+}
+
+test "variant conversion evaluates once borrows payloads and runs only the active converter" {
+    try Fixture.expectParity(
+        \\struct First
+        \\    move = none
+        \\    copy = none
+        \\    calls: Ref(int)
+        \\    drops: Ref(int)
+        \\    drop = func(deinit self: First) -> self.drops.value += 1
+        \\struct Second
+        \\    move = none
+        \\    copy = none
+        \\    calls: Ref(int)
+        \\    drops: Ref(int)
+        \\    drop = func(deinit self: Second) -> self.drops.value += 1
+        \\converter(imm value: First) int
+        \\    value.calls.value += 10
+        \\    return 19
+        \\converter(imm value: Second) int
+        \\    value.calls.value += 10
+        \\    return 23
+        \\func make(choose: bool, calls: Ref(int), drops: Ref(int)) First | Second
+        \\    calls.value += 1
+        \\    if choose? -> return First{calls = calls, drops = drops}
+        \\    return Second{calls = calls, drops = drops}
+        \\func run() int
+        \\    var calls = 0
+        \\    var drops = 0
+        \\    const total = int(make(true, Ref.from(calls), Ref.from(drops))) + int(make(false, Ref.from(calls), Ref.from(drops)))
+        \\    if calls <> 22 or drops <> 2 -> return 90
+        \\    return total
+    , 42);
+}
+
+test "whole variant converters take precedence over member dispatch" {
+    try Fixture.expectParity(
+        \\struct First
+        \\struct Second
+        \\struct Target
+        \\    value: int
+        \\converter(imm value: First) Target -> panic "member converter must not run"
+        \\converter(imm value: Second) Target -> panic "member converter must not run"
+        \\converter(imm value: First | Second) Target -> Target{value = 21}
+        \\func first() First | Second -> First{}
+        \\func second() First | Second -> Second{}
+        \\func run() int -> Target(first()).value + Target(second()).value
+    , 42);
+}
+
+test "variant conversion joins borrowed identity and owned results with exact cleanup" {
+    try Fixture.expectParity(
+        \\struct Source
+        \\    drops: Ref(int)
+        \\struct Target
+        \\    copy = none
+        \\    value: int
+        \\    drops: Ref(int)
+        \\    drop = func(deinit self: Target) -> self.drops.value += 1
+        \\converter(imm value: Source) Target -> Target{value = 19, drops = value.drops}
+        \\func inspect(imm value: Target) int -> value.value
+        \\func calculate(drops: Ref(int)) int
+        \\    const source: Source | Target = Source{drops = drops}
+        \\    const identity: Source | Target = Target{value = 23, drops = drops}
+        \\    const total = inspect(Target(source)) + inspect(Target(identity))
+        \\    if drops.value <> 1 -> return 90
+        \\    if ref selected = identity as Target
+        \\        if selected.value <> 23 -> return 92
+        \\    else
+        \\        return 93
+        \\    return total
+        \\func run() int
+        \\    var drops = 0
+        \\    const total = calculate(Ref.from(drops))
+        \\    if drops <> 2 -> return 91
+        \\    return total
+    , 42);
+}
+
+test "variant conversion constructs immovable results into bindings fields arguments and returns" {
+    try Fixture.expectParity(
+        \\struct First
+        \\struct Second
+        \\struct Pinned
+        \\    move = none
+        \\    copy = none
+        \\    value: int
+        \\struct Wrapper
+        \\    item: Pinned
+        \\converter(imm value: First) Pinned -> Pinned{value = 19}
+        \\converter(imm value: Second) Pinned -> Pinned{value = 23}
+        \\func make(choose: bool) First | Second -> if choose? -> First{} else Second{}
+        \\func convert(imm value: First | Second) Pinned -> value
+        \\func receive(var value: Pinned) int -> value.value
+        \\func run() int
+        \\    const first: Pinned = make(true)
+        \\    const wrapper = Wrapper{item = make(false)}
+        \\    if first.value + wrapper.item.value <> 42 -> return 90
+        \\    return receive(make(true)) + convert(make(false)).value
+    , 42);
+}
+
+test "diverging variant member conversions leave no result join" {
+    const declarations =
+        \\struct First
+        \\struct Second
+        \\converter(imm value: First) never -> exit(42)
+        \\converter(imm value: Second) never -> exit(42)
+        \\func stop(imm value: First | Second) never -> never(value)
+    ;
+    inline for (.{ "First{}", "Second{}" }) |constructor| {
+        try Fixture.expectParity(declarations ++ "\nfunc run() int\n    stop(" ++ constructor ++ ")\n", 42);
+    }
+}
+
+test "variant conversion combines member conversion and builtin widening" {
+    try Fixture.expectParity(
+        \\struct Source
+        \\converter(imm value: Source) bool -> true
+        \\func convert(imm value: Source | int) int | bool -> value
+        \\func run() int
+        \\    if const integer = convert(40) as int
+        \\        if const boolean = convert(Source{}) as bool
+        \\            if boolean? -> return integer + 2
+        \\    return 90
+    , 42);
+}
+
+test "variant conversion bodies reject missing ambiguous and constrained members" {
+    const declarations =
+        \\struct First
+        \\struct Second
+        \\converter(imm value: First) int -> 19
+        \\func check(imm value: First | Second) int -> int(value)
+    ;
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\nexit(check(First{}))", .local_type_mismatch);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\converter(imm value: Second) int where 1 == 2 -> 23
+        \\exit(check(First{}))
+    , .where_condition_failed);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+        \\converter(imm value: Second) int -> 23
+        \\converter(imm value: Second) int -> 24
+        \\exit(check(First{}))
+    , .ambiguous_conversion);
+}
+
+test "conversion does not chain converters for scalars or variant members" {
     const declarations =
         \\struct Source
         \\    copy = trivial
@@ -556,23 +1088,46 @@ test "conversion does not chain or preconvert source variants" {
         \\
     ;
     try Fixture.expectAnySourceDiagnostic(declarations ++ "const result: Target = Source{value = 42}\nexit(0)", .local_type_mismatch);
+    try Fixture.expectAnySourceDiagnostic(declarations ++ "const source: Source | Middle = Source{value = 42}\nconst result: Target = source\nexit(0)", .local_type_mismatch);
 }
 
-test "builtin widening competes with member converters" {
-    try Fixture.expectAnySourceDiagnostic(
+test "builtin widening preserves members before converters" {
+    try Fixture.expectParity(
         \\struct Source
-        \\    copy = trivial
+        \\    move = none
+        \\    copy = none
         \\    value: int
         \\struct Target
         \\    copy = trivial
         \\    value: int
-        \\converter(value: Source) Target -> Target{value = value.value}
-        \\const result: Source | Target = Source{value = 42}
-        \\exit(0)
-    , .ambiguous_conversion);
+        \\converter(value: Source) Target -> panic "widening must not run converters"
+        \\func run() int
+        \\    const result: Source | Target = Source{value = 42}
+        \\    if ref selected = result as Source -> return selected.value
+        \\    return 90
+    , 42);
+    try Fixture.expectParity(
+        \\func run() int
+        \\    const number = 10
+        \\    const literal = [10, "Hello", [1, 2, 3]]
+        \\    const bound = [number, "Hello", [1, 2, 3]]
+        \\    if const first = literal[0] as int
+        \\        if const second = bound[0] as int -> return first + second + 22
+        \\    return 90
+    , 42);
+    try Fixture.expectParity(
+        \\func render(value: int) String -> value
+        \\func accept(imm value: String) int -> value.byte_length()
+        \\func run() int
+        \\    const number = 10
+        \\    const bound: String = number
+        \\    const returned = render(number)
+        \\    const explicit = String(number)
+        \\    return bound.byte_length() + returned.byte_length() + explicit.byte_length() + accept(number) + 34
+    , 42);
 }
 
-test "converter lookup follows type ownership across unimported sibling files and privacy edits" {
+test "converter lookup follows type ownership across source annotation and privacy edits" {
     const source =
         \\import library.{Source, Target}
         \\const result: Target = Source{value = 42}
@@ -593,6 +1148,10 @@ test "converter lookup follows type ownership across unimported sibling files an
         .{ .path = "library/conversion.chi", .module_path = "library", .source = public },
     });
     defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(sources.queries.SourceText, 2, "pub converter(value: int) Target -> Target{value = value}");
+    try testing.expect((try fixture.db.get(sources.queries.BuildExecutable, 0)).* == null);
+    try fixture.db.setInput(sources.queries.SourceText, 2, public);
     try fixture.expectExit(0, 42);
     try fixture.db.setInput(sources.queries.SourceText, 2, private);
     try testing.expect((try fixture.db.get(sources.queries.BuildExecutable, 0)).* == null);

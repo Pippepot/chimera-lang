@@ -17,6 +17,10 @@ pub const Tokenizer = struct {
         var indent_levels = try std.ArrayList(u32).initCapacity(gpa, 8);
         indent_levels.appendAssumeCapacity(0);
 
+        return initialState(gpa, buffer, indent_levels);
+    }
+
+    fn initialState(gpa: std.mem.Allocator, buffer: []const u8, indent_levels: std.ArrayList(u32)) Tokenizer {
         return .{
             .gpa = gpa,
             .buffer = buffer,
@@ -25,6 +29,27 @@ pub const Tokenizer = struct {
             .at_line_start = true,
             .indent = 0,
             .indent_levels = indent_levels,
+        };
+    }
+
+    pub fn tokenizeComptime(comptime buffer: []const u8) []const Token {
+        return comptime blk: {
+            @setEvalBranchQuota(10_000_000);
+            if (buffer.len > std.math.maxInt(u32)) @compileError("embedded source is too large");
+            var indent_storage: [buffer.len + 1]u32 = undefined;
+            var indent_levels = std.ArrayList(u32).initBuffer(&indent_storage);
+            indent_levels.appendAssumeCapacity(0);
+            var scanner = initialState(std.heap.page_allocator, buffer, indent_levels);
+            var tokens: [buffer.len * 2 + 1]Token = undefined;
+            var count: usize = 0;
+            while (true) {
+                const token = scanner.next() catch |err| @compileError(@errorName(err));
+                tokens[count] = token;
+                count += 1;
+                if (token.tag == .eof) break;
+            }
+            const result = tokens[0..count].*;
+            break :blk &result;
         };
     }
 
@@ -111,7 +136,11 @@ pub const Tokenizer = struct {
         const current_indent = self.indent_levels.items[self.indent_levels.items.len - 1];
         if (self.indent > current_indent) {
             self.at_line_start = false;
-            try self.indent_levels.append(self.gpa, self.indent);
+            if (@inComptime()) {
+                self.indent_levels.appendAssumeCapacity(self.indent);
+            } else {
+                try self.indent_levels.append(self.gpa, self.indent);
+            }
             return Token{ .tag = .indent, .loc = .{ .start = self.index - self.indent, .end = self.index } };
         }
 

@@ -71,10 +71,18 @@ flowchart TD
     MD --> EC
     AB --> CF["CompileFunction(InstanceId) → ?CompiledFunction"]
     SP["SourcePath(FileId)"] --> CF
+    ST --> LS["SourceLineStarts(FileId)"]
+    LS --> CF
     VL["VariantLayout(TypeId)"] --> TL["HostTypeLayout(TypeId)"]
     SD --> SL["StructLayout(TypeId)"]
     SL --> TL
     SD --> OC["OwnershipCapabilities(TypeId)"]
+    SD --> BS["BorrowShape(TypeId)"]
+    BS --> AB
+    SD --> RC["RuntimeCapable(TypeId)"]
+    OC --> RC
+    RC --> CF
+    RC --> TL
     OC --> SL
     OC --> AB
     VL --> CF
@@ -87,11 +95,18 @@ flowchart TD
 ```
 
 1. `ParseFile` and `DiscoverItems` identify declarations and the synthetic entry. `IndexItems` interns identities; `ModuleDeclarations` checks names across current member files, and `IndexModuleItems` publishes source locations. Building effective file scope does not demand signatures or bodies. Duplicate declarations fail even when unused.
-2. Static resolution demands referenced declarations recursively. Direct type aliases and declared struct identities can resolve without interpretation. Other initializers, explicit `comptime` expressions, static arguments, and calls in type positions use `AnalyzeComptimeThunk` then `ExecuteComptimeThunk`; the site key includes specialization and optional expected type. `ExecuteComptimeCall` keys concrete calls by instance and canonical arguments, obtaining typed bodies from `AnalyzeComptimeFunctionBody`. Mutable calls also return canonical copy-back arguments. Repeated instance-and-argument recursion is diagnosed; changing-argument recursion and loops have no step limit. Execution failures retain instruction spans and call-site notes.
-3. `AnalyzeFunctionInstance` demands its signature, effective scope, definitions, and ownership capabilities, then builds typed SSA. Overload membership and candidate headers are separate cached facts; only the selected signature validates constraints. After deferred reference uses resolve, lifetime analysis plans cleanup, typing diagnoses explicit abandonment, and cleanup is materialized. A final reference check accounts for mutating destructors at their actual lowered positions before the body is published. All runtime instances use this same query, including unspecialized declarations; the synthetic entry supplies its own unit signature.
-4. `CompileFunction` demands the typed body and validates runtime eligibility, including initializer regions, before requesting host layouts; it does not compile callees. Layout consumes logical ownership validation. Codegen publishes machine code with symbolic instance references and call-site trace metadata derived from source paths and retained spans. Source or path edits refresh trace labels. Emission and assembly rendering use the same instruction descriptions.
+2. Static resolution demands referenced declarations recursively. Direct type aliases and declared struct identities can resolve without interpretation. Other initializers, explicit `comptime` expressions, static arguments, and calls in type positions use `ExecuteComptimeThunk`; the site key includes specialization and optional expected type. Static-only type calls use ordinary semantic call preparation and demand `ExecuteComptimeCall` directly; other sites first demand `AnalyzeComptimeThunk`. Forwarded static arguments and representable integer literals with an established expected type reuse canonical values without a thunk. `ExecuteComptimeCall` keys concrete calls by instance and canonical arguments, obtaining typed bodies from `AnalyzeComptimeFunctionBody`. Mutable calls also return canonical copy-back arguments. Repeated instance-and-argument recursion is diagnosed; changing-argument recursion and loops have no step limit. Execution failures retain instruction spans and call-site notes.
+3. `AnalyzeFunctionInstance` demands its signature, effective scope, definitions, and ownership capabilities, then builds typed SSA. Overload membership and candidate headers are separate cached facts; only the selected signature validates constraints. After deferred reference uses resolve, lifetime analysis plans cleanup, typing diagnoses explicit abandonment, and cleanup is materialized. A final reference check accounts for mutating destructors at their actual lowered positions before the body is published. All runtime instances use this same query, including unspecialized declarations; the synthetic entry supplies its own fallible unit signature.
+4. `CompileFunction` demands the typed body and validates runtime eligibility, including initializer regions, before requesting host layouts; it does not compile callees. Structural runtime capability is cached per type, while primitive layouts are derived directly. Layout consumes logical ownership validation. Codegen publishes machine code with symbolic instance references and call-site trace metadata derived from source paths, retained spans, and a shared per-file line-start index. Source or path edits refresh trace labels. Emission and assembly rendering use the same instruction descriptions.
 5. `ValidateModuleGraph` first validates imports, public exports, and converter declaration placement, ownership, and parameter shape throughout the dependency graph without compiling or evaluating any entry body. Reachability starts only at the designated entry and compiles each referenced instance once in breadth-first order, including recursive graphs. The linker consumes that order, lays out artifacts, and patches relocations. When panic is reachable, it also resolves trace metadata and links the shared panic reporter. Unreachable function bodies stay unanalyzed.
 6. The CLI handles a transitive compile-time `exit` control outcome without producing an executable, otherwise renders transitive diagnostics or optional AST/SSA/assembly/timing views, writes the executable through `src/runtime.zig`, and runs it through a private hard link to the published inode (or a private copy on filesystems without hard links). SSA debug output uses the same reachable set. The CLI registers the entry directory tree plus the embedded `std` sources and uses two workers by default where available. Module validation prefetches independent file queries, and reachability prefetches referenced function compilation.
+
+Reference-effect requests first use signature and cached borrow-shape facts to
+exclude impossible effects. `InferReferenceContract` derives acyclic summaries
+from cached typed bodies. A query cycle activates direct-callee discovery and
+fixed-point inference within the root's recursive component; contract-only passes
+do not freeze unused IR. The separate contract result retains its invalidation
+boundary when body edits leave the summary unchanged.
 
 Each demanded evaluation owns a logical heap shared by transient nested calls and
 initializer regions. Resolved result and mutable-parameter types participate in
@@ -105,8 +120,35 @@ publication boundary. Evaluation-local handles never enter interners or snapshot
 storage escape is diagnosed at its consuming expression. Compiler exit has no
 copy-back consumer, and infrastructure OOM leaves execution retryable.
 
-Known expected types discover conversions through the existing source/target
-owner module declarations and specialize through normal function signatures.
+Collection static expansion demands `ExecuteStaticIteration` for each static
+source and condition thunks for static filters. Their keys include canonical
+lexical bindings as well as the owning specialization. Iteration snapshots items
+through a private interpreter callback while the source, cursor, and poll carrier
+are still live; ordinary loop cleanup runs before the query publishes the interned
+item tuple. Generated types and callable references retain lexical environments
+in their identities. Runtime collection construction remains inside ordinary body
+analysis and initializer regions. Static environment intern values participate in
+snapshot serialization and ID validation; no evaluation-local heap handle is
+published.
+
+Static clause environments also record unavailable runtime names without their
+data. Semantic lowering reports a capture when it reaches such a name, allowing
+nested excluded items to remain unanalyzed.
+
+An `init collection_sequence(T)` parameter prepares a List construction region
+with recoverable bracket allocation. The parameter type carries this policy
+through callable values and initializer forwarding. Its logical List field maps
+reference origins between the carrier and the constructed result; the carrier
+itself has no runtime representation.
+
+Known expected types discover conversions through indexed source/target owner
+module declarations. Header summaries build sorted converter-only buckets;
+visibility-filtered bucket queries preserve dependencies on absent candidates.
+`ConversionCandidates` caches source/target matching with requester visibility,
+canonical static values, and target-first collection shapes in its key.
+`ConverterMatch` shares declaration probes across requesters. Both successful
+and empty candidate sets are disk-cache fingerprint boundaries; ordinary
+signature queries still validate the selected converter's constraints.
 Imports do not control the candidate set. Generic argument inference types full
 expressions without executing conversions; executable arguments and their
 selected conversions then evaluate left to right. For frame-local static-only
@@ -133,10 +175,19 @@ The CLI labels loaded ASTs and reachable SSA/assembly functions with their sourc
 paths. Timing follows normal demand and never analyzes unused bodies.
 Timing rows are dependency-inclusive wall-clock intervals: `validate modules`
 covers module-graph validation; `analyze entry` covers entry selection and entry
-body analysis; `compile reachable functions (includes callee analysis)` covers
+body analysis; `compile reachable functions` covers
 reachable compilation, including any callee typing it demands. These are not
 exclusive per-stage totals, and compile-time work is charged to the interval
 that first demands it.
+
+The timing tree's children record exclusive worker elapsed time, subtracting
+nested query and phase work. Body analysis groups expression construction,
+typing/SSA, reference/lifetime analysis and cleanup, IR finalization, and body
+setup/publication. Dependency waiting/dispatch is separate from query self-time.
+Query and function counts describe actual computations, not memo hits; phase
+and dependency-request counts are invocations. Worker sums can exceed parent
+wall time during parallel execution. Profiling is opt-in and adds measurement
+overhead; it does not create semantic query dependencies or change results.
 
 ## Revisions and failures
 
@@ -171,7 +222,8 @@ Most compiler queries return `?Output`: `null` propagates source rejection or un
 | Source bytes | Database input; replaced by `setInput` |
 | Item names, canonical variants, callable signatures, compile-time values, and value tuples | Database interners; valid for the session |
 | AST, indexes, scopes, signatures, IR, artifacts, reachability, executable bytes | Cached outputs; valid until replacement or database destruction |
-| Expression graph, borrowed source spellings, typing and traversal scratch | One query run; freed before publication |
+| Expression graph and borrowed source spellings | One query run; freed before publication |
+| Typing construction graphs, nested initializer regions, persistent flow versions, and lifetime scratch | One body-analysis workspace; the structural result is copied out before releasing the workspace |
 | Logical allocations, element cells, references, and initializer captures | One evaluation session; backing released on deallocation, compiler identities freed on every session outcome |
 | Dependency edges and diagnostics | Entry-owned; committed or discarded with recomputation |
 | `./prog` | Atomically published executable bytes; independent of database lifetime |

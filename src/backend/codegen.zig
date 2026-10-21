@@ -10,8 +10,27 @@ const linux_munmap_syscall: i32 = 11;
 pub const TraceSource = struct {
     path: []const u8,
     source: []const u8,
+    line_starts: []const usize = &.{},
     name: []const u8,
     fallback_span: structures.SourceSpan,
+
+    fn location(source: TraceSource, offset: usize) struct { line: usize, column: usize } {
+        std.debug.assert(offset <= source.source.len);
+        if (source.line_starts.len == 0) {
+            const prefix = source.source[0..offset];
+            return .{
+                .line = std.mem.count(u8, prefix, "\n") + 1,
+                .column = offset - (if (std.mem.lastIndexOfScalar(u8, prefix, '\n')) |index| index + 1 else 0) + 1,
+            };
+        }
+        var lower: usize = 0;
+        var upper = source.line_starts.len;
+        while (lower + 1 < upper) {
+            const middle = lower + (upper - lower) / 2;
+            if (source.line_starts[middle] <= offset) lower = middle else upper = middle;
+        }
+        return .{ .line = lower + 1, .column = offset - source.line_starts[lower] + 1 };
+    }
 };
 
 const Elf64Header = extern struct {
@@ -63,13 +82,13 @@ const indirect_layout: structures.TypeLayout = .{ .byte_size = @sizeOf(u64), .by
 const initializer_layout: structures.TypeLayout = .{ .byte_size = 16, .byte_alignment = 8 };
 const zero_sized_address_layout: structures.TypeLayout = .{ .byte_size = 1, .byte_alignment = 1 };
 
-fn argumentByAddress(types: anytype, argument: structures.FunctionBlockArgument) !bool {
-    return argument.representation == .storage or (argument.representation == .value and try types.facts().argumentPassing(argument.type_id) == .indirect);
-}
+const ArgumentLayout = struct { storage: structures.TypeLayout, indirect: bool };
 
-fn argumentLayout(types: anytype, argument: structures.FunctionBlockArgument) !structures.TypeLayout {
-    if (argument.representation == .initializer) return initializer_layout;
-    return if (try argumentByAddress(types, argument)) indirect_layout else try types.layout(argument.type_id);
+fn argumentLayout(types: anytype, argument: structures.FunctionBlockArgument) !ArgumentLayout {
+    if (argument.representation == .initializer) return .{ .storage = initializer_layout, .indirect = false };
+    if (argument.representation == .storage or try types.facts().argumentPassing(argument.type_id) == .indirect)
+        return .{ .storage = indirect_layout, .indirect = true };
+    return .{ .storage = try types.layout(argument.type_id), .indirect = false };
 }
 
 fn initializerSlotLayout(captures: structures.FunctionValueRange) error{FunctionTooLarge}!structures.TypeLayout {
@@ -127,7 +146,7 @@ fn branchStorageEnd(ssa: *const structures.FunctionBodyAnalysis, types: anytype,
     const target = ssa.blocks[@backingInt(branch.target)];
     var end = start;
     for (ssa.block_arguments[target.argument_start..target.argument_end]) |argument| {
-        _ = try reserveStack(&end, try argumentLayout(types, argument));
+        _ = try reserveStack(&end, (try argumentLayout(types, argument)).storage);
     }
     return end;
 }
@@ -146,8 +165,9 @@ const CallLayout = struct {
             break :blk if (try types.facts().argumentPassing(return_type) == .indirect) .{ .indirect = offset } else .{ .stack = offset };
         } else .eax;
         for (parameters, arguments) |parameter, *argument| {
-            const offset = try reserveStack(&end, try argumentLayout(types, parameter));
-            argument.* = if (try argumentByAddress(types, parameter)) .{ .indirect = offset } else .{ .stack = offset };
+            const layout = try argumentLayout(types, parameter);
+            const offset = try reserveStack(&end, layout.storage);
+            argument.* = if (layout.indirect) .{ .indirect = offset } else .{ .stack = offset };
         }
         return .{ .result = result, .arguments = arguments, .storage_end = end };
     }
@@ -301,14 +321,11 @@ const LocationPlan = struct {
             for (terminator.operands()) |operand| if (operand) |value| {
                 needed[@backingInt(value.*)] = .used;
             };
-            switch (terminator) {
-                .branch => |branch| markBranchArguments(ssa, branch, needed, addressable),
-                .predicate_branch => |predicate| {
-                    markBranchArguments(ssa, predicate.then_branch, needed, addressable);
-                    markBranchArguments(ssa, predicate.else_branch, needed, addressable);
-                },
-                .fallible_call => |fallible| markCallArguments(ssa, fallible.call, needed, addressable),
-                .return_unit, .return_value, .return_failure, .diverge => {},
+            for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
+                markBranchArguments(ssa, branch.*, needed, addressable);
+            };
+            if (terminator == .fallible_call) {
+                markCallArguments(ssa, terminator.fallible_call.call, needed, addressable);
             }
         }
         for (ssa.blocks) |block| {
@@ -340,14 +357,12 @@ const LocationPlan = struct {
             else => {},
         };
         var edge_scratch_end = outgoing_size;
-        for (ssa.blocks) |block| switch (block.terminator) {
-            .branch => |branch| edge_scratch_end = @max(edge_scratch_end, try branchStorageEnd(ssa, types, branch, outgoing_size)),
-            .predicate_branch => |predicate| {
-                edge_scratch_end = @max(edge_scratch_end, try branchStorageEnd(ssa, types, predicate.then_branch, outgoing_size));
-                edge_scratch_end = @max(edge_scratch_end, try branchStorageEnd(ssa, types, predicate.else_branch, outgoing_size));
-            },
-            else => {},
-        };
+        for (ssa.blocks) |block| {
+            var terminator = block.terminator;
+            for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
+                edge_scratch_end = @max(edge_scratch_end, try branchStorageEnd(ssa, types, branch.*, outgoing_size));
+            };
+        }
         const local_start = edge_scratch_end;
         const locations = try gpa.alloc(ValueLocation, ssa.valueCount());
         errdefer gpa.free(locations);
@@ -361,13 +376,13 @@ const LocationPlan = struct {
             if (block_index == entry_index) continue;
             for (block.argument_start..block.argument_end) |argument_index| {
                 if (needed[argument_index] == .unused) continue;
-                if (try argumentByAddress(types, ssa.block_arguments[argument_index])) {
-                    locations[argument_index] = .{ .indirect = try reserveStack(&local_end, indirect_layout) };
+                const layout = try argumentLayout(types, ssa.block_arguments[argument_index]);
+                if (layout.indirect) {
+                    locations[argument_index] = .{ .indirect = try reserveStack(&local_end, layout.storage) };
                     continue;
                 }
-                const layout = try argumentLayout(types, ssa.block_arguments[argument_index]);
-                if (layout.byte_size == 0 and !addressable[argument_index]) continue;
-                locations[argument_index] = .{ .stack = try reserveStack(&local_end, if (layout.byte_size == 0) zero_sized_address_layout else layout) };
+                if (layout.storage.byte_size == 0 and !addressable[argument_index]) continue;
+                locations[argument_index] = .{ .stack = try reserveStack(&local_end, if (layout.storage.byte_size == 0) zero_sized_address_layout else layout.storage) };
             }
         }
         for (ssa.instructions, locations[ssa.block_arguments.len..], 0..) |instruction, *location, instruction_index| {
@@ -393,25 +408,24 @@ const LocationPlan = struct {
                     } else break :location_blk .discarded,
                     else => {},
                 }
+                if (needed[value_index] == .unused and
+                    (instruction != .call or try types.facts().argumentPassing(value_types[value_index]) != .indirect))
+                    break :location_blk .discarded;
                 const layout = try valueSlotLayout(types, value_types[value_index]);
-                const indirect_return = try types.facts().argumentPassing(value_types[value_index]) == .indirect;
                 if (needed[value_index] == .returned and value_types[value_index] == .int and !addressable[value_index]) {
                     break :location_blk .eax;
                 }
-                if (needed[value_index] != .unused or (indirect_return and instruction == .call)) {
-                    if (layout.byte_size == 0) {
-                        if (addressable[value_index]) break :location_blk .{ .stack = try reserveStack(&local_end, zero_sized_address_layout) };
-                        break :location_blk .discarded;
-                    }
-                    break :location_blk .{ .stack = try reserveStack(&local_end, layout) };
+                if (layout.byte_size == 0) {
+                    if (addressable[value_index]) break :location_blk .{ .stack = try reserveStack(&local_end, zero_sized_address_layout) };
+                    break :location_blk .discarded;
                 }
-                break :location_blk .discarded;
+                break :location_blk .{ .stack = try reserveStack(&local_end, layout) };
             };
         }
         const entry = ssa.blocks[entry_index];
         for (entry.argument_start..entry.argument_end) |argument_index| {
             if (!addressable[argument_index]) continue;
-            if ((try argumentLayout(types, ssa.block_arguments[argument_index])).byte_size != 0) continue;
+            if ((try argumentLayout(types, ssa.block_arguments[argument_index])).storage.byte_size != 0) continue;
             locations[argument_index] = .{ .stack = try reserveStack(&local_end, zero_sized_address_layout) };
         }
         if (ssa.is_initializer_region) {
@@ -446,9 +460,9 @@ const LocationPlan = struct {
                 else => unreachable,
             };
             const offset = std.math.add(u32, caller_stack_offset, argument_stack_offset) catch return error.FunctionTooLarge;
-            try ensureAddressableStackRange(offset, layout.byte_size);
-            if (needed[argument_index] != .unused and layout.byte_size != 0) {
-                location.* = if (try argumentByAddress(types, parameter)) .{ .indirect = offset } else .{ .incoming_argument = offset };
+            try ensureAddressableStackRange(offset, layout.storage.byte_size);
+            if (needed[argument_index] != .unused and layout.storage.byte_size != 0) {
+                location.* = if (layout.indirect) .{ .indirect = offset } else .{ .incoming_argument = offset };
             }
         }
         return .{
@@ -590,21 +604,13 @@ fn FunctionEmitter(comptime Types: type) type {
                 const instruction = ssa.instructions[instruction_index];
                 const destination = self.locations[@backingInt(ssa.instructionValue(instruction_index))];
                 switch (instruction) {
-                    .const_int => |value| if (destination == .stack) {
-                        try self.encoder.immediate(.mov_eax, value);
-                        try self.storeResult(destination);
-                    },
-                    .const_byte => |value| if (destination == .stack) {
-                        try self.encoder.immediate(.mov_eax, value);
-                        try self.storeComponent(u8, destination, 0);
-                    },
-                    .const_bool => |value| if (destination == .stack) {
-                        try self.encoder.immediate(.mov_eax, @intFromBool(value));
-                        try self.storeResult(destination);
+                    inline .const_int, .const_byte, .const_bool => |value| if (destination == .stack) {
+                        try self.encoder.immediate(.mov_eax, if (@TypeOf(value) == bool) @intFromBool(value) else value);
+                        try self.storeComponent(if (@TypeOf(value) == u8) u8 else u32, destination, 0);
                     },
                     .const_unit, .const_none => {},
                     .const_type, .const_int_literal, .const_string_literal, .static_conversion => unreachable,
-                    .const_data => |data| try self.emitDataAddress(data, 0, destination),
+                    .const_static_string => |constant| try self.emitStaticString(constant, destination),
                     .const_storage_cursor => |cursor| {
                         if (cursor.data) |data| {
                             try self.emitDataAddress(data, cursor.offset, destination);
@@ -769,7 +775,7 @@ fn FunctionEmitter(comptime Types: type) type {
             }
             var scratch_end = self.edge_scratch_offset;
             for (arguments, 0..) |argument, argument_offset| {
-                const scratch_offset = try reserveStack(&scratch_end, try argumentLayout(self.types, ssa.block_arguments[target.argument_start + argument_offset]));
+                const scratch_offset = try reserveStack(&scratch_end, (try argumentLayout(self.types, ssa.block_arguments[target.argument_start + argument_offset])).storage);
                 const destination = self.locations[target.argument_start + argument_offset];
                 if (destination == .indirect) {
                     try self.loadArgumentAddress(argument);
@@ -781,7 +787,7 @@ fn FunctionEmitter(comptime Types: type) type {
             scratch_end = self.edge_scratch_offset;
             for (arguments, 0..) |_, argument_offset| {
                 const type_id = ssa.block_arguments[target.argument_start + argument_offset].type_id;
-                const scratch_offset = try reserveStack(&scratch_end, try argumentLayout(self.types, ssa.block_arguments[target.argument_start + argument_offset]));
+                const scratch_offset = try reserveStack(&scratch_end, (try argumentLayout(self.types, ssa.block_arguments[target.argument_start + argument_offset])).storage);
                 const destination = self.locations[target.argument_start + argument_offset];
                 if (destination == .indirect) {
                     try self.encoder.offset(.mov_rax_rsp, scratch_offset);
@@ -869,11 +875,8 @@ fn FunctionEmitter(comptime Types: type) type {
             if (@hasField(TypeView, "trace_source")) {
                 if (self.types.trace_source) |source| {
                     const span = self.current_span orelse source.fallback_span;
-                    std.debug.assert(span.start <= source.source.len);
-                    const prefix = source.source[0..span.start];
-                    const line = std.mem.count(u8, prefix, "\n") + 1;
-                    const column = prefix.len - (if (std.mem.lastIndexOfScalar(u8, prefix, '\n')) |index| index + 1 else 0) + 1;
-                    label = try self.gpa.print("  at {s} ({s}:{d}:{d})\n", .{ source.name, source.path, line, column });
+                    const location = source.location(span.start);
+                    label = try self.gpa.print("  at {s} ({s}:{d}:{d})\n", .{ source.name, source.path, location.line, location.column });
                 }
             }
             errdefer self.gpa.free(label);
@@ -1007,18 +1010,37 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.storeAddress(destination);
         }
 
+        fn emitStaticString(self: *Self, constant: structures.StaticStringConstant, destination: ValueLocation) !void {
+            if (destination == .discarded) return;
+            const base = switch (destination) {
+                .stack, .return_buffer => |offset| offset,
+                .discarded, .immediate, .eax, .incoming_argument, .indirect => unreachable,
+            };
+            const span_type = (try self.types.facts().staticStringBytes(constant.type_id)) orelse return error.Unavailable;
+            const bytes_offset = ((try self.types.structLayout(constant.type_id)) orelse return error.Unavailable).field_offsets[0];
+            const span_layout = (try self.types.structLayout(span_type)) orelse return error.Unavailable;
+            const data_offset = std.math.add(u32, base, bytes_offset + span_layout.field_offsets[0]) catch return error.FunctionTooLarge;
+            try self.emitDataAddress(constant.data, 0, if (destination == .stack) .{ .stack = data_offset } else .{ .return_buffer = data_offset });
+            try self.encoder.immediate(.mov_eax, std.math.cast(i32, (try self.types.byteString(constant.data)).len) orelse return error.TypeTooLarge);
+            try self.storeComponent(u32, destination, bytes_offset + span_layout.field_offsets[1]);
+        }
+
+        fn prepareElementOffset(self: *Self, index: structures.FunctionValueId, type_id: structures.TypeId) !bool {
+            const byte_size = (try self.types.layout(type_id)).byte_size;
+            if (byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
+            if (byte_size == 0) return false;
+            try self.loadComponent(u32, self.locations[@backingInt(index)], 0);
+            try self.encoder.emit(.movsxd_rcx_eax);
+            try self.encoder.immediate(.imul_rcx, @intCast(byte_size));
+            return true;
+        }
+
         fn emitCursorElement(self: *Self, operation: structures.CursorElement, destination: ValueLocation) !void {
             if (destination == .discarded) return;
             const element = (try self.types.facts().borrowElement(operation.type_id)) orelse (try self.types.facts().storageCursorAccess(operation.type_id)).?;
-            const layout = try self.types.layout(element);
-            if (layout.byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
-            if (layout.byte_size != 0) {
-                try self.loadComponent(u32, self.locations[@backingInt(operation.index)], 0);
-                try self.encoder.emit(.movsxd_rcx_eax);
-                try self.encoder.immediate(.imul_rcx, @intCast(layout.byte_size));
-            }
+            const has_offset = try self.prepareElementOffset(operation.index, element);
             try self.loadAddress(self.locations[@backingInt(operation.cursor)]);
-            if (layout.byte_size != 0) try self.encoder.emit(.add_rax_rcx);
+            if (has_offset) try self.encoder.emit(.add_rax_rcx);
             try self.storeAddress(destination);
         }
 
@@ -1227,28 +1249,16 @@ fn FunctionEmitter(comptime Types: type) type {
                 .indirect => |value| value,
                 else => unreachable,
             };
-            const layout = try self.types.layout(operation.type_id);
-            if (layout.byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
-            if (layout.byte_size != 0) {
-                try self.loadComponent(u32, self.locations[@backingInt(operation.index)], 0);
-                try self.encoder.emit(.movsxd_rcx_eax);
-                try self.encoder.immediate(.imul_rcx, @intCast(layout.byte_size));
-            }
+            const has_offset = try self.prepareElementOffset(operation.index, operation.type_id);
             try self.loadAddress(self.locations[@backingInt(operation.allocation)]);
-            if (layout.byte_size != 0) try self.encoder.emit(.add_rax_rcx);
+            if (has_offset) try self.encoder.emit(.add_rax_rcx);
             try self.encoder.offset(.mov_rsp_rax, offset);
         }
 
         fn emitArrayElement(self: *Self, operation: structures.ArrayElement, destination_offset: u32) !void {
-            const layout = try self.types.layout(operation.type_id);
-            if (layout.byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
-            if (layout.byte_size != 0) {
-                try self.loadComponent(u32, self.locations[@backingInt(operation.index)], 0);
-                try self.encoder.emit(.movsxd_rcx_eax);
-                try self.encoder.immediate(.imul_rcx, @intCast(layout.byte_size));
-            }
+            const has_offset = try self.prepareElementOffset(operation.index, operation.type_id);
             try self.loadValueAddress(self.locations[@backingInt(operation.array)]);
-            if (layout.byte_size != 0) try self.encoder.emit(.add_rax_rcx);
+            if (has_offset) try self.encoder.emit(.add_rax_rcx);
             try self.encoder.offset(.mov_rsp_rax, destination_offset);
         }
 
@@ -1684,25 +1694,6 @@ pub fn buildExecutable(
         std.debug.assert(function.artifact.code.len != 0);
         std.debug.assert(function.artifact.required_alignment != 0);
         std.debug.assert(std.math.isPowerOfTwo(function.artifact.required_alignment));
-        for (function.artifact.relocations) |relocation| {
-            switch (relocation.reference) {
-                .function => |reference| if (@backingInt(reference) >= function.artifact.referenced_instances.len) return error.RelocationOutOfBounds,
-                .data => |index| {
-                    if (index >= function.artifact.constant_data.len or relocation.kind != .address_absolute_64) return error.RelocationOutOfBounds;
-                    if (relocation.addend < 0 or relocation.addend > function.artifact.constant_data[index].bytes.len) return error.RelocationOutOfBounds;
-                },
-            }
-            const relocation_offset: usize = relocation.offset;
-            const field_size: usize = switch (relocation.kind) {
-                .call_relative_32 => @sizeOf(i32),
-                .address_absolute_64 => @sizeOf(u64),
-            };
-            if (relocation_offset > function.artifact.code.len or
-                function.artifact.code.len - relocation_offset < field_size)
-            {
-                return error.RelocationOutOfBounds;
-            }
-        }
     }
 
     var function_indices = std.AutoHashMap(structures.InstanceId, usize).init(gpa);
@@ -1711,13 +1702,13 @@ pub fn buildExecutable(
     try function_indices.ensureTotalCapacity(function_count);
     for (functions, 0..) |function, index| {
         const result = function_indices.getOrPutAssumeCapacity(function.instance);
-        if (result.found_existing) return error.DuplicateFunctionArtifact;
+        std.debug.assert(!result.found_existing);
         result.value_ptr.* = index;
     }
-    const entry_index = function_indices.get(entry) orelse return error.MissingEntryArtifact;
+    const entry_index = function_indices.get(entry) orelse unreachable;
     for (functions) |function| {
         for (function.artifact.referenced_instances) |target| {
-            if (!function_indices.contains(target)) return error.MissingReferencedArtifact;
+            std.debug.assert(function_indices.contains(target));
         }
     }
 
@@ -1730,7 +1721,8 @@ pub fn buildExecutable(
     };
     const call_displacement_offset = encoder.code.items.len + 1;
     try encoder.immediate(.call_relative, 0);
-    try encoder.emit(.zero_edi);
+    try encoder.immediate(.mov_edi, 1);
+    try encoder.emit(.sub_edi_edx);
     try encoder.immediate(.mov_eax, linux_exit_syscall);
     try encoder.emit(.syscall);
 
@@ -1964,38 +1956,27 @@ const X86Encoder = struct {
     }
 
     fn integerBinary(self: *@This(), operation: IntegerBinaryOperation, rhs: ValueLocation) !void {
-        if (operation == .divide_signed) {
-            switch (rhs) {
-                .immediate => |value| {
-                    try self.immediate(.mov_ecx, value);
-                    try self.emit(.cdq);
-                    try self.emit(.idiv_ecx);
-                },
-                .stack, .incoming_argument => |stack_offset| {
-                    try self.emit(.cdq);
-                    try self.offset(.idiv_rsp, stack_offset);
-                },
-                .indirect => |stack_offset| {
-                    try self.offset(.mov_rcx_rsp, stack_offset);
-                    try self.emit(.cdq);
-                    try self.emit(.idiv_rcx);
-                },
-                .eax, .return_buffer, .discarded => unreachable,
-            }
-            return;
-        }
-
         const encoding: struct { immediate: x86.Operation, stack: x86.Operation, indirect: x86.Operation } = switch (operation) {
             .add => .{ .immediate = .add_eax, .stack = .add_eax_rsp, .indirect = .add_eax_rcx },
             .subtract => .{ .immediate = .sub_eax, .stack = .sub_eax_rsp, .indirect = .sub_eax_rcx },
             .multiply => .{ .immediate = .imul_eax, .stack = .imul_eax_rsp, .indirect = .imul_eax_rcx },
-            .divide_signed => unreachable,
+            .divide_signed => .{ .immediate = .mov_ecx, .stack = .idiv_rsp, .indirect = .idiv_rcx },
         };
         switch (rhs) {
-            .immediate => |value| try self.immediate(encoding.immediate, value),
-            .stack, .incoming_argument => |stack_offset| try self.offset(encoding.stack, stack_offset),
+            .immediate => |value| {
+                try self.immediate(encoding.immediate, value);
+                if (operation == .divide_signed) {
+                    try self.emit(.cdq);
+                    try self.emit(.idiv_ecx);
+                }
+            },
+            .stack, .incoming_argument => |stack_offset| {
+                if (operation == .divide_signed) try self.emit(.cdq);
+                try self.offset(encoding.stack, stack_offset);
+            },
             .indirect => |stack_offset| {
                 try self.offset(.mov_rcx_rsp, stack_offset);
+                if (operation == .divide_signed) try self.emit(.cdq);
                 try self.emit(encoding.indirect);
             },
             .eax, .return_buffer, .discarded => unreachable,

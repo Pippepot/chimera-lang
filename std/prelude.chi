@@ -1,7 +1,7 @@
-pub import std.text.{String, StringView, BytesView, byte_int}
+pub import std.text.{String, StaticString, StringView, BytesView, byte_int}
 pub import std.io.{print}
 pub import std.exit.{exit}
-pub import std.memory.{Box, Ref, Span, List}
+pub import std.memory.{Box, Ref, Span, List, collection_sequence}
 pub import std.array.{Array, collection_literal}
 pub import std.iteration.{End}
 

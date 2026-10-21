@@ -25,6 +25,11 @@ pub extern func unsafe_take(static T: type, mut allocation: Allocation(T), index
 pub extern func unsafe_destroy(static T: type, mut allocation: Allocation(T), index: int)
 pub extern func unsafe_borrow(static T: type, ref allocation: Allocation(T), index: int) ref T
 
+pub struct collection_sequence(T: type)
+    move = none
+    copy = none
+    value: List(T)
+
 pub struct List(T: type)
     copy = none
     storage: Allocation(T)
@@ -43,6 +48,10 @@ pub struct List(T: type)
         result.initialized = N
         return result^
 
+    pub fallible collect(init values: collection_sequence(T)) List(T)
+        var result: List(T) = values
+        return result^
+
     pub fallible new(reserved: int) List(T)
         const storage = allocate?(T, reserved)
         return List(T){storage = storage^, initialized = 0}
@@ -53,7 +62,7 @@ pub struct List(T: type)
     pub func iter(ref self: List(T)) SpanIterator(T)
         var view = self.span()
         return view.iter()
-    pub fallible slice(ref self: List(T), static A: type, static B: type, bounds: Range(A, B)) Span(T)
+    pub fallible slice(ref self: List(T), bounds: Range) Span(T)
         var view = self.span()
         return view.slice?(bounds)
     pub fallible bytes(imm self: List(byte)) BytesView -> BytesView.unsafe_from_allocation?(self.storage, self.initialized)
@@ -70,24 +79,14 @@ pub struct List(T: type)
         minimum_capacity >= 0
         if minimum_capacity <= self.capacity() -> return
         var replacement = allocate?(T, minimum_capacity)
-        const initialized = self.initialized
-        var index = initialized
+        var index = self.initialized
         loop
             if index == 0 -> break
             index -= 1
             var item = unsafe_take(T, self.storage, index)
-            self.initialized = index
-            if unsafe_initialize(T, replacement, index, item^) -> continue
-            var cleanup = initialized
-            loop
-                if cleanup == index + 1 -> break
-                cleanup -= 1
-                unsafe_destroy(T, replacement, cleanup)
-            deallocate(T, replacement)
-            fail
+            initialize_collection_element(T, replacement, index, item^)
         const previous = self.storage^
         self.storage = replacement^
-        self.initialized = initialized
         deallocate(T, previous^)
 
     pub fallible append(mut self: List(T), var item: T)
@@ -125,6 +124,48 @@ pub converter(static T: type, static N: int, init values: collection_literal(T, 
     result.initialized = N
     return result^
 
+# Compiler-generated collection construction uses these internal declarations.
+extern func static_iteration_item(static T: type, imm item: T) unit
+
+func collection_array_iterator(static T: type, static N: int, ref value: Array(T, N)) SpanIterator(T)
+    return SpanIterator(T){source = Span(T){data = array_cursor(T, N, value), size = N}, position = 0}
+
+func new_collection_list(static T: type, static capacity: int) List(T)
+    return List(T){storage = allocate_literal(T, capacity), initialized = 0}
+
+fallible new_collection_list_fallible(static T: type, static capacity: int) List(T)
+    return List(T){storage = allocate?(T, capacity), initialized = 0}
+
+extern func initialize_collection_element(static T: type, mut storage: Allocation(T), index: int, init item: T) unit
+
+func append_collection_bounded(static T: type, mut result: List(T), init item: T)
+    if result.initialized >= result.capacity() -> panic "Collection construction bound exceeded"
+    initialize_collection_element(T, result.storage, result.initialized, item)
+    result.initialized += 1
+
+func append_collection_growing(static T: type, mut result: List(T), init item: T)
+    const capacity = result.capacity()
+    if result.initialized == capacity
+        var next = 1
+        if capacity > 0
+            if capacity <= 1073741823 -> next = capacity * 2
+            else next = 2147483647
+        if result.initialized == 2147483647 -> panic "List literal capacity exceeded"
+        if result.reserve(next) -> ()
+        else panic "List literal allocation failed"
+    append_collection_bounded(T, result, item)
+
+fallible append_collection_fallible(static T: type, mut result: List(T), init item: T)
+    const capacity = result.capacity()
+    if result.initialized == capacity
+        result.initialized < 2147483647
+        var next = 1
+        if capacity > 0
+            if capacity <= 1073741823 -> next = capacity * 2
+            else next = 2147483647
+        result.reserve?(next)
+    append_collection_bounded(T, result, item)
+
 pub struct Box(T: type)
     allocation: Allocation(T)
     drop = func(deinit self: Box(T))
@@ -158,7 +199,6 @@ pub struct Span(T: type)
         initialized >= 0
         initialized <= allocation.capacity()
         return Span(T){data = allocation_cursor(T, allocation), size = initialized}
-    pub func unsafe_from_static(imm source: static_data, size: int) Span(byte) -> Span(byte){data = static_cursor(source), size = size}
     pub func len(imm self: Span(T)) int -> self.size
     pub func iter(ref self: Span(T)) SpanIterator(T)
         return SpanIterator(T){source = self, position = 0}
@@ -170,7 +210,7 @@ pub struct Span(T: type)
     pub fallible []=(mut self: Span(T), index: int, var item: T) unit
         ref element = self.get?(index)
         element = item^
-    pub fallible slice(ref self: Span(T), static A: type, static B: type, bounds: Range(A, B)) Span(T)
+    pub fallible slice(ref self: Span(T), bounds: Range) Span(T)
         const offsets = bounds.resolve?(self.size)
         return Span(T){data = cursor_offset(T, self.data, offsets.0), size = offsets.1 - offsets.0}
     pub func as_imm(imm self: Span(T)) Span(T) -> Span(T){data = cursor_attenuate(T, self.data), size = self.size}
@@ -188,7 +228,6 @@ pub struct SpanIterator(T: type)
         panic "invalid span iterator element"
 
 extern func empty_cursor(static T: type) StorageCursor(T)
-extern func static_cursor(imm source: static_data) StorageCursor(byte)
 extern func array_cursor(static T: type, static N: int, ref array: Array(T, N)) StorageCursor(T)
 extern func allocation_cursor(static T: type, ref allocation: Allocation(T)) StorageCursor(T)
 extern func cursor_offset(static T: type, ref source: StorageCursor(T), offset: int) StorageCursor(T)

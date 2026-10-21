@@ -137,7 +137,11 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
         try writer.print("    %{d} = {s}", .{ @backingInt(ssa.instructionValue(instruction_index)), @tagName(instruction) });
     switch (instruction) {
         inline .const_int, .const_byte, .const_int_literal => |value| try writer.print(" {d}", .{value}),
-        inline .const_string_literal, .const_data => |value| try writer.print(" @{d}", .{@backingInt(value)}),
+        .const_string_literal => |value| try writer.print(" @{d}", .{@backingInt(value)}),
+        .const_static_string => |constant| {
+            try writer.print(" @{d} ", .{@backingInt(constant.data)});
+            try renderType(db, constant.type_id, writer);
+        },
         .const_storage_cursor => |cursor| try writer.print(" {any}", .{cursor}),
         .storage_cursor, .borrow_box, .borrow_read => |operation| try writer.print(" %{d}", .{@backingInt(operation.source)}),
         .cursor_offset, .cursor_element => |operation| try writer.print(" %{d}, %{d}", .{ @backingInt(operation.cursor), @backingInt(operation.index) }),

@@ -2,6 +2,154 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const Fixture = test_sources.SourceFixture;
 
+test "large nested calls preserve arguments across temporary storage growth" {
+    const source = comptime block: {
+        @setEvalBranchQuota(100_000);
+        var declarations: []const u8 = "func identity(imm value: int) int -> value\nfunc total(";
+        var arguments: []const u8 = "";
+        for (0..96) |index| {
+            const separator = if (index == 0) "" else ", ";
+            declarations = declarations ++ std.fmt.comptimePrint("{s}imm argument{d}: int", .{ separator, index });
+            arguments = arguments ++ std.fmt.comptimePrint("{s}identity({d})", .{ separator, index });
+        }
+        break :block declarations ++ ") int -> argument0 + argument95 - 53\nfunc run() int -> total(" ++ arguments ++ ")";
+    };
+    try Fixture.expectParity(source, 42);
+}
+
+test "forwarded borrow-carrying receivers keep their owned storage alive" {
+    try Fixture.expectParity(
+        \\struct Holder
+        \\    copy = none
+        \\    storage: Span(int) | List(int)
+        \\
+        \\    func view(imm self: Holder) Span(int)
+        \\        if const span = self.storage as Span(int) -> return span
+        \\        if ref list = self.storage as List(int) -> return list.span()
+        \\        panic "invalid holder"
+        \\
+        \\    func forward(imm self: Holder) Span(int) -> self.view()
+        \\
+        \\func make() Holder
+        \\    const values: List(int) = [5, 7, 9]
+        \\    return Holder{storage = values^}
+        \\
+        \\func run() int
+        \\    const holder = make()
+        \\    const span = holder.forward()
+        \\    const text = String(7).view()
+        \\    if const first = span.get(1)
+        \\        if const second = span.get(2)
+        \\            if const digit = text.as_bytes().get(0) -> return first + second + byte_int(digit) - 29
+        \\    return 90
+    , 42);
+}
+
+test "variant member conversions retain borrowed backing and reject its mutation" {
+    const declarations =
+        \\struct Marker
+        \\converter(imm value: Marker) StringView -> "marker"
+        \\func view(imm value: ref String | Marker) StringView -> value
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    var text = "hello"
+        \\    const source: ref String | Marker = text
+        \\    const result = view(source)
+        \\    const marker: ref String | Marker = Marker{}
+        \\    if view(marker) <> "marker" -> return 90
+        \\    if result <> "hello" -> return 91
+        \\    return 42
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\var text = "hello"
+        \\const source: ref String | Marker = text
+        \\const result = view(source)
+        \\text.append?(" world")
+        \\print(result)
+    , .borrow_outlives_source);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func escaped() StringView
+        \\    var text = "hello"
+        \\    const source: ref String | Marker = text
+        \\    return view(source)
+        \\print(escaped())
+    , .borrow_outlives_source);
+}
+
+test "references copied optional call arguments remain independent in growing work queues" {
+    try Fixture.expectParity(
+        \\func must(static T: type, var outcome: T | none) T
+        \\    if const value = outcome^ as T -> return value^
+        \\    panic "required operation failed"
+        \\fallible calculate() int
+        \\    var pending: List(int) = [1]
+        \\    var head = 0
+        \\    var total = 0
+        \\    loop
+        \\        if head == pending.len() -> break
+        \\        const current = must(pending[head])
+        \\        head += 1
+        \\        total += current
+        \\        if current < 4
+        \\            pending.append?(current * 2)
+        \\            pending.append?(current * 2 + 1)
+        \\    return total + 14
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+    , 42);
+}
+
+test "references owned optional argument preparation copies only successful payloads" {
+    try Fixture.expectParity(
+        \\struct Item
+        \\    copies: Ref(int)
+        \\    value: int
+        \\    copy = func(imm self: Item) Item
+        \\        self.copies.value += 1
+        \\        return Item{copies = self.copies, value = self.value}
+        \\func receive(var outcome: Item | none) int
+        \\    if const item = outcome^ as Item -> return item.value
+        \\    return 0
+        \\func run() int
+        \\    var copies = 0
+        \\    const values = [Item{copies = Ref.from(copies), value = 20}]
+        \\    var total = 0
+        \\    for index in 0..3 -> total += receive(values[index % 2])
+        \\    return total + copies
+    , 42);
+}
+
+test "references optional borrowed results still reject use across loop growth" {
+    try Fixture.expectSourceDiagnostic(
+        \\func must_ref(static T: type, var outcome: ref T | none) ref T
+        \\    if ref value = outcome as T -> return value
+        \\    panic "required element missing"
+        \\var values: List(int) = [42]
+        \\loop
+        \\    ref current = must_ref(values[0])
+        \\    values.append?(17)
+        \\    print(current)
+        \\    break
+    , .borrow_outlives_source);
+}
+
+test "references copied optional view results retain their backing dependencies" {
+    try Fixture.expectSourceDiagnostic(
+        \\func must(static T: type, var outcome: T | none) T
+        \\    if const value = outcome^ as T -> return value^
+        \\    panic "required operation failed"
+        \\var text = "hello"
+        \\var values: List(StringView) = [text.view()]
+        \\loop
+        \\    const current = must(values[0])
+        \\    text.append?(" world")
+        \\    print(current)
+        \\    break
+    , .borrow_outlives_source);
+}
+
 test "references custom drops preserve temporal conflicts between captures" {
     const declarations =
         \\struct Captures
@@ -1069,6 +1217,35 @@ test "references list element aliases cannot survive reallocation" {
         \\    exit(item)
         \\if invalid() -> unit
     , .borrow_outlives_source);
+}
+
+test "references recursive components recompute after dependency edits" {
+    const first =
+        \\pub func first(ref left: int, ref right: int, count: int) ref int
+        \\    if count == 0 -> return left
+        \\    return second(left, right, count - 1)
+        \\
+    ;
+    const direct = first ++
+        \\pub func second(ref left: int, ref right: int, count: int) ref int -> left
+    ;
+    const recursive = first ++
+        \\pub func second(ref left: int, ref right: int, count: int) ref int -> first(right, left, count)
+    ;
+    const fixture = try Fixture.initFiles(
+        \\import library.{first}
+        \\var left = 12
+        \\const right = 30
+        \\ref selected = first(left, right, 1)
+        \\selected += 30
+        \\exit(left)
+    , &.{.{ .path = "library/functions.chi", .module_path = "library", .source = direct }});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(test_sources.queries.SourceText, 1, recursive);
+    try fixture.expectDiagnostic(0, .reference_not_writable);
+    try fixture.db.setInput(test_sources.queries.SourceText, 1, direct);
+    try fixture.expectExit(0, 42);
 }
 
 test "references recursive forwarding infers writes through every participating argument" {

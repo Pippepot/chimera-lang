@@ -1,55 +1,287 @@
 const std = @import("std");
 const structures = @import("structures.zig");
+const profiling = @import("profiling.zig");
 
 pub const TimingLog = struct {
     const Stage = struct {
         label: []const u8,
         duration: std.Io.Duration,
+        work: ?profiling.Snapshot = null,
     };
 
     started: std.Io.Timestamp,
     previous: std.Io.Timestamp,
     stages: [16]Stage = undefined,
     count: usize = 0,
+    program_run: ?std.Io.Duration = null,
+    collector: ?*profiling.Collector = null,
+    previous_work: profiling.Snapshot = .{},
 
     pub fn init(started: std.Io.Timestamp) TimingLog {
         return .{ .started = started, .previous = started };
     }
 
+    pub fn enableQueryProfiling(self: *TimingLog, collector: *profiling.Collector) void {
+        self.collector = collector;
+        self.previous_work = collector.snapshot();
+    }
+
     pub fn mark(self: *TimingLog, io: std.Io, label: []const u8) void {
         std.debug.assert(self.count < self.stages.len);
         const now = std.Io.Clock.awake.now(io);
-        self.stages[self.count] = .{ .label = label, .duration = self.previous.durationTo(now) };
+        const work: ?profiling.Snapshot = if (self.collector) |collector| work: {
+            const current = collector.snapshot();
+            const delta = current.since(self.previous_work);
+            self.previous_work = current;
+            break :work delta;
+        } else null;
+        self.stages[self.count] = .{ .label = label, .duration = self.previous.durationTo(now), .work = work };
         self.count += 1;
         self.previous = now;
     }
 
+    pub fn markProgramRun(self: *TimingLog, io: std.Io) void {
+        std.debug.assert(self.program_run == null);
+        const now = std.Io.Clock.awake.now(io);
+        self.program_run = self.previous.durationTo(now);
+        self.previous = now;
+    }
+
     pub fn print(self: *const TimingLog, io: std.Io, writer: *std.Io.Writer) !void {
-        const finished = std.Io.Clock.awake.now(io);
-        const total = self.started.durationTo(finished);
-        var buffer: [32]u8 = undefined;
-
-        var label_width: usize = "total".len;
-        var value_width = displayWidth(try formatDuration(&buffer, total));
-        for (self.stages[0..self.count]) |stage| {
-            label_width = @max(label_width, stage.label.len);
-            value_width = @max(value_width, displayWidth(try formatDuration(&buffer, stage.duration)));
+        const total = self.started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+        const stages = self.stages[0..self.count];
+        var label_width: usize = @max("run program".len, work_label_width);
+        var compile: i96 = 0;
+        var compile_thread: i96 = 0;
+        for (stages) |stage| {
+            label_width = @max(label_width, displayWidth(stage.label));
+            compile += stage.duration.toNanoseconds();
+            if (stage.work) |work| compile_thread += threadNanoseconds(work);
         }
 
-        try writer.writeAll("timing\n");
-        for (self.stages[0..self.count]) |stage| {
-            try writeRow(writer, stage.label, label_width, try formatDuration(&buffer, stage.duration), value_width);
-            const share = fractionOf(stage.duration, total);
-            try writer.print("  {d:>5.1}%  ", .{share * 100});
-            try writeShareBar(writer, share);
-            try writer.writeByte('\n');
+        try writer.writeAll("timing");
+        try writer.splatByteAll(' ', 2 + label_width - "timing".len);
+        try writer.print("  {s:>9}  {s:>9}  {s:>5}\n", .{ "wall ms", "thread ms", "%" });
+        for (stages) |stage| {
+            const duration = stage.duration.toNanoseconds();
+            const share = fraction(duration, compile);
+            const thread = if (stage.work) |work| threadNanoseconds(work) else 0;
+            try writeTimingRow(writer, label_width, .{
+                .label = stage.label,
+                .wall = duration,
+                .thread = if (thread != 0) thread else null,
+                .share = share,
+                .bar = true,
+            });
+            const work = stage.work orelse continue;
+            var kinds: usize = 0;
+            for (work_rows) |row| kinds += @intFromBool(hasWork(work, row));
+            if (kinds < 2) continue;
+            try writeWorkRows(writer, label_width, work, &work_rows, 1, thread);
+            const waiting = workCounter(work, dependency_wait_row);
+            if (waiting.runs != 0) try writeTimingRow(writer, label_width, .{
+                .label = dependency_wait_row.label,
+                .depth = 1,
+                .thread = waiting.nanoseconds,
+                .runs = .{ .count = waiting.runs, .unit = dependency_wait_row.unit },
+            });
         }
-        try writeRow(writer, "total", label_width, try formatDuration(&buffer, total), value_width);
-        try writer.writeByte('\n');
+        try writeTimingRow(writer, label_width, .{
+            .label = "compile",
+            .wall = compile,
+            .thread = if (compile_thread != 0) compile_thread else null,
+        });
+        if (self.program_run) |run| try writeTimingRow(writer, label_width, .{ .label = "run program", .wall = run.toNanoseconds() });
+        try writeTimingRow(writer, label_width, .{ .label = "total", .wall = total });
     }
 };
 
-// Wraps the backing allocator to report peak and total heap usage.
+const WorkUnit = enum { query, parse, phase, function, request };
+
+const WorkRow = struct {
+    label: []const u8,
+    categories: []const profiling.Category,
+    unit: WorkUnit = .query,
+    parts: []const WorkRow = &.{},
+};
+
+const work_rows = [_]WorkRow{
+    .{ .label = "parsing", .categories = &.{.parsing}, .unit = .parse },
+    .{ .label = "declarations", .categories = &.{.declarations} },
+    .{ .label = "signatures", .categories = &.{ .signatures, .conversion_matching }, .parts = &.{
+        .{ .label = "conversion matching", .categories = &.{.conversion_matching} },
+    } },
+    .{ .label = "body analysis", .categories = &.{ .body_overhead, .body_build, .body_typing, .body_lifetimes, .body_freeze }, .parts = &.{
+        .{ .label = "unresolved expressions", .categories = &.{.body_build}, .unit = .phase },
+        .{ .label = "typing / SSA", .categories = &.{.body_typing}, .unit = .phase },
+        .{ .label = "lifetimes / cleanup", .categories = &.{.body_lifetimes}, .unit = .phase },
+        .{ .label = "IR finalization", .categories = &.{.body_freeze}, .unit = .phase },
+        .{ .label = "body setup", .categories = &.{.body_overhead} },
+    } },
+    .{ .label = "type facts", .categories = &.{.type_facts} },
+    .{ .label = "comptime", .categories = &.{.comptime_execution} },
+    .{ .label = "codegen", .categories = &.{.codegen}, .unit = .function },
+    .{ .label = "other queries", .categories = &.{.query_other} },
+};
+
+const dependency_wait_row: WorkRow = .{ .label = "dependency wait", .categories = &.{.dependency_wait}, .unit = .request };
+
+const work_label_width = width: {
+    var width: usize = dependency_wait_row.label.len + 2;
+    for (work_rows) |row| {
+        width = @max(width, row.label.len + 2);
+        for (row.parts) |part| width = @max(width, part.label.len + 4);
+    }
+    break :width width;
+};
+
+fn workCounter(work: profiling.Snapshot, row: WorkRow) profiling.Counter {
+    var counter: profiling.Counter = .{ .runs = work.get(row.categories[0]).runs };
+    for (row.categories) |category| counter.nanoseconds += work.get(category).nanoseconds;
+    return counter;
+}
+
+fn hasWork(work: profiling.Snapshot, row: WorkRow) bool {
+    const counter = workCounter(work, row);
+    return counter.runs != 0 or counter.nanoseconds != 0;
+}
+
+fn threadNanoseconds(work: profiling.Snapshot) i96 {
+    var nanoseconds: i96 = 0;
+    for (work_rows) |row| nanoseconds += workCounter(work, row).nanoseconds;
+    return nanoseconds;
+}
+
+const WorkOrder = struct {
+    work: *const profiling.Snapshot,
+    rows: []const WorkRow,
+
+    fn slower(self: WorkOrder, lhs: usize, rhs: usize) bool {
+        return workCounter(self.work.*, self.rows[lhs]).nanoseconds > workCounter(self.work.*, self.rows[rhs]).nanoseconds;
+    }
+};
+
+fn writeWorkRows(
+    writer: *std.Io.Writer,
+    label_width: usize,
+    work: profiling.Snapshot,
+    rows: []const WorkRow,
+    depth: usize,
+    stage_thread: i96,
+) std.Io.Writer.Error!void {
+    var order: [work_rows.len]usize = undefined;
+    var count: usize = 0;
+    for (rows, 0..) |row, index| {
+        if (!hasWork(work, row)) continue;
+        order[count] = index;
+        count += 1;
+    }
+    std.mem.sort(usize, order[0..count], WorkOrder{ .work = &work, .rows = rows }, WorkOrder.slower);
+    for (order[0..count]) |index| {
+        const row = rows[index];
+        const counter = workCounter(work, row);
+        try writeTimingRow(writer, label_width, .{
+            .label = row.label,
+            .depth = depth,
+            .thread = counter.nanoseconds,
+            .share = fraction(counter.nanoseconds, stage_thread),
+            .runs = .{ .count = counter.runs, .unit = row.unit },
+        });
+        try writeWorkRows(writer, label_width, work, row.parts, depth + 1, stage_thread);
+    }
+}
+
+const TimingRow = struct {
+    label: []const u8,
+    depth: usize = 0,
+    wall: ?i96 = null,
+    thread: ?i96 = null,
+    share: ?f64 = null,
+    bar: bool = false,
+    runs: ?struct { count: usize, unit: WorkUnit } = null,
+};
+
+fn writeTimingRow(writer: *std.Io.Writer, label_width: usize, row: TimingRow) std.Io.Writer.Error!void {
+    var buffer: [256]u8 = undefined;
+    var line: std.Io.Writer = .fixed(&buffer);
+    const indent = 2 * row.depth;
+    try line.splatByteAll(' ', 2 + indent);
+    try writePadded(&line, row.label, label_width - indent, .left);
+    try writeMilliseconds(&line, row.wall);
+    try writeMilliseconds(&line, row.thread);
+    if (row.share) |share| try line.print("  {d:>5.1}", .{share * 100}) else try line.splatByteAll(' ', 7);
+    if (row.bar) try writeShareBar(&line, row.share.?);
+    if (row.runs) |runs| if (runs.count != 0) {
+        const average = @as(f64, @floatFromInt(row.thread.?)) / 1_000.0 / @as(f64, @floatFromInt(runs.count));
+        try line.print("  {d:>6} × {d:>6.1} µs/{s}", .{ runs.count, average, @tagName(runs.unit) });
+    };
+    try writer.writeAll(std.mem.trimEnd(u8, line.buffered(), " "));
+    try writer.writeByte('\n');
+}
+
+fn writeMilliseconds(writer: *std.Io.Writer, nanoseconds: ?i96) std.Io.Writer.Error!void {
+    const value = nanoseconds orelse return writer.splatByteAll(' ', 11);
+    try writer.print("  {d:>9.3}", .{@as(f64, @floatFromInt(value)) / 1_000_000.0});
+}
+
+fn expectTimingRow(text: []const u8, expected: []const []const u8) !void {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    next_line: while (lines.next()) |line| {
+        var tokens = std.mem.tokenizeScalar(u8, line, ' ');
+        for (expected) |token| {
+            if (!std.mem.eql(u8, tokens.next() orelse continue :next_line, token)) continue :next_line;
+        }
+        if (tokens.next() == null) return;
+    }
+    std.debug.print("missing timing row starting {s}\n{s}", .{ expected[0], text });
+    return error.TestExpectedEqual;
+}
+
+test "timing table sorts stage work and keeps waiting and the program run out of compile shares" {
+    var analysis: profiling.Snapshot = .{};
+    analysis.counters[@backingInt(profiling.Category.body_overhead)] = .{ .nanoseconds = 1_000_000, .runs = 2 };
+    analysis.counters[@backingInt(profiling.Category.body_typing)] = .{ .nanoseconds = 4_000_000, .runs = 2 };
+    analysis.counters[@backingInt(profiling.Category.codegen)] = .{ .nanoseconds = 3_000_000, .runs = 4 };
+    analysis.counters[@backingInt(profiling.Category.query_other)] = .{ .nanoseconds = 2_000_000, .runs = 1 };
+    analysis.counters[@backingInt(profiling.Category.dependency_wait)] = .{ .nanoseconds = 9_000_000, .runs = 7 };
+    var linking: profiling.Snapshot = .{};
+    linking.counters[@backingInt(profiling.Category.parsing)] = .{ .nanoseconds = 50_000, .runs = 1 };
+
+    var timings: TimingLog = .init(std.Io.Clock.awake.now(std.testing.io));
+    timings.stages[0] = .{ .label = "load source", .duration = .fromNanoseconds(1_000_000), .work = .{} };
+    timings.stages[1] = .{ .label = "analyze", .duration = .fromNanoseconds(8_000_000), .work = analysis };
+    timings.stages[2] = .{ .label = "link", .duration = .fromNanoseconds(100_000), .work = linking };
+    timings.count = 3;
+    timings.program_run = .fromNanoseconds(50_000_000);
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try timings.print(std.testing.io, &output.writer);
+    const text = output.writer.buffered();
+
+    try expectTimingRow(text, &.{ "timing", "wall", "ms", "thread", "ms", "%" });
+    try expectTimingRow(text, &.{ "load", "source", "1.000", "11.0", "██▋" });
+    try expectTimingRow(text, &.{ "analyze", "8.000", "10.000", "87.9", "█████████████████████▏" });
+    try expectTimingRow(text, &.{ "body", "analysis", "5.000", "50.0", "2", "×", "2500.0", "µs/query" });
+    try expectTimingRow(text, &.{ "typing", "/", "SSA", "4.000", "40.0", "2", "×", "2000.0", "µs/phase" });
+    try expectTimingRow(text, &.{ "body", "setup", "1.000", "10.0", "2", "×", "500.0", "µs/query" });
+    try expectTimingRow(text, &.{ "codegen", "3.000", "30.0", "4", "×", "750.0", "µs/function" });
+    try expectTimingRow(text, &.{ "other", "queries", "2.000", "20.0", "1", "×", "2000.0", "µs/query" });
+    try expectTimingRow(text, &.{ "dependency", "wait", "9.000", "7", "×", "1285.7", "µs/request" });
+    try expectTimingRow(text, &.{ "link", "0.100", "0.050", "1.1", "▎" });
+    try expectTimingRow(text, &.{ "compile", "9.100", "10.050" });
+    try expectTimingRow(text, &.{ "run", "program", "50.000" });
+
+    const order = [_][]const u8{ "body analysis", "typing / SSA", "body setup", "codegen", "other queries", "dependency wait", "link", "compile", "run program", "total" };
+    var previous: usize = 0;
+    for (order) |label| {
+        const index = std.mem.indexOfPos(u8, text, previous, label) orelse return error.TestExpectedEqual;
+        previous = index + label.len;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, text, "parsing") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "signatures") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, " \n") == null);
+}
+
 pub const MemoryTracker = struct {
     backing: std.mem.Allocator,
     live: std.atomic.Value(usize) = .init(0),
@@ -135,18 +367,7 @@ pub const MemoryTracker = struct {
 };
 
 const share_bar_width = 24;
-
-fn formatDuration(buffer: []u8, duration: std.Io.Duration) ![]const u8 {
-    const nanoseconds = duration.toNanoseconds();
-    if (nanoseconds < 1_000) return std.fmt.bufPrint(buffer, "{d} ns", .{nanoseconds});
-    const scale: struct { divisor: f64, unit: []const u8 } = if (nanoseconds < 1_000_000)
-        .{ .divisor = 1_000.0, .unit = "µs" }
-    else if (nanoseconds < 1_000_000_000)
-        .{ .divisor = 1_000_000.0, .unit = "ms" }
-    else
-        .{ .divisor = 1_000_000_000.0, .unit = "s" };
-    return std.fmt.bufPrint(buffer, "{d:.2} {s}", .{ @as(f64, @floatFromInt(nanoseconds)) / scale.divisor, scale.unit });
-}
+const partial_share_blocks = [_][]const u8{ "", "▏", "▎", "▍", "▌", "▋", "▊", "▉" };
 
 fn formatByteSize(buffer: []u8, bytes: usize) ![]const u8 {
     const units = [_][]const u8{ "KiB", "MiB", "GiB", "TiB" };
@@ -157,17 +378,16 @@ fn formatByteSize(buffer: []u8, bytes: usize) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{d:.2} {s}", .{ scaled, units[unit] });
 }
 
-fn fractionOf(part: std.Io.Duration, whole: std.Io.Duration) f64 {
-    const whole_ns = whole.toNanoseconds();
-    if (whole_ns <= 0) return 0;
-    const fraction = @as(f64, @floatFromInt(part.toNanoseconds())) / @as(f64, @floatFromInt(whole_ns));
-    return std.math.clamp(fraction, 0, 1);
+fn fraction(part: i96, whole: i96) f64 {
+    if (whole <= 0) return 0;
+    return @as(f64, @floatFromInt(part)) / @as(f64, @floatFromInt(whole));
 }
 
-fn writeShareBar(writer: *std.Io.Writer, share: f64) !void {
-    const filled: usize = @intFromFloat(@round(share * share_bar_width));
-    try writer.splatBytesAll("█", filled);
-    try writer.splatBytesAll("░", share_bar_width - filled);
+fn writeShareBar(writer: *std.Io.Writer, share: f64) std.Io.Writer.Error!void {
+    const eighths: usize = @intFromFloat(@round(std.math.clamp(share, 0, 1) * share_bar_width * partial_share_blocks.len));
+    try writer.writeAll("  ");
+    try writer.splatBytesAll("█", eighths / partial_share_blocks.len);
+    try writer.writeAll(partial_share_blocks[eighths % partial_share_blocks.len]);
 }
 
 fn writeRow(
@@ -242,7 +462,7 @@ fn writeType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId)
 
 pub fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) anyerror!void {
     switch (type_id) {
-        .int, .int_literal, .string_literal, .static_data, .byte, .bool, .unit, .none, .never, .type => return writer.writeAll(@tagName(type_id)),
+        .int, .int_literal, .string_literal, .byte, .bool, .unit, .none, .never, .type => return writer.writeAll(@tagName(type_id)),
         _ => {},
     }
     if (try types.arrayType(type_id)) |array| {
@@ -302,7 +522,7 @@ pub fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structure
 
 /// Shared source-style callable identity, including inherited and own static arguments.
 pub fn writeFunctionName(types: anytype, writer: *std.Io.Writer, instance: structures.InstanceId) anyerror!void {
-    const arguments = if (instance.specialization) |tuple| try types.staticArguments(tuple) else &.{};
+    const arguments: []const structures.CompileTimeValueId = if (instance.specialization) |tuple| try types.staticArguments(tuple) else &.{};
     try writeFunctionParts(types, writer, instance.item, arguments);
 }
 
@@ -349,7 +569,6 @@ fn writeStaticRuntime(types: anytype, writer: *std.Io.Writer, runtime: structure
         .unit => try writer.writeAll("()"),
         .none => try writer.writeAll("none"),
         .string_literal => |value| try writer.print("\"{f}\"", .{std.zig.fmtString(try types.byteString(value))}),
-        .static_data => |value| try writer.print("bytes(\"{f}\")", .{std.zig.fmtString(try types.byteString(value))}),
         .storage_cursor => |cursor| try writeStaticCursor(types, writer, cursor),
         .function_ref => |reference| try writeFunctionName(types, writer, reference.instance()),
         .structure => |tuple| try writeStaticAggregate(types, writer, runtime.type_id, try types.staticArguments(tuple)),
@@ -674,6 +893,10 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writeType(types, writer, type_id);
             try writer.writeAll(" must be transferred with `^` or passed to a `deinit` parameter before this scope ends");
         },
+        .invalid_collection_sequence => try writer.writeAll("collection_sequence must contain one owned List value matching its element type"),
+        .collection_requires_static_count => try writer.writeAll("Array construction requires a statically known element count; use List for runtime-sized results"),
+        .collection_size_out_of_range => try writer.writeAll("collection element count exceeds the supported range"),
+        .static_iteration_binding_mode => try writer.writeAll("static for bindings must be bare or const value bindings"),
         .expression_not_supported => try writer.writeAll("this expression is not supported yet"),
         .struct_initializer_not_struct => |found| try writeTypedMessage(types, writer, "only a struct type can be initialized with `{...}`; found ", found, ""),
         .unknown_struct_field => try writeSourceLabel(writer, "unknown struct field", source, span),

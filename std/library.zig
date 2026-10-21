@@ -68,15 +68,14 @@ pub const External = enum {
     array_borrow,
     literal_byte,
     initialize_collection,
+    initialize_collection_element,
+    static_iteration_item,
     empty_cursor,
-    static_cursor,
     array_cursor,
     allocation_cursor,
     cursor_offset,
     cursor_element,
     cursor_attenuate,
-    literal_data,
-    literal_size,
     byte_int,
     io_read,
     io_write,
@@ -86,14 +85,14 @@ pub const External = enum {
         return switch (symbol) {
             .exit => .exit,
             .literal_byte, .primitive_operation => .prelude,
-            .literal_data, .literal_size, .byte_int, .panic_message => .text,
+            .byte_int, .panic_message => .text,
             .io_read => .memory_allocation,
             .io_write => .text,
             .copy_value, .move_value => .ownership,
             .array_filled, .array_from, .array_borrow => .array,
             .allocate_host_storage, .deallocate_host_storage => .memory_host,
-            .empty_cursor, .static_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => .memory_allocation,
-            .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow, .borrow, .unsafe_own_box, .unsafe_take_box, .unsafe_destroy_box, .deallocate_box, .initialize_collection => .memory_allocation,
+            .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => .memory_allocation,
+            .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow, .borrow, .unsafe_own_box, .unsafe_take_box, .unsafe_destroy_box, .deallocate_box, .initialize_collection, .initialize_collection_element, .static_iteration_item => .memory_allocation,
         };
     }
 };
@@ -107,6 +106,7 @@ pub const Structure = enum {
     Span,
     Array,
     collection_literal,
+    collection_sequence,
     List,
 
     pub fn declarationName(self: Structure) []const u8 {

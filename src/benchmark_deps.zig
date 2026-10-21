@@ -1,3 +1,4 @@
+pub const optimize_mode = @import("builtin").mode;
 pub const query = @import("query/engine.zig");
 pub const modules = @import("modules.zig");
 pub const queries = @import("queries.zig");

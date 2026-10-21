@@ -8,6 +8,115 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "collection snapshots retain static callback environments and recompute selections" {
+    const source =
+        \\fallible calculate() int
+        \\    const callbacks: Array(func() int, 2) = [(struct
+        \\        pub func amount() int -> i + 19
+        \\    ).amount static for i in 0..4 static if i % 2 == 1]
+        \\    return callbacks[0]() + callbacks[1]()
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const selected = try std.mem.replaceOwned(u8, std.testing.allocator, source, "i % 2 == 1", "i % 2 == 0");
+    defer std.testing.allocator.free(selected);
+    try fixture.db.setInput(queries.SourceText, 0, selected);
+    try fixture.expectExit(40);
+    const bounds = try std.mem.replaceOwned(u8, std.testing.allocator, source, "0..4", "2..6");
+    defer std.testing.allocator.free(bounds);
+    try fixture.db.setInput(queries.SourceText, 0, bounds);
+    try fixture.expectExit(46);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "top-level failure snapshots recompute outcomes and local handlers" {
+    const source =
+        \\func run() -> ()
+        \\fallible check() -> 1 < 2
+        \\check?()
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(0);
+    const rejected = try std.mem.replaceOwned(u8, std.testing.allocator, source, "1 < 2", "2 < 1");
+    defer std.testing.allocator.free(rejected);
+    try fixture.db.setInput(queries.SourceText, 0, rejected);
+    try fixture.expectExit(1);
+    const handled = try std.mem.replaceOwned(u8, std.testing.allocator, rejected, "check?()", "if not check() -> ()");
+    defer std.testing.allocator.free(handled);
+    try fixture.db.setInput(queries.SourceText, 0, handled);
+    try fixture.expectExit(0);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(0);
+}
+
+test "copied optional argument snapshots preserve loop growth and reject retained aliases" {
+    const source =
+        \\func must(static T: type, var outcome: T | none) T
+        \\    if const value = outcome^ as T -> return value^
+        \\    panic "required operation failed"
+        \\fallible calculate() int
+        \\    var pending: List(int) = [1]
+        \\    var head = 0
+        \\    var total = 0
+        \\    loop
+        \\        if head == pending.len() -> break
+        \\        const current = must(pending[head])
+        \\        head += 1
+        \\        total += current
+        \\        if current < 4
+        \\            pending.append?(current * 2)
+        \\            pending.append?(current * 2 + 1)
+        \\    return total + 14
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const shorter = try std.mem.replaceOwned(u8, std.testing.allocator, source, "current < 4", "current < 2");
+    defer std.testing.allocator.free(shorter);
+    try fixture.db.setInput(queries.SourceText, 0, shorter);
+    try fixture.expectExit(20);
+    const borrowed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "const current = must(pending[head])", "ref current = pending[head]");
+    defer std.testing.allocator.free(borrowed);
+    try fixture.db.setInput(queries.SourceText, 0, borrowed);
+    try fixture.expectDiagnostic(.borrow_outlives_source);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "string conversion snapshots refresh variant member constraints and bodies" {
+    const source =
+        \\struct Item
+        \\    pub value: int
+        \\pub converter(imm value: Item) String where 1 == 1 -> String(value.value)
+        \\func run() int -> String([7, Item{value = 7}]).byte_length() + 36
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const body = try std.mem.replaceOwned(u8, std.testing.allocator, source, "String(value.value)", "String(value.value + 10)");
+    defer std.testing.allocator.free(body);
+    try fixture.db.setInput(queries.SourceText, 0, body);
+    try fixture.expectExit(43);
+    const constraint = try std.mem.replaceOwned(u8, std.testing.allocator, source, "where 1 == 1", "where 1 == 2");
+    defer std.testing.allocator.free(constraint);
+    try fixture.db.setInput(queries.SourceText, 0, constraint);
+    try fixture.expectDiagnostic(.where_condition_failed);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
 test "overload snapshots restore selection and refresh membership and signatures" {
     const prefix =
         \\func first(value: int) int -> value
@@ -503,7 +612,7 @@ test "nested span snapshots recompute slice bounds extent and readonly backing" 
     try fixture.expectExit(42);
 }
 
-test "range snapshots restore raw bounds and recompute omitted endpoint types" {
+test "range snapshots restore raw bounds and recompute runtime endpoint presence" {
     const source =
         \\static bounds = 1..3
         \\fallible calculate() int
@@ -781,6 +890,59 @@ test "converter snapshots restore calls literals and invalidate owner edits" {
     defer denied.db.deinit();
     try denied.db.setInput(queries.SourceText, 1, library);
     try denied.expectExit(42);
+}
+
+test "conversion snapshot misses invalidate after a converter is added" {
+    const library =
+        \\pub struct Source
+        \\    pub value: int
+        \\pub struct Target
+        \\    pub value: int
+    ;
+    const converted = library ++ "\npub converter(value: Source) Target -> Target{value = value.value}\n";
+    const source =
+        \\import library.{Source, Target}
+        \\func run(imm value: Source) int where not (Source.Target is func(imm Source) Target) -> 42
+        \\exit(run(Source{value = 0}))
+    ;
+    const original_files = [_]modules.SourceFile{.{ .path = "library/types.chi", .module_path = "library", .source = library }};
+    const changed_files = [_]modules.SourceFile{.{ .path = "library/types.chi", .module_path = "library", .source = converted }};
+    const fixture = try Fixture.restoreSources(source, &original_files, &changed_files, .where_condition_failed);
+    defer fixture.db.deinit();
+    try fixture.db.setInput(queries.SourceText, 1, library);
+    try fixture.expectExit(42);
+    try fixture.db.setInput(queries.SourceText, 1, converted);
+    try fixture.expectDiagnostic(.where_condition_failed);
+}
+
+test "conversion callable snapshots refresh stored references after converter edits" {
+    const source =
+        \\struct Source
+        \\    value: int
+        \\struct Target
+        \\    value: int
+        \\converter(imm value: Source) Target where 1 == 1 -> Target{value = value.value}
+        \\static convert = Source.Target
+        \\func run() int -> convert(Source{value = 42}).value
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const body = try std.mem.replaceOwned(u8, std.testing.allocator, source, "value = value.value", "value = value.value + 1");
+    defer std.testing.allocator.free(body);
+    try fixture.db.setInput(queries.SourceText, 0, body);
+    try fixture.expectExit(43);
+    const constraint = try std.mem.replaceOwned(u8, std.testing.allocator, source, "where 1 == 1", "where 1 == 2");
+    defer std.testing.allocator.free(constraint);
+    try fixture.db.setInput(queries.SourceText, 0, constraint);
+    try fixture.expectDiagnostic(.where_condition_failed);
+    const removed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "converter(imm value: Source) Target where 1 == 1 -> Target{value = value.value}", "");
+    defer std.testing.allocator.free(removed);
+    try fixture.db.setInput(queries.SourceText, 0, removed);
+    try fixture.expectDiagnostic(.unknown_namespace_member);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
 }
 
 test "staged static conversion snapshots track source and converter changes" {
@@ -1586,6 +1748,96 @@ test "captured owner cleanup survives snapshots and source edits" {
     const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "make?(trace, 42, true)", "make?(trace, 43, true)");
     defer std.testing.allocator.free(edited);
     try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(44);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "collection snapshots restore static environments runtime builders and edited shapes" {
+    const source =
+        \\static limit = 4
+        \\func run() int
+        \\    const runtime = 99
+        \\    const ignored: Array(int, 0) = [value static for value in Array(int, 0)([runtime static if 1 < 0])]
+        \\    const expanded = [i + 19 static for i in 0..limit static if i % 2 == 0]
+        \\    const values = [x for x in expanded if x > 0]
+        \\    return values.len() + ignored.len() + 40
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "limit = 4", "limit = 6");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(44);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "collection snapshots retain generated callable lexical environments" {
+    const source =
+        \\func run() int
+        \\    const callbacks: Array(func() int, 2) = [(struct
+        \\        pub func amount() int -> i + 19
+        \\    ).amount static for i in [1, 3]]
+        \\    if const first = callbacks[0]
+        \\        if const second = callbacks[1] -> return first() + second()
+        \\    return 90
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "i + 19", "i + 20");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(46);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "collection snapshots restore sequence carriers and callable reference origins" {
+    const source =
+        \\fallible gather(imm collect: fallible(init collection_sequence(Ref(int))) List(Ref(int)), ref source: Array(int, 2)) int
+        \\    const values = collect?([Ref.from(item) for ref item in source])
+        \\    return values[0].value + values[1].value
+        \\func run() int
+        \\    var source = [19, 23]
+        \\    if const result = gather(List(Ref(int)).collect, source) -> return result
+        \\    return 90
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "19, 23", "20, 24");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(46);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "collection snapshots restore inferred generic sequence construction" {
+    const source =
+        \\fallible gather(static T: type, init values: collection_sequence(T)) List(T)
+        \\    return List(T).collect?(values)
+        \\func run() int
+        \\    if const values = gather([value for value in [19, 23]]) -> return values.len() + 40
+        \\    return 90
+        \\static answer = run()
+        \\exit(run() + answer - 42)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "19, 23", "19, 23, 29");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
     try fixture.expectExit(44);
     try fixture.db.setInput(queries.SourceText, 0, source);
     try fixture.expectExit(42);

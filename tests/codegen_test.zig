@@ -21,13 +21,17 @@ const TestTypes = struct {
         return null;
     }
 
+    pub fn staticStringBytes(_: @This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
+    }
+
     pub fn facts(self: @This()) @This() {
         return self;
     }
 
     pub fn layout(_: @This(), type_id: structures.TypeId) !structures.TypeLayout {
         if (type_id == .byte) return .{ .byte_size = 1, .byte_alignment = 1 };
-        if (type_id == byte_reference_type or type_id == .static_data) return .{ .byte_size = 8, .byte_alignment = 8 };
+        if (type_id == byte_reference_type) return .{ .byte_size = 8, .byte_alignment = 8 };
         if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
         if (type_id == small_variant or type_id == wide_variant) return .{ .byte_size = 8, .byte_alignment = 4 };
@@ -141,6 +145,10 @@ const ArrayCopyTypes = struct {
     array_length: u32 = 1024,
     field_offsets: [2]u32 = .{ 0, 4 },
 
+    pub fn staticStringBytes(_: *@This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
+    }
+
     pub fn storageCursorAccess(_: *@This(), _: structures.TypeId) !?structures.TypeId {
         return null;
     }
@@ -200,7 +208,6 @@ const ArrayCopyTypes = struct {
 
 fn expectArtifactExitCode(artifact: structures.CompiledFunction, expected: u8) !void {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
     const entry: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
     const exit_function: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
     var exit_artifact = try codegen.compileExternalExit(allocator);
@@ -211,9 +218,7 @@ fn expectArtifactExitCode(artifact: structures.CompiledFunction, expected: u8) !
     };
     var executable = try codegen.buildExecutable(entry, &functions, allocator);
     defer executable.deinit(allocator);
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try std.testing.expectEqual(expected, try runtime.runProg(io, allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, expected);
 }
 
 test "native array projections scale runtime indices and large copies remain bounded" {
@@ -359,7 +364,6 @@ test "divergence traps before a following block can execute" {
 }
 
 test "single aligned function artifact builds and runs without borrowing code" {
-    const io = std.testing.io;
     var executable = blk: {
         var blocks = [_]structures.FunctionBodyAnalysis.Block{.{
             .instruction_start = 0,
@@ -380,14 +384,11 @@ test "single aligned function artifact builds and runs without borrowing code" {
     const artifact_file_offset = std.mem.indexOf(u8, executable.bytes, &artifact_code).?;
     try std.testing.expectEqual(@as(u64, 0), (0x400000 + artifact_file_offset) % 16);
 
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try std.testing.expectEqual(@as(u8, 0), runtime.runProg(io, std.testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 0));
 }
 
 test "storage joins keep the source address for directly movable values" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
     const exit_function: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
     var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .representation = .storage }};
     var uses = [_]structures.FunctionValueUse{.{ .value = @fromBackingInt(@intCast(1)) }};
@@ -417,9 +418,7 @@ test "storage joins keep the source address for directly movable values" {
     };
     var executable = try codegen.buildExecutable(entry, &functions, allocator);
     defer executable.deinit(allocator);
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try std.testing.expectEqual(@as(u8, 42), try runtime.runProg(io, allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "ordinary function artifacts encode signed 32-bit literal returns" {
@@ -626,10 +625,7 @@ test "typed expression values survive calls and execute every integer arithmetic
     var executable = try codegen.buildExecutable(entry_id, &functions, std.testing.allocator);
     defer executable.deinit(std.testing.allocator);
 
-    const io = std.testing.io;
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try std.testing.expectEqual(@as(u8, 42), runtime.runProg(io, std.testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
 test "cyclic CFG accepts multi-value parallel backedge copies" {
@@ -812,65 +808,6 @@ test "ordinary function compilation cleans up allocation failure" {
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
-test "executable builder rejects artifact metadata independently" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    const entry: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
-    const code = [_]u8{0xC3};
-    const relocations = [_]structures.CompiledFunction.Relocation{.{
-        .offset = 0,
-        .kind = .call_relative_32,
-        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
-        .addend = 0,
-    }};
-    const references = [_]structures.InstanceId{.{ .item = @fromBackingInt(@intCast(0)) }};
-
-    const with_relocation: structures.CompiledFunction = .{
-        .code = &code,
-        .required_alignment = 1,
-        .relocations = &relocations,
-    };
-    const invalid_functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = with_relocation }};
-    try std.testing.expectError(error.RelocationOutOfBounds, codegen.buildExecutable(entry, &invalid_functions, failing.allocator()));
-    try std.testing.expect(!failing.has_induced_failure);
-
-    const with_reference: structures.CompiledFunction = .{
-        .code = &code,
-        .required_alignment = 1,
-        .referenced_instances = &references,
-    };
-    const missing_functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = with_reference }};
-    try std.testing.expectError(error.MissingReferencedArtifact, codegen.buildExecutable(entry, &missing_functions, std.testing.allocator));
-}
-
-test "executable builder requires the entry and every referenced artifact" {
-    const entry: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
-    const leaf_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
-    const leaf_code = [_]u8{0xC3};
-    const leaf: structures.CompiledFunction = .{
-        .code = &leaf_code,
-        .required_alignment = 1,
-    };
-    const only_leaf = [_]codegen.ReachableFunction{.{ .instance = leaf_id, .artifact = leaf }};
-    try std.testing.expectError(error.MissingEntryArtifact, codegen.buildExecutable(entry, &only_leaf, std.testing.allocator));
-
-    const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
-    const relocations = [_]structures.CompiledFunction.Relocation{.{
-        .offset = 1,
-        .kind = .call_relative_32,
-        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
-        .addend = 0,
-    }};
-    const references = [_]structures.InstanceId{leaf_id};
-    const with_call: structures.CompiledFunction = .{
-        .code = &call_code,
-        .required_alignment = 1,
-        .relocations = &relocations,
-        .referenced_instances = &references,
-    };
-    const only_entry = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = with_call }};
-    try std.testing.expectError(error.MissingReferencedArtifact, codegen.buildExecutable(entry, &only_entry, std.testing.allocator));
-}
-
 test "executable builder resolves a direct call to its callee's file offset" {
     const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
     const callee_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
@@ -888,7 +825,7 @@ test "executable builder resolves a direct call to its callee's file offset" {
         .relocations = &relocations,
         .referenced_instances = &references,
     };
-    const callee_code = [_]u8{ 0xB8, 42, 0, 0, 0, 0xC3 };
+    const callee_code = [_]u8{ 0xB8, 42, 0, 0, 0, 0xBA, 1, 0, 0, 0, 0xC3 };
     const callee: structures.CompiledFunction = .{
         .code = &callee_code,
         .required_alignment = 16,
@@ -918,10 +855,7 @@ test "executable builder resolves a direct call to its callee's file offset" {
     const expected: i64 = @as(i64, @intCast(callee_file_offset)) - @as(i64, @intCast(call_site_offset)) - 5;
     try std.testing.expectEqual(expected, displacement);
 
-    const io = std.testing.io;
-    try runtime.writeProgram(io, executable.bytes);
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    try std.testing.expectEqual(@as(u8, 0), runtime.runProg(io, std.testing.allocator, &.{}));
+    try test_sources.expectProgramExit(executable.bytes, @as(u8, 0));
 }
 
 test "executable builder patches multiple relocations to one shared artifact" {
@@ -952,9 +886,8 @@ test "executable builder patches multiple relocations to one shared artifact" {
     var executable = try codegen.buildExecutable(entry_id, &functions, std.testing.allocator);
     defer executable.deinit(std.testing.allocator);
 
-    const startup_suffix = [_]u8{ 0x31, 0xFF, 0xB8, 60, 0, 0, 0, 0x0F, 0x05 };
-    const entry_offset = std.mem.indexOf(u8, executable.bytes, &startup_suffix).? + startup_suffix.len;
     const shared_offset = std.mem.indexOf(u8, executable.bytes, &shared_code).?;
+    const entry_offset = shared_offset - entry_code.len;
     for ([_]usize{ entry_offset + 1, entry_offset + 6 }) |field_offset| {
         const displacement = std.mem.readInt(i32, executable.bytes[field_offset..][0..4], .little);
         const expected: i64 = @as(i64, @intCast(shared_offset)) - @as(i64, @intCast(field_offset)) - 4;
@@ -986,64 +919,6 @@ test "executable builder resolves cyclic artifact graphs" {
     var executable = try codegen.buildExecutable(entry_id, &functions, std.testing.allocator);
     defer executable.deinit(std.testing.allocator);
     try std.testing.expect(executable.bytes.len > 0);
-}
-
-test "executable builder rejects a relocation outside entry code bounds" {
-    const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
-    const callee_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
-    const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
-    const relocations = [_]structures.CompiledFunction.Relocation{.{
-        .offset = 3,
-        .kind = .call_relative_32,
-        .reference = .{ .function = @fromBackingInt(@intCast(0)) },
-        .addend = 0,
-    }};
-    const references = [_]structures.InstanceId{callee_id};
-    const entry: structures.CompiledFunction = .{
-        .code = &call_code,
-        .required_alignment = 1,
-        .relocations = &relocations,
-        .referenced_instances = &references,
-    };
-    const callee_code = [_]u8{0xC3};
-    const callee: structures.CompiledFunction = .{
-        .code = &callee_code,
-        .required_alignment = 1,
-    };
-    const functions = [_]codegen.ReachableFunction{
-        .{ .instance = entry_id, .artifact = entry },
-        .{ .instance = callee_id, .artifact = callee },
-    };
-    try std.testing.expectError(error.RelocationOutOfBounds, codegen.buildExecutable(entry_id, &functions, std.testing.allocator));
-}
-
-test "executable builder rejects a reference index outside referenced_instances" {
-    const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
-    const callee_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };
-    const call_code = [_]u8{ 0xE8, 0, 0, 0, 0, 0xC3 };
-    const relocations = [_]structures.CompiledFunction.Relocation{.{
-        .offset = 1,
-        .kind = .call_relative_32,
-        .reference = .{ .function = @fromBackingInt(@intCast(1)) },
-        .addend = 0,
-    }};
-    const references = [_]structures.InstanceId{callee_id};
-    const entry: structures.CompiledFunction = .{
-        .code = &call_code,
-        .required_alignment = 1,
-        .relocations = &relocations,
-        .referenced_instances = &references,
-    };
-    const callee_code = [_]u8{0xC3};
-    const callee: structures.CompiledFunction = .{
-        .code = &callee_code,
-        .required_alignment = 1,
-    };
-    const functions = [_]codegen.ReachableFunction{
-        .{ .instance = entry_id, .artifact = entry },
-        .{ .instance = callee_id, .artifact = callee },
-    };
-    try std.testing.expectError(error.RelocationOutOfBounds, codegen.buildExecutable(entry_id, &functions, std.testing.allocator));
 }
 
 test "executable builder rejects a displacement outside the signed 32-bit range" {

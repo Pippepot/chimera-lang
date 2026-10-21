@@ -171,7 +171,8 @@ test "evaluation heap compiler allocation failure is retryable without publishin
     defer db.deinit();
     try modules.registerSources(db, failing.allocator(),
         \\func compute() int
-        \\    if const owner = Box(int).new(42) -> return owner.take()
+        \\    if const owner = Box(Array(int, 2048)).new(Array(int, 2048).filled(42))
+        \\        if ref first = owner.borrow().get(0) -> return first
         \\    return 90
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
@@ -444,6 +445,10 @@ const ArrayTestExecutor = struct {
 
     pub fn variantMembers(_: *@This(), _: structures.TypeId) !?[]const structures.TypeId {
         return null;
+    }
+
+    pub fn staticString(_: *@This(), _: structures.StaticStringConstant) !structures.CompileTimeValue.RuntimeValue {
+        return error.Unavailable;
     }
 
     pub fn internRuntime(self: *@This(), type_id: structures.TypeId, value: structures.CompileTimeValue.RuntimeValue) !structures.CompileTimeValueId {
@@ -952,6 +957,10 @@ test "initializer capture cell subtrees survive the constructing region storage"
             else
                 .{ .type_id = .int, .value = .{ .int = 17 } };
         }
+        pub fn staticString(_: *@This(), _: structures.StaticStringConstant) !structures.CompileTimeValue.RuntimeValue {
+            return error.Unavailable;
+        }
+
         pub fn internRuntime(_: *@This(), _: structures.TypeId, _: structures.CompileTimeValue.RuntimeValue) !structures.CompileTimeValueId {
             unreachable;
         }
@@ -1029,6 +1038,10 @@ test "fallible initializer calls route ordinary failure without a value" {
         pub fn lookupRuntime(_: *@This(), _: structures.CompileTimeValueId) !?structures.CompileTimeValue.Runtime {
             unreachable;
         }
+        pub fn staticString(_: *@This(), _: structures.StaticStringConstant) !structures.CompileTimeValue.RuntimeValue {
+            return error.Unavailable;
+        }
+
         pub fn internRuntime(_: *@This(), _: structures.TypeId, _: structures.CompileTimeValue.RuntimeValue) !structures.CompileTimeValueId {
             unreachable;
         }

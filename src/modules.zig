@@ -141,21 +141,21 @@ pub fn readSources(
     entry_dir: std.Io.Dir,
     files: []const DiscoveredFile,
 ) ![]SourceFile {
-    var sources: std.ArrayList(SourceFile) = .empty;
+    const sources = try gpa.alloc(SourceFile, files.len);
+    var initialized: usize = 0;
     errdefer {
-        for (sources.items) |file| gpa.free(file.source);
-        sources.deinit(gpa);
+        for (sources[0..initialized]) |file| gpa.free(file.source);
+        gpa.free(sources);
     }
-    for (files) |file| {
-        const source = try entry_dir.readFileAlloc(io, file.path, gpa, .limited(std.math.maxInt(usize)));
-        errdefer gpa.free(source);
-        try sources.append(gpa, .{
+    for (files, sources) |file, *source| {
+        source.* = .{
             .path = file.path,
-            .source = source,
+            .source = try entry_dir.readFileAlloc(io, file.path, gpa, .limited(std.math.maxInt(usize))),
             .module_path = file.module_path,
-        });
+        };
+        initialized += 1;
     }
-    return sources.toOwnedSlice(gpa);
+    return sources;
 }
 
 /// Retain this registry alongside a database when refreshing a directory tree.
@@ -366,6 +366,32 @@ test "source registration groups members by module" {
     try std.testing.expect(physics.resolve("answer").? != other.resolve("answer").?);
     const empty = try db.intern(queries.ModulePaths, .{ .path = "empty" });
     try std.testing.expectEqual(@as(usize, 0), (try db.get(queries.ModuleDeclarations, empty)).*.?.entries.len);
+}
+
+test "source loading preserves borrowed paths and cleans up partial reads" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "helpers.chi", .data = "static X = 1" });
+    var module_path = "helpers".*;
+    const files = [_]DiscoveredFile{
+        .{ .path = "helpers.chi", .module_path = &module_path },
+        .{ .path = "missing.chi", .module_path = &module_path },
+    };
+    const empty = try readSources(io, allocator, tmp.dir, &.{});
+    defer allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    const sources = try readSources(io, allocator, tmp.dir, files[0..1]);
+    defer {
+        for (sources) |file| allocator.free(file.source);
+        allocator.free(sources);
+    }
+    try std.testing.expectEqual(@as(usize, 1), sources.len);
+    try std.testing.expectEqualStrings("static X = 1", sources[0].source);
+    try std.testing.expectEqual(files[0].path.ptr, sources[0].path.ptr);
+    try std.testing.expectEqual(files[0].module_path.ptr, sources[0].module_path.ptr);
+    try std.testing.expectError(error.FileNotFound, readSources(io, allocator, tmp.dir, &files));
 }
 
 test "module discovery and loading clean up every allocation failure" {

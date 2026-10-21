@@ -6,6 +6,7 @@ pub const diagnostic_rendering = @import("src/diagnostics.zig");
 pub const debug = @import("src/debug.zig");
 pub const comptime_interpreter = @import("src/frontend/comptime_interpreter.zig");
 pub const modules = @import("src/modules.zig");
+pub const profiling = @import("src/profiling.zig");
 pub const query = @import("src/query/engine.zig");
 pub const queries = @import("src/queries.zig");
 pub const query_disk_cache = @import("src/query_disk_cache.zig");
@@ -52,15 +53,10 @@ pub const SourceFixture = struct {
 
     pub fn expectExit(self: SourceFixture, entry: structures.FileId, status: u8) !void {
         const program = try self.executable(entry);
-        try runtime.writeProgram(std.testing.io, program.bytes);
-        defer std.Io.Dir.cwd().deleteFile(std.testing.io, "prog") catch {};
-        const actual_status = runtime.runProg(std.testing.io, std.testing.allocator, &.{}) catch |err| {
+        expectProgramExit(program.bytes, status) catch |err| {
             try self.printDiagnostics(entry);
-            std.debug.print("generated program failed: {t}\n", .{err});
             return err;
         };
-        if (actual_status != status) try self.printDiagnostics(entry);
-        try std.testing.expectEqual(status, actual_status);
     }
 
     pub fn runIo(self: SourceFixture, input: []const u8) !std.process.RunResult {
@@ -167,6 +163,13 @@ pub const SourceFixture = struct {
     }
 };
 
+pub fn expectProgramExit(bytes: []const u8, status: u8) !void {
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, bytes);
+    try std.testing.expectEqual(status, try runtime.runProg(io, std.testing.allocator, &.{}));
+}
+
 pub fn renderTemplate(allocator: std.mem.Allocator, source: []const u8, values: anytype) ![]u8 {
     var result: std.ArrayList(u8) = .empty;
     defer result.deinit(allocator);
@@ -207,6 +210,7 @@ test {
     _ = query_disk_cache;
     _ = queries;
     _ = modules;
+    _ = profiling;
     _ = runtime;
     _ = @import("src/frontend/tokenizer.zig");
     _ = @import("src/frontend/parser.zig");
@@ -216,4 +220,5 @@ test {
     _ = @import("src/frontend/typing.zig");
     _ = @import("src/query/codec.zig");
     _ = @import("src/backend/disasm.zig");
+    _ = @import("src/backend/x86_encoding.zig");
 }

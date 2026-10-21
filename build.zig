@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const use_llvm = optimize == .fast;
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -17,6 +18,7 @@ pub fn build(b: *std.Build) void {
     const compiler = b.addExecutable(.{
         .name = "chi",
         .root_module = root_module,
+        .use_llvm = use_llvm,
     });
     compiler.incremental = true;
     compiler.build_id = .sha1;
@@ -31,17 +33,21 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/benchmark_deps.zig"),
     });
     benchmark_compiler.addImport("standard_library", standard_library);
-    for ([_]struct { name: []const u8, source: []const u8, step: []const u8, description: []const u8 }{
+    for ([_]struct { name: []const u8, source: []const u8, step: []const u8, description: []const u8, optimize: ?std.builtin.OptimizeMode = null }{
         .{ .name = "comptime_benchmark", .source = "benchmarks/comptime_benchmark.zig", .step = "benchmark", .description = "Run the compile-time execution benchmark" },
         .{ .name = "flow_benchmark", .source = "benchmarks/flow_benchmark.zig", .step = "flow-benchmark", .description = "Measure typing snapshots and lifetime tables" },
+        .{ .name = "conversion_benchmark", .source = "benchmarks/conversion_benchmark.zig", .step = "conversion-benchmark", .description = "Measure converter discovery and repeated matching" },
+        .{ .name = "prelude_benchmark", .source = "benchmarks/prelude_benchmark.zig", .step = "test-prelude-performance", .description = "Check cold prelude loading and scalar compilation budgets", .optimize = .fast },
+        .{ .name = "prelude_debug_benchmark", .source = "benchmarks/prelude_benchmark.zig", .step = "test-prelude-debug-performance", .description = "Check cold Debug prelude loading and scalar compilation budgets", .optimize = .debug },
     }) |benchmark| {
+        const benchmark_optimize = benchmark.optimize orelse optimize;
         const benchmark_module = b.createModule(.{
             .root_source_file = b.path(benchmark.source),
             .target = target,
-            .optimize = optimize,
+            .optimize = benchmark_optimize,
         });
         benchmark_module.addImport("compiler", benchmark_compiler);
-        const executable = b.addExecutable(.{ .name = benchmark.name, .root_module = benchmark_module });
+        const executable = b.addExecutable(.{ .name = benchmark.name, .root_module = benchmark_module, .use_llvm = benchmark_optimize == .fast });
         b.step(benchmark.step, benchmark.description).dependOn(&b.addRunArtifact(executable).step);
     }
 
@@ -66,6 +72,7 @@ pub fn build(b: *std.Build) void {
         "tests/overload_test.zig",
         "tests/query_disk_cache_test.zig",
         "tests/array_test.zig",
+        "tests/collection_test.zig",
         "tests/iteration_test.zig",
         "tests/reference_test.zig",
         "tests/text_test.zig",
@@ -82,7 +89,7 @@ pub fn build(b: *std.Build) void {
         test_module.addImport("standard_library", standard_library);
         test_module.addImport("test_sources", test_sources_module);
         test_module.addImport("test_options", test_options_module);
-        const test_binary = b.addTest(.{ .root_module = test_module, .filters = if (test_filter) |filter| &.{filter} else &.{} });
+        const test_binary = b.addTest(.{ .root_module = test_module, .filters = if (test_filter) |filter| &.{filter} else &.{}, .use_llvm = use_llvm });
         // Disk-cache tests identify the compiler image without hashing the whole binary.
         test_binary.build_id = .sha1;
         const run_test = b.addRunArtifact(test_binary);

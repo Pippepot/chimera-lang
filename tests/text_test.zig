@@ -2,6 +2,158 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const SourceFixture = test_sources.SourceFixture;
 
+test "scalar string converters format decimal limits booleans and empty values in both engines" {
+    try SourceFixture.expectParity(
+        \\func run() int
+        \\    if String(0) <> "0" -> return 90
+        \\    if String(1) <> "1" -> return 91
+        \\    if String(-10) <> "-10" -> return 92
+        \\    if String(2147483647) <> "2147483647" -> return 93
+        \\    if String(-2147483648) <> "-2147483648" -> return 94
+        \\    const byte_value: byte = 255
+        \\    if String(byte_value) <> "255" -> return 95
+        \\    if String(true) <> "true" or String(false) <> "false" -> return 96
+        \\    if String(()) <> "()" or String(none) <> "none" -> return 97
+        \\    const view: StringView = "hé\0"
+        \\    if String(view) <> "hé\0" -> return 98
+        \\    if const text = String(42)
+        \\        if text <> "42" -> return 99
+        \\    else
+        \\        return 100
+        \\    return 42
+    , 42);
+}
+
+test "collection string converters recursively borrow strings and custom move only elements" {
+    try SourceFixture.expectParity(
+        \\struct Item
+        \\    copy = none
+        \\    pub value: int
+        \\pub converter(imm value: Item) String -> String(value.value)
+        \\fallible inspect() int
+        \\    var values = [Item{value = -2}, Item{value = 42}]
+        \\    if String(values) <> "[-2, 42]" -> return 90
+        \\    if String(values.span()) <> "[-2, 42]" -> return 91
+        \\    if String(values.slice?(1..)) <> "[42]" -> return 92
+        \\    const nested = [[1, 2], [3, 4]]
+        \\    if String(nested) <> "[[1, 2], [3, 4]]" -> return 93
+        \\    if String([1, 2]) <> "[1, 2]" -> return 103
+        \\    const converted: String = [[1], [2]]
+        \\    if converted <> "[[1], [2]]" -> return 104
+        \\    const words = ["hello", "world"]
+        \\    if String(words) <> "[hello, world]" -> return 94
+        \\    if words[0] <> "hello" -> return 95
+        \\    const list: List(Item) = [Item{value = 1}, Item{value = 2}]
+        \\    if String(list) <> "[1, 2]" -> return 96
+        \\    if list[1].value <> 2 -> return 97
+        \\    const empty: Array(int, 0) = []
+        \\    if String(empty) <> "[]" -> return 98
+        \\    const bytes: Array(byte, 3) = [0, 128, 255]
+        \\    if String(BytesView.from_array(3, bytes)) <> "[0, 128, 255]" -> return 99
+        \\    if String(Ref.from(values[1])) <> "Ref(42)" -> return 100
+        \\    const boxed = Box(Item).new?(Item{value = 42})
+        \\    if String(boxed) <> "Box(42)" -> return 101
+        \\    return values[0].value + 44
+        \\func run() int
+        \\    if const result = inspect() -> return result
+        \\    return 102
+    , 42);
+}
+
+test "string conversion borrows immovable elements and drops each owner once" {
+    try SourceFixture.expectParity(
+        \\struct Item
+        \\    move = none
+        \\    copy = none
+        \\    pub value: int
+        \\    pub drops: Ref(int)
+        \\    drop = func(deinit self: Item) -> self.drops.value += self.value
+        \\pub converter(imm value: Item) String -> String(value.value)
+        \\func render(ref drops: int) String
+        \\    const values = [Item{value = 19, drops = Ref.from(drops)}, Item{value = 23, drops = Ref.from(drops)}]
+        \\    const text = String(values)
+        \\    if drops <> 0 -> panic "formatting consumed an element"
+        \\    if values.len() <> 2 -> panic "formatting changed the source"
+        \\    return text^
+        \\func run() int
+        \\    var drops = 0
+        \\    const text = render(drops)
+        \\    if text <> "[19, 23]" -> return 90
+        \\    return drops
+    , 42);
+}
+
+test "literal string conversion preserves initializer failure and partial cleanup" {
+    try SourceFixture.expectParity(
+        \\struct Item
+        \\    copy = none
+        \\    pub drops: Ref(int)
+        \\    drop = func(deinit self: Item) -> self.drops.value += 1
+        \\pub converter(imm value: Item) String -> "item"
+        \\fallible stop() Item -> fail
+        \\func late(ref count: int) Item
+        \\    count += 10
+        \\    return Item{drops = Ref.from(count)}
+        \\func run() int
+        \\    var counters = [0, 0]
+        \\    if ref drops = counters.get(0)
+        \\        if ref calls = counters.get(1)
+        \\            if const text: String = [Item{drops = Ref.from(drops)}, stop?(), late(calls)] -> return 90
+        \\            return drops + calls + 41
+        \\    return 91
+    , 42);
+}
+
+test "range string converters preserve independently omitted bounds and inclusivity" {
+    try SourceFixture.expectParity(
+        \\func run() int
+        \\    if String(-2..4) <> "-2..4" -> return 90
+        \\    if String(1..^3) <> "1..^3" -> return 91
+        \\    if String(..3) <> "..3" -> return 92
+        \\    if String(2..) <> "2.." -> return 93
+        \\    if String(..) <> ".." -> return 94
+        \\    return 42
+    , 42);
+}
+
+test "runtime optional range bounds share slicing and formatting consumers" {
+    try SourceFixture.expectParity(
+        \\import std.range.{Range}
+        \\func select(include_first: bool, include_limit: bool) Range
+        \\    const first: int | none = if include_first? -> 1 else none
+        \\    const limit: int | none = if include_limit? -> 3 else none
+        \\    return first..limit
+        \\fallible calculate() int
+        \\    var values = [10, 20, 30, 40]
+        \\    const list: List(int) = [10, 20, 30, 40]
+        \\    var span = values.span()
+        \\    const text: StringView = "abcd"
+        \\    const bytes: BytesView = "abcd"
+        \\    const ranges = [select(true, true), select(false, true), select(true, false), select(false, false)]
+        \\    var length = 0
+        \\    for bounds in ranges
+        \\        const array_slice = values.slice?(bounds)
+        \\        const list_slice = list.slice?(bounds)
+        \\        const span_slice = span.slice?(bounds)
+        \\        const text_slice = text.slice?(bounds)
+        \\        const bytes_slice = bytes.slice?(bounds)
+        \\        const size = array_slice.len()
+        \\        size == list_slice.len()
+        \\        size == span_slice.len()
+        \\        size == text_slice.byte_length()
+        \\        size == bytes_slice.byte_length()
+        \\        length += size
+        \\    String(ranges[0]) == "1..3"
+        \\    String(ranges[1]) == "..3"
+        \\    String(ranges[2]) == "1.."
+        \\    String(ranges[3]) == ".."
+        \\    return length + 30
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 90
+    , 42);
+}
+
 test "text equality compares exact UTF-8 bytes including empty strings and NUL" {
     try SourceFixture.expectParity(
         \\func run() int
@@ -235,6 +387,42 @@ test "literal escapes and empty array views preserve exact bytes in both engines
     , 42);
 }
 
+test "string literals materialize as StaticString for every runtime target" {
+    try SourceFixture.expectParity(
+        \\static constant: String = "lmnop"
+        \\func size(imm text: StaticString) int -> text.byte_length()
+        \\func run() int
+        \\    const first: StringView = "ab"
+        \\    const second: StringView = "cde"
+        \\    const bytes: BytesView = "fghi"
+        \\    const owned = "jk"
+        \\    const literal: StaticString = "qrstuv"
+        \\    const choice: StaticString | none = "w"
+        \\    if const present = choice as StaticString
+        \\        return first.byte_length() + second.byte_length() + bytes.byte_length() + owned.byte_length() + constant.byte_length() + size(literal) + size(present) + 19
+        \\    return 90
+    , 42);
+}
+
+test "distinct string literals share converter instances" {
+    const fixture = try SourceFixture.init(
+        \\const first: StringView = "first"
+        \\const second: StringView = "second"
+        \\const owned = "third"
+        \\exit(first.byte_length() + second.byte_length() + owned.byte_length())
+    );
+    defer fixture.deinit();
+    try fixture.expectExit(0, 16);
+    const reachable = (try fixture.db.get(test_sources.queries.CollectReachableInstances, 0)).*.?;
+    for (reachable.instances) |instance| {
+        const tuple = instance.specialization orelse continue;
+        for ((try fixture.db.lookupInterned(test_sources.queries.CompileTimeValueTuples, tuple)).values) |value_id| {
+            const value = try fixture.db.lookupInterned(test_sources.queries.CompileTimeValues, value_id);
+            try std.testing.expect(value.* != .runtime or value.runtime.type_id != .string_literal);
+        }
+    }
+}
+
 test "user literal converters receive canonical string literal values" {
     try SourceFixture.expectParity(
         \\struct Label
@@ -267,6 +455,66 @@ fn expectIo(source: []const u8, input: []const u8, output: []const u8, errors: [
     try std.testing.expectEqual(std.process.Child.Term{ .exited = status }, result.term);
     try std.testing.expectEqualSlices(u8, output, result.stdout);
     try std.testing.expectEqualSlices(u8, errors, result.stderr);
+}
+
+test "print accepts scalar collection and custom string converters and evaluates once" {
+    try expectIo(
+        \\struct Item
+        \\    copy = none
+        \\    pub count: Ref(int)
+        \\pub converter(imm value: Item) String
+        \\    value.count.value += 1
+        \\    return "item"
+        \\func make(count: Ref(int)) Item
+        \\    count.value += 10
+        \\    return Item{count = count}
+        \\func output()
+        \\    var count = 0
+        \\    print(-2147483648)
+        \\    print(true)
+        \\    print(false)
+        \\    print(())
+        \\    print(none)
+        \\    print([[1, 2], [3, 4]])
+        \\    print(["hello", "world"])
+        \\    print(make(Ref.from(count)))
+        \\    print(count)
+        \\    const write_integer: func(imm int) unit = print
+        \\    write_integer(42)
+        \\output()
+        \\exit(42)
+    , "", "-2147483648\ntrue\nfalse\n()\nnone\n[[1, 2], [3, 4]]\n[hello, world]\nitem\n11\n42\n", "", 42);
+}
+
+test "print requires a usable string converter including collection elements" {
+    for ([_][]const u8{ "Missing{}", "[Missing{}]", "[10, Missing{}]" }) |expression| {
+        const source = try std.testing.allocator.print("struct Missing\nprint({s})", .{expression});
+        defer std.testing.allocator.free(source);
+        try SourceFixture.expectAnySourceDiagnostic(source, .local_type_mismatch);
+    }
+}
+
+test "variant string conversion formats heterogeneous collections without copying strings" {
+    try SourceFixture.expectParity(
+        \\func length(static T: type, imm value: T) int -> String(value).byte_length()
+        \\func run() int
+        \\    const values = [10, "Hello", [1, 2, 3]]
+        \\    if String(values) <> "[10, Hello, [1, 2, 3]]" -> return 90
+        \\    if String(values.span()) <> "[10, Hello, [1, 2, 3]]" -> return 91
+        \\    const list: List(int | String) = [42, "hello"]
+        \\    if String(list) <> "[42, hello]" -> return 92
+        \\    var number = 42
+        \\    const reference: ref int | bool = number
+        \\    const boolean: ref int | bool = true
+        \\    if String(reference) <> "42" or String(boolean) <> "true" -> return 93
+        \\    return length(values) + length(list) + 9
+    , 42);
+    try expectIo(
+        \\const arr = [10, "Hello", [1, 2, 3]]
+        \\print(arr)
+        \\const i = 10
+        \\print(i)
+    , "", "[10, Hello, [1, 2, 3]]\n10\n", "", 0);
 }
 
 test "text output writes exact UTF-8 NUL and newline bytes to standard streams" {
@@ -472,12 +720,6 @@ test "range slicing resolves independently omitted bounds against initialized ex
         \\    if const result = inspect() -> return result
         \\    return 90
     , 42);
-    try SourceFixture.expectSourceDiagnostic(
-        \\func run() int
-        \\    var cursor = (1..).iter()
-        \\    return 42
-        \\exit(run())
-    , .call_argument_type_mismatch);
 }
 
 test "range slicing preserves collection permissions and rejects sequence operands" {
@@ -511,7 +753,7 @@ test "range slicing preserves collection permissions and rejects sequence operan
             \\if const result = inspect() -> exit(result)
         , .{ .sequence = sequence });
         defer std.testing.allocator.free(source);
-        try SourceFixture.expectSourceDiagnostic(source, .static_argument_cannot_be_inferred);
+        try SourceFixture.expectSourceDiagnostic(source, .call_argument_type_mismatch);
     }
 }
 
@@ -1081,7 +1323,7 @@ test "owned strings convert to borrowed text for ordinary print callables" {
         \\fallible output()
         \\    var text = "hello"
         \\    text.append?("!")
-        \\    const writer = print
+        \\    const writer: func(imm String) unit = print
         \\    writer(text)
         \\if output() -> exit(42)
         \\exit(90)
@@ -1217,6 +1459,29 @@ test "allocation failure preserves strings and repeated clones release their sto
         \\exit(run())
     , .ignore, .ignore, true);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, term);
+}
+
+test "string converter temporaries release their allocations" {
+    const term = try runWithStreams(
+        \\func run() int
+        \\    var index = 0
+        \\    loop
+        \\        if index == 1000 -> break
+        \\        const text = String([index, -index])
+        \\        if text.byte_length() < 6 -> return 90
+        \\        index += 1
+        \\    return 42
+        \\exit(run())
+    , .ignore, .ignore, true);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, term);
+}
+
+test "print panics on string conversion allocation failure" {
+    const term = try runWithStreams(
+        \\if print(Array(unit, 1000000).filled(())) -> exit(90)
+        \\exit(91)
+    , .ignore, .ignore, true);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 134 }, term);
 }
 
 test "temporary array backing cannot escape through a borrowed view" {

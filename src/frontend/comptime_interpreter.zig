@@ -46,6 +46,11 @@ pub const Heap = struct {
         try self.records.append(self.allocator, record);
         return record;
     }
+
+    pub fn allocateValue(self: *Heap, type_id: structures.TypeId, element_type: structures.TypeId, element_size: u32, count: i32, storage: std.mem.Allocator) !?Value {
+        if (allocationByteSize(element_size, count) == null) return null;
+        return try allocationValue(type_id, try self.allocate(element_type, @intCast(count)), storage);
+    }
 };
 
 pub const Allocation = struct {
@@ -436,7 +441,7 @@ fn ExecutionFrame(comptime Executor: type) type {
                 .const_int => |value| return .{ .returned = .{ .runtime = .{ .int = value } } },
                 .const_int_literal => |value| return .{ .returned = .{ .runtime = .{ .int_literal = value } } },
                 .const_string_literal => |value| return .{ .returned = .{ .runtime = .{ .string_literal = value } } },
-                .const_data => |value| return .{ .returned = .{ .runtime = .{ .static_data = value } } },
+                .const_static_string => |constant| return .{ .returned = .{ .runtime = try self.executor.staticString(constant) } },
                 .const_storage_cursor => |value| return .{ .returned = .{ .runtime = .{ .storage_cursor = value } } },
                 .const_byte => |value| return .{ .returned = .{ .runtime = .{ .byte = value } } },
                 .const_bool => |value| return .{ .returned = .{ .runtime = .{ .bool = value } } },
@@ -634,7 +639,6 @@ fn ExecutionFrame(comptime Executor: type) type {
         }
 
         fn storageCursor(self: *const Self, operation: structures.BorrowOperation) !Result {
-            if (self.body.valueType(operation.source) == .static_data) return .{ .returned = .{ .runtime = .{ .storage_cursor = .{ .type_id = operation.type_id, .data = scalar(self.slots, operation.source).static_data } } } };
             const owner = try storageCell(self.body, self.slots, operation.source, self.storage);
             if (owner.contents != .allocation and !try expandFields(owner, self.executor)) return .unavailable;
             const cell = try Cell.create(self.storage, operation.type_id, .{ .storage_cursor = .{ .owner = owner, .offset = 0 } });
@@ -1184,4 +1188,27 @@ pub fn allocationRecord(value: Value) *Allocation {
 pub fn allocationValue(type_id: structures.TypeId, allocation: *Allocation, storage: std.mem.Allocator) !Value {
     const cell = try Cell.create(storage, type_id, .{ .allocation = allocation });
     return .{ .place = cell };
+}
+
+pub fn integerValue(value: Value) i32 {
+    return switch (value) {
+        .runtime => |runtime| runtime.int,
+        .place => |cell| cell.contents.value.int,
+        .type, .initializer => unreachable,
+    };
+}
+
+pub fn releaseAllocation(value: Value) void {
+    allocationRecord(value).release();
+}
+
+pub fn allocationCount(value: Value) i32 {
+    return @intCast(allocationRecord(value).capacity);
+}
+
+pub fn ownAllocation(type_id: structures.TypeId, field_type: structures.TypeId, allocation: Value, storage: std.mem.Allocator) !Value {
+    const fields = try storage.alloc(Cell, 1);
+    errdefer storage.free(fields);
+    fields[0] = .{ .type_id = field_type, .storage = storage, .contents = .{ .allocation = allocationRecord(allocation) } };
+    return .{ .place = try Cell.create(storage, type_id, .{ .fields = fields }) };
 }
