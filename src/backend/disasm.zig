@@ -55,7 +55,12 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
             break;
         };
         switch (pat.operand) {
-            .none => try out.print(gpa, "  {s}\n", .{pat.asm_prefix}),
+            .none => try out.print(gpa, "  {s}{s}\n", .{ pat.asm_prefix, pat.asm_suffix }),
+            .i8 => {
+                const val: i8 = @bitCast(code[cursor + pat.prefix.len]);
+                try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
+            },
+            .u8 => try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, code[cursor + pat.prefix.len], pat.asm_suffix }),
             .i32 => {
                 const val = std.mem.readInt(i32, code[cursor + pat.prefix.len ..][0..4], .little);
                 try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
@@ -117,15 +122,35 @@ test "every encoder operation decodes as exactly one instruction" {
     for (std.meta.tags(x86.Operation)) |operation| {
         var code: std.ArrayList(u8) = .empty;
         defer code.deinit(std.testing.allocator);
-        try x86.append(&code, std.testing.allocator, operation, 0xe8e8e8e8e8e8e8e8);
-        const pattern = matchPattern(code.items).?;
-        try std.testing.expectEqual(code.items.len, pattern.length());
-        try std.testing.expectEqualStrings(x86.encoding(operation).asm_prefix, pattern.asm_prefix);
-        const rendered = try disassemble(code.items, std.testing.allocator);
-        defer std.testing.allocator.free(rendered);
-        try std.testing.expect(std.mem.indexOf(u8, rendered, "db ") == null);
-        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "\n"));
+        for ([_]u64{ 0, 1, 127, 128, 0xffffff80, 0xffffff7f, 0xe8e8e8e8e8e8e8e8 }) |bits| {
+            code.clearRetainingCapacity();
+            try x86.append(&code, std.testing.allocator, operation, bits);
+            const pattern = matchPattern(code.items).?;
+            try std.testing.expectEqual(code.items.len, pattern.length());
+            const selected = x86.selectedEncoding(operation, bits);
+            try std.testing.expectEqualStrings(selected.asm_prefix, pattern.asm_prefix);
+            try std.testing.expectEqualStrings(selected.asm_suffix, pattern.asm_suffix);
+            const rendered = try disassemble(code.items, std.testing.allocator);
+            defer std.testing.allocator.free(rendered);
+            try std.testing.expect(std.mem.indexOf(u8, rendered, "db ") == null);
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "\n"));
+        }
     }
+}
+
+test "disassembly decodes compact instruction forms and truncated operands" {
+    var code: std.ArrayList(u8) = .empty;
+    defer code.deinit(std.testing.allocator);
+    try x86.append(&code, std.testing.allocator, .mov_eax_rsp, 0);
+    try x86.append(&code, std.testing.allocator, .mov_rsp_rax, 127);
+    try x86.append(&code, std.testing.allocator, .add_eax, @as(u32, @bitCast(@as(i32, -128))));
+    try x86.append(&code, std.testing.allocator, .imul_eax, 128);
+    const rendered = try disassemble(code.items, std.testing.allocator);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings("  mov eax, [rsp]\n  mov [rsp+127], rax\n  add eax, -128\n  imul eax, eax, 128\n", rendered);
+    const truncated = try disassemble(&.{ 0x8b, 0x44, 0x24 }, std.testing.allocator);
+    defer std.testing.allocator.free(truncated);
+    try std.testing.expectEqualStrings("  db 0x8b\n  db 0x44\n  db 0x24\n", truncated);
 }
 
 test "unknown bytes and instruction interiors do not become branch labels" {

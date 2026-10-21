@@ -76,7 +76,7 @@ def count_braces(view: str) -> int:
 
 def is_test_file(path: str) -> bool:
     name = os.path.basename(path)
-    return name == "test.zig" or name.endswith("_test.zig")
+    return name.startswith("test") or name.endswith("_test.zig")
 
 
 def starts_test_decl(view: str) -> bool:

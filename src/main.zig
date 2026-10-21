@@ -28,7 +28,7 @@ const RunInput = struct {
     debug_flags: DebugFlags,
     started: std.Io.Timestamp,
     cache_directory: ?[]const u8 = null,
-    worker_count: usize = 0,
+    worker_count: ?usize = null,
 };
 
 const RunOutcome = union(enum) {
@@ -63,7 +63,7 @@ fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
 
 const CommandLine = struct {
     debug_flags: DebugFlags,
-    worker_count: usize,
+    worker_count: ?usize,
     disk_cache_enabled: bool,
     positional: []const []const u8,
 };
@@ -75,7 +75,7 @@ const ParsedCommandLine = union(enum) {
 
 fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?ParsedCommandLine {
     var flags: DebugFlags = .{};
-    var worker_count: usize = 0;
+    var worker_count: ?usize = null;
     var disk_cache_enabled = false;
     var valid = true;
     var index: usize = 0;
@@ -91,9 +91,9 @@ fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?ParsedCo
                 valid = false;
             }
         } else if (std.mem.startsWith(u8, args[index], "--workers=")) {
-            worker_count = std.fmt.parseUnsigned(usize, args[index]["--workers=".len..], 10) catch 0;
-            if (worker_count == 0 or worker_count > 64) {
-                try printError(errors, "worker count must be between 1 and 64", .{});
+            worker_count = std.fmt.parseUnsigned(usize, args[index]["--workers=".len..], 10) catch null;
+            if (worker_count == null or worker_count.? > 64) {
+                try printError(errors, "worker count must be between 0 and 64", .{});
                 valid = false;
             }
         } else if (std.mem.eql(u8, args[index], "--disk-cache")) {
@@ -148,10 +148,7 @@ fn compileAndRun(
             return runExecutable(io, gpa, input, bytes, &timings, errors);
         }
     }
-    const worker_count = if (input.worker_count == 0)
-        @min(2, std.Thread.getCpuCount() catch 1)
-    else
-        input.worker_count;
+    const worker_count = input.worker_count orelse @min(2, std.Thread.getCpuCount() catch 1);
     const snapshot_key = if (compiler_digest) |digest|
         cache.querySnapshotKey(digest, input.source_path, input.source_files)
     else
@@ -433,8 +430,10 @@ test "CLI options stop at the source path and preserve program arguments" {
     try std.testing.expect(try parseCommandLine(&.{ "--debug=unknown", "main.chi" }, &errors.writer) == null);
     try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "unknown debug flag 'unknown'") != null);
     const workers = (try parseCommandLine(&.{ "--workers=4", "main.chi" }, &errors.writer)).?.run;
-    try std.testing.expectEqual(@as(usize, 4), workers.worker_count);
-    try std.testing.expect(try parseCommandLine(&.{ "--workers=0", "main.chi" }, &errors.writer) == null);
+    try std.testing.expectEqual(@as(?usize, 4), workers.worker_count);
+    const serial = (try parseCommandLine(&.{ "--workers=0", "main.chi" }, &errors.writer)).?.run;
+    try std.testing.expectEqual(@as(?usize, 0), serial.worker_count);
+    try std.testing.expect(try parseCommandLine(&.{ "--workers=65", "main.chi" }, &errors.writer) == null);
     const disk_cached = (try parseCommandLine(&.{ "--disk-cache", "--workers=2", "main.chi", "--disk-cache" }, &errors.writer)).?.run;
     try std.testing.expect(disk_cached.disk_cache_enabled);
     try std.testing.expectEqualSlices([]const u8, &.{ "main.chi", "--disk-cache" }, disk_cached.positional);
@@ -539,7 +538,7 @@ test "CLI reuses a complete disk cache entry and invalidates changed source" {
     try std.testing.expectEqual(@as(usize, 0), recovered_errors.writer.buffered().len);
 }
 
-test "one and four workers produce identical multi-file artifacts" {
+test "zero one and four workers produce identical multi-file artifacts" {
     const io = std.testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     const source_files = [_]modules.SourceFile{
@@ -548,7 +547,7 @@ test "one and four workers produce identical multi-file artifacts" {
     };
     var first_artifact: ?[]u8 = null;
     defer if (first_artifact) |bytes| std.testing.allocator.free(bytes);
-    for ([_]usize{ 1, 4 }) |workers| {
+    for ([_]usize{ 0, 1, 4 }) |workers| {
         var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer output.deinit();
         var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);

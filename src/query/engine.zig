@@ -20,7 +20,7 @@ pub const QueryError = error{
 };
 
 pub const Options = struct {
-    worker_count: usize = 0,
+    worker_count: ?usize = null,
     profile: ?*profiling.Collector = null,
 };
 
@@ -71,12 +71,14 @@ const Computation = struct {
 const QueryStorage = struct {
     const sizes = .{ 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576 };
     const general_class_count = 6;
+    const large_sizes = .{ 4194304, 16777216, 67108864, 268435456 };
 
     backing: std.mem.Allocator,
     pool_arena: std.heap.ArenaAllocator.State = .{},
     io: std.Io = undefined,
     mutex: std.Io.Mutex = .init,
     free_lists: [sizes.len]std.SinglyLinkedList = @splat(.{}),
+    large_free_lists: [large_sizes.len]std.SinglyLinkedList = @splat(.{}),
 
     fn allocator(storage: *QueryStorage) std.mem.Allocator {
         return storage.classAllocator(general_class_count);
@@ -107,8 +109,20 @@ const QueryStorage = struct {
     }
 
     fn deinit(storage: *QueryStorage) void {
+        storage.releaseLarge();
         var arena = storage.pool_arena.promote(storage.backing);
         arena.deinit();
+    }
+
+    fn releaseLarge(storage: *QueryStorage) void {
+        storage.mutex.lockUncancelable(storage.io);
+        defer storage.mutex.unlock(storage.io);
+        inline for (large_sizes, 0..) |size, index| {
+            while (storage.large_free_lists[index].popFirst()) |node| {
+                const memory: [*]u8 = @ptrCast(node);
+                storage.backing.rawFree(memory[0..size], .@"16", @returnAddress());
+            }
+        }
     }
 
     fn allocClass(storage: *QueryStorage, comptime class_count: usize, length: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
@@ -124,6 +138,12 @@ const QueryStorage = struct {
                     return memory.ptr;
                 }
             }
+            inline for (large_sizes, 0..) |size, index| {
+                if (length > sizes[sizes.len - 1] and length <= size) {
+                    if (storage.large_free_lists[index].popFirst()) |node| return @ptrCast(node);
+                    return storage.backing.rawAlloc(size, .@"16", return_address);
+                }
+            }
         }
         return storage.backing.rawAlloc(length, alignment, return_address);
     }
@@ -135,6 +155,12 @@ const QueryStorage = struct {
             inline for (sizes, 0..) |size, index| {
                 if (index < class_count and memory.len <= size) {
                     storage.free_lists[index].prepend(@ptrCast(@alignCast(memory.ptr)));
+                    return;
+                }
+            }
+            inline for (large_sizes, 0..) |size, index| {
+                if (memory.len > sizes[sizes.len - 1] and memory.len <= size) {
+                    storage.large_free_lists[index].prepend(@ptrCast(@alignCast(memory.ptr)));
                     return;
                 }
             }
@@ -235,6 +261,14 @@ test "query storage reuses allocation classes without overlapping live storage" 
     const retained = storage.free_lists[QueryStorage.general_class_count].first;
     general.free(try general.alloc(u8, QueryStorage.sizes[QueryStorage.general_class_count - 1] + 1));
     try std.testing.expectEqual(retained, storage.free_lists[QueryStorage.general_class_count].first);
+
+    const large = try allocator.alloc(u8, QueryStorage.sizes[QueryStorage.sizes.len - 1] + 1);
+    allocator.free(large);
+    const reused_large = try general.alloc(u8, QueryStorage.large_sizes[0]);
+    try std.testing.expectEqual(large.ptr, reused_large.ptr);
+    general.free(reused_large);
+    storage.releaseLarge();
+    try std.testing.expectEqual(null, storage.large_free_lists[0].first);
 }
 
 pub const Context = struct {
@@ -306,8 +340,10 @@ pub fn Handle(comptime Q: type) type {
         entry: *Entry,
         waiter: ?*Context,
         dependency_index: ?usize,
+        settled: bool,
 
         pub fn wait(handle: @This()) anyerror!*const Q.Output {
+            if (handle.settled) return @ptrCast(@alignCast(handle.entry.output.?.pointer));
             return handle.db.waitFor(Q, handle.entry, handle.waiter);
         }
     };
@@ -320,7 +356,6 @@ pub const Database = struct {
     io_runtime: std.Io.Threaded,
     mutex: std.Io.Mutex = .init,
     work_available: std.Io.Condition = .init,
-    entry_finished: std.Io.Condition = .init,
     stopping: bool = false,
     pending_queries: usize = 0,
     workers: []Worker,
@@ -329,7 +364,8 @@ pub const Database = struct {
     query_storage: QueryStorage,
     scratch_arenas: std.ArrayList(std.heap.ArenaAllocator.State) = .empty,
     inputs: InputMap,
-    interns: InternMap,
+    intern_mutex: std.Io.Mutex = .init,
+    intern_slots: std.atomic.Value(*InternSlots),
     interned_values: InternValues,
     published_interns: std.atomic.Value(u64) = .init(0),
     next_worker: usize = 0,
@@ -337,11 +373,7 @@ pub const Database = struct {
     visit_token: usize = 1,
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !*Database {
-        const requested_workers = if (options.worker_count == 0)
-            std.Thread.getCpuCount() catch 1
-        else
-            options.worker_count;
-        const worker_count = @max(requested_workers, 1);
+        const worker_count = options.worker_count orelse std.Thread.getCpuCount() catch 1;
 
         const db = try allocator.create(Database);
         errdefer allocator.destroy(db);
@@ -353,21 +385,21 @@ pub const Database = struct {
             .workers = undefined,
             .entries = undefined,
             .inputs = undefined,
-            .interns = undefined,
+            .intern_slots = undefined,
             .interned_values = .empty,
         };
         db.query_storage.io = db.io();
         db.entries = .init(db.query_storage.allocator());
         db.inputs = .init(db.query_storage.allocator());
-        db.interns = .init(db.query_storage.allocator());
         errdefer db.query_storage.deinit();
         errdefer {
             db.entries.deinit();
             db.inputs.deinit();
-            db.interns.deinit();
             db.interned_values.deinit(db.query_storage.allocator());
             db.io_runtime.deinit();
         }
+        db.intern_slots = .init(try InternSlots.create(db.query_storage.allocator(), null, 64));
+        errdefer db.destroyInternSlots();
 
         db.workers = try allocator.alloc(Worker, worker_count);
         errdefer allocator.free(db.workers);
@@ -391,13 +423,13 @@ pub const Database = struct {
     pub fn deinit(db: *Database) void {
         db.stopWorkers(db.workers.len);
         db.destroyEntries();
-        for (db.scratch_arenas.items) |state| state.promote(db.query_storage.arenaAllocator()).deinit();
-        db.scratch_arenas.deinit(db.query_storage.allocator());
+        for (db.workers) |*worker| db.destroyScratchArenas(&worker.scratch_arenas);
+        db.destroyScratchArenas(&db.scratch_arenas);
         db.destroyInputs();
         db.destroyInternedValues();
         db.entries.deinit();
         db.inputs.deinit();
-        db.interns.deinit();
+        db.destroyInternSlots();
         db.interned_values.deinit(db.query_storage.allocator());
         db.query_storage.deinit();
         db.io_runtime.deinit();
@@ -497,16 +529,19 @@ pub const Database = struct {
     pub fn intern(db: *Database, comptime I: type, value: I.Value) anyerror!I.Id {
         validateInterner(I);
         const value_hash = I.hash(value);
-        const lookup_key = cacheKey(I, &value, value_hash, "eql");
+        if (db.published_interns.load(.acquire) == stopped_interns) return error.SchedulerStopped;
+        if (db.findIntern(I, db.intern_slots.load(.acquire), &value, value_hash)) |index| return internId(I, index);
 
-        db.lock();
-        defer db.unlock();
+        db.intern_mutex.lockUncancelable(db.io());
+        defer db.intern_mutex.unlock(db.io());
 
-        if (db.stopping) return error.SchedulerStopped;
-        if (db.interns.get(lookup_key)) |index| return internId(I, index);
+        if (db.published_interns.load(.monotonic) == stopped_interns) return error.SchedulerStopped;
+        const slots = db.intern_slots.load(.monotonic);
+        if (db.findIntern(I, slots, &value, value_hash)) |index| return internId(I, index);
         if (db.interned_values.len > std.math.maxInt(@typeInfo(I.Id).@"enum".tag_type)) return error.InternIdOverflow;
+        if (db.interned_values.len == std.math.maxInt(u32)) return error.InternIdOverflow;
 
-        try db.interns.ensureUnusedCapacity(1);
+        const current = if ((db.interned_values.len + 1) * 2 > slots.slots.len) try db.growInternSlots(slots) else slots;
         try db.interned_values.ensureUnusedCapacity(db.query_storage.allocator(), 1);
 
         const value_box = try db.query_storage.allocator().create(I.Value);
@@ -517,18 +552,48 @@ pub const Database = struct {
         const index: u32 = @intCast(db.interned_values.len);
         db.interned_values.appendAssumeCapacity(.{
             .type_identity = comptime typeIdentity(I),
+            .hash = value_hash,
             .value_ptr = @ptrCast(value_box),
             .destroy_value_fn = comptime destroyBoxFn(I.Value, I.deinit),
             .write_value_fn = comptime writeValueFn(I.Value),
         });
-        db.interns.putAssumeCapacityNoClobber(cacheKey(I, value_box, value_hash, "eql"), index);
+        current.insert(index, value_hash);
         db.published_interns.store(@intCast(db.interned_values.len), .release);
         return internId(I, index);
     }
 
+    fn findIntern(db: *Database, comptime I: type, table: *const InternSlots, value: *const I.Value, hash: u64) ?u32 {
+        const mask = table.slots.len - 1;
+        var slot: usize = @as(usize, @truncate(hash)) & mask;
+        while (true) : (slot = (slot + 1) & mask) {
+            const stored = table.slots[slot].load(.acquire);
+            if (stored == 0) return null;
+            const entry = db.interned_values.at(stored - 1);
+            if (entry.hash != hash or entry.type_identity != comptime typeIdentity(I)) continue;
+            const interned: *const I.Value = @ptrCast(@alignCast(entry.value_ptr));
+            if (I.eql(interned.*, value.*)) return stored - 1;
+        }
+    }
+
+    fn growInternSlots(db: *Database, table: *InternSlots) !*InternSlots {
+        const grown = try InternSlots.create(db.query_storage.allocator(), table, table.slots.len * 2);
+        for (0..db.interned_values.len) |index| grown.insert(@intCast(index), db.interned_values.at(index).hash);
+        db.intern_slots.store(grown, .release);
+        return grown;
+    }
+
+    fn destroyInternSlots(db: *Database) void {
+        var table: ?*InternSlots = db.intern_slots.raw;
+        while (table) |current| {
+            table = current.previous;
+            db.query_storage.allocator().free(current.slots);
+            db.query_storage.allocator().destroy(current);
+        }
+    }
+
     pub fn writeInternedValues(db: *Database, writer: *disk_codec.Writer) !void {
-        db.lock();
-        defer db.unlock();
+        db.intern_mutex.lockUncancelable(db.io());
+        defer db.intern_mutex.unlock(db.io());
         try writer.write(u64, @intCast(db.interned_values.len));
         for (0..db.interned_values.len) |index| {
             const entry = db.interned_values.at(index).*;
@@ -701,7 +766,7 @@ pub const Database = struct {
         validateInterner(I);
         const index: usize = @backingInt(id);
         const published = db.published_interns.load(.acquire);
-        if (published == std.math.maxInt(u64)) return error.SchedulerStopped;
+        if (published == stopped_interns) return error.SchedulerStopped;
         if (index >= published) return error.InvalidInternId;
         const entry = db.interned_values.at(index);
         if (entry.type_identity != comptime typeIdentity(I)) return null;
@@ -765,6 +830,7 @@ pub const Database = struct {
                 .entry = existing,
                 .waiter = waiter,
                 .dependency_index = dependency_index,
+                .settled = settledLocked(db, existing),
             };
         }
 
@@ -782,6 +848,7 @@ pub const Database = struct {
             .entry = entry,
             .waiter = waiter,
             .dependency_index = dependency_index,
+            .settled = false,
         };
     }
 
@@ -879,8 +946,12 @@ pub const Database = struct {
                 continue;
             }
 
-            db.waitEntryFinished();
+            std.debug.assert(db.workers.len != 0);
+            const finished = entry.finished.raw;
+            _ = entry.waiters.fetchAdd(1, .monotonic);
             db.unlock();
+            db.io().futexWaitUncancelable(u32, &entry.finished.raw, finished);
+            _ = entry.waiters.fetchSub(1, .monotonic);
         }
     }
 
@@ -932,8 +1003,11 @@ pub const Database = struct {
         }
         std.debug.assert(db.pending_queries != 0);
         db.pending_queries -= 1;
-        db.entry_finished.broadcast(db.io());
+        if (db.pending_queries == 0) db.query_storage.releaseLarge();
+        _ = entry.finished.fetchAdd(1, .release);
+        const waiting = entry.waiters.load(.monotonic) != 0;
         db.unlock();
+        if (waiting) db.io().futexWake(u32, &entry.finished.raw, std.math.maxInt(u32));
     }
 
     fn dependenciesChanged(db: *Database, entry: *Entry, worker_index: ?usize) bool {
@@ -1023,7 +1097,7 @@ pub const Database = struct {
 
     fn enqueueLocked(db: *Database, entry: *Entry, publish: Publish) void {
         db.pending_queries += 1;
-        if (publish == .deferred) return;
+        if (publish == .deferred or db.workers.len == 0) return;
         const index = db.next_worker % db.workers.len;
         db.next_worker = (index + 1) % db.workers.len;
         entry.queue_owner = index;
@@ -1216,8 +1290,10 @@ pub const Database = struct {
     fn stopWorkers(db: *Database, spawned: usize) void {
         db.lock();
         db.stopping = true;
-        db.published_interns.store(std.math.maxInt(u64), .release);
-        db.broadcastWork();
+        db.intern_mutex.lockUncancelable(db.io());
+        db.published_interns.store(stopped_interns, .release);
+        db.intern_mutex.unlock(db.io());
+        db.work_available.broadcast(db.io());
         db.unlock();
 
         var index: usize = 0;
@@ -1229,26 +1305,40 @@ pub const Database = struct {
         }
     }
 
-    fn acquireScratchArena(db: *Database) std.heap.ArenaAllocator {
-        db.lock();
-        defer db.unlock();
+    fn acquireScratchArena(db: *Database, worker_index: ?usize) std.heap.ArenaAllocator {
         const allocator = db.query_storage.arenaAllocator();
-        return if (db.scratch_arenas.pop()) |state| state.promote(allocator) else .init(allocator);
+        const index = worker_index orelse {
+            db.lock();
+            defer db.unlock();
+            return if (db.scratch_arenas.pop()) |state| state.promote(allocator) else .init(allocator);
+        };
+        std.debug.assert(db.workers[index].thread_id == std.Thread.getCurrentId());
+        return if (db.workers[index].scratch_arenas.pop()) |state| state.promote(allocator) else .init(allocator);
     }
 
-    fn releaseScratchArena(db: *Database, arena: *std.heap.ArenaAllocator) void {
+    fn releaseScratchArena(db: *Database, worker_index: ?usize, arena: *std.heap.ArenaAllocator) void {
         if (!arena.reset(.{ .retain_with_limit = 128 * 1024 })) {
             arena.deinit();
             return;
         }
         if (arena.queryCapacity() == 0) return;
-        db.lock();
-        defer db.unlock();
-        db.scratch_arenas.append(db.query_storage.allocator(), arena.state) catch {
+        const retained = if (worker_index) |index|
+            db.workers[index].scratch_arenas.append(db.query_storage.allocator(), arena.state)
+        else retained: {
+            db.lock();
+            defer db.unlock();
+            break :retained db.scratch_arenas.append(db.query_storage.allocator(), arena.state);
+        };
+        retained catch {
             arena.deinit();
             return;
         };
         arena.* = .init(db.query_storage.arenaAllocator());
+    }
+
+    fn destroyScratchArenas(db: *Database, arenas: *std.ArrayList(std.heap.ArenaAllocator.State)) void {
+        for (arenas.items) |state| state.promote(db.query_storage.arenaAllocator()).deinit();
+        arenas.deinit(db.query_storage.allocator());
     }
 
     fn io(db: *Database) std.Io {
@@ -1256,6 +1346,10 @@ pub const Database = struct {
     }
 
     fn lock(db: *Database) void {
+        for (0..lock_spin_attempts) |_| {
+            if (db.mutex.state.load(.monotonic) == .unlocked and db.mutex.tryLock()) return;
+            std.atomic.spinLoopHint();
+        }
         db.mutex.lockUncancelable(db.io());
     }
 
@@ -1267,17 +1361,8 @@ pub const Database = struct {
         db.work_available.waitUncancelable(db.io(), &db.mutex);
     }
 
-    fn waitEntryFinished(db: *Database) void {
-        db.entry_finished.waitUncancelable(db.io(), &db.mutex);
-    }
-
     fn signalWork(db: *Database) void {
         db.work_available.signal(db.io());
-    }
-
-    fn broadcastWork(db: *Database) void {
-        db.work_available.broadcast(db.io());
-        db.entry_finished.broadcast(db.io());
     }
 };
 
@@ -1304,7 +1389,6 @@ const ErasedKeyContext = struct {
 
 const EntryMap = std.HashMap(ErasedKey, *Entry, ErasedKeyContext, 80);
 const InputMap = std.HashMap(ErasedKey, *InputEntry, ErasedKeyContext, 80);
-const InternMap = std.HashMap(ErasedKey, u32, ErasedKeyContext, 80);
 const ComputeFn = *const fn (*Database, *Entry, ?usize) anyerror!QueryOutput;
 const DestroyOpaqueFn = *const fn (std.mem.Allocator, *anyopaque) void;
 const DestroyOutputFn = *const fn (std.mem.Allocator, *anyopaque, bool) void;
@@ -1445,6 +1529,8 @@ const Entry = struct {
     accums_in_subtree: bool,
     computation: ?Computation,
     verification_dependency: ?*Entry = null,
+    finished: std.atomic.Value(u32) = .init(0),
+    waiters: std.atomic.Value(u32) = .init(0),
     queue_owner: ?usize,
     queue_prev: ?*Entry,
     queue_next: ?*Entry,
@@ -1462,8 +1548,33 @@ const InputEntry = struct {
     fingerprint_fn: FingerprintFn,
 };
 
+const stopped_interns = std.math.maxInt(u64);
+const lock_spin_attempts = 128;
+
+const InternSlots = struct {
+    previous: ?*InternSlots,
+    slots: []std.atomic.Value(u32),
+
+    fn create(allocator: std.mem.Allocator, previous: ?*InternSlots, count: usize) !*InternSlots {
+        const table = try allocator.create(InternSlots);
+        errdefer allocator.destroy(table);
+        const slots = try allocator.alloc(std.atomic.Value(u32), count);
+        @memset(slots, .init(0));
+        table.* = .{ .previous = previous, .slots = slots };
+        return table;
+    }
+
+    fn insert(table: *InternSlots, index: u32, hash: u64) void {
+        const mask = table.slots.len - 1;
+        var slot: usize = @as(usize, @truncate(hash)) & mask;
+        while (table.slots[slot].raw != 0) slot = (slot + 1) & mask;
+        table.slots[slot].store(index + 1, .release);
+    }
+};
+
 const InternEntry = struct {
     type_identity: *const TypeIdentity,
+    hash: u64,
     value_ptr: *anyopaque,
     destroy_value_fn: DestroyOpaqueFn,
     write_value_fn: WriteOpaqueFn,
@@ -1516,7 +1627,9 @@ const AccumBucket = struct {
 
 const Worker = struct {
     thread: ?std.Thread,
+    thread_id: std.Thread.Id = undefined,
     queue: WorkQueue,
+    scratch_arenas: std.ArrayList(std.heap.ArenaAllocator.State) = .empty,
 };
 
 const WorkQueue = struct {
@@ -1571,6 +1684,7 @@ const WorkQueue = struct {
 };
 
 fn workerMain(db: *Database, worker_index: usize) void {
+    db.workers[worker_index].thread_id = std.Thread.getCurrentId();
     while (true) {
         db.lock();
         while (true) {
@@ -1820,8 +1934,8 @@ fn computeFn(comptime Q: type) ComputeFn {
             computation.begin(db.profile, comptime profiling.queryCategory(Q));
             defer computation.end();
             const input_value: *const Q.Input = @ptrCast(@alignCast(entry.input_ptr));
-            var scratch = db.acquireScratchArena();
-            defer db.releaseScratchArena(&scratch);
+            var scratch = db.acquireScratchArena(worker_index);
+            defer db.releaseScratchArena(worker_index, &scratch);
             var recycler: RecyclingAllocator = .{ .backing = scratch.allocator() };
             var ctx: Context = .{
                 .db = db,

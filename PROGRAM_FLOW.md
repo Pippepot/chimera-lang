@@ -185,13 +185,14 @@ nested query and phase work. Body analysis groups expression construction,
 typing/SSA, reference/lifetime analysis and cleanup, IR finalization, and body
 setup/publication. Dependency waiting/dispatch is separate from query self-time.
 Query and function counts describe actual computations, not memo hits; phase
-and dependency-request counts are invocations. Worker sums can exceed parent
+counts are invocations, and dependency waits count requests for incomplete
+dependencies. Worker sums can exceed parent
 wall time during parallel execution. Profiling is opt-in and adds measurement
 overhead; it does not create semantic query dependencies or change results.
 
 ## Revisions and failures
 
-`ctx.input`, `ctx.get`, and `ctx.spawn` record dependencies; `ctx.emit` records diagnostics. Requests share queued/running work. Successful computations settle all spawned dependencies before publishing their output and transitive accumulators. A pending-work counter guards input updates without scanning the query cache. Idle workers steal general work; a worker waiting recursively runs only the queued dependency it awaits, which prevents unrelated work from acquiring a dependency on the waiting query. Cycle detection includes the dependency currently being revalidated, without treating other stale edges as current dependencies.
+`ctx.input`, `ctx.get`, and `ctx.spawn` record dependencies; `ctx.emit` records diagnostics. Requests share queued/running work. Successful computations settle all spawned dependencies before publishing their output and transitive accumulators. A pending-work counter guards input updates without scanning the query cache. Idle workers steal general work; a worker waiting recursively runs only the queued dependency it awaits, which prevents unrelated work from acquiring a dependency on the waiting query. A request for a dependency already settled in the current revision returns under the lock that records it; a request for running work sleeps until that entry finishes, and finishing wakes only its own waiters. With zero workers, spawned work stays queued until its requester runs it. Cycle detection includes the dependency currently being revalidated, without treating other stale edges as current dependencies.
 
 `SourceRegistry.update` refreshes a directory snapshot in an idle database. It preserves file IDs across enumeration changes, updates source ownership and membership, and records module additions/removals in the catalog. Removed source inputs remain unreachable through current membership.
 

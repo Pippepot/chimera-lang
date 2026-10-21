@@ -797,13 +797,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     current = origin.next;
                     if (origin.parameter == null and !origin.permanent) continue;
                     const source_start: u32 = @intCast(paths.items.len);
-                    var source = origin.source_path;
-                    while (source) |projection| {
-                        const part = self.reference_storage.projections.items[projection];
-                        try paths.append(allocator, part.step);
-                        source = part.next;
-                    }
-                    std.mem.reverse(structures.ReferencePathStep, paths.items[source_start..]);
+                    try self.referenceSourcePath(origin, &paths);
                     const recursive_path = if (origin.parameter) |parameter|
                         try self.normalizeReferencePath(&paths, source_start, self.block_arguments.items[parameter].type_id)
                     else
@@ -850,13 +844,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     current = origin.next;
                     const parameter = origin.parameter orelse continue;
                     const start: u32 = @intCast(paths.items.len);
-                    var source = origin.source_path;
-                    while (source) |projection| {
-                        const part = self.reference_storage.projections.items[projection];
-                        try paths.append(allocator, part.step);
-                        source = part.next;
-                    }
-                    std.mem.reverse(structures.ReferencePathStep, paths.items[start..]);
+                    try self.referenceSourcePath(origin, &paths);
                     const recursive_path = try self.normalizeReferencePath(&paths, start, self.block_arguments.items[parameter].type_id);
                     const entry: structures.ReferenceRequirement = .{
                         .parameter = parameter,
@@ -1058,17 +1046,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const left = self.values[0].?.id;
             const right = self.values[1].?.id;
             const minus_one = try self.appendInstruction(.{ .const_int = -1 });
-            const start: u32 = @intCast(self.block_arguments.items.len);
-            const zero = try self.newBlock(start, start);
-            const divide = try self.newBlock(start, start);
+            const zero = try self.newEmptyBlock();
+            const divide = try self.newEmptyBlock();
             // Every integer has remainder zero with -1, including minInt.
             // Avoid the overflowing division in that case.
-            self.terminate(.{ .predicate_branch = .{
-                .operation = .eqi,
-                .operands = .{ .lhs = right, .rhs = minus_one.id },
-                .then_branch = self.emptyBranch(zero),
-                .else_branch = self.emptyBranch(divide),
-            } });
+            self.branchOn(.eqi, right, minus_one.id, zero, divide);
             self.enterBlock(zero);
             try self.returnValue(try self.appendInstruction(.{ .const_int = 0 }), .{ .start = 0, .end = 0 });
             self.enterBlock(divide);
@@ -1081,15 +1063,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const left = self.values[0].?;
             const right = if (operation == .not) try self.appendInstruction(.{ .const_bool = false }) else self.values[1].?;
             const predicate = primitivePredicateOperation(operation, left.type_id);
-            const start: u32 = @intCast(self.block_arguments.items.len);
-            const success = try self.newBlock(start, start);
-            const failure = try self.newBlock(start, start);
-            self.terminate(.{ .predicate_branch = .{
-                .operation = predicate,
-                .operands = .{ .lhs = left.id, .rhs = right.id },
-                .then_branch = self.emptyBranch(success),
-                .else_branch = self.emptyBranch(failure),
-            } });
+            const success = try self.newEmptyBlock();
+            const failure = try self.newEmptyBlock();
+            self.branchOn(predicate, left.id, right.id, success, failure);
             self.enterBlock(success);
             try self.finishFunctionExit(.{ .start = 0, .end = 0 }, .return_unit);
             self.enterBlock(failure);
@@ -1580,8 +1556,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn failFunction(self: *Self, span: structures.SourceSpan) !void {
             if (self.failure_scope != null) {
-                const start: u32 = @intCast(self.block_arguments.items.len);
-                const failed = try self.newBlock(start, start);
+                const failed = try self.newEmptyBlock();
                 try self.moveCurrentBoundaryEffectsToTerminator();
                 self.terminate(.{ .branch = self.emptyBranch(failed) });
                 return self.propagateFailure(.{ .block = failed, .state = try self.captureState() }, span);
@@ -1798,21 +1773,15 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const destination = context.fresh_destination;
             const baseline = try self.captureState();
             const tag = try self.appendInstruction(.{ .variant_tag = operand.id });
-            const start: u32 = @intCast(self.block_arguments.items.len);
             var exits: std.ArrayList(FlowExit) = .empty;
             const parent_boundary = self.current_boundary;
             defer self.current_boundary = parent_boundary;
             for (members, conversions, 0..) |member, conversion, index| {
-                const next = if (index + 1 != members.len) try self.newBlock(start, start) else null;
+                const next = if (index + 1 != members.len) try self.newEmptyBlock() else null;
                 if (next) |next_block| {
-                    const selected = try self.newBlock(start, start);
+                    const selected = try self.newEmptyBlock();
                     const expected = try self.appendInstruction(.{ .const_int = @intCast(index) });
-                    self.terminate(.{ .predicate_branch = .{
-                        .operation = .eqi,
-                        .operands = .{ .lhs = tag.id, .rhs = expected.id },
-                        .then_branch = self.emptyBranch(selected),
-                        .else_branch = self.emptyBranch(next_block),
-                    } });
+                    self.branchOn(.eqi, tag.id, expected.id, selected, next_block);
                     self.enterBlock(selected);
                 }
                 const boundary = try self.newBoundary(span);
@@ -2195,9 +2164,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (is_string) return self.stringLiteralConversion(id, expression.operation.string_literal, context, expression.span);
             // Inference must not execute conversions nested inside the source.
             if (self.type_check_only) return try self.stageStaticConversion(id, source_type, context, expression.span);
-            if (!is_literal and (self.allow_type_values or expression.operation == .local_read)) {
+            if (!is_literal and (self.allow_type_values or expression.operation == .local_read))
                 return try self.stageStaticConversion(id, source_type, context, expression.span);
-            }
             const source_value = (try self.analysis_context.executeComptimeWithType(expression.source_node, source_type)) orelse return error.Unavailable;
             const candidate = (try self.selectConversion(source_type, target, source_value, expression.span)) orelse return null;
             return try self.convertValue(null, candidate, context, expression.span);
@@ -3363,9 +3331,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             self.collection_allocation_fallible = previous_policy or construction.fallible_allocation;
             defer self.collection_allocation_fallible = previous_policy;
             _ = try self.inferInitializerType(raw, constructed_type);
-            if (self.type_check_only) {
+            if (self.type_check_only)
                 return self.appendInstruction(.{ .initializer_ref = .{ .region = 0, .captures = .{ .start = 0, .end = 0 }, .type_id = type_id } });
-            }
             var region = self.initializerRegion(constructed_type);
             region.publish_instruction_spans = self.publish_instruction_spans;
 
@@ -3911,16 +3878,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         ) !Value {
             const argument_start: u32 = @intCast(self.block_arguments.items.len);
             _ = try self.appendBlockArgument(source.type_id, null);
-            const copy_block = try self.newBlock(argument_start, argument_start);
-            const owned_block = try self.newBlock(argument_start, argument_start);
+            const copy_block = try self.newEmptyBlock();
+            const owned_block = try self.newEmptyBlock();
             const join = try self.newBlock(argument_start, argument_start + 1);
             const expected = try self.appendInstruction(.{ .const_bool = true });
-            self.terminate(.{ .predicate_branch = .{
-                .operation = .eqb,
-                .operands = .{ .lhs = borrow_predicate, .rhs = expected.id },
-                .then_branch = self.emptyBranch(copy_block),
-                .else_branch = self.emptyBranch(owned_block),
-            } });
+            self.branchOn(.eqb, borrow_predicate, expected.id, copy_block, owned_block);
             self.enterBlock(copy_block);
             const copied = try self.copyValueAcrossJoin(source, span);
             self.terminate(.{ .branch = try self.valuesBranch(join, &.{copied}) });
@@ -4216,17 +4178,12 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const one = try self.appendInstruction(.{ .const_int = 1 });
             const argument = try self.appendBlockArgument(.int, null);
             const header = try self.newBlock(argument, argument + 1);
-            const body = try self.newBlock(argument + 1, argument + 1);
-            const exit = try self.newBlock(argument + 1, argument + 1);
+            const body = try self.newEmptyBlock();
+            const exit = try self.newEmptyBlock();
             self.terminate(.{ .branch = try self.valuesBranch(header, &.{if (reverse) limit else zero}) });
             self.enterBlock(header);
             var index: Value = .{ .id = @fromBackingInt(@intCast(argument)), .type_id = .int };
-            self.terminate(.{ .predicate_branch = .{
-                .operation = if (reverse) .gti else .lti,
-                .operands = .{ .lhs = index.id, .rhs = if (reverse) zero.id else limit.id },
-                .then_branch = self.emptyBranch(body),
-                .else_branch = self.emptyBranch(exit),
-            } });
+            self.branchOn(if (reverse) .gti else .lti, index.id, if (reverse) zero.id else limit.id, body, exit);
             self.enterBlock(body);
             if (reverse) index = try self.appendInstruction(.{ .subi = .{ .lhs = index.id, .rhs = one.id } });
             return .{ .header = header, .exit = exit, .index = index, .one = one };
@@ -4366,19 +4323,14 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (!containsType(destination_members, member)) continue;
                 const member_index = std.mem.indexOfScalar(structures.TypeId, source_members, member).?;
                 remaining -= 1;
-                const case = try self.newBlock(argument_start, argument_start);
+                const case = try self.newEmptyBlock();
                 const next = if (remaining == 0)
                     null
                 else
-                    try self.newBlock(argument_start, argument_start);
+                    try self.newEmptyBlock();
                 if (next) |next_block| {
                     const expected = try self.appendInstruction(.{ .const_int = @intCast(member_index) });
-                    self.terminate(.{ .predicate_branch = .{
-                        .operation = .eqi,
-                        .operands = .{ .lhs = tag.id, .rhs = expected.id },
-                        .then_branch = self.emptyBranch(case),
-                        .else_branch = self.emptyBranch(next_block),
-                    } });
+                    self.branchOn(.eqi, tag.id, expected.id, case, next_block);
                 } else {
                     self.terminate(.{ .branch = self.emptyBranch(case) });
                 }
@@ -4449,9 +4401,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (borrowed.initializer_parameter != null) return self.reject(span, .initializer_requires_construction);
             if (borrowed.explicit_transfer) return self.reject(span, .ownership_transfer_requires_owning_context);
             const capabilities = (try self.analysis_context.facts().ownershipCapabilities(borrowed.type_id)) orelse return error.Unavailable;
-            if (borrowed.borrowed_type == null and capabilities.requires_explicit_drop) {
+            if (borrowed.borrowed_type == null and capabilities.requires_explicit_drop)
                 return self.reject(span, .{ .value_requires_explicit_drop = borrowed.type_id });
-            }
             try self.recordUse(borrowed);
             return borrowed;
         }
@@ -5453,16 +5404,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         ) !Value {
             const argument_start: u32 = @intCast(self.block_arguments.items.len);
             _ = try self.appendBlockArgument(field.type_id, null);
-            const borrowed = try self.newBlock(argument_start, argument_start);
-            const owned = try self.newBlock(argument_start, argument_start);
+            const borrowed = try self.newEmptyBlock();
+            const owned = try self.newEmptyBlock();
             const join = try self.newBlock(argument_start, argument_start + 1);
             const expected = try self.appendInstruction(.{ .const_bool = true });
-            self.terminate(.{ .predicate_branch = .{
-                .operation = .eqb,
-                .operands = .{ .lhs = borrow_condition, .rhs = expected.id },
-                .then_branch = self.emptyBranch(borrowed),
-                .else_branch = self.emptyBranch(owned),
-            } });
+            self.branchOn(.eqb, borrow_condition, expected.id, borrowed, owned);
             self.enterBlock(borrowed);
             self.terminate(.{ .branch = try self.valuesBranch(join, &.{field}) });
             self.enterBlock(owned);
@@ -5748,9 +5694,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             for (0..self.local_availability.len, 0..) |flow_current_index, local_index| {
                 const current = self.local_availability.get(flow_current_index);
                 const initial = baseline.get(local_index);
-                if (initial == .available and current != .available) {
+                if (initial == .available and current != .available)
                     return self.reject(span, .transferred_value_not_restored_before_loop_backedge);
-                }
             }
             for (0..self.field_availability.len, self.field_places, 0..) |flow_current_index, place, field_index| {
                 const current = self.field_availability.get(flow_current_index);
@@ -5978,9 +5923,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 for (fields.items) |field| origins = try self.appendSourcePath(origins, .{ .field = field.index });
                 try self.reference_writes.append(self.gpa, .{ .origins = origins, .written_type = target_type });
             }
-            if (fields.items.len != 0 and self.local_availability.get(local_index) != .available) {
+            if (fields.items.len != 0 and self.local_availability.get(local_index) != .available)
                 return self.reject(assignment_value.target_span, unavailableUse(self.local_availability.get(local_index)));
-            }
             const replaced = early_replaced orelse try self.replacedFields(assignment_value.target, source_fields, fields.items.len != 0, target_span);
             if (!replaces and replaced.unavailable)
                 return self.reject(target_span, .use_after_transfer);
@@ -6000,9 +5944,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 try self.finishReplacementUses(target_span);
                 if (fields.items.len != 0) {
                     // Partial-place lifetimes are not modeled yet, so a replaced field ends here.
-                    if (self.local_availability.get(local_index) == .maybe_transferred and target_capabilities.needs_automatic_drop) {
+                    if (self.local_availability.get(local_index) == .maybe_transferred and target_capabilities.needs_automatic_drop)
                         return self.reject(target_span, .possibly_transferred);
-                    }
                     if (!replaced.skip_old_drop or self.local_values.get(local_index).?.owned_generation != null)
                         try self.dropReplacedField(self.local_values.get(local_index).?, latest_target, fields.items, self.locals.items(.can_deinit)[local_index], target_span);
                 }
@@ -6831,9 +6774,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     maybe_place = null;
                     argument_places.items[argument_index] = null;
                 }
-                if (expected.mode == .mut and operand.type_id != expected.type_id) {
+                if (expected.mode == .mut and operand.type_id != expected.type_id)
                     return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
-                }
                 var argument = try self.coerceValue(operand.id, operand.type_id, expected.type_id) orelse
                     return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(expected.type_id, operand.type_id) });
                 if (argument.coerce_to != null and try self.usesIndirectStorage(expected.type_id)) {
@@ -7200,19 +7142,6 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             }
         }
 
-        fn invokeOperation(self: *Self, name: []const u8, arguments: []const semantic.UnresolvedBody.ValueUse, span: structures.SourceSpan, mode: ResultRequest) !Value {
-            const call: semantic.UnresolvedBody.Call = .{
-                .target = .{ .operation = name },
-                .arguments = .{ .start = 0, .end = 0 },
-                .span = span,
-            };
-            const resolved = try self.resolveCall(call, span, false, arguments);
-            switch (resolved) {
-                .diverged => |value_to_return| return value_to_return,
-                .callable => |callable| return self.resolvedCallResult(callable, call, span, mode),
-            }
-        }
-
         fn resolvedCallResult(self: *Self, callable: ResolvedCallable, call: semantic.UnresolvedBody.Call, span: structures.SourceSpan, request: ResultRequest) !Value {
             if (request.destination == null and request.value.access != .borrow and request.value.access != .consume)
                 return self.resolvedCallValue(callable, call, span, null);
@@ -7431,9 +7360,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn projectRetainedResultOrigins(self: *Self, origins: ?u32, result_type: structures.TypeId, visiting: *std.ArrayList(structures.TypeId)) anyerror!?u32 {
-            if (try self.analysis_context.facts().storageAccess(result_type) != null or try self.analysis_context.facts().borrowElement(result_type) != null) {
+            if (try self.analysis_context.facts().storageAccess(result_type) != null or try self.analysis_context.facts().borrowElement(result_type) != null)
                 return origins;
-            }
             if (std.mem.indexOfScalar(structures.TypeId, visiting.items, result_type) != null)
                 return self.readReferenceOrigins(origins, null, @intCast(self.instruction_count), false);
             try visiting.append(self.gpa, result_type);
@@ -7627,78 +7555,6 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             return self.appendInstruction(.{ .call = call });
         }
 
-        fn indexedAllocationOperation(
-            self: *Self,
-            operation: structures.FunctionCall,
-            call: semantic.UnresolvedBody.Call,
-            span: structures.SourceSpan,
-            mut_arguments: structures.FunctionValueRange,
-        ) !Value {
-            std.debug.assert(operation.arguments.end == operation.arguments.start + 2);
-            const arguments = self.call_arguments.items[operation.arguments.start..operation.arguments.end];
-            const original = try self.value(self.unresolved.call_arguments[call.arguments.start].value);
-            const element_type = (try self.analysis_context.facts().allocationElement(original.type_id)) orelse unreachable;
-            const element = try self.appendInstruction(.{ .allocation_element = .{
-                .allocation = arguments[0].valueId(),
-                .index = arguments[1].valueId(),
-                .type_id = element_type,
-            } });
-            if ((try self.analysis_context.callBehavior(operation.target.direct.item)) == .allocation_destroy) {
-                try self.dropValue(element, true, span);
-                for (self.pending_mut_arguments.items[mut_arguments.start..mut_arguments.end]) |pending| {
-                    if (pending.place.root == .local) try self.updateLocal(@backingInt(pending.place.root.local), .{ .binding_identity = try self.newBindingIdentity() });
-                }
-                return self.appendInstruction(.const_unit);
-            }
-            std.debug.assert(operation.return_type == element_type);
-            var borrowed = element;
-            borrowed.borrowed_type = element_type;
-            borrowed.borrowed_generation = original.borrowed_generation orelse original.owned_generation;
-            borrowed.borrowed_cleanup_value = original.borrowed_cleanup_value orelse original.id;
-            borrowed.materialize_on_copy = true;
-            return self.withReferenceOrigin(original, borrowed);
-        }
-
-        fn boxBorrowOperation(self: *Self, operation: structures.FunctionCall, call: semantic.UnresolvedBody.Call) !Value {
-            std.debug.assert(operation.arguments.end == operation.arguments.start + 1);
-            const owner_value = switch (call.target) {
-                .member => |member| member.receiver.value,
-                else => self.unresolved.call_arguments[call.arguments.start].value,
-            };
-            const owner = try self.value(owner_value);
-            const argument = self.call_arguments.items[operation.arguments.start];
-            const reference = try self.appendInstruction(.{ .borrow_box = .{ .source = argument.valueId(), .type_id = operation.return_type } });
-            var borrowed = try self.withReferenceOrigin(owner, reference);
-            if (owner.borrow_root) |root| {
-                const local_reference = owner.local_reference;
-                if (owner.id == self.local_values.get(@backingInt(root)).?.id or
-                    (local_reference != null and local_reference.?.local == root and local_reference.?.projections.start == local_reference.?.projections.end))
-                {
-                    borrowed.stable_reference_root = root;
-                } else if (@backingInt(owner_value) >= self.unresolved.parameter_count) {
-                    const receiver = self.unresolved.expressions[@backingInt(owner_value) - self.unresolved.parameter_count];
-                    if (receiver.operation == .local_read) {}
-                }
-            }
-            if (borrowed.stable_reference_root) |root| {
-                var origins: ?u32 = null;
-                var current = borrowed.reference_origins;
-                while (current) |index| {
-                    var origin = self.reference_storage.origins.items[index];
-                    if (origin.root == root) {
-                        origin.stable = true;
-                        const owner_value_at_root = self.local_values.get(@backingInt(root)).?;
-                        origin.binding_identity = owner_value_at_root.storage_identity orelse owner_value_at_root.binding_identity;
-                    }
-                    origins = try self.addReferenceOrigin(origins, origin);
-                    current = origin.next;
-                }
-                borrowed.reference_origins = origins;
-            }
-            borrowed.reference_origins = try self.retainResultFrames(borrowed.reference_origins, borrowed.type_id);
-            return borrowed;
-        }
-
         fn stableStorageOrigins(self: *Self, origins: ?u32, storage_root: ?semantic.UnresolvedBody.LocalId) !?u32 {
             const root = storage_root orelse return origins;
             var result: ?u32 = null;
@@ -7718,14 +7574,6 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn addReferenceOrigin(self: *Self, head: ?u32, origin: ReferenceOrigin) !?u32 {
             return self.reference_storage.add(self.gpa, head, origin);
-        }
-
-        fn sameReferenceProjection(self: *const Self, left: ?u32, right: ?u32) bool {
-            return self.reference_storage.sameProjection(left, right);
-        }
-
-        fn sameReferenceTransform(self: *const Self, left: ?u32, right: ?u32) bool {
-            return self.reference_storage.sameTransform(left, right);
         }
 
         fn deferReferenceTransform(self: *Self, origin: *ReferenceOrigin, operation: @FieldType(ReferenceTransform, "operation")) !void {
@@ -7791,8 +7639,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                         origin.readonly_owned = null;
                     },
                     .readonly_owned => |type_id| try self.restrictOwnedOrigin(&origin, type_id),
-                    .relocate_read => |relocation| {
-                        if (origin.read == relocation.from) origin.read = relocation.to;
+                    .relocate_read => |relocation| if (origin.read == relocation.from) {
+                        origin.read = relocation.to;
                     },
                     .refresh_written => |state| if (origin.after_write) {
                         if (origin.root) |root| {
@@ -8459,26 +8307,6 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             return self.readReference(updated_reference, element_type);
         }
 
-        fn borrowWriteOperation(
-            self: *Self,
-            operation: structures.FunctionCall,
-            call: semantic.UnresolvedBody.Call,
-            span: structures.SourceSpan,
-            consumed_arguments: structures.FunctionValueRange,
-        ) !Value {
-            std.debug.assert(operation.arguments.end == operation.arguments.start + 2);
-            const arguments = self.call_arguments.items[operation.arguments.start..operation.arguments.end];
-            const reference_id = switch (call.target) {
-                .member => |member| member.receiver.value,
-                else => self.unresolved.call_arguments[call.arguments.start].value,
-            };
-            const reference = try self.value(reference_id);
-            try self.recordCallArgumentConsumes(consumed_arguments);
-            const result = try self.replaceReference(reference, arguments[0].valueId(), arguments[1].valueId(), span);
-            try self.advanceOwnedReferenceOrigins(reference, reference.id, null);
-            return result;
-        }
-
         fn replaceReference(self: *Self, reference: Value, reference_id: structures.FunctionValueId, item_id: structures.FunctionValueId, span: structures.SourceSpan) !Value {
             try self.validateInitializerReferenceWrite(reference, span);
             try self.recordUse(reference);
@@ -8491,23 +8319,6 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .value = item_id,
                 .type_id = element_type,
             } });
-        }
-
-        fn attenuateRefOperation(self: *Self, operation: structures.FunctionCall, call: semantic.UnresolvedBody.Call) !Value {
-            std.debug.assert(operation.arguments.end == operation.arguments.start + 1);
-            const reference_value = switch (call.target) {
-                .member => |member| member.receiver.value,
-                else => self.unresolved.call_arguments[call.arguments.start].value,
-            };
-            const reference = try self.value(reference_value);
-            var result = try self.appendInstruction(.{ .value_copy = .{
-                .source = self.call_arguments.items[operation.arguments.start].valueId(),
-                .type_id = operation.return_type,
-            } });
-            result.reference_origins = reference.reference_origins;
-            result.stable_reference_root = reference.stable_reference_root;
-            result.local_reference = reference.local_reference;
-            return result;
         }
 
         fn applyCallMutArguments(self: *Self, call: structures.FunctionCall, range: structures.FunctionValueRange) !void {
@@ -8798,15 +8609,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (operand.type_id != .bool) return self.reject(span, .{ .query_operand_not_bool = operand.type_id });
             try self.recordUse(operand);
             const expected = try self.appendInstruction(.{ .const_bool = !invert });
-            const start: u32 = @intCast(self.block_arguments.items.len);
-            const success = try self.newBlock(start, start);
-            const failure = try self.newBlock(start, start);
-            self.terminate(.{ .predicate_branch = .{
-                .operation = .eqb,
-                .operands = .{ .lhs = operand.id, .rhs = expected.id },
-                .then_branch = self.emptyBranch(success),
-                .else_branch = self.emptyBranch(failure),
-            } });
+            const success = try self.newEmptyBlock();
+            const failure = try self.newEmptyBlock();
+            self.branchOn(.eqb, operand.id, expected.id, success, failure);
             const state = try self.captureState();
             return .{ .success = .{ .block = success, .state = state }, .failure = .{ .block = failure, .state = state } };
         }
@@ -8834,8 +8639,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn knownCondition(self: *Self, matches: bool) !ConditionFlow {
-            const argument_start: u32 = @intCast(self.block_arguments.items.len);
-            const next = try self.newBlock(argument_start, argument_start);
+            const next = try self.newEmptyBlock();
             self.terminate(.{ .branch = self.emptyBranch(next) });
             const exit: FlowExit = .{ .block = next, .state = try self.captureState() };
             return if (matches) .{ .success = exit, .failure = null } else .{ .success = null, .failure = exit };
@@ -8854,8 +8658,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn successfulValueCondition(self: *Self, constructed: Value, binding: ?semantic.UnresolvedBody.ConditionBinding) !ConditionFlow {
             if (constructed.type_id == .never) return .{ .success = null, .failure = null, .diverged = constructed };
-            const start: u32 = @intCast(self.block_arguments.items.len);
-            const next = try self.newBlock(start, start);
+            const next = try self.newEmptyBlock();
             self.terminate(.{ .branch = self.emptyBranch(next) });
             return .{ .success = .{ .block = next, .state = try self.captureState(), .binding = if (binding) |value_binding| .{ .call = value_binding } else null, .constructed = constructed }, .failure = null };
         }
@@ -8916,13 +8719,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     };
                 },
                 .eq, .ne => blk: {
-                    if (lhs.type_id != .int and lhs.type_id != .int_literal and lhs.type_id != .bool and lhs.type_id != .type) {
+                    if (lhs.type_id != .int and lhs.type_id != .int_literal and lhs.type_id != .bool and lhs.type_id != .type)
                         return self.reject(comparison.operands.lhs.span, .{ .equality_operand_not_supported = lhs.type_id });
-                    }
                     const integers = (lhs.type_id == .int or lhs.type_id == .int_literal) and (rhs.type_id == .int or rhs.type_id == .int_literal);
-                    if (rhs.type_id != lhs.type_id and !integers) {
+                    if (rhs.type_id != lhs.type_id and !integers)
                         return self.reject(comparison.operands.rhs.span, .{ .equality_operand_type_mismatch = self.typeMismatch(lhs.type_id, rhs.type_id) });
-                    }
                     break :blk switch (lhs.type_id) {
                         .int, .int_literal => if (comparison.operation == .eq) .eqi else .nei,
                         .bool => if (comparison.operation == .eq) .eqb else .neb,
@@ -8931,15 +8732,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     };
                 },
             };
-            const branch_argument_start: u32 = @intCast(self.block_arguments.items.len);
-            const success = try self.newBlock(branch_argument_start, branch_argument_start);
-            const failure = try self.newBlock(branch_argument_start, branch_argument_start);
-            self.terminate(.{ .predicate_branch = .{
-                .operation = operation,
-                .operands = .{ .lhs = lhs.id, .rhs = rhs.id },
-                .then_branch = self.emptyBranch(success),
-                .else_branch = self.emptyBranch(failure),
-            } });
+            const success = try self.newEmptyBlock();
+            const failure = try self.newEmptyBlock();
+            self.branchOn(operation, lhs.id, rhs.id, success, failure);
             const state = try self.captureState();
             return .{
                 .success = .{ .block = success, .state = state },
@@ -8976,9 +8771,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             for (source_members) |member| {
                 if (includesType(membership.target_type, target_members, (try self.analysis_context.facts().memberSpec(member)).type_id)) matching_count += 1;
             }
-            const argument_start: u32 = @intCast(self.block_arguments.items.len);
-            const success = try self.newBlock(argument_start, argument_start);
-            const failure = try self.newBlock(argument_start, argument_start);
+            const success = try self.newEmptyBlock();
+            const failure = try self.newEmptyBlock();
             try self.moveCurrentBoundaryEffectsToTerminator();
             if (matching_count == 0 or matching_count == source_members.len) {
                 self.terminate(.{ .branch = self.emptyBranch(if (matching_count == 0) failure else success) });
@@ -8991,14 +8785,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     const next_failure = if (remaining == 0)
                         failure
                     else
-                        try self.newBlock(argument_start, argument_start);
+                        try self.newEmptyBlock();
                     const expected = try self.appendInstruction(.{ .const_int = @intCast(member_index) });
-                    self.terminate(.{ .predicate_branch = .{
-                        .operation = .eqi,
-                        .operands = .{ .lhs = tag.id, .rhs = expected.id },
-                        .then_branch = self.emptyBranch(success),
-                        .else_branch = self.emptyBranch(next_failure),
-                    } });
+                    self.branchOn(.eqi, tag.id, expected.id, success, next_failure);
                     if (remaining != 0) self.enterBlock(next_failure);
                 }
             }
@@ -9103,9 +8892,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             };
             if (target_type != source_type and matching_count == 0 and try self.analysis_context.facts().variantMembers(target_type) != null)
                 return self.reject(membership.operand.span, .reference_projection_requires_member);
-            const start: u32 = @intCast(self.block_arguments.items.len);
-            const success = try self.newBlock(start, start);
-            const failure = try self.newBlock(start, start);
+            const success = try self.newEmptyBlock();
+            const failure = try self.newEmptyBlock();
             const matches = target_type == source_type or matching_count != 0;
             if (target_type == source_type or matching_count == members.len or !matches) {
                 self.terminate(.{ .branch = self.emptyBranch(if (matches) success else failure) });
@@ -9115,14 +8903,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 for (members, 0..) |member, index| {
                     if ((try self.analysis_context.facts().memberSpec(member)).type_id != target_type) continue;
                     remaining -= 1;
-                    const next = if (remaining == 0) failure else try self.newBlock(start, start);
+                    const next = if (remaining == 0) failure else try self.newEmptyBlock();
                     const expected = try self.appendInstruction(.{ .const_int = @intCast(index) });
-                    self.terminate(.{ .predicate_branch = .{
-                        .operation = .eqi,
-                        .operands = .{ .lhs = tag.id, .rhs = expected.id },
-                        .then_branch = self.emptyBranch(success),
-                        .else_branch = self.emptyBranch(next),
-                    } });
+                    self.branchOn(.eqi, tag.id, expected.id, success, next);
                     if (remaining != 0) self.enterBlock(next);
                 }
             }
@@ -9164,23 +8947,17 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             std.debug.assert(matching.items.len != 0);
             if (matching.items.len == 1) return self.extractLogicalMember(extraction, operand, matching.items[0], target, kind, span);
             const baseline = try self.captureState();
-            const start: u32 = @intCast(self.block_arguments.items.len);
             const tag = try self.appendInstruction(.{ .variant_tag = operand.id });
             var exits: std.ArrayList(FlowExit) = .empty;
 
             for (matching.items, 0..) |member, index| {
                 const last = index + 1 == matching.items.len;
-                const next = if (!last) try self.newBlock(start, start) else null;
+                const next = if (!last) try self.newEmptyBlock() else null;
                 if (next) |failure| {
-                    const success = try self.newBlock(start, start);
+                    const success = try self.newEmptyBlock();
                     const member_index = std.mem.indexOfScalar(structures.TypeId, members, member).?;
                     const expected = try self.appendInstruction(.{ .const_int = @intCast(member_index) });
-                    self.terminate(.{ .predicate_branch = .{
-                        .operation = .eqi,
-                        .operands = .{ .lhs = tag.id, .rhs = expected.id },
-                        .then_branch = self.emptyBranch(success),
-                        .else_branch = self.emptyBranch(failure),
-                    } });
+                    self.branchOn(.eqi, tag.id, expected.id, success, failure);
                     self.enterBlock(success);
                 }
                 const selected = try self.extractLogicalMember(extraction, operand, member, target, kind, span);
@@ -9265,8 +9042,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             // End only the unmatched, automatically droppable alternatives.
             try self.dropVariantMember(operand, unmatched.items, false, span);
             try self.appendBoundary(boundary);
-            const arguments: u32 = @intCast(self.block_arguments.items.len);
-            const continuation = try self.newBlock(arguments, arguments);
+            const continuation = try self.newEmptyBlock();
             self.terminate(.{ .branch = self.emptyBranch(continuation) });
             return .{ .block = continuation, .state = try self.captureState() };
         }
@@ -9805,8 +9581,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 self.terminate(.{ .branch = try self.joinBranch(target, exit, result_type, changed_slots, null, null) });
                 return exit.block;
             }
-            const argument_start: u32 = @intCast(self.block_arguments.items.len);
-            const edge = try self.newBlock(argument_start, argument_start);
+            const edge = try self.newEmptyBlock();
             self.terminate(.{ .branch = self.emptyBranch(edge) });
             self.enterBlock(edge);
             const borrowed_on_path = if (include_borrow_condition) exit.constructed.?.borrow_condition orelse (try self.appendInstruction(.{
@@ -10068,12 +9843,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (capture.position == .entry) return 0;
             for (self.blocks.items[@backingInt(capture.block)].items.items, 0..) |item, index| switch (capture.position) {
                 .entry => unreachable,
-                .instruction => |instruction| {
-                    if (item == .instruction and item.instruction.id == instruction) return index + 1;
-                },
-                .boundary => |boundary| {
-                    if (item == .boundary and item.boundary == boundary) return index + 1;
-                },
+                .instruction => |instruction| if (item == .instruction and item.instruction.id == instruction) return index + 1,
+                .boundary => |boundary| if (item == .boundary and item.boundary == boundary) return index + 1,
             };
             unreachable;
         }
@@ -10117,12 +9888,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const owned = try self.newBlock(argument_index, argument_index);
             const join = try self.newBlock(argument_index, argument_index);
             const expected = try self.appendInstruction(.{ .const_bool = true });
-            self.terminate(.{ .predicate_branch = .{
-                .operation = .eqb,
-                .operands = .{ .lhs = cleanup_condition, .rhs = expected.id },
-                .then_branch = self.emptyBranch(borrowed),
-                .else_branch = self.emptyBranch(owned),
-            } });
+            self.branchOn(.eqb, cleanup_condition, expected.id, borrowed, owned);
             self.enterBlock(borrowed);
             self.terminate(.{ .branch = self.emptyBranch(join) });
             self.enterBlock(owned);
@@ -10139,7 +9905,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     const ancestor_predicate = self.generations.items[@backingInt(generation)].cleanup_condition orelse continue;
                     const argument_start: u32 = @intCast(self.block_arguments.items.len);
                     const retained = try self.newBlock(argument_start, argument_start);
-                    self.terminate(.{ .predicate_branch = .{ .operation = .eqb, .operands = .{ .lhs = ancestor_predicate, .rhs = expected.id }, .then_branch = self.emptyBranch(join), .else_branch = self.emptyBranch(retained) } });
+                    self.branchOn(.eqb, ancestor_predicate, expected.id, join, retained);
                     self.enterBlock(retained);
                 }
             }
@@ -10667,6 +10433,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (self.boundary_locations.items.len != 0) self.boundary_locations.items[@backingInt(boundary)] = .{ .block = block_id, .item_index = item_index };
         }
 
+        fn newEmptyBlock(self: *Self) !structures.FunctionBlockId {
+            const end: u32 = @intCast(self.block_arguments.items.len);
+            return self.newBlock(end, end);
+        }
+
         fn newBlock(self: *Self, argument_start: u32, argument_end: u32) !structures.FunctionBlockId {
             std.debug.assert(self.block_arguments.items.len == self.block_argument_generations.items.len);
             const id: structures.FunctionBlockId = @fromBackingInt(@intCast(self.blocks.items.len));
@@ -10729,6 +10500,15 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn emptyBranch(self: *const Self, target: structures.FunctionBlockId) structures.FunctionBranch {
             const start: u32 = @intCast(self.branch_arguments.items.len);
             return .{ .target = target, .arguments = .{ .start = start, .end = start } };
+        }
+
+        fn branchOn(self: *Self, operation: structures.PredicateOperation, lhs: structures.FunctionValueId, rhs: structures.FunctionValueId, success: structures.FunctionBlockId, failure: structures.FunctionBlockId) void {
+            self.terminate(.{ .predicate_branch = .{
+                .operation = operation,
+                .operands = .{ .lhs = lhs, .rhs = rhs },
+                .then_branch = self.emptyBranch(success),
+                .else_branch = self.emptyBranch(failure),
+            } });
         }
 
         fn finish(self: *Self, retained_captures: ?*std.ArrayList(u32)) !structures.FunctionBodyAnalysis {

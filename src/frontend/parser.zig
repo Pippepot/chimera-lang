@@ -621,10 +621,7 @@ fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
     const then_body = try parseBody(parser, token_index);
     if (parser.eat(.keyword_else) != null) {
         const else_body = if (parser.eat(.indent) != null) try parseBlock(parser, parser.index - 1) else try parseRequiredExpression(parser);
-        const ref_start: u32 = @intCast(parser.node_refs.items.len);
-        try parser.node_refs.appendSlice(parser.gpa, &.{ condition, then_body, else_body });
-        const ref_end: u32 = @intCast(parser.node_refs.items.len);
-        return try parser.addNode(.{ .tag = .if_else, .token_index = token_index, .data = .{ .ref = .{ .start = ref_start, .end = ref_end } } });
+        return parser.addNode(.{ .tag = .if_else, .token_index = token_index, .data = try parser.listToSpan(&.{ condition, then_body, else_body }) });
     }
     return try parser.addNode(.{ .tag = .@"if", .token_index = token_index, .data = .{ .node_node = .{ .a = condition, .b = then_body } } });
 }
@@ -1071,13 +1068,8 @@ fn parseExpressionList(parser: *ParserState, opening: Token.Tag, closing: Token.
 /// Freeze each list before releasing its scratch range; nested lists share the
 /// stack while retaining their own delimiter and continuation handling.
 fn parseDelimitedList(parser: *ParserState, opening: Token.Tag, closing: Token.Tag, prefix: []const Node.Index, comptime parse_item: anytype, arguments: anytype) ParseError!Node.Data {
-    const ItemArguments = comptime blk: {
-        const argument_types = @typeInfo(@TypeOf(arguments)).@"struct".field_types;
-        var types: [argument_types.len + 1]type = undefined;
-        types[0] = *ParserState;
-        for (argument_types, 1..) |argument_type, index| types[index] = argument_type;
-        break :blk @Tuple(&types);
-    };
+    const argument_types = comptime @typeInfo(@TypeOf(arguments)).@"struct".field_types;
+    const ItemArguments = @Tuple(&([_]type{*ParserState} ++ argument_types[0..argument_types.len].*));
     _ = try parser.expect(opening);
     const stack_top = parser.scratch_stack.items.len;
     defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);

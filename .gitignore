@@ -8,4 +8,4 @@ zig-out/
 .chi-run-*
 *.qcache
 *.o
-agentloop
+playground

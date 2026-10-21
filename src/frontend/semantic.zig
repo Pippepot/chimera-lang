@@ -1247,9 +1247,8 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
 
         fn appendAssignment(self: *Self, index: structures.Node.Index) !ValueId {
             const node = self.ast.nodes[index.index()];
-            if (node.tag == .assign and self.isDiscardAssignment(index)) {
+            if (node.tag == .assign and self.isDiscardAssignment(index))
                 return self.appendExpression(index, .{ .discard = try self.appendUse(node.data.node_node.b, false) });
-            }
             const target_node_value = self.ast.nodes[node.data.node_node.a.index()];
             if (target_node_value.tag == .index_access) {
                 const receiver = try self.appendUse(target_node_value.data.node_node.a, false);
@@ -1543,9 +1542,8 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 },
                 else => try self.append(last, result_is_type),
             };
-            if (result == null and (last_node.tag == .const_binding or last_node.tag == .var_binding)) {
+            if (result == null and (last_node.tag == .const_binding or last_node.tag == .var_binding))
                 return self.finishBlock(statements.items, try self.appendExpression(index, .unit), tokenSpan(self.ast, node.token_index));
-            }
             return self.finishBlock(statements.items, result, tokenSpan(self.ast, node.token_index));
         }
 
@@ -1856,9 +1854,8 @@ pub fn analyzeFunctionShape(
             return .{ .unsupported = issueAt(ast, parameter.data.node_node.a.unwrap().?.index(), .parameter_mode_not_supported) };
         const name_span = tokenSpan(ast, parameter.token_index);
         const name = source[name_span.start..name_span.end];
-        if ((try names.getOrPut(name)).found_existing) {
+        if ((try names.getOrPut(name)).found_existing)
             return .{ .unsupported = .{ .span = name_span, .kind = .duplicate_parameter } };
-        }
         const annotation = parameter.data.node_node.b.unwrap() orelse {
             return .{ .unsupported = .{ .span = name_span, .kind = .parameter_type_missing } };
         };
@@ -2127,13 +2124,7 @@ pub fn analyzeIndependentStructFieldType(
     const parts = functionParts(ast, declaration);
     const signature = ast.nodes[parts.signature.index()];
     const parameters = ast.nodeList(signature.data.signature.parameters);
-    const static_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = parameters, .static_only = true };
-    if (runtimeReference(ast, source, annotation, static_parameters) != null or ast.nodes[annotation.index()].tag == .call)
-        return .{ .success = null };
-    return switch (try analyzeType(ast, source, annotation, analysis_context, gpa, .struct_field_type_not_supported)) {
-        .success => |type_id| .{ .success = type_id },
-        .unsupported => |issue| .{ .unsupported = issue },
-    };
+    return analyzeIndependentAnnotation(ast, source, annotation, parameters, analysis_context, gpa, .struct_field_type_not_supported);
 }
 
 fn structFactoryFieldAnnotation(ast: *const structures.Ast, source: []const u8, declaration: u32, name: []const u8) ?structures.Node.Index {
@@ -2358,10 +2349,14 @@ pub fn analyzeIndependentReturnType(
     const signature = ast.nodes[parts.signature.index()];
     const annotation = signature.data.signature.return_type.unwrap() orelse return .{ .success = null };
     const parameters = ast.nodeList(signature.data.signature.parameters);
+    return analyzeIndependentAnnotation(ast, source, annotation, parameters, analysis_context, gpa, .return_type_not_supported);
+}
+
+fn analyzeIndependentAnnotation(ast: *const structures.Ast, source: []const u8, annotation: structures.Node.Index, parameters: []const structures.Node.Index, analysis_context: anytype, gpa: std.mem.Allocator, unsupported: structures.Diagnostic.Kind) !SemanticResult(?structures.TypeId) {
     const static_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = parameters, .static_only = true };
     if (runtimeReference(ast, source, annotation, static_parameters) != null or ast.nodes[annotation.index()].tag == .call)
         return .{ .success = null };
-    return switch (try analyzeType(ast, source, annotation, analysis_context, gpa, .return_type_not_supported)) {
+    return switch (try analyzeType(ast, source, annotation, analysis_context, gpa, unsupported)) {
         .success => |type_id| .{ .success = type_id },
         .unsupported => |issue| .{ .unsupported = issue },
     };
@@ -2384,13 +2379,7 @@ pub fn analyzeIndependentParameterType(
         if (parameterMode(ast, parameter).? == .static) continue;
         if (current == runtime_index) {
             const annotation = parameter.data.node_node.b.unwrap().?;
-            const static_parameters: ParameterScope = .{ .ast = ast, .source = source, .parameters = parameters, .static_only = true };
-            if (runtimeReference(ast, source, annotation, static_parameters) != null) return .{ .success = null };
-            if (ast.nodes[annotation.index()].tag == .call) return .{ .success = null };
-            return switch (try analyzeType(ast, source, annotation, analysis_context, gpa, .parameter_type_not_supported)) {
-                .success => |type_id| .{ .success = type_id },
-                .unsupported => |issue| .{ .unsupported = issue },
-            };
+            return analyzeIndependentAnnotation(ast, source, annotation, parameters, analysis_context, gpa, .parameter_type_not_supported);
         }
         current += 1;
     }
@@ -2457,16 +2446,14 @@ pub fn analyzeShapedFunctionSignature(
         const mode = parameter_shape.mode;
         const name_span = tokenSpan(ast, parameter.token_index);
         const name = source[name_span.start..name_span.end];
-        if (try analysis_context.resolveLocalConflict(name) != null) {
+        if (try analysis_context.resolveLocalConflict(name) != null)
             return .{ .unsupported = .{ .span = name_span, .kind = .duplicate_parameter } };
-        }
         const annotation = parameter.data.node_node.b.unwrap().?;
         if (runtimeReference(ast, source, annotation, runtime_parameters)) |reference|
             return .{ .unsupported = issueAt(ast, reference.index(), .value_used_as_type) };
         if (mode == .static) {
-            if (specialization_index >= specialization.len) {
+            if (specialization_index >= specialization.len)
                 return .{ .unsupported = .{ .span = name_span, .kind = .static_parameter_requires_specialization } };
-            }
             const argument = try analysis_context.lookupCompileTimeValue(specialization[specialization_index]);
             specialization_index += 1;
             if (parameter_shape.is_meta_type) {
@@ -2811,9 +2798,7 @@ pub fn analyzeStaticDeclaration(
         .success => |type_id| type_id,
         .unsupported => |issue| return .{ .unsupported = issue },
     };
-    if (expected == .type) {
-        return .{ .unsupported = issueAt(ast, annotation.index(), .static_initializer_not_supported) };
-    }
+    if (expected == .type) return .{ .unsupported = issueAt(ast, annotation.index(), .static_initializer_not_supported) };
     return .{ .success = .{ .interpret = expected } };
 }
 
@@ -2829,9 +2814,8 @@ pub fn analyzeStructDefinition(
     std.debug.assert(binding.tag == .static_binding);
     const initializer = binding.data.node_node.b.unwrap() orelse unreachable;
     if (binding.data.node_node.a.unwrap()) |annotation| {
-        if (!isMetaTypeAnnotation(ast, source, annotation)) {
+        if (!isMetaTypeAnnotation(ast, source, annotation))
             return .{ .unsupported = issueAt(ast, annotation.index(), .static_initializer_not_supported) };
-        }
     }
     return analyzeStructMembers(ast, source, initializer, .{ .declared = item_id }, analysis_context, gpa);
 }
@@ -2893,11 +2877,10 @@ fn analyzeStructMembers(
         if (member.tag == .struct_property) {
             const property_span = tokenSpan(ast, member.token_index);
             const property_name = source[property_span.start..property_span.end];
-            const operation = StructOwnershipOperation.fromName(property_name) orelse
+            const operation = std.meta.stringToEnum(StructOwnershipOperation, property_name) orelse
                 return .{ .unsupported = .{ .span = property_span, .kind = .unknown_struct_property } };
-            if (operation.isDefined(ownership)) {
+            if (operation.isDefined(ownership))
                 return .{ .unsupported = .{ .span = property_span, .kind = .duplicate_struct_property } };
-            }
             const value = ast.nodes[member.data.node.index()];
             const value_span = tokenSpan(ast, value.token_index);
             const value_name = if (value.tag == .identifier) source[value_span.start..value_span.end] else "";
@@ -2930,34 +2913,22 @@ fn analyzeStructMembers(
                     } },
                 } };
                 switch (operation) {
-                    .copy => ownership.copy = .{ .capability = .custom, .hook = hook, .span = property_span },
-                    .move => ownership.move = .{ .capability = .custom, .hook = hook, .span = property_span },
-                    .drop => ownership.drop = .{ .capability = .custom, .hook = hook, .span = property_span },
+                    inline else => |kind| @field(ownership, @tagName(kind)) = .{ .capability = .custom, .hook = hook, .span = property_span },
                 }
                 continue;
             }
             switch (operation) {
-                .move => {
-                    const capability: structures.MoveCapability = if (std.mem.eql(u8, value_name, "trivial"))
+                inline .move, .copy => |kind| {
+                    const Capability = if (kind == .move) structures.MoveCapability else structures.CopyCapability;
+                    const capability: Capability = if (std.mem.eql(u8, value_name, "trivial"))
                         .trivial
                     else if (std.mem.eql(u8, value_name, "fieldwise"))
                         .fieldwise
                     else if (value.tag == .none_literal)
                         .none
                     else
-                        return .{ .unsupported = .{ .span = value_span, .kind = .{ .invalid_struct_property_value = .move } } };
-                    ownership.move = .{ .capability = capability, .span = property_span };
-                },
-                .copy => {
-                    const capability: structures.CopyCapability = if (std.mem.eql(u8, value_name, "trivial"))
-                        .trivial
-                    else if (std.mem.eql(u8, value_name, "fieldwise"))
-                        .fieldwise
-                    else if (value.tag == .none_literal)
-                        .none
-                    else
-                        return .{ .unsupported = .{ .span = value_span, .kind = .{ .invalid_struct_property_value = .copy } } };
-                    ownership.copy = .{ .capability = capability, .span = property_span };
+                        return .{ .unsupported = .{ .span = value_span, .kind = .{ .invalid_struct_property_value = @field(structures.Diagnostic.InvalidStructPropertyValue, @tagName(kind)) } } };
+                    @field(ownership, @tagName(kind)) = .{ .capability = capability, .span = property_span };
                 },
                 .drop => {
                     const capability: structures.DropCapability = if (std.mem.eql(u8, value_name, "trivial"))
@@ -3006,18 +2977,9 @@ const StructOwnershipOperation = enum {
     copy,
     drop,
 
-    fn fromName(name: []const u8) ?StructOwnershipOperation {
-        if (std.mem.eql(u8, name, "move")) return .move;
-        if (std.mem.eql(u8, name, "copy")) return .copy;
-        if (std.mem.eql(u8, name, "drop")) return .drop;
-        return null;
-    }
-
     fn isDefined(operation: StructOwnershipOperation, ownership: structures.StructOwnershipProperties) bool {
         return switch (operation) {
-            .move => ownership.move != null,
-            .copy => ownership.copy != null,
-            .drop => ownership.drop != null,
+            inline else => |kind| @field(ownership, @tagName(kind)) != null,
         };
     }
 };

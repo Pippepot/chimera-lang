@@ -172,9 +172,7 @@ pub const Tokenizer = struct {
             result.loc.start = self.index;
         }
 
-        if (self.index == self.buffer.len) {
-            return self.eofOrDedent();
-        }
+        if (self.index == self.buffer.len) return self.eofOrDedent();
 
         state: switch (State.start) {
             .start => switch (self.current()) {
@@ -217,36 +215,8 @@ pub const Tokenizer = struct {
                     continue :state .equal;
                 },
                 '|' => result.tag = self.binaryOperator(.pipe, .pipe_equal),
-                '(' => {
-                    result.tag = .l_paren;
-                    self.index += 1;
-                },
-                ')' => {
-                    result.tag = .r_paren;
-                    self.index += 1;
-                },
-                '[' => {
-                    result.tag = .l_bracket;
-                    self.index += 1;
-                },
-                ']' => {
-                    result.tag = .r_bracket;
-                    self.index += 1;
-                },
-                ';' => {
-                    result.tag = .semicolon;
-                    self.index += 1;
-                },
-                ',' => {
-                    result.tag = .comma;
-                    self.index += 1;
-                },
-                '?' => {
-                    result.tag = .question_mark;
-                    self.index += 1;
-                },
-                ':' => {
-                    result.tag = .colon;
+                inline '(', ')', '[', ']', ';', ',', '?', ':', '{', '}', '~' => |byte| {
+                    result.tag = comptime Token.punctuation.get(&.{byte}).?;
                     self.index += 1;
                 },
                 '%' => result.tag = self.binaryOperator(.percent, .percent_equal),
@@ -255,18 +225,6 @@ pub const Tokenizer = struct {
                 '<' => continue :state .angle_bracket_left,
                 '>' => continue :state .angle_bracket_right,
                 '^' => result.tag = self.binaryOperator(.caret, .caret_equal),
-                '{' => {
-                    result.tag = .l_brace;
-                    self.index += 1;
-                },
-                '}' => {
-                    result.tag = .r_brace;
-                    self.index += 1;
-                },
-                '~' => {
-                    result.tag = .tilde;
-                    self.index += 1;
-                },
                 '.' => continue :state .period,
                 '-' => {
                     result.tag = .minus;
@@ -362,67 +320,40 @@ pub const Tokenizer = struct {
                 }
             },
 
-            .equal => {
+            inline .equal, .minus => |operator| {
                 self.index += 1;
                 switch (self.current()) {
                     '=' => {
-                        result.tag = .equal_equal;
+                        result.tag = if (operator == .equal) .equal_equal else .minus_equal;
                         self.index += 1;
                     },
                     '>' => {
-                        result.tag = .equal_angle_bracket_right;
+                        result.tag = if (operator == .equal) .equal_angle_bracket_right else .arrow;
                         self.index += 1;
                     },
-                    else => result.tag = .equal,
+                    else => result.tag = if (operator == .equal) .equal else .minus,
                 }
             },
 
-            .minus => {
+            inline .angle_bracket_left, .angle_bracket_right => |operator| {
+                const byte: u8 = comptime if (operator == .angle_bracket_left) '<' else '>';
                 self.index += 1;
                 switch (self.current()) {
-                    '>' => {
-                        result.tag = .arrow;
-                        self.index += 1;
-                    },
-                    '=' => {
-                        result.tag = .minus_equal;
-                        self.index += 1;
-                    },
-                    else => result.tag = .minus,
-                }
-            },
-
-            .angle_bracket_left => {
-                self.index += 1;
-                switch (self.current()) {
-                    '<' => result.tag = self.binaryOperator(
-                        .angle_bracket_angle_bracket_left,
-                        .angle_bracket_angle_bracket_left_equal,
-                    ),
-                    '>' => {
-                        result.tag = .angle_bracket_left_angle_bracket_right;
-                        self.index += 1;
-                    },
-                    '=' => {
-                        result.tag = .angle_bracket_left_equal;
-                        self.index += 1;
-                    },
-                    else => result.tag = .angle_bracket_left,
-                }
-            },
-
-            .angle_bracket_right => {
-                self.index += 1;
-                switch (self.current()) {
-                    '>' => result.tag = self.binaryOperator(
-                        .angle_bracket_angle_bracket_right,
-                        .angle_bracket_angle_bracket_right_equal,
+                    byte => result.tag = self.binaryOperator(
+                        comptime Token.punctuation.get(&.{ byte, byte }).?,
+                        comptime Token.punctuation.get(&.{ byte, byte, '=' }).?,
                     ),
                     '=' => {
-                        result.tag = .angle_bracket_right_equal;
+                        result.tag = comptime Token.punctuation.get(&.{ byte, '=' }).?;
                         self.index += 1;
                     },
-                    else => result.tag = .angle_bracket_right,
+                    else => {
+                        result.tag = comptime Token.punctuation.get(&.{byte}).?;
+                        if (operator == .angle_bracket_left and self.current() == '>') {
+                            result.tag = .angle_bracket_left_angle_bracket_right;
+                            self.index += 1;
+                        }
+                    },
                 }
             },
 
@@ -462,9 +393,7 @@ pub const Tokenizer = struct {
                         continue :state .start;
                     },
                     '\r' => continue :state .expect_newline,
-                    0x01...0x09, 0x0b...0x0c, 0x0e...0x1f, 0x7f => {
-                        continue :state .invalid;
-                    },
+                    0x01...0x09, 0x0b...0x0c, 0x0e...0x1f, 0x7f => continue :state .invalid,
                     else => continue :state .line_comment,
                 }
             },
@@ -477,9 +406,7 @@ pub const Tokenizer = struct {
                     self.index += 1;
                     continue :state .int;
                 },
-                'e', 'E', 'p', 'P' => {
-                    continue :state .int_exponent;
-                },
+                'e', 'E', 'p', 'P' => continue :state .int_exponent,
                 else => {},
             },
             .int_exponent => {
@@ -499,9 +426,7 @@ pub const Tokenizer = struct {
                         self.index += 1;
                         continue :state .float;
                     },
-                    'e', 'E', 'p', 'P' => {
-                        continue :state .float_exponent;
-                    },
+                    'e', 'E', 'p', 'P' => continue :state .float_exponent,
                     else => self.index -= 1,
                 }
             },
@@ -510,9 +435,7 @@ pub const Tokenizer = struct {
                     self.index += 1;
                     continue :state .float;
                 },
-                'e', 'E', 'p', 'P' => {
-                    continue :state .float_exponent;
-                },
+                'e', 'E', 'p', 'P' => continue :state .float_exponent,
                 else => {},
             },
             .float_exponent => {
@@ -531,6 +454,20 @@ pub const Tokenizer = struct {
         return result;
     }
 };
+
+test "fixed lexemes roundtrip their spelling and token extent" {
+    for ([_]@TypeOf(Token.punctuation){ Token.punctuation, Token.keywords }) |lexemes| {
+        for (lexemes.keys(), lexemes.values()) |text, tag| {
+            try testTokenize(text, &.{tag});
+            try std.testing.expectEqualStrings(text, Token.spelling(tag).?);
+            var scanner = try Tokenizer.init(std.testing.allocator, text);
+            defer scanner.deinit();
+            const token = try scanner.next();
+            try std.testing.expectEqual(@as(u32, 0), token.loc.start);
+            try std.testing.expectEqual(text.len, token.loc.end);
+        }
+    }
+}
 
 test "keywords" {
     try testTokenize("if else const var imm mut deinit return fail true false comptime static func struct is as and or not none sizeof test loop break continue import pub", &.{
@@ -1133,7 +1070,7 @@ test "token loc skips leading blank lines" {
     }
 }
 
-fn testTokenize(source: [:0]const u8, expected_token_tags: []const Token.Tag) !void {
+fn testTokenize(source: []const u8, expected_token_tags: []const Token.Tag) !void {
     var tokenizer = try Tokenizer.init(std.testing.allocator, source);
     defer tokenizer.deinit();
     for (expected_token_tags) |expected_token_tag| {

@@ -112,50 +112,77 @@ pub const Token = struct {
         keyword_pub,
     };
 
-    pub const keywords = std.StaticStringMap(Tag).initComptime(.{
-        .{ "and", .keyword_and },
-        .{ "as", .keyword_as },
-        .{ "break", .keyword_break },
-        .{ "comptime", .keyword_comptime },
-        .{ "const", .keyword_const },
-        .{ "converter", .keyword_converter },
-        .{ "continue", .keyword_continue },
-        .{ "deinit", .keyword_deinit },
-        .{ "init", .keyword_init },
-        .{ "else", .keyword_else },
-        .{ "extern", .keyword_extern },
-        .{ "fail", .keyword_fail },
-        .{ "fallible", .keyword_fallible },
-        .{ "false", .keyword_false },
-        .{ "func", .keyword_func },
-        .{ "for", .keyword_for },
-        .{ "if", .keyword_if },
-        .{ "in", .keyword_in },
-        .{ "is", .keyword_is },
-        .{ "loop", .keyword_loop },
-        .{ "match", .keyword_match },
-        .{ "mut", .keyword_mut },
-        .{ "ref", .keyword_ref },
-        .{ "not", .keyword_not },
-        .{ "none", .keyword_none },
-        .{ "or", .keyword_or },
-        .{ "overload", .keyword_overload },
-        .{ "panic", .keyword_panic },
-        .{ "imm", .keyword_imm },
-        .{ "return", .keyword_return },
-        .{ "sizeof", .keyword_sizeof },
-        .{ "static", .keyword_static },
-        .{ "struct", .keyword_struct },
-        .{ "test", .keyword_test },
-        .{ "true", .keyword_true },
-        .{ "var", .keyword_var },
-        .{ "where", .keyword_where },
-        .{ "import", .keyword_import },
-        .{ "pub", .keyword_pub },
+    pub const keywords = std.StaticStringMap(Tag).initComptime(blk: {
+        const info = @typeInfo(Tag).@"enum";
+        var entries: [info.field_names.len]struct { []const u8, Tag } = undefined;
+        var count: usize = 0;
+        for (info.field_names, info.field_values) |name, value| {
+            if (std.mem.startsWith(u8, name, "keyword_")) {
+                entries[count] = .{ name["keyword_".len..], @fromBackingInt(value) };
+                count += 1;
+            }
+        }
+        break :blk entries[0..count].*;
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
         return keywords.get(bytes);
+    }
+
+    pub const punctuation = std.StaticStringMap(Tag).initComptime(.{
+        .{ "=", .equal },
+        .{ "=>", .equal_angle_bracket_right },
+        .{ "+", .plus },
+        .{ "-", .minus },
+        .{ "*", .asterisk },
+        .{ "/", .slash },
+        .{ "%", .percent },
+        .{ "^", .caret },
+        .{ "|", .pipe },
+        .{ "&", .ampersand },
+        .{ "<", .angle_bracket_left },
+        .{ "<<", .angle_bracket_angle_bracket_left },
+        .{ "<>", .angle_bracket_left_angle_bracket_right },
+        .{ ">", .angle_bracket_right },
+        .{ ">>", .angle_bracket_angle_bracket_right },
+        .{ "==", .equal_equal },
+        .{ "+=", .plus_equal },
+        .{ "-=", .minus_equal },
+        .{ "*=", .asterisk_equal },
+        .{ "/=", .slash_equal },
+        .{ "%=", .percent_equal },
+        .{ "^=", .caret_equal },
+        .{ "|=", .pipe_equal },
+        .{ "&=", .ampersand_equal },
+        .{ "<=", .angle_bracket_left_equal },
+        .{ "<<=", .angle_bracket_angle_bracket_left_equal },
+        .{ ">=", .angle_bracket_right_equal },
+        .{ ">>=", .angle_bracket_angle_bracket_right_equal },
+        .{ "{", .l_brace },
+        .{ "}", .r_brace },
+        .{ "(", .l_paren },
+        .{ ")", .r_paren },
+        .{ "[", .l_bracket },
+        .{ "]", .r_bracket },
+        .{ "?", .question_mark },
+        .{ "->", .arrow },
+        .{ "~", .tilde },
+        .{ ".", .period },
+        .{ ",", .comma },
+        .{ ":", .colon },
+        .{ ";", .semicolon },
+        .{ "..", .ellipsis2 },
+        .{ "...", .ellipsis3 },
+    });
+
+    pub fn spelling(tag: Tag) ?[]const u8 {
+        for (punctuation.keys(), punctuation.values()) |text, candidate| {
+            if (candidate == tag) return text;
+        }
+        for (keywords.keys(), keywords.values()) |text, candidate| {
+            if (candidate == tag) return text;
+        }
+        return null;
     }
 };
 
@@ -1450,36 +1477,20 @@ pub const ReferenceContract = struct {
 
     /// Inference joins sets of dependencies; their discovery order is irrelevant.
     pub fn equivalent(left: @This(), right: @This()) bool {
-        if (left.origins.len != right.origins.len or left.requirements.len != right.requirements.len or left.exclusions.len != right.exclusions.len) return false;
-        for (left.origins) |a| {
-            var found = false;
-            for (right.origins) |b| {
-                if (sameOrigin(left, a, right, b)) {
-                    found = true;
-                    break;
+        inline for (.{ "origins", "requirements", "exclusions" }, .{ sameOrigin, sameRequirement, sameExclusion }) |name, same| {
+            const first = @field(left, name);
+            const second = @field(right, name);
+            if (first.len != second.len) return false;
+            for (first) |entry| {
+                var found = false;
+                for (second) |candidate| {
+                    if (same(left, entry, right, candidate)) {
+                        found = true;
+                        break;
+                    }
                 }
+                if (!found) return false;
             }
-            if (!found) return false;
-        }
-        for (left.requirements) |a| {
-            var found = false;
-            for (right.requirements) |b| {
-                if (sameRequirement(left, a, right, b)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return false;
-        }
-        for (left.exclusions) |a| {
-            var found = false;
-            for (right.exclusions) |b| {
-                if (sameExclusion(left, a, right, b)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return false;
         }
         return true;
     }

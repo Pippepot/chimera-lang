@@ -2,6 +2,7 @@ const std = @import("std");
 
 pub const cache = @import("src/cache.zig");
 pub const codegen = @import("src/backend/codegen.zig");
+pub const disasm = @import("src/backend/disasm.zig");
 pub const diagnostic_rendering = @import("src/diagnostics.zig");
 pub const debug = @import("src/debug.zig");
 pub const comptime_interpreter = @import("src/frontend/comptime_interpreter.zig");
