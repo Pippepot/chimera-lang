@@ -236,6 +236,10 @@ pub const Node = struct {
         var_binding,
         ref_binding,
         static_binding,
+        destructure_binding,
+        binding_annotation,
+        binding_tuple,
+        binding_sequence,
         namespace_declaration,
         comptime_expr,
         field_access,
@@ -310,10 +314,10 @@ pub const Node = struct {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .fail_expr, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
             .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .reference_type, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread => .node,
-            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .func, .param, .type_func, .@"if", .collection_if => .node_node,
+            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .func, .param, .type_func, .@"if", .collection_if => .node_node,
             .struct_field => .field,
             .signature => .signature,
-            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .import, .selective_import, .overload => .ref,
+            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .binding_tuple, .binding_sequence, .import, .selective_import, .overload => .ref,
             else => null,
         };
     }
@@ -461,6 +465,7 @@ pub const Operation = enum {
 pub const Name = union(enum) {
     identifier: []const u8,
     operation: Operation,
+    converter: struct { file_id: FileId, ordinal: u32 },
 
     pub fn fromText(spelling: []const u8, operands: ?usize) Name {
         if (Operation.fromName(spelling, operands)) |operation| return .{ .operation = operation };
@@ -471,6 +476,7 @@ pub const Name = union(enum) {
         return switch (self) {
             .identifier => |identifier| identifier,
             .operation => |operation| operation.spelling(),
+            .converter => "$converter",
         };
     }
 
@@ -479,6 +485,11 @@ pub const Name = union(enum) {
         if (spelling != .eq) return spelling;
         if (left == .operation and right == .operation)
             return std.math.order(left.operation.operandCount(), right.operation.operandCount());
+        if (left == .converter and right == .converter) {
+            const file = std.math.order(left.converter.file_id, right.converter.file_id);
+            if (file != .eq) return file;
+            return std.math.order(left.converter.ordinal, right.converter.ordinal);
+        }
         return spelling;
     }
 
@@ -1157,9 +1168,10 @@ pub const CallBehavior = enum {
     ordinary,
     box_new,
     box_value,
-    list_new,
     list_append,
     list_reserve,
+    list_remove,
+    list_consume,
     collection_append_bounded,
     collection_append_growing,
 };
@@ -1368,19 +1380,64 @@ pub const FunctionInstruction = union(enum) {
 
 /// Paths describe references inside logical values, independently of the
 /// address projections consumed by code generation.
+/// A slot selector can be constant or affine in one immutable integer argument.
+/// Unresolved runtime selectors widen to `element`, never to a guessed slot.
+pub const ReferenceIndex = struct {
+    parameter: ?u32 = null,
+    offset: i32 = 0,
+};
+
 pub const ReferencePathStep = union(enum) {
     field: u32,
     variant: TypeId,
     element,
+    element_at: ReferenceIndex,
+    without_element: ?ReferenceIndex,
+    without_field: u32,
+    without_variant: TypeId,
     target,
     referent,
     descendants,
+
+    pub fn isElement(step: @This()) bool {
+        return step == .element or step == .element_at;
+    }
+
+    pub fn isExclusion(step: @This()) bool {
+        return step == .without_element or step == .without_field or step == .without_variant;
+    }
+
+    pub fn indexSelector(step: @This()) ?ReferenceIndex {
+        switch (step) {
+            .element_at => |index| return index,
+            .without_element => |index| return index,
+            else => return null,
+        }
+    }
+
+    pub fn matches(a: @This(), b: @This()) bool {
+        if (a.isElement() and b.isElement()) return a.overlaps(b);
+        return value_operations.equal(@This(), a, b);
+    }
+
+    pub fn overlaps(a: @This(), b: @This()) bool {
+        if (a.isElement() and b.isElement()) {
+            if (a == .element or b == .element) return true;
+            const first = a.element_at;
+            const second = b.element_at;
+            if (first.parameter != second.parameter) return true;
+            return first.offset == second.offset;
+        }
+        if (a.isExclusion() or b.isExclusion()) return true;
+        return value_operations.equal(@This(), a, b);
+    }
 };
 
 pub const ReferenceSourceKind = enum { place, contents };
 
 pub const ReferenceOriginContract = struct {
     output_parameter: ?u32 = null,
+    failure: bool = false,
     parameter: ?u32,
     kind: ReferenceSourceKind,
     source_path: FunctionValueRange,
@@ -1439,7 +1496,7 @@ pub const ReferenceContract = struct {
     }
 
     pub fn sameOrigin(left: @This(), a: ReferenceOriginContract, right: @This(), b: ReferenceOriginContract) bool {
-        return a.output_parameter == b.output_parameter and a.parameter == b.parameter and a.kind == b.kind and a.readonly == b.readonly and a.readonly_owned == b.readonly_owned and
+        return a.output_parameter == b.output_parameter and a.failure == b.failure and a.parameter == b.parameter and a.kind == b.kind and a.readonly == b.readonly and a.readonly_owned == b.readonly_owned and
             a.storage_depth == b.storage_depth and a.recursive_storage == b.recursive_storage and a.variant_guard == b.variant_guard and a.stable == b.stable and a.after_write == b.after_write and a.reads_contents == b.reads_contents and
             samePath(left, a.source_path, right, b.source_path) and samePath(left, a.result_path, right, b.result_path);
     }
@@ -1717,7 +1774,10 @@ pub const Diagnostic = struct {
         compile_time_only_type: TypeId,
         ambiguous_conversion: TypeMismatch,
         ambiguous_variant_member: TypeMismatch,
-        tuple_requires_expected_type,
+        tuple_context_not_tuple,
+        destructure_requires_tuple,
+        destructure_requires_sequence,
+        destructure_length_mismatch: struct { expected: u32, found: u32 },
         tuple_member_count_mismatch: struct { expected: u32, found: u32 },
         invalid_converter,
         invalid_converter_owner,
@@ -1779,9 +1839,9 @@ pub const Diagnostic = struct {
         type_not_movable: TypeId,
         relocation_requires_direct_move: TypeId,
         type_not_copyable: TypeNotCopyable,
-        list_cannot_store_borrow_element: TypeId,
         list_requires_automatic_drop: TypeId,
         list_requires_direct_move: TypeId,
+        list_iteration_item_conflicts_with_end: TypeId,
         borrow_write_requires_automatic_drop: TypeId,
         borrow_write_requires_direct_move: TypeId,
         box_requires_automatic_drop: TypeId,

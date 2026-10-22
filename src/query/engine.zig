@@ -361,6 +361,48 @@ pub const Database = struct {
     published_interns: std.atomic.Value(u64) = .init(0),
     next_worker: usize = 0,
     visit_token: usize = 1,
+    memo_provider: ?MemoProvider = null,
+
+    const MemoProvider = struct {
+        context: *anyopaque,
+        load: *const fn (*anyopaque, *Context, *const TypeIdentity, *const anyopaque, *anyopaque) anyerror!bool,
+        deinit: *const fn (*anyopaque) void,
+    };
+
+    /// Transfer an optional memo source to the database while it is idle.
+    /// Loads run as ordinary computations and record dependencies through Context.
+    pub fn installMemoProvider(db: *Database, comptime Provider: type, provider: *Provider) !void {
+        db.lock();
+        defer db.unlock();
+        try db.ensureIdleLocked();
+        std.debug.assert(db.memo_provider == null);
+        db.memo_provider = .{
+            .context = provider,
+            .load = struct {
+                fn load(pointer: *anyopaque, ctx: *Context, identity: *const TypeIdentity, input_pointer: *const anyopaque, output: *anyopaque) anyerror!bool {
+                    const source: *Provider = @ptrCast(@alignCast(pointer));
+                    inline for (Provider.query_types) |Q| {
+                        if (identity == comptime typeIdentity(Q)) {
+                            const key: *const Q.Input = @ptrCast(@alignCast(input_pointer));
+                            if (try source.load(Q, ctx, key.*)) |value| {
+                                const result: *Q.Output = @ptrCast(@alignCast(output));
+                                result.* = value;
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                    return false;
+                }
+            }.load,
+            .deinit = struct {
+                fn deinit(pointer: *anyopaque) void {
+                    const source: *Provider = @ptrCast(@alignCast(pointer));
+                    source.deinit();
+                }
+            }.deinit,
+        };
+    }
 
     pub fn init(allocator: std.mem.Allocator, options: Options) !*Database {
         const worker_count = options.worker_count orelse std.Thread.getCpuCount() catch 1;
@@ -407,6 +449,7 @@ pub const Database = struct {
     pub fn deinit(db: *Database) void {
         const storage = db.query_storage.allocator();
         db.stopWorkers(db.workers.len);
+        if (db.memo_provider) |provider| provider.deinit(provider.context);
         var entries = db.entries.valueIterator();
         while (entries.next()) |entry| db.destroyEntry(entry.*);
         db.entry_pool.deinit(storage);
@@ -474,6 +517,7 @@ pub const Database = struct {
             .destroy_key_fn = comptime destroyBoxFn(I.Key, null),
             .destroy_value_fn = comptime destroyInputValueFn(I),
             .write_key_fn = comptime writeValueFn(I.Key),
+            .write_value_fn = comptime writeValueFn(I.Value),
             .fingerprint_fn = comptime fingerprintInputFn(I),
         };
         var stored_key = lookup_key;
@@ -597,6 +641,35 @@ pub const Database = struct {
         }
     }
 
+    pub fn writePortableInterns(db: *Database, writer: *disk_codec.Writer, comptime interners: anytype) !void {
+        db.intern_mutex.lockUncancelable(db.io());
+        defer db.intern_mutex.unlock(db.io());
+        try writer.write(u64, @intCast(db.interned_values.len));
+        for (0..db.interned_values.len) |index| {
+            const entry = db.interned_values.at(index).*;
+            try writeTypeIndex(writer, entry.type_identity, interners);
+            try entry.write_value_fn(writer, entry.value_ptr);
+        }
+    }
+
+    pub fn writeInputs(db: *Database, comptime I: type, writer: *disk_codec.Writer) !void {
+        db.lock();
+        defer db.unlock();
+        try db.ensureIdleLocked();
+        var count: u64 = 0;
+        var entries = db.inputs.valueIterator();
+        while (entries.next()) |entry| {
+            if (entry.*.type_identity == (comptime typeIdentity(I)) and entry.*.value_ptr != null) count += 1;
+        }
+        try writer.write(u64, count);
+        entries = db.inputs.valueIterator();
+        while (entries.next()) |entry| {
+            if (entry.*.type_identity != (comptime typeIdentity(I)) or entry.*.value_ptr == null) continue;
+            try entry.*.write_key_fn(writer, entry.*.key_ptr);
+            try entry.*.write_value_fn(writer, entry.*.value_ptr.?);
+        }
+    }
+
     pub fn matchPersistedInput(db: *Database, comptime I: type, key: I.Key, digest: [32]u8) !?PersistedInputRef {
         validateInput(I);
         const key_copy = key;
@@ -624,6 +697,23 @@ pub const Database = struct {
     }
 
     pub fn importCompletedQuery(db: *Database, comptime Q: type, input_value: Q.Input, output_value: Q.Output, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
+        const output_box = try db.allocator.create(Q.Output);
+        errdefer db.allocator.destroy(output_box);
+        output_box.* = output_value;
+        try db.importQueryStorage(Q, input_value, .{ .pointer = @ptrCast(output_box) }, inputs, queries);
+    }
+
+    /// Copy a borrowed decoded value into the same compact result ownership
+    /// used by ordinary query computations, without one heap owner per slice.
+    pub fn importQueryCopy(db: *Database, comptime Q: type, input_value: Q.Input, output_value: Q.Output, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
+        var arena = std.heap.ArenaAllocator.init(db.query_storage.arenaAllocator());
+        errdefer arena.deinit();
+        const output_box = try arena.allocator().create(Q.Output);
+        output_box.* = try value_operations.Owned(Q.Output).clone(arena.allocator(), output_value);
+        try db.importQueryStorage(Q, input_value, .{ .pointer = @ptrCast(output_box), .storage = .{ .arena = arena } }, inputs, queries);
+    }
+
+    fn importQueryStorage(db: *Database, comptime Q: type, input_value: Q.Input, output: QueryOutput, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
         validateQuery(Q);
         const input_copy = input_value;
         const lookup_key = queryKey(Q, &input_copy);
@@ -632,9 +722,9 @@ pub const Database = struct {
         try db.ensureIdleLocked();
         if (db.entries.get(lookup_key)) |existing| {
             if (!settledLocked(db, existing) or existing.accums_in_subtree) return error.InvalidCache;
-            if (!existing.output_eql_fn(existing.output.?.pointer, @ptrCast(&output_value))) return error.InvalidCache;
-            var redundant = output_value;
-            deinitTypedValue(Q.Output, db.allocator, &redundant);
+            if (!existing.output_eql_fn(existing.output.?.pointer, output.pointer)) return error.InvalidCache;
+            var redundant = output;
+            redundant.deinit(db.allocator, comptime destroyValueFn(Q.Output));
             return;
         }
         const entry = try db.insertEntryLocked(Q, lookup_key);
@@ -644,9 +734,7 @@ pub const Database = struct {
         }
         try entry.memo.input_deps.appendSlice(db.query_storage.allocator(), inputs);
         for (queries) |dependency| _ = try entry.memo.deps.getOrPut(db.query_storage.allocator(), dependency);
-        const output_box = try db.allocator.create(Q.Output);
-        output_box.* = output_value;
-        entry.output = .{ .pointer = @ptrCast(output_box) };
+        entry.output = output;
         entry.state = .complete;
     }
 
@@ -654,6 +742,16 @@ pub const Database = struct {
     /// retain equal-result invalidation, while the remaining edges terminate
     /// at the exact inputs observed by the computation.
     pub fn writeCompletedQueries(db: *Database, comptime Q: type, writer: *disk_codec.Writer) !void {
+        return db.writeQueryRecords(Q, writer, false, .{}, .{});
+    }
+
+    /// Portable artifacts retain dependency values so their identities can be
+    /// translated before comparing them with the receiving database.
+    pub fn writePortableQueries(db: *Database, comptime Q: type, writer: *disk_codec.Writer, comptime inputs: anytype, comptime queries: anytype) !void {
+        return db.writeQueryRecords(Q, writer, true, inputs, queries);
+    }
+
+    fn writeQueryRecords(db: *Database, comptime Q: type, writer: *disk_codec.Writer, comptime portable: bool, comptime input_types: anytype, comptime query_types: anytype) !void {
         validateQuery(Q);
         comptime if (@typeInfo(Q.Output) != .optional) @compileError("persisted query output must be optional");
         db.lock();
@@ -672,11 +770,23 @@ pub const Database = struct {
             if (output.* == null) continue;
             if (try db.persistedSubtreeClean(entry, &clean)) try records.append(db.allocator, entry);
         }
+        if (portable) {
+            var ordered: std.ArrayList(*Entry) = .empty;
+            errdefer ordered.deinit(db.allocator);
+            var visited: std.AutoHashMapUnmanaged(*Entry, void) = .empty;
+            defer visited.deinit(db.allocator);
+            for (records.items) |entry| try db.orderPortableRecords(Q, entry, &visited, &ordered);
+            records.deinit(db.allocator);
+            records = ordered;
+        }
         try writer.write(u64, @intCast(records.items.len));
         for (records.items) |entry| {
             const query_input: *const Q.Input = @ptrCast(@alignCast(entry.input_ptr));
             const output: *const Q.Output = @ptrCast(@alignCast(entry.output.?.pointer));
             try writer.write(Q.Input, query_input.*);
+            const length_offset = writer.bytes.items.len;
+            if (portable) try writer.write(u64, 0);
+            const record_start = writer.bytes.items.len;
             try writer.write(Q.Output, output.*);
             var visited: std.AutoHashMapUnmanaged(*Entry, void) = .empty;
             defer visited.deinit(db.allocator);
@@ -687,19 +797,37 @@ pub const Database = struct {
             try db.collectPersistedDependencies(entry, &visited, &input_deps, &query_deps);
             try writer.write(u64, @intCast(input_deps.count()));
             for (input_deps.keys()) |dep| {
-                try writer.write([]const u8, dep.type_identity.name);
+                if (portable) try writeTypeIndex(writer, dep.type_identity, input_types) else try writer.write([]const u8, dep.type_identity.name);
                 try dep.write_key_fn(writer, dep.key_ptr);
-                const digest = try dep.fingerprint_fn(db.allocator, dep.value_ptr);
-                try writer.bytes.appendSlice(writer.allocator, &digest);
+                if (portable) {
+                    try writer.write(bool, dep.value_ptr != null);
+                    if (dep.value_ptr) |value| try dep.write_value_fn(writer, value);
+                } else {
+                    const digest = try dep.fingerprint_fn(db.allocator, dep.value_ptr);
+                    try writer.bytes.appendSlice(writer.allocator, &digest);
+                }
             }
             try writer.write(u64, @intCast(query_deps.count()));
             for (query_deps.keys()) |dep| {
-                try writer.write([]const u8, dep.type_identity.name);
+                if (portable) try writeTypeIndex(writer, dep.type_identity, query_types) else try writer.write([]const u8, dep.type_identity.name);
                 try dep.write_input_fn(writer, dep.input_ptr);
-                const digest = try dep.fingerprint_output_fn.?(db.allocator, dep.output.?.pointer);
-                try writer.bytes.appendSlice(writer.allocator, &digest);
+                if (portable) {
+                    try dep.write_output_fn.?(writer, dep.output.?.pointer);
+                } else {
+                    const digest = try dep.fingerprint_output_fn.?(db.allocator, dep.output.?.pointer);
+                    try writer.bytes.appendSlice(writer.allocator, &digest);
+                }
             }
+            if (portable) std.mem.writeInt(u64, writer.bytes.items[length_offset..][0..8], @intCast(writer.bytes.items.len - record_start), .little);
         }
+    }
+
+    fn orderPortableRecords(db: *Database, comptime Q: type, entry: *Entry, visited: *std.AutoHashMapUnmanaged(*Entry, void), ordered: *std.ArrayList(*Entry)) anyerror!void {
+        if ((try visited.getOrPut(db.allocator, entry)).found_existing) return;
+        for (entry.memo.deps.entries.items) |dependency| try db.orderPortableRecords(Q, dependency.entry, visited, ordered);
+        if (entry.type_identity != comptime typeIdentity(Q)) return;
+        const output: *const Q.Output = @ptrCast(@alignCast(entry.output.?.pointer));
+        if (output.* != null) try ordered.append(db.allocator, entry);
     }
 
     fn persistedSubtreeClean(db: *Database, entry: *Entry, clean: *std.AutoHashMap(*Entry, bool)) !bool {
@@ -852,6 +980,7 @@ pub const Database = struct {
             .destroy_output_fn = comptime destroyValueFn(Q.Output),
             .output_eql_fn = comptime outputEqlFn(Q),
             .write_input_fn = comptime writeValueFn(Q.Input),
+            .write_output_fn = comptime if (@hasDecl(Q, "disk_boundary") and Q.disk_boundary) writeValueFn(Q.Output) else null,
             .fingerprint_output_fn = comptime if (@hasDecl(Q, "disk_boundary") and Q.disk_boundary) fingerprintQueryOutputFn(Q) else null,
         };
         input_box.* = @as(*const Q.Input, @ptrCast(@alignCast(lookup_key.value_ptr))).*;
@@ -1178,7 +1307,7 @@ pub const Database = struct {
         arenas.deinit(db.query_storage.allocator());
     }
 
-    fn io(db: *Database) std.Io {
+    pub fn io(db: *Database) std.Io {
         return db.io_runtime.io();
     }
 
@@ -1331,6 +1460,7 @@ const Entry = struct {
     destroy_output_fn: DestroyValueFn,
     output_eql_fn: EqlOpaqueFn,
     write_input_fn: WriteOpaqueFn,
+    write_output_fn: ?WriteOpaqueFn,
     fingerprint_output_fn: ?FingerprintQueryFn,
     /// The edges and accumulator values of the committed computation.
     memo: Computation = .{},
@@ -1354,6 +1484,7 @@ const InputEntry = struct {
     destroy_key_fn: DestroyOpaqueFn,
     destroy_value_fn: DestroyOpaqueFn,
     write_key_fn: WriteOpaqueFn,
+    write_value_fn: WriteOpaqueFn,
     fingerprint_fn: FingerprintFn,
 };
 
@@ -1639,6 +1770,13 @@ fn internId(comptime I: type, index: u32) I.Id {
     return @fromBackingInt(@intCast(index));
 }
 
+fn writeTypeIndex(writer: *disk_codec.Writer, identity: *const TypeIdentity, comptime candidates: anytype) !void {
+    inline for (candidates, 0..) |Owner, index| {
+        if (identity == comptime typeIdentity(Owner)) return writer.write(u8, index);
+    }
+    return error.InvalidCache;
+}
+
 fn writeValueFn(comptime T: type) WriteOpaqueFn {
     return struct {
         fn write(writer: *disk_codec.Writer, ptr: *const anyopaque) anyerror!void {
@@ -1667,7 +1805,7 @@ fn fingerprintInputFn(comptime I: type) FingerprintFn {
     }.fingerprintInput;
 }
 
-fn fingerprint(comptime T: type, allocator: std.mem.Allocator, value: T) ![32]u8 {
+pub fn fingerprint(comptime T: type, allocator: std.mem.Allocator, value: T) ![32]u8 {
     var writer: disk_codec.Writer = .{ .allocator = allocator };
     defer writer.deinit();
     try writer.write(T, value);
@@ -1718,7 +1856,6 @@ fn computeFn(comptime Q: type) ComputeFn {
     return struct {
         fn compute(db: *Database, entry: *Entry, worker_index: ?usize) anyerror!QueryOutput {
             var computation: profiling.Scope = .{};
-            computation.begin(db.profile, comptime profiling.queryCategory(Q));
             defer computation.end();
             const input_value: *const Q.Input = @ptrCast(@alignCast(entry.input_ptr));
             var scratch = db.acquireScratchArena(worker_index);
@@ -1732,7 +1869,15 @@ fn computeFn(comptime Q: type) ComputeFn {
             };
 
             // Every successful return transfers the output into entry storage.
-            var output_value = try Q.run(&ctx, input_value.*);
+            var output_value: Q.Output = undefined;
+            const restored = if (db.memo_provider) |provider|
+                try provider.load(provider.context, &ctx, comptime typeIdentity(Q), input_value, &output_value)
+            else
+                false;
+            if (!restored) {
+                computation.begin(db.profile, comptime profiling.queryCategory(Q));
+                output_value = try Q.run(&ctx, input_value.*);
+            }
             errdefer deinitTypedValue(Q.Output, scratch.allocator(), &output_value);
 
             // Spawned dependencies belong to this computation even when their

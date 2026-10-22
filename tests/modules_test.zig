@@ -3786,16 +3786,14 @@ test "list tracks initialized length separately from allocation capacity" {
     , 42);
 }
 
-test "list rejects Ref elements without origin tracking across mutations" {
-    const fixture = try Fixture.initFiles(
+test "list creates empty reference-containing storage" {
+    try Fixture.expectSourceExit(
         \\import std.memory.{List}
         \\fallible run() int
         \\  const buffer = List(Ref(int)).new?(1)
         \\  return buffer.len()
         \\if const length = run() -> exit(length + 42) else exit(1)
-    , &.{});
-    defer fixture.deinit();
-    try fixture.expectLibraryDiagnostic(.list_cannot_store_borrow_element);
+    , 42);
 }
 
 test "list initialization metadata is opaque outside std.memory" {

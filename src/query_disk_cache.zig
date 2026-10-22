@@ -6,12 +6,12 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIQRY40";
+const format = "CHIQRY42";
 const max_records = 1_000_000;
 // Snapshot records name their interner, input, or query boundary by type name.
-const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
-const persisted_inputs = .{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile };
-const persisted_query_dependencies = .{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.ConversionCandidates, queries.InferReferenceContract, queries.AnalyzeFunctionInstance };
+pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
+pub const persisted_inputs = .{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile };
+pub const persisted_query_dependencies = .{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.ConversionCandidates, queries.InferReferenceContract, queries.AnalyzeFunctionInstance, queries.StandardLibraryUnchanged };
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
     var writer: codec.Writer = .{ .allocator = allocator };
@@ -48,6 +48,11 @@ fn restoreNamedIntern(name: []const u8, db: *query.Database, reader: *codec.Read
 fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, index: usize) !void {
     var value = try reader.read(I.Value);
     defer codec.freeValue(I.Value, reader.allocator, &value);
+    const id = try importIntern(I, db, value);
+    if (@backingInt(id) != index) return error.InvalidCache;
+}
+
+pub fn importIntern(comptime I: type, db: *query.Database, value: I.Value) !I.Id {
     if (!(try validateIds(I.Value, db, value))) return error.InvalidCache;
     if (I == queries.ByteStrings and !std.unicode.utf8ValidateSlice(value.bytes)) return error.InvalidCache;
     if (I == queries.CompileTimeValues and !(try validRuntimeValue(db, value))) return error.InvalidCache;
@@ -57,10 +62,10 @@ fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, i
             if ((try db.lookupInternedAs(queries.ItemLocations, declaration.item)).?.kind != .overload) return error.InvalidCache;
         }
         var seen: std.AutoHashMapUnmanaged(structures.InstanceId, void) = .empty;
-        defer seen.deinit(reader.allocator);
+        defer seen.deinit(db.allocator);
         for (value.candidates) |candidate| {
             if ((try db.lookupInternedAs(queries.ItemLocations, candidate.item)).?.kind != .function) return error.InvalidCache;
-            if ((try seen.getOrPut(reader.allocator, candidate)).found_existing) return error.InvalidCache;
+            if ((try seen.getOrPut(db.allocator, candidate)).found_existing) return error.InvalidCache;
         }
     }
     if (I == queries.Types) {
@@ -77,8 +82,7 @@ fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, i
             else => {},
         }
     }
-    const id = try db.intern(I, value);
-    if (@backingInt(id) != index) return error.InvalidCache;
+    return db.intern(I, value);
 }
 
 pub fn restoreQueries(db: *query.Database, payload: []const u8, offset: usize) !usize {
@@ -156,7 +160,7 @@ fn validArrayType(db: *query.Database, array: structures.ArrayType) !bool {
 }
 
 fn validTupleType(db: *query.Database, tuple: structures.TupleType) anyerror!bool {
-    if (tuple.members.len < 2) return false;
+    if (tuple.members.len == 0) return false;
     for (tuple.members) |member| if (!try validArrayElementType(db, member.type_id)) return false;
     return true;
 }
@@ -237,7 +241,7 @@ fn persistedCursorAccess(db: *query.Database, type_id: structures.TypeId) !?stru
     return .{ .element_type = element.type, .reference = false };
 }
 
-fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
+pub fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     if (T == u8) return true;
     inline for (interners) |I| {
         if (T == I.Id) return (try db.lookupInternedAs(I, value)) != null;
@@ -272,7 +276,7 @@ fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     };
 }
 
-fn validOutput(comptime Q: type, db: *query.Database, output: Q.Output) !bool {
+pub fn validOutput(comptime Q: type, db: *query.Database, output: Q.Output) !bool {
     if (Q == queries.CompileFunction) return validCompiledFunction(output.?);
     if (output.?.is_initializer_region) return false;
     if (!validFunctionBody(output.?)) return false;
@@ -344,7 +348,7 @@ fn referencePathElement(db: *query.Database, types: anytype, type_id: structures
 fn validReferencePath(db: *query.Database, types: anytype, initial: structures.TypeId, path: []const structures.ReferencePathStep) anyerror!bool {
     var type_id = initial;
     for (path, 0..) |step, position| {
-        if (step == .field or step == .variant or step == .element)
+        if (step == .field or step == .variant or step.isElement())
             while (try types.borrowElement(type_id)) |element| {
                 type_id = element;
             };
@@ -358,7 +362,13 @@ fn validReferencePath(db: *query.Database, types: anytype, initial: structures.T
                 if (!try hasVariantMember(types, type_id, member)) return false;
                 type_id = member;
             },
-            .element => type_id = (try referencePathElement(db, types, type_id)) orelse return false,
+            .element, .element_at => type_id = (try referencePathElement(db, types, type_id)) orelse return false,
+            .without_element => if (try referencePathElement(db, types, type_id) == null) return false,
+            .without_field => |field| {
+                const definition = (try types.structDefinition(type_id)) orelse return false;
+                if (field >= definition.fields.len) return false;
+            },
+            .without_variant => |member| if (!try hasVariantMember(types, type_id, member)) return false,
             .target, .referent => type_id = (try types.borrowElement(type_id)) orelse return false,
             .descendants => return position + 1 == path.len,
         }
@@ -368,7 +378,18 @@ fn validReferencePath(db: *query.Database, types: anytype, initial: structures.T
 
 fn validReferenceContractTypes(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis) anyerror!bool {
     const contract = body.reference_contract;
+    for (contract.paths) |step| {
+        const index = switch (step) {
+            .element_at => |index| index,
+            .without_element => |index| index orelse continue,
+            else => continue,
+        };
+        if (index.parameter) |parameter| {
+            if (body.block_arguments[parameter].type_id != .int or body.parameter_modes[parameter] != .imm) return false;
+        }
+    }
     for (contract.origins) |origin| {
+        if (origin.failure and origin.output_parameter == null) return false;
         if (origin.readonly_owned) |type_id| {
             if (origin.readonly or type_id.isPrimitive()) return false;
             if (try types.borrowElement(type_id) != null or try types.storageAccess(type_id) != null) return false;
@@ -537,6 +558,14 @@ fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyA
 }
 
 fn validReferenceContract(contract: structures.ReferenceContract, parameter_count: usize) bool {
+    for (contract.paths) |step| {
+        const index = switch (step) {
+            .element_at => |index| index,
+            .without_element => |index| index orelse continue,
+            else => continue,
+        };
+        if (index.parameter) |parameter| if (parameter >= parameter_count) return false;
+    }
     for (contract.origins) |origin| {
         if (origin.output_parameter) |parameter| if (parameter >= parameter_count) return false;
         if (origin.parameter) |parameter| if (parameter >= parameter_count) return false;
@@ -794,6 +823,7 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
         \\func copied(imm input: Pair) Pair -> input
         \\func selected(ref input: Pair) ref Ref(int) -> input.first
         \\func install(var target: Ref(Ref(int)), ref source: int) -> target.value = Ref.from(source)
+        \\fallible element(ref values: Array(Ref(int), 2), index: int) ref Ref(int) -> values.get?(index)
         \\struct Buffers
         \\    first: Ref(String)
         \\    second: Ref(String)
@@ -803,10 +833,30 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
         \\    return view.byte_length()
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
-    for ([_][]const u8{ "nested", "copied", "selected", "install", "retained" }) |name| {
+    for ([_][]const u8{ "nested", "copied", "selected", "install", "retained", "element" }) |name| {
         errdefer std.debug.print("rejected analyzed reference contract: {s}\n", .{name});
         const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction(name).? })).*.?;
         try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
+        if (std.mem.eql(u8, name, "element")) {
+            var invalid = body;
+            const paths = try std.testing.allocator.dupe(structures.ReferencePathStep, body.reference_contract.paths);
+            defer std.testing.allocator.free(paths);
+            invalid.reference_contract.paths = paths;
+            const selected = for (paths, 0..) |step, index| {
+                if (step == .element_at) break index;
+            } else return error.MissingElementSelector;
+            const original = paths[selected];
+            paths[selected].element_at.parameter = @intCast(body.parameter_modes.len);
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            paths[selected] = original;
+            paths[selected].element_at.parameter = 0;
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            paths[selected] = original;
+            var origins = [_]structures.ReferenceOriginContract{body.reference_contract.origins[0]};
+            invalid.reference_contract.origins = &origins;
+            origins[0].failure = true;
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+        }
         if (std.mem.eql(u8, name, "copied")) {
             var invalid = body;
             var origins = [_]structures.ReferenceOriginContract{body.reference_contract.origins[0]};

@@ -8,6 +8,73 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "List mutation snapshots preserve slot filters and recompute removal indices" {
+    const declarations =
+        \\fallible remove(mut values: List(Ref(int)), index: int) Ref(int) -> values.remove?(index)
+        \\fallible calculate() int
+        \\    var source = 21
+        \\    var values: List(Ref(int)) = [Ref.from(source), Ref.from(source)]
+        \\    if 1 == 1
+        \\        var temporary = 7
+        \\        values[0] = Ref.from(temporary)
+        \\        const removed = remove?(values, 0)
+        \\        if removed.value <> 7 -> return 90
+        \\    return values[0].value * 2
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 91
+    ;
+    for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)" }) |entry| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "{s}\n{s}", .{ declarations, entry });
+        defer std.testing.allocator.free(source);
+        const fixture = try Fixture.restore(source);
+        defer fixture.db.deinit();
+        try fixture.expectExit(42);
+        const wrong = try std.mem.replaceOwned(u8, std.testing.allocator, source, "remove?(values, 0)", "remove?(values, 1)");
+        defer std.testing.allocator.free(wrong);
+        try fixture.db.setInput(queries.SourceText, 0, wrong);
+        try fixture.expectDiagnostic(.borrow_outlives_source);
+        try fixture.db.setInput(queries.SourceText, 0, source);
+        try fixture.expectExit(42);
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var source = 21", "var source = 22");
+        defer std.testing.allocator.free(changed);
+        try fixture.db.setInput(queries.SourceText, 0, changed);
+        try fixture.expectExit(44);
+    }
+}
+
+test "List consuming snapshots track transfer intent and factory declarations" {
+    const source =
+        \\struct Item
+        \\    copy = none
+        \\    value: int
+        \\func consume(deinit item: Item) int -> item.value
+        \\func run() int
+        \\    const values: List(Item) = [Item{value = 20}, Item{value = 22}]
+        \\    var total = 0
+        \\    for item in values^ -> total += consume(item^)
+        \\    return total
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const borrowed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "in values^", "in values");
+    defer std.testing.allocator.free(borrowed);
+    try fixture.db.setInput(queries.SourceText, 0, borrowed);
+    try fixture.expectDiagnostic(.ownership_transfer_requires_owned_place);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+    const allocation_file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_allocation))).*;
+    const allocation_source = standard_library.source("memory/allocation.chi");
+    const renamed = try std.mem.replaceOwned(u8, std.testing.allocator, allocation_source, "pub func consume_iter", "pub func owning_iter");
+    defer std.testing.allocator.free(renamed);
+    try fixture.db.setInput(queries.SourceText, allocation_file, renamed);
+    try fixture.expectDiagnostic(.ownership_transfer_requires_owned_place);
+    try fixture.db.setInput(queries.SourceText, allocation_file, allocation_source);
+    try fixture.expectExit(42);
+}
+
 test "collection snapshots retain static callback environments and recompute selections" {
     const source =
         \\fallible calculate() int
@@ -1841,4 +1908,58 @@ test "collection snapshots restore inferred generic sequence construction" {
     try fixture.expectExit(44);
     try fixture.db.setInput(queries.SourceText, 0, source);
     try fixture.expectExit(42);
+}
+
+test "structural tuple snapshots restore singleton inference and recompute pattern shapes and permissions" {
+    const source =
+        \\static base = (19,)
+        \\func run() int
+        \\    var fields = (base, [23])
+        \\    const ((ref first,), [second]) = fields
+        \\    first += 0
+        \\    return first + second
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    for ([_]struct { before: []const u8, after: []const u8, diagnostic: std.meta.Tag(structures.Diagnostic.Kind) }{
+        .{ .before = "[second]", .after = "[second, extra]", .diagnostic = .destructure_length_mismatch },
+        .{ .before = "var fields", .after = "const fields", .diagnostic = .reference_not_writable },
+    }) |edit| {
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, edit.before, edit.after);
+        defer std.testing.allocator.free(changed);
+        try fixture.db.setInput(queries.SourceText, 0, changed);
+        try fixture.expectDiagnostic(edit.diagnostic);
+        try fixture.db.setInput(queries.SourceText, 0, source);
+        try fixture.expectExit(42);
+    }
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "(19,)", "(20,)");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(43);
+}
+
+test "List pattern snapshots track counted transfer helper changes" {
+    for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)" }) |entry| {
+        const source = try std.fmt.allocPrint(std.testing.allocator,
+            \\func run() int
+            \\    var values: List(int) = [19, 23]
+            \\    if const [a, b] = values^ -> return a + b
+            \\    return 90
+            \\{s}
+        , .{entry});
+        defer std.testing.allocator.free(source);
+        const fixture = try Fixture.restore(source);
+        defer fixture.db.deinit();
+        try fixture.expectExit(42);
+        const allocation_file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_allocation))).*;
+        const allocation_source = standard_library.source("memory/allocation.chi");
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, allocation_source, "owner.initialized == N", "owner.initialized == N + 1");
+        defer std.testing.allocator.free(changed);
+        try fixture.db.setInput(queries.SourceText, allocation_file, changed);
+        try fixture.expectExit(90);
+        try fixture.db.setInput(queries.SourceText, allocation_file, allocation_source);
+        try fixture.expectExit(42);
+    }
 }

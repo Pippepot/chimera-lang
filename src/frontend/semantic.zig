@@ -36,6 +36,8 @@ pub const UnresolvedBody = struct {
     method_call_arguments: []MethodCallArgument = &.{},
     struct_field_values: []StructFieldValue = &.{},
     assignment_fields: []FieldName = &.{},
+    binding_patterns: []BindingPattern = &.{},
+    binding_pattern_children: []u32 = &.{},
     root_block: BlockId,
 
     pub const ValueId = enum(u32) { _ };
@@ -62,7 +64,7 @@ pub const UnresolvedBody = struct {
         local: LocalId,
         annotation_type: ?structures.TypeId,
         span: structures.SourceSpan,
-        reference: bool = false,
+        mode: BindingMode = .owned,
     };
     pub const StatementRange = struct { start: u32, end: u32 };
     pub const BindingMode = enum { owned, reference, inferred };
@@ -71,6 +73,22 @@ pub const UnresolvedBody = struct {
         result: ?ValueId,
         span: structures.SourceSpan,
     };
+    pub const BindingPattern = struct {
+        carrier: LocalId,
+        read: ValueId,
+        span: structures.SourceSpan,
+        annotation_type: ?structures.TypeId = null,
+        position: ?ValueId = null,
+        shape: union(enum) {
+            name: Name,
+            tuple: structures.FunctionValueRange,
+            sequence: Sequence,
+        },
+
+        pub const Name = struct { local: ?LocalId, mode: BindingMode, mutable: bool };
+        pub const Sequence = struct { children: structures.FunctionValueRange, storage: LocalId, storage_read: ValueId };
+    };
+    pub const PatternBinding = struct { pattern: u32, value: ValueId, span: structures.SourceSpan };
     pub const Statement = union(enum) {
         discard: ValueUse,
         lifetime_extend: ValueUse,
@@ -82,6 +100,7 @@ pub const UnresolvedBody = struct {
             mutable: bool,
             mode: BindingMode = .owned,
         },
+        bind_pattern: PatternBinding,
         break_loop: ValueId,
         continue_loop: structures.SourceSpan,
         return_nothing: structures.SourceSpan,
@@ -133,6 +152,7 @@ pub const UnresolvedBody = struct {
         negation: ConditionId,
         call: struct { target: Call, binding: ?ConditionBinding = null },
         initialization: struct { value: ValueUse, binding: ?ConditionBinding = null },
+        pattern: PatternBinding,
     };
     pub const StructInitTarget = union(enum) { concrete: structures.TypeId, inferred: structures.InstanceId };
     pub const Expression = struct {
@@ -193,13 +213,12 @@ pub const UnresolvedBody = struct {
             },
             loop: BlockId,
             scope: BlockId,
-            iterator: struct { source: ValueUse, structural_array: bool },
+            iterator: struct { source: ValueUse, acquisition: ValueId, structural_array: bool },
             iterator_item: struct {
                 carrier: LocalId,
                 operand: ValueUse,
                 end_type: structures.TypeId,
                 binding: ConditionBinding,
-                mode: BindingMode,
             },
         };
     };
@@ -319,6 +338,8 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         method_call_arguments: std.ArrayList(UnresolvedBody.MethodCallArgument) = .empty,
         struct_field_values: std.ArrayList(UnresolvedBody.StructFieldValue) = .empty,
         assignment_fields: std.ArrayList(UnresolvedBody.FieldName) = .empty,
+        binding_patterns: std.ArrayList(UnresolvedBody.BindingPattern) = .empty,
+        binding_pattern_children: std.ArrayList(u32) = .empty,
         loop_depth: u32 = 0,
         can_return: bool = false,
         returns_type: bool = false,
@@ -464,6 +485,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             if ((node.tag == .return_nothing or node.tag == .return_expr) and !self.can_return) return self.reject(index, .top_level_return);
             return switch (node.tag) {
                 .const_binding, .var_binding, .ref_binding => try self.buildBinding(index),
+                .destructure_binding => try self.buildPatternBinding(index, false),
                 .@"pub" => return self.reject(index, .misplaced_pub),
                 .import, .selective_import => return self.reject(index, .import_outside_top_level),
                 .return_nothing => .{ .return_nothing = span },
@@ -533,6 +555,75 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .mutable = node.tag == .var_binding,
                 .mode = if (node.tag == .ref_binding) .reference else .owned,
             } };
+        }
+
+        fn buildPatternBinding(self: *Self, index: structures.Node.Index, conditional: bool) !UnresolvedBody.Statement {
+            const node = self.ast.nodes[index.index()];
+            const source_index = node.data.node_node.b;
+            const source = self.ast.nodes[source_index.index()];
+            var value = if (source.tag == .as)
+                try self.appendPatternExtraction(source_index)
+            else if (conditional and source.tag == .call and try self.conversionTarget(source.data.node_node.a) == null) call: {
+                var operation = try self.buildCall(source_index, true);
+                operation.implicit_effects = true;
+                break :call try self.appendExpression(source_index, .{ .call = operation });
+            } else try self.append(source_index, false);
+            const pattern = try self.buildBindingPattern(node.data.node_node.a, null);
+            if (self.binding_patterns.items[pattern].annotation_type) |type_id| {
+                value = try self.appendExpression(index, .{ .annotation = .{ .value = .{ .value = value, .span = nodeFocusSpan(self.ast, node.data.node_node.b) }, .type_id = type_id } });
+            }
+            return .{ .bind_pattern = .{ .pattern = pattern, .value = value, .span = nodeFocusSpan(self.ast, node.data.node_node.b) } };
+        }
+
+        fn buildBindingPattern(self: *Self, index: structures.Node.Index, existing_carrier: ?UnresolvedBody.LocalId) anyerror!u32 {
+            const node = self.ast.nodes[index.index()];
+            if (node.tag == .binding_annotation) {
+                const pattern = try self.buildBindingPattern(node.data.node_node.a, existing_carrier);
+                const expected = try self.bindingType(node.data.node_node.b);
+                if (self.binding_patterns.items[pattern].annotation_type) |inner| if (inner != expected)
+                    return self.reject(index, .{ .local_type_mismatch = .{ .expected = expected, .found = inner } });
+                self.binding_patterns.items[pattern].annotation_type = expected;
+                return pattern;
+            }
+            const carrier = existing_carrier orelse self.newLocal();
+            var pattern: UnresolvedBody.BindingPattern = .{
+                .carrier = carrier,
+                .read = try self.appendExpression(index, .{ .local_read = carrier }),
+                .span = nodeFocusSpan(self.ast, index),
+                .shape = undefined,
+            };
+            if (node.tag == .param) {
+                const mode = if (node.data.node_node.a.unwrap()) |access| self.ast.tokens[self.ast.nodes[access.index()].token_index].tag else null;
+                const name = tokenText(self.ast, self.source, node.token_index);
+                const local: ?UnresolvedBody.LocalId = if (std.mem.eql(u8, name, "_")) null else self.newLocal();
+                if (local) |output| {
+                    if (try self.nameIsVisible(name)) return self.reject(index, .duplicate_local_binding);
+                    try self.declare(name, .{ .place = .{ .id = output, .mutable = mode == .keyword_var or mode == .keyword_ref } });
+                }
+                pattern.annotation_type = if (node.data.node_node.b.unwrap()) |annotation| try self.bindingType(annotation) else null;
+                pattern.shape = .{ .name = .{ .local = local, .mode = if (mode == .keyword_ref) .reference else if (mode == null) .inferred else .owned, .mutable = mode == .keyword_var } };
+            } else {
+                std.debug.assert(node.tag == .binding_tuple or node.tag == .binding_sequence);
+                var children: std.ArrayList(u32) = .empty;
+                defer children.deinit(self.gpa);
+                for (self.ast.nodeList(index), 0..) |child, position| {
+                    const child_id = try self.buildBindingPattern(child, null);
+                    if (node.tag == .binding_sequence) self.binding_patterns.items[child_id].position = try self.appendExpression(child, .{ .integer = @intCast(position) });
+                    try children.append(self.gpa, child_id);
+                }
+                const start: u32 = @intCast(self.binding_pattern_children.items.len);
+                try self.binding_pattern_children.appendSlice(self.gpa, children.items);
+                const range: structures.FunctionValueRange = .{ .start = start, .end = @intCast(self.binding_pattern_children.items.len) };
+                if (node.tag == .binding_tuple) {
+                    pattern.shape = .{ .tuple = range };
+                } else {
+                    const storage = self.newLocal();
+                    pattern.shape = .{ .sequence = .{ .children = range, .storage = storage, .storage_read = try self.appendExpression(index, .{ .local_read = storage }) } };
+                }
+            }
+            const result: u32 = @intCast(self.binding_patterns.items.len);
+            try self.binding_patterns.append(self.gpa, pattern);
+            return result;
         }
 
         fn bindingType(self: *Self, node: structures.Node.Index) !structures.TypeId {
@@ -642,13 +733,9 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             const node = self.ast.nodes[index.index()];
             if (node.tag == .collection_for and self.ast.tokens[node.token_index].tag == .keyword_static) {
                 const parts = self.ast.nodeList(index);
-                const binding = self.ast.nodes[parts[0].index()];
-                if (binding.data.node_node.a.unwrap()) |access| {
-                    const mode = self.ast.tokens[self.ast.nodes[access.index()].token_index].tag;
-                    if (mode == .keyword_var or mode == .keyword_ref) return self.reject(parts[0], .static_iteration_binding_mode);
-                }
-                const name = tokenText(self.ast, self.source, binding.token_index);
-                if (!std.mem.eql(u8, name, "_") and try self.nameIsVisible(name)) return self.reject(parts[0], .duplicate_local_binding);
+                var names: std.StringHashMapUnmanaged(void) = .empty;
+                defer names.deinit(self.gpa);
+                try self.validateStaticPattern(parts[0], &names);
                 var bindings = try self.staticClauseBindings();
                 defer bindings.deinit(self.gpa);
                 const values = (try self.analysis_context.withStaticBindings(bindings.items).staticIteration(index)) orelse return error.Unavailable;
@@ -656,11 +743,8 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 const static_mark = self.static_bindings.items.len;
                 defer self.restoreStaticScope(mark, static_mark);
                 for (values) |value| {
-                    if (!std.mem.eql(u8, name, "_")) {
-                        try self.declare(name, .{ .static_value = value });
-                        try self.static_bindings.append(self.gpa, .{ .name = name, .value = value });
-                        self.analysis_context = self.analysis_context.withStaticBindings(self.static_bindings.items);
-                    }
+                    try self.bindStaticPattern(parts[0], value);
+                    self.analysis_context = self.analysis_context.withStaticBindings(self.static_bindings.items);
                     try self.appendCollectionEntries(parts[2], elements);
                     self.restoreStaticScope(mark, static_mark);
                 }
@@ -682,6 +766,64 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 else => try self.append(index, false),
             };
             try elements.append(self.gpa, .{ .value = value, .span = nodeFocusSpan(self.ast, index) });
+        }
+
+        fn validateStaticPattern(self: *Self, index: structures.Node.Index, names: *std.StringHashMapUnmanaged(void)) anyerror!void {
+            const node = self.ast.nodes[index.index()];
+            if (node.tag == .binding_annotation) {
+                _ = try self.bindingType(node.data.node_node.b); // Validate the header even when traversal is empty.
+                return self.validateStaticPattern(node.data.node_node.a, names);
+            }
+            if (node.tag == .binding_tuple or node.tag == .binding_sequence) {
+                for (self.ast.nodeList(index)) |child| try self.validateStaticPattern(child, names);
+                return;
+            }
+            std.debug.assert(node.tag == .param);
+            if (node.data.node_node.a.unwrap()) |access| {
+                const mode = self.ast.tokens[self.ast.nodes[access.index()].token_index].tag;
+                if (mode == .keyword_var or mode == .keyword_ref) return self.reject(index, .static_iteration_binding_mode);
+            }
+            if (node.data.node_node.b.unwrap()) |annotation| _ = try self.bindingType(annotation); // Validate the header's annotation.
+            const name = tokenText(self.ast, self.source, node.token_index);
+            if (std.mem.eql(u8, name, "_")) return;
+            if (try self.nameIsVisible(name)) return self.reject(index, .duplicate_local_binding);
+            if ((try names.getOrPut(self.gpa, name)).found_existing) return self.reject(index, .duplicate_local_binding);
+        }
+
+        fn bindStaticPattern(self: *Self, index: structures.Node.Index, value_id: structures.CompileTimeValueId) anyerror!void {
+            const node = self.ast.nodes[index.index()];
+            if (node.tag == .binding_annotation) {
+                try self.validateStaticPatternType(node.data.node_node.b, value_id);
+                return self.bindStaticPattern(node.data.node_node.a, value_id);
+            }
+            if (node.tag == .param) {
+                if (node.data.node_node.b.unwrap()) |annotation| try self.validateStaticPatternType(annotation, value_id);
+                const name = tokenText(self.ast, self.source, node.token_index);
+                if (std.mem.eql(u8, name, "_")) return;
+                try self.declare(name, .{ .static_value = value_id });
+                try self.static_bindings.append(self.gpa, .{ .name = name, .value = value_id });
+                return;
+            }
+            const value = try self.analysis_context.lookupCompileTimeValue(value_id);
+            const tuple = node.tag == .binding_tuple;
+            if (tuple and value == .runtime and value.runtime.type_id == .unit and self.ast.nodeList(index).len == 0) return;
+            if (value != .runtime) return self.reject(index, if (tuple) .destructure_requires_tuple else .destructure_requires_sequence);
+            const valid = if (tuple)
+                try self.analysis_context.facts().tupleMembers(value.runtime.type_id) != null
+            else
+                try self.analysis_context.facts().arrayType(value.runtime.type_id) != null;
+            if (!valid) return self.reject(index, if (tuple) .destructure_requires_tuple else .destructure_requires_sequence);
+            const children = self.ast.nodeList(index);
+            const elements = try self.analysis_context.lookupCompileTimeTuple(value.runtime.value.structure);
+            if (elements.len != children.len) return self.reject(index, .{ .destructure_length_mismatch = .{ .expected = @intCast(children.len), .found = @intCast(elements.len) } });
+            for (children, elements) |child, element| try self.bindStaticPattern(child, element);
+        }
+
+        fn validateStaticPatternType(self: *Self, annotation: structures.Node.Index, value_id: structures.CompileTimeValueId) !void {
+            const expected = try self.bindingType(annotation);
+            const value = try self.analysis_context.lookupCompileTimeValue(value_id);
+            const actual = if (value == .type) structures.TypeId.type else value.runtime.type_id;
+            if (!try canWidenTo(self.analysis_context, actual, expected)) return self.reject(annotation, .{ .local_type_mismatch = .{ .expected = expected, .found = actual } });
         }
 
         fn staticClauseBindings(self: *Self) !std.ArrayList(structures.StaticBinding) {
@@ -735,12 +877,13 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .bool_literal => return self.appendExpression(index, .{ .boolean = self.ast.tokens[node.token_index].tag == .keyword_true }),
                 .unit_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .unit } else .unit),
                 .none_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .none } else .none),
-                .type, .implicit_type, .type_func, .type_variant, .type_tuple => return self.appendTypeValue(index),
+                .type, .implicit_type, .type_func, .type_variant, .type_tuple, .reference_type => return self.appendTypeValue(index),
                 .comptime_expr => return self.appendComptime(index),
                 .call => return self.appendCall(index),
                 .panic_expr => return self.appendPanic(index),
                 .struct_init => return self.appendStructInit(index),
-                .collection_literal, .tuple_literal => return self.appendCollectionLiteral(index),
+                .collection_literal => return self.appendCollectionLiteral(index),
+                .tuple_literal => return if (result_is_type) self.appendTypeValue(index) else self.appendCollectionLiteral(index),
                 .field_access => return self.appendFieldAccess(index),
                 .index_access => return self.appendExpression(index, .{ .call = try self.buildIndexCall(index) }),
                 .@"struct" => return self.appendExpression(index, .{ .type_value = try self.analysis_context.generatedStructType(index) }),
@@ -937,13 +1080,14 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
 
         fn appendForParts(self: *Self, index: structures.Node.Index, binding_index: ?structures.Node.Index, source_index: structures.Node.Index, body_index: ?structures.Node.Index) !ValueId {
             const binding = if (binding_index) |item| self.ast.nodes[item.index()] else structures.Node{ .tag = .param, .token_index = self.ast.nodes[index.index()].token_index, .data = .{ .node_node = .{ .a = .null, .b = .null } } };
-            std.debug.assert(binding.tag == .param);
-            const mode = if (binding.data.node_node.a.unwrap()) |access|
-                self.ast.tokens[self.ast.nodes[access.index()].token_index].tag
+            const pattern_binding = binding.tag != .param;
+            const destructuring = pattern_binding and !(self.static_iteration and body_index == null);
+            const mode = if (!pattern_binding and binding.data.node_node.a != .null)
+                self.ast.tokens[self.ast.nodes[binding.data.node_node.a.index()].token_index].tag
             else
                 null;
             const name_span = tokenSpan(self.ast, binding.token_index);
-            const name = if (binding_index != null) self.source[name_span.start..name_span.end] else "$spread";
+            const name = if (pattern_binding or binding_index == null) "$spread" else self.source[name_span.start..name_span.end];
             if (!std.mem.eql(u8, name, "_") and try self.nameIsVisible(name)) return self.reject(binding_index.?, .duplicate_local_binding);
             const scope_mark = self.local_names.items.len;
             defer self.restoreScope(scope_mark);
@@ -951,7 +1095,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             const source = try self.appendUse(source_index, false);
             const source_local = self.newLocal();
             const source_read = try self.appendExpression(index, .{ .local_read = source_local });
-            const cursor = try self.appendExpression(index, .{ .iterator = .{ .source = .{ .value = source_read, .span = source.span }, .structural_array = self.ast.nodes[index.index()].tag == .collection_spread } });
+            const cursor = try self.appendExpression(index, .{ .iterator = .{ .source = .{ .value = source_read, .span = source.span }, .acquisition = source.value, .structural_array = self.ast.nodes[index.index()].tag == .collection_spread } });
             const cursor_local = self.newLocal();
             const cursor_read = try self.appendExpression(index, .{ .local_read = cursor_local });
             const receiver: UnresolvedBody.ValueUse = .{ .value = cursor_read, .span = source.span };
@@ -967,16 +1111,17 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .carrier = next_local,
                 .operand = poll,
                 .end_type = end_type,
-                .binding = .{ .local = item_local, .annotation_type = null, .span = name_span, .reference = mode == .keyword_ref },
-                .mode = item_mode,
+                .binding = .{ .local = item_local, .annotation_type = null, .span = name_span, .mode = item_mode },
             } });
-            if (binding.data.node_node.b.unwrap()) |annotation| {
+            if (!pattern_binding and binding.data.node_node.b != .null) {
+                const annotation = binding.data.node_node.b;
                 item = try self.appendExpression(annotation, .{ .annotation = .{
                     .value = .{ .value = item, .span = span },
                     .type_id = try self.bindingType(annotation),
                 } });
             }
-            if (!std.mem.eql(u8, name, "_"))
+            const pattern = if (destructuring) try self.buildBindingPattern(binding_index.?, item_local) else null;
+            if (!pattern_binding and !std.mem.eql(u8, name, "_"))
                 try self.declare(name, .{ .place = .{ .id = item_local, .mutable = mode == .keyword_var or mode == .keyword_ref } });
             self.loop_depth += 1;
             defer self.loop_depth -= 1;
@@ -991,13 +1136,16 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             const body_value = try self.appendExpression(index, .{ .scope = user_body });
             const success_unit = try self.appendExpression(index, .unit);
             const success = try self.finishBlock(&.{
-                .{ .bind_local = .{
-                    .local = item_local,
-                    .value = item,
-                    .span = name_span,
-                    .mutable = mode == .keyword_var,
-                    .mode = item_mode,
-                } },
+                if (pattern) |pattern_id|
+                    .{ .bind_pattern = .{ .pattern = pattern_id, .value = item, .span = name_span } }
+                else
+                    .{ .bind_local = .{
+                        .local = item_local,
+                        .value = item,
+                        .span = name_span,
+                        .mutable = mode == .keyword_var,
+                        .mode = item_mode,
+                    } },
                 .{ .discard = .{ .value = body_value, .span = span } },
             }, success_unit, span);
             const unit = try self.appendExpression(index, .unit);
@@ -1239,6 +1387,14 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
 
         fn buildIfCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ConditionId {
             const node = self.ast.nodes[index.index()];
+            if (node.tag == .destructure_binding) {
+                const first_pattern = self.binding_patterns.items.len;
+                const statement = try self.buildPatternBinding(index, true);
+                for (self.binding_patterns.items[first_pattern..]) |pattern| {
+                    if (pattern.shape == .name and pattern.shape.name.mutable) return self.reject(index, .condition_binding_must_be_immutable);
+                }
+                return self.appendCondition(.{ .pattern = statement.bind_pattern });
+            }
             if (node.tag != .const_binding and node.tag != .var_binding and node.tag != .ref_binding) return self.buildCondition(index);
             if (node.tag == .var_binding) return self.reject(index, .condition_binding_must_be_immutable);
 
@@ -1253,7 +1409,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .local = local,
                 .annotation_type = annotation_type,
                 .span = nodeFocusSpan(self.ast, value_index),
-                .reference = node.tag == .ref_binding,
+                .mode = if (node.tag == .ref_binding) .reference else .owned,
             };
             const condition = if (value_node.tag == .as)
                 try self.buildVariantMembership(value_node, binding)
@@ -1266,6 +1422,12 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
 
             try self.declare(name, .{ .place = .{ .id = local, .mutable = node.tag == .ref_binding } });
             return condition;
+        }
+
+        fn appendPatternExtraction(self: *Self, index: structures.Node.Index) !ValueId {
+            const local = self.newLocal();
+            const condition = try self.buildVariantMembership(self.ast.nodes[index.index()], .{ .local = local, .annotation_type = null, .span = nodeFocusSpan(self.ast, index), .mode = .inferred });
+            return self.appendExpression(index, .{ .extraction = .{ .condition = condition, .local = local } });
         }
 
         fn appendExtraction(self: *Self, index: structures.Node.Index) !ValueId {
@@ -1373,7 +1535,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             for (children[0 .. children.len - 1]) |statement| try statements.append(self.gpa, try self.buildStatement(statement, false));
             const last = children[children.len - 1];
             const last_tag = self.ast.nodes[last.index()].tag;
-            if (last_tag != .const_binding and last_tag != .var_binding and !isTerminator(last_tag))
+            if (last_tag != .const_binding and last_tag != .var_binding and last_tag != .ref_binding and last_tag != .destructure_binding and !isTerminator(last_tag))
                 return self.finishBlock(statements.items, try self.append(last, result_is_type), span);
             try statements.append(self.gpa, try self.buildStatement(last, result_is_type));
             // A trailing binding yields unit; a terminator leaves the block without a result.
@@ -2433,7 +2595,7 @@ fn analyzeType(
             .is_fallible = ast.tokens[node.token_index].tag == .keyword_fallible,
         }) };
     }
-    if (node.tag != .type_variant and node.tag != .type_tuple) return .{ .unsupported = issueAt(ast, node_index.index(), unsupported_kind) };
+    if (node.tag != .type_variant and node.tag != .type_tuple and node.tag != .tuple_literal) return .{ .unsupported = issueAt(ast, node_index.index(), unsupported_kind) };
 
     var members: std.ArrayList(structures.MemberSpec) = .empty;
     defer members.deinit(gpa);
@@ -2449,8 +2611,8 @@ fn analyzeType(
             .kind = if (member_node.tag == .reference_type) .reference else .owned,
         });
     }
-    std.debug.assert(members.items.len >= 2);
-    if (node.tag == .type_tuple) return .{ .success = try analysis_context.facts().internTuple(members.items) };
+    std.debug.assert(members.items.len >= 1);
+    if (node.tag == .type_tuple or node.tag == .tuple_literal) return .{ .success = try analysis_context.facts().internTuple(members.items) };
 
     return switch (try analysis_context.facts().internVariantMembers(members.items)) {
         .type_id => |type_id| .{ .success = type_id },
@@ -2877,13 +3039,11 @@ pub fn discoverItems(gpa: std.mem.Allocator, ast: *const structures.Ast, source:
         const value = target_node.data.node_node.b.unwrap() orelse unreachable;
         const kind = itemKind(ast, value);
 
-        const synthetic_name = if (ast.nodes[value.index()].is_converter)
-            try gpa.print("$converter{d}_{d}", .{ ast.file_id, items.items.len })
+        const name: structures.Name = if (ast.nodes[value.index()].is_converter)
+            .{ .converter = .{ .file_id = ast.file_id, .ordinal = @intCast(items.items.len) } }
         else
-            null;
-        defer if (synthetic_name) |allocated| gpa.free(allocated);
-        const name = synthetic_name orelse tokenText(ast, source, target_node.token_index);
-        const parent = try appendItem(gpa, &items, kind, ast.file_id, module, declarationName(ast, name, target.index()), target.index(), node.tag == .@"pub", null, null);
+            declarationName(ast, tokenText(ast, source, target_node.token_index), target.index());
+        const parent = try appendItem(gpa, &items, kind, ast.file_id, module, name, target.index(), node.tag == .@"pub", null, null);
         if (namespace != .null) items.items[parent].qualified_owner = try qualifiedName(gpa, ast, source, namespace);
         if (kind == .structure) {
             try discoverStructItems(gpa, &items, ast, source, module, value, parent, null);

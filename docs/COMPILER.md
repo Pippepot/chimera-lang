@@ -38,6 +38,15 @@ Thread time is elapsed time on each worker, not CPU time. Collection is disabled
 without the flag and adds measurement overhead when enabled. Cache stages appear
 only when those operations occur.
 
+The build generates and embeds precompiled concrete std functions and their
+reachable specializations. Fresh projects index that bundle automatically, without
+`--disk-cache` or adjacent std files. Generic instantiations that are absent from
+the bundle compile normally. Artifact IDs are translated into each project
+database, and dependency and representation checks retain normal invalidation.
+Bodies, native functions, and required intern values decode only when requested.
+AST, SSA, and assembly debug views bypass the bundle; `--debug=timing` reports
+body/function counts loaded on demand and an `index precompiled std` stage.
+
 `zig build run` defaults to `debug`, which favors fast compiler builds and keeps
 runtime safety checks, and enables incremental compilation of the compiler.
 Use it for everyday edits. Zig caches the compiler binary,
@@ -105,8 +114,14 @@ recoverable for the deferred construction. Implicit List construction retains
 its panic policy. A known static upper bound supports fresh immovable elements;
 unbounded growth requires movable, automatically droppable elements.
 
-`List(T).new`, `reserve`, and `append` provide fallible dynamic growth. Array and
-List expose `span()` over their initialized elements.
+`List(T).new`, `reserve`, and `append` provide fallible dynamic growth, including
+reference-containing elements. `remove?(index)` returns the owned element and
+shifts the suffix without allocation; bounds failure preserves the List.
+`for item in values^` yields owned elements in order and cleans up on early exit;
+ordinary iteration borrows. Growth, removal, and consuming iteration require
+directly movable, automatically droppable elements. Consuming iteration excludes
+owned End alternatives, which signal exhaustion.
+Array and List expose `span()` over their initialized elements.
 Array, List, and Span expose checked `slice?(bounds)`, for example
 `values.slice?(1..3)`, `values.slice?(..3)`, `values.slice?(2..)`, or
 `values.slice?(..)`. Bounds are reusable `Range` values with two `int | none`
@@ -175,8 +190,12 @@ Type annotations distinguish `ref T | End`, an owned variant with a reference
 alternative, from `ref (T | End)`, a borrow of an existing whole variant. Matching
 uses logical type; reference alternatives retain their own captured authority
 and origins. Explicitly typed tuples such as `(ref A, B)` use positional `.0`
-and `.1` access and ordinary elementwise ownership. Tuple literals currently
-require an expected tuple type. Compiler lowering and standard range/span cursors
+and `.1` access and ordinary elementwise ownership. Tuple literals infer their
+structural types without annotations; `(x,)` is a singleton and `(x)` groups x.
+Nested `(x, y)` and `[x, y]` binding patterns support tuples and Array/List/Span
+in declarations, conditional bindings, loops, and comprehensions, with per-element
+const/var/ref modes. List/Span length mismatches follow ordinary failure flow;
+Array lengths are checked during typing. Compiler lowering and standard range/span cursors
 use only `next/End`; no protocol build option or legacy fallback remains.
 The next result must contain an owned `std.iteration.End` alternative,
 independently of caller imports or shadowing. Bare bindings preserve
@@ -187,7 +206,7 @@ and mixed/nested zip cases exercise explicit static type arguments and separatel
 declared failure shapes; computed member specifications and one-definition exact
 generic fallibility are not yet a standard-library interface. Existing type
 factories select exact effects and delivery kinds from explicit static arguments;
-automatic discovery, builders, and new binding syntax are deferred proposals,
+automatic discovery and type builders are deferred proposals,
 not prerequisites for iteration. For focused verification, run
 `zig build test --seed=0 -Dtest-source=tests/iteration_test.zig`.
 `if const item = source^ as T` consumes a variant on both paths; success owns the
@@ -362,16 +381,26 @@ zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/comptime_interpreter
 Run the focused collection-construction suite with
 `zig build test --seed=0 -Dtest-source=tests/collection_test.zig`.
 
+Run the structural tuple and destructuring suite with
+`zig build test --seed=0 -Dtest-source=tests/tuple_test.zig`.
+
+Run the List mutation and consuming traversal suite with
+`zig build test --seed=0 -Dtest-source=tests/list_test.zig`.
+
 Run the focused overload suite with
 `zig build test --seed=0 -Dtest-source=tests/overload_test.zig`.
 
 These entrypoints supply required module imports. Both suite modes run inline
-tests once through `test_sources.zig` and thirteen standalone suites (fourteen default
+tests once through `test_sources.zig` and sixteen standalone suites (seventeen default
 roots total): `tests/array_test.zig`, `tests/collection_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
 `tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`, `tests/overload_test.zig`,
-`tests/query_disk_cache_test.zig`, `tests/query_test.zig`, `tests/reference_test.zig`,
-`tests/text_test.zig`, `tests/panic_test.zig`, and `tests/iteration_test.zig`.
+`tests/query_disk_cache_test.zig`, `tests/query_artifact_test.zig`, `tests/query_test.zig`, `tests/reference_test.zig`,
+`tests/text_test.zig`, `tests/panic_test.zig`, `tests/iteration_test.zig`,
+`tests/list_test.zig`, and `tests/tuple_test.zig`.
 Each runs in its own binary's directory.
+Run portable artifact remapping and std reuse checks with
+`zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/query_artifact_test.zig`.
+
 Private disk-cache tests remain inline in
 `src/query_disk_cache.zig`; its snapshot integration suite lives in
 `tests/query_disk_cache_test.zig`.
@@ -386,7 +415,7 @@ caches compilation but reruns tests. The `safe` mode speeds up allocation checks
 with a slower first compile.
 
 For quick test iteration, omit `-Doptimize=safe` and select the affected
-suite with `-Dtest-source`. The full suite builds fourteen separate test binaries;
+suite with `-Dtest-source`. The full suite builds sixteen separate test binaries;
 its compilation cost is different from building the CLI once.
 
 Use focused checks during edits; run the routine suite once for changes spanning
@@ -423,6 +452,40 @@ The timer covers database creation, source registration, analysis, native compil
 and linking. Database teardown, CLI file discovery and output writes, and execution
 of the generated program are excluded, so the actual CLI requires separate timing
 verification. The prelude case alone does not exercise reachable function analysis.
+
+The std precompilation comparison uses the same compiler and source fixtures
+with bundle loading disabled (`source`) and enabled (`bundled`):
+
+```sh
+zig build std-benchmark --seed=0 -Doptimize=fast -j1
+zig build std-benchmark --seed=0 -j1
+```
+
+Each case warms up both paths, then measures 21 alternating pairs of fresh
+zero-worker databases without disk caching. `compile` includes database creation,
+source registration, bundle loading where enabled, analysis, code generation, and
+linking; `lifecycle` also includes teardown. `load` isolates bundle loading.
+File discovery, output writes, and execution are excluded. Body-typing and codegen
+counts come from separate instrumented warm-ups, outside the timed samples.
+
+The recorded Zig 0.17 measurements use an AMD Ryzen 7 5800H, pinned to CPU 4
+with `taskset -c 4`, without concurrent compiler builds or tests. The
+[Fast results](../benchmarks/std_precompile.csv) use LLVM; the
+[Debug results](../benchmarks/std_precompile_debug.csv) use the self-hosted backend.
+Median compilation times, including bundle loading, are:
+
+| Program | Fast source | Fast bundled | Debug source | Debug bundled |
+| --- | ---: | ---: | ---: | ---: |
+| Exit | 0.644 ms | 1.575 ms | 3.505 ms | 9.123 ms |
+| Math clamp | 0.888 ms | 1.875 ms | 4.279 ms | 9.352 ms |
+| Scalar print | 3.047 ms | 1.884 ms | 19.582 ms | 13.245 ms |
+| List, text, range, and math | 5.419 ms | 3.728 ms | 35.768 ms | 24.660 ms |
+
+Printing and the collection workload improve by 38% and 31% in Fast, and 32%
+and 31% in Debug. Eager bundle loading costs roughly 0.8–1.1 ms in Fast and
+5.8–5.9 ms in Debug, making the tiny exit/math cases slower. Native compilation
+counts fall from 41 to 2 for printing and from 75 to 21 for the collection
+workload; new generic specializations still compile normally.
 
 Converter discovery and matching have a separate benchmark:
 
@@ -560,14 +623,35 @@ including all scalar and owning sizes. Scalar/128 medians in that matched round:
 | `baseline` (`4556095`) | 3.023 ms | baseline |
 | `prior` (`7cb3afd`) | 3.391 ms | +12.2% |
 | `parser_order` (only allocation order restored) | 3.058 ms | +1.2% |
-| `flow_reads` (pending flow optimization) | 3.250 ms | +7.5% |
+| `flow_reads` (flow-value read optimization) | 3.250 ms | +7.5% |
 | `flow_reads_parser_order` (both changes) | 2.846 ms | -5.8% |
 
-All graph and retained-memory counters match across every run. The
-allocation-order correction is a diagnostic ablation, not yet applied to
-the main worktree. The roadmap gate remains open until the production change
-passes behavioral tests and adjacent-case performance verification. These
-typing-only results do not establish an end-to-end compilation speedup.
+All graph and retained-memory counters match across every run.
+
+The runtime parser now preserves tokenizer-first allocation, releasing
+tokenizer scratch before parsing the resulting tokens. Ordinary OOM tests
+cover cleanup when either initial allocation fails.
+
+The [production-source verification](../benchmarks/flow_parser_application.csv)
+repeats the unchanged full matrix with fifteen rotating trials per variant,
+LLVM fast mode, and CPU 4 affinity. `baseline` is `4556095`; `before` and `after`
+both include `924a474` and the same pending workspace changes, with `after`
+adding the parser correction. The measurements and safe-suite run describe
+that application snapshot, not subsequent unrelated workspace edits. Each row
+summarizes five-sample trial medians:
+
+| Scalar branches | Baseline | Before correction | After correction | Versus baseline |
+| --- | ---: | ---: | ---: | ---: |
+| 128 | 3.071 ms | 3.185 ms | 2.825 ms | -8.0% |
+| 256 | 6.484 ms | 5.682 ms | 5.767 ms | -11.1% |
+| 512 | 12.737 ms | 10.296 ms | 10.427 ms | -18.1% |
+
+Graph and retained-memory counters match across every variant and trial.
+The smaller scalar cases and owning cases show no repeatable adjacent
+regression from the correction; owning medians range from 2.2% faster to
+2.2% slower than baseline. Parser tests, the routine safe suite, formatting,
+and whitespace checks pass. These typing-only results do not establish an
+end-to-end compilation speedup.
 
 For cold multi-file worker scaling and warm and edited disk cache reuse against
 uncached runs, build an optimized compiler and run the generated benchmark fixture.

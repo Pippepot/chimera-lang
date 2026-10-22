@@ -235,10 +235,48 @@ const subtract: func(imm int, imm int) int = int.-
 # positions use .0, .1, and so on. Reference members capture existing places and
 # retain independent authority and origins through copies and const carriers.
 # Owned members retain their ordinary copy, move, and drop obligations.
-# Implemented tuple literals have two or more elements and require an expected
-# tuple type. Unannotated inference, destructuring, and singleton syntax remain
-# open; () already denotes unit. Named fields belong to structs.
-const pair: (int, bool) = (1, true)
+# Parentheses without a comma group an expression or type: (x) is x.
+# A trailing comma selects a singleton: (x,) has type (T,). () denotes unit,
+# including in type positions; unit is not an empty tuple. Named fields belong
+# to structs. An expected tuple type supplies member types and storage kinds;
+# otherwise each element infers its ordinary value type and owned storage.
+# This applies recursively, including tuple types returned by type factories.
+const pair = (1, true)
+const singleton: (int,) = (42,)
+
+# Binding patterns use (x, y) for tuples and [x, y] for Array, List, and Span.
+# Patterns nest, accept trailing commas and type annotations, and use _ to
+# ignore an element without copying it. Empty () and [] patterns require unit
+# and an empty sequence respectively. A sequence pattern requires exactly its
+# number of elements; there is no implicit prefix or rest match. Tuple and Array
+# length mismatches are source errors. List and Span check their lengths at
+# runtime before extracting elements; mismatch follows ordinary failure flow.
+# An if binding catches both source failure and length mismatch, and exposes
+# names only to its successful branch. Conditional patterns permit const/ref
+# bindings; mutable conditional bindings remain unsupported.
+#
+# The source evaluates once. const and var copy elements of an existing source;
+# ref aliases their places. Fresh results and explicitly transferred sources
+# hand owned elements to owning bindings. Reference members retain their own
+# authority and origins, and owning bindings copy their referents. Each leaf
+# inherits the outer const/var/ref mode unless it specifies its own mode.
+# Decomposing an owned tuple or Array partitions its ownership in place, so
+# fresh immovable members can bind without relocation. Taking owned List
+# elements requires direct movement; reference-only patterns keep its backing
+# storage and can borrow immovable elements. Ignored owners and partially bound
+# values retain ordinary cleanup and explicit-drop obligations on every exit.
+var coordinates = (19, 23)
+const (ref x, var y) = coordinates
+x += 1
+y -= 1
+const [first, second] = [x, y]
+
+# The same patterns bind for-loop and comprehension items. Bare leaves own
+# owned items and alias borrowed items readonly; explicit const/var/ref modes
+# select copying/ownership or aliasing independently per element. A pattern
+# consumes neither an existing tuple nor its sequence merely by naming it;
+# use ^ to transfer an existing owner. Static comprehensions accept nested
+# patterns with immutable owning leaves, following ordinary static expansion.
 
 
 # Standard library
@@ -845,7 +883,8 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # Assigning a value to `_` is a non-consuming use that explicitly extends its
 # lifetime to that point. The expression is evaluated once, but an owning value
 # is neither copied nor transferred merely to perform the discard.
-# A discard produces unit when used as an inline body or a block's final value.
+# A discard produces unit when used as an inline body or a conditional body's
+# final value.
 # Its behavior does not depend on whether another statement follows it.
 # An inline function body with declared unit result evaluates its expression
 # and discards the value. Explicit return expressions still check their result
@@ -870,9 +909,9 @@ _ = resource
 # place moves into it. Copy and move capabilities are independent: an immovable
 # source can be copied into distinct storage if it supports copy.
 # Fresh struct initializers construct their fields at their final addresses.
-# Calls receive the caller's result destination; blocks, conditional results,
-# loop break results, and variant widenings propagate destinations to the
-# selected result and its storage projections. These guarantees apply to direct
+# Calls receive the caller's result destination; conditional results, loop break
+# results, and variant widenings propagate destinations to the selected result
+# and its storage projections. These guarantees apply to direct
 # and indirect calls, including fallible calls, regardless of optimization.
 # Delivering a fresh result does not itself invoke a copy or move hook.
 # An immovable object retains its address throughout its lifetime, including
@@ -1198,10 +1237,10 @@ fallible forward_initializer(static T: type, init item: T) T
 # unsafe_borrow, unsafe_take, and unsafe_destroy names as their free functions.
 # Their ordinary wrappers preserve initializer timing and ownership modes.
 # An uninitialized Allocation(T) has no live T origins; unsafe operations with
-# Ref-containing elements retain conservative content origins and cannot return
-# references to callee-local owners. The caller still proves per-slot
-# initialization and keeps referents live; destruction does not precisely remove
-# individual slots from the current origin set.
+# reference-containing elements cannot return references to callee-local owners.
+# Known slots track captures separately: replacement, extraction, and destruction
+# remove old captures, and extraction transfers them to the result. Unknown
+# indices retain all possible dependencies. The caller proves bounds and initialization.
 # Allocation(T).capacity() returns its allocated element count, including for
 # zero-sized T. List capacity is derived from that count rather than stored twice.
 # std.memory.List(T) owns Allocation(T) and a contiguous initialized prefix
@@ -1210,9 +1249,9 @@ fallible forward_initializer(static T: type, init item: T) T
 # Destroying a List destroys only the initialized prefix, in reverse order,
 # then deallocates the storage. Its allocation and counters are not exposed for
 # external mutation. Only directly movable, automatically droppable elements
-# may be appended or relocated by the dynamic List API. Literal construction
-# also supports immovable and reference-containing elements; dynamic mutation
-# of reference-containing elements remains unsupported.
+# may be appended, removed, or relocated by the dynamic List API. Reference fields
+# and reference-containing elements retain their captures through these operations.
+# Literal construction also supports immovable elements.
 # List growth allocates replacement storage before disturbing initialized
 # elements; allocation failure leaves the original contents intact. reserve
 # relocates in reverse index order. unsafe_take extracts the owned value with
@@ -1232,6 +1271,14 @@ fallible forward_initializer(static T: type, init item: T) T
 # reallocation or destruction invalidates loans into ended element storage.
 # Dynamic indices can conservatively share an owner dependency. Moving a List handle does not
 # inherently relocate heap elements, but owner transfer invalidates prior borrows.
+# remove(index) fails unless 0 <= index < length, without changing the List.
+# Success returns the owned element and shifts the suffix, preserving order and
+# capacity. Removed and relocated slots end their lifetimes; earlier slots remain
+# stable. After bounds checks, removal neither allocates nor fails. Captured
+# references follow their referents independently of the old slot. Append prepares
+# its owned argument eagerly; failed growth preserves contents and cleans that argument.
+# Potential reallocation or unknown-slot mutation conservatively invalidates loans,
+# even when runtime inputs avoid mutation.
 #
 # Span(T) is a copyable nonowning contiguous initialized range, not an
 # allocation or a container owner. Array also supplies span(). Span
@@ -2056,6 +2103,7 @@ const maybe: int | unit = if 1 < 2 -> 1
 # its declaration through the rest of its scope, but cannot escape that scope.
 # A declaration cannot reuse a name that is already visible; sibling scopes may
 # reuse the same name.
+# Standalone block expressions and labeled break targets are not part of the language.
 
 
 # Match
@@ -2210,6 +2258,18 @@ fallible range_examples()
 # cursor: named cursor state resumes in place instead of being copied or reset.
 # A factory's fresh result is owned, and a borrowed result remains borrowed.
 # Ordinary cleanup and last-use rules apply to both source and cursor.
+# An explicitly transferred source selects consume_iter when that member exists.
+# Its signature determines effects and delivery; an invalid factory is an error.
+# Without it, the loop owns the source and uses iter or next normally. Fresh
+# sources use iter; transferring a view does not acquire its backing elements.
+# List.consume_iter transfers the allocation and yields elements in forward order
+# without copies or shifting. Elements must be directly movable and automatically
+# droppable, with no owned End alternative that could be confused with exhaustion.
+# Captured references retain their referents and permissions; aliases into an
+# owned item depend on its poll carrier, independently of the former List slot.
+# Break, return, and ordinary failure destroy remaining elements in reverse order
+# and release storage. Even empty traversal consumes the List. Cursor and item
+# follow independent last-use cleanup. Panic and process exit do not unwind.
 #
 # Each iteration calls next once and retains its result carrier. End means
 # successful exhaustion; otherwise the item is extracted and the body runs.

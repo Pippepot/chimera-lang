@@ -196,7 +196,7 @@ overhead; it does not create semantic query dependencies or change results.
 
 `SourceRegistry.update` refreshes a directory snapshot in an idle database. It preserves file IDs across enumeration changes, updates source ownership and membership, and records module additions/removals in the catalog. Removed source inputs remain unreachable through current membership.
 
-Before building the query database, an ordinary CLI run looks for a successful
+With `--disk-cache`, before building the query database the CLI looks for a successful
 whole-program executable under a content key covering every source and module
 input plus the linked compiler build ID, or a running binary digest when no
 build ID is available. Cache files carry a payload checksum and are published
@@ -209,6 +209,19 @@ runtime function bodies and compiled artifacts are restored after their recorded
 input contents and equal-result query boundaries are checked. A stale result is
 recomputed through the ordinary query path. Query snapshots are rewritten after
 successful compilation; malformed snapshots are discarded and built afresh.
+
+After source registration, ordinary CLI runs install the index of an embedded std
+bundle built by `src/precompile_std.zig`, independently of optional disk snapshots.
+`src/standard_bundle.zig` looks up demanded body and native-function queries by
+logical identity, then decodes just that result and its required intern values.
+The engine schedules these loads as ordinary queries and owns their completed
+outputs. `StandardLibraryUnchanged` validates the closed compiler-owned sources;
+loaded results depend on it. Its output includes file identities, so changed
+assignments invalidate results and reset the loader's identity memo. Variant
+types observed by each producer computation are checked before reuse; incompatible
+tags or source overrides use ordinary query computation. Source definitions and
+generic factories remain available normally. Unrequested functions stay encoded.
+AST, SSA, and assembly debug views bypass the bundle.
 
 An idle input update advances the revision only when its value changes. A missing input read records a dependency before returning `InputNotFound`; registering that input later advances the revision and invalidates cached fallback results. A cached query re-verifies recorded dependencies and reruns if they changed or failed, allowing its `run` function to handle dependency errors again. Equal output and accumulators preserve the previous allocation and `changed_at`; changed output or diagnostics become observable. Fresh dependency sets replace old edges on commit. An infrastructure failure discards fresh state, keeps the last completed memo, and remains retryable. Failed children contribute no stale accumulators; their failure revision also invalidates parents' cached fallbacks after recovery to an otherwise equal result.
 

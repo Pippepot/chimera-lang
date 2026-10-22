@@ -124,13 +124,11 @@ pub fn validOperationShape(operation: structures.Operation, signature: structure
     return signature.return_type == (if (operation.isPredicate()) structures.TypeId.unit else receiver.type_id);
 }
 
-pub fn signatureIssue(facts: anytype, behavior: structures.CallBehavior, signature: structures.FunctionSignature) !?structures.Diagnostic.Kind {
+pub fn signatureIssue(facts: anytype, behavior: structures.CallBehavior, signature: structures.FunctionSignature, iteration_end: ?structures.TypeId) !?structures.Diagnostic.Kind {
     switch (behavior) {
         .box_new => return boxNewIssue(facts, signature),
         .box_value => return boxValueIssue(facts, signature),
-        .list_new => return listNewIssue(facts, signature),
-        .collection_append_bounded => return listAppendIssue(facts, signature, false),
-        .list_append, .list_reserve, .collection_append_growing => return listAppendIssue(facts, signature, true),
+        .list_append, .list_reserve, .list_remove, .list_consume, .collection_append_bounded, .collection_append_growing => return listElementIssue(facts, behavior, signature, iteration_end),
         else => return null,
     }
 }
@@ -147,17 +145,17 @@ fn boxValueIssue(facts: anytype, signature: structures.FunctionSignature) !?stru
     return if (!capabilities.isDirectlyMovable()) .{ .box_extraction_requires_direct_move = signature.return_type } else null;
 }
 
-fn listNewIssue(facts: anytype, signature: structures.FunctionSignature) !?structures.Diagnostic.Kind {
-    const element = (try facts.listElement(signature.return_type)) orelse return error.Unavailable;
-    return if (try facts.containsBorrow(element)) .{ .list_cannot_store_borrow_element = element } else null;
-}
-
-fn listAppendIssue(facts: anytype, signature: structures.FunctionSignature, requires_direct_move: bool) !?structures.Diagnostic.Kind {
+fn listElementIssue(facts: anytype, behavior: structures.CallBehavior, signature: structures.FunctionSignature, iteration_end: ?structures.TypeId) !?structures.Diagnostic.Kind {
     if (signature.parameters.len == 0) return null;
     const element = (try facts.listElement(signature.parameters[0].type_id)) orelse return null;
     const capabilities = (try facts.ownershipCapabilities(element)) orelse return error.Unavailable;
     if (capabilities.requires_explicit_drop) return .{ .list_requires_automatic_drop = element };
-    if (requires_direct_move and !capabilities.isDirectlyMovable()) return .{ .list_requires_direct_move = element };
+    if (behavior != .collection_append_bounded and !capabilities.isDirectlyMovable()) return .{ .list_requires_direct_move = element };
+    if (behavior != .list_consume) return null;
+    if (element == iteration_end) return .{ .list_iteration_item_conflicts_with_end = element };
+    if (try facts.variantMembers(element)) |members| {
+        for (members) |member| if (member == iteration_end) return .{ .list_iteration_item_conflicts_with_end = element };
+    }
     return null;
 }
 

@@ -5,6 +5,7 @@ const diagnostics = @import("diagnostics.zig");
 const modules = @import("modules.zig");
 const query = @import("query/engine.zig");
 const query_disk_cache = @import("query_disk_cache.zig");
+const standard_bundle = @import("standard_bundle.zig");
 const queries = @import("queries.zig");
 const runtime = @import("runtime.zig");
 const structures = @import("structures.zig");
@@ -182,6 +183,7 @@ fn compileAndRun(
     }
     try source_registry.update(db, gpa, input.source, input.source_files, input.module_paths);
     timings.mark(io, "add source");
+
     if (restored_offset) |offset| {
         _ = query_disk_cache.restoreQueries(db, snapshot.?, offset) catch |err| switch (err) {
             error.InvalidCache, error.InvalidInternId => {
@@ -197,9 +199,20 @@ fn compileAndRun(
         timings.mark(io, "restore queries");
     }
 
+    const bundled = if (!input.debug_flags.ast and !input.debug_flags.ssa and !input.debug_flags.@"asm")
+        try standard_bundle.install(db, @embedFile("standard_bundle"))
+    else
+        null;
+    if (bundled != null) timings.mark(io, "index precompiled std");
     if (input.debug_flags.timing) try buildWithStageTimings(db, io, &timings);
     const executable_result = try db.get(queries.BuildExecutable, file_id);
     timings.mark(io, "link executable");
+    if (input.debug_flags.timing) {
+        if (bundled) |loader| {
+            const loaded = loader.stats();
+            try errors.print("precompiled std: {d} bodies, {d} functions loaded on demand\n", .{ loaded.bodies, loaded.functions });
+        }
+    }
     const emitted = try db.transitiveAccumulatorValues(
         queries.BuildExecutable,
         file_id,

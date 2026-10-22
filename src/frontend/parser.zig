@@ -205,17 +205,20 @@ const ParserState = struct {
 };
 
 fn parseState(gpa: std.mem.Allocator, source: []const u8) !ParserState {
-    var tokens = try std.ArrayList(Token).initCapacity(gpa, source.len / 8);
-    errdefer tokens.deinit(gpa);
-    {
+    // Keep tokenizer scratch before the token buffer to preserve arena reuse.
+    var tokens = blk: {
         var tok = try Tokenizer.init(gpa, source);
         defer tok.deinit();
+        var buffer = try std.ArrayList(Token).initCapacity(gpa, source.len / 8);
+        errdefer buffer.deinit(gpa);
         while (true) {
             const token = try tok.next();
-            try tokens.append(gpa, token);
+            try buffer.append(gpa, token);
             if (token.tag == .eof) break;
         }
-    }
+        break :blk buffer;
+    };
+    errdefer tokens.deinit(gpa);
 
     var parser: ParserState = .{
         .gpa = gpa,
@@ -437,25 +440,63 @@ fn parseFor(parser: *ParserState) ParseError!Node.Index {
 }
 
 fn parseForBinding(parser: *ParserState) ParseError!Node.Index {
-    const mode_index = parser.index;
-    const mode = parser.eatAny(&.{ .keyword_const, .keyword_var, .keyword_ref });
-    const name_index = parser.index;
-    _ = try parser.expect(.identifier);
-    const annotation = try parseTypeAnnotation(parser);
-    const access = if (mode != null) try parser.addNode(.{ .tag = .access, .token_index = mode_index, .data = .{ .none = {} } }) else Node.Index.null;
-    const binding = try parser.addNode(.{
-        .tag = .param,
-        .token_index = name_index,
-        .data = .{ .node_node = .{ .a = access, .b = annotation } },
-    });
+    const binding = try parseBindingPattern(parser, .null);
     _ = try parser.expect(.keyword_in);
     return binding;
+}
+
+fn parseBindingPattern(parser: *ParserState, inherited_access: Node.Index) ParseError!Node.Index {
+    const mode_index = parser.index;
+    const mode = parser.eatAny(&.{ .keyword_const, .keyword_var, .keyword_ref });
+    const access = if (mode != null)
+        try parser.addNode(.{ .tag = .access, .token_index = mode_index, .data = .{ .none = {} } })
+    else
+        inherited_access;
+    const token_index = parser.index;
+    var pattern: Node.Index = undefined;
+    if (parser.eatAny(&.{ .l_paren, .l_bracket })) |open| {
+        const close: Token.Tag = if (open.tag == .l_paren) .r_paren else .r_bracket;
+        const stack_top = parser.scratch_stack.items.len;
+        defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
+        parser.skipContinuationIndent();
+        var comma = false;
+        while (parser.current().tag != close) {
+            const child = try parseBindingPattern(parser, access);
+            try parser.scratch_stack.append(parser.gpa, child);
+            parser.skipContinuationIndent();
+            if (parser.eat(.comma) == null) break;
+            comma = true;
+            parser.skipContinuationIndent();
+        }
+        _ = try parser.expect(close);
+        const children = parser.scratch_stack.items[stack_top..];
+        pattern = if (open.tag == .l_paren and children.len == 1 and !comma)
+            children[0]
+        else
+            try parser.addNode(.{ .tag = if (open.tag == .l_paren) .binding_tuple else .binding_sequence, .token_index = token_index, .data = try parser.listToSpan(children) });
+        if (parser.eat(.colon) != null) {
+            const annotation = try parseType(parser);
+            pattern = try parser.addNode(.{ .tag = .binding_annotation, .token_index = token_index, .data = .{ .node_node = .{ .a = pattern, .b = annotation } } });
+        }
+    } else {
+        _ = try parser.expect(.identifier);
+        const annotation = try parseTypeAnnotation(parser);
+        pattern = try parser.addNode(.{ .tag = .param, .token_index = token_index, .data = .{ .node_node = .{ .a = access, .b = annotation } } });
+    }
+    return pattern;
 }
 
 fn parseBinding(parser: *ParserState) !Node.Index {
     if (parser.current().tag == .keyword_static and parser.tokens[parser.index + 1].tag == .keyword_struct)
         return parseStruct(parser);
     const binding_keyword = parser.eatAny(&.{ .keyword_const, .keyword_var, .keyword_ref, .keyword_static }) orelse return .null;
+    if (binding_keyword.tag != .keyword_static and (parser.current().tag == .l_paren or parser.current().tag == .l_bracket)) {
+        const access = try parser.addNode(.{ .tag = .access, .token_index = parser.index - 1, .data = .{ .none = {} } });
+        const pattern = try parseBindingPattern(parser, access);
+        _ = try parser.expect(.equal);
+        const value = try parseRequiredExpression(parser);
+        return parser.addNode(.{ .tag = .destructure_binding, .token_index = parser.nodes.items[pattern.index()].token_index, .data = .{ .node_node = .{ .a = pattern, .b = value } } });
+    }
     const name = try parseDeclarationName(parser, binding_keyword.tag == .keyword_static);
     const type_annotation = try parseTypeAnnotation(parser);
     _ = try parser.expect(.equal);
@@ -739,7 +780,7 @@ fn parseParenthesized(parser: *ParserState, comptime is_type: bool) ParseError!N
     const token_index = parser.index;
     _ = try parser.expect(.l_paren);
     parser.skipContinuationIndent();
-    if (!is_type and parser.eat(.r_paren) != null)
+    if (parser.eat(.r_paren) != null)
         return parser.addNode(.{ .tag = .unit_literal, .token_index = token_index, .data = .{ .none = {} } });
     const first = if (is_type) try parseType(parser) else try parseExpressionPrecedence(parser, 0);
     parser.skipContinuationIndent();
@@ -750,7 +791,8 @@ fn parseParenthesized(parser: *ParserState, comptime is_type: bool) ParseError!N
     const stack_top = parser.scratch_stack.items.len;
     defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
     try parser.scratch_stack.append(parser.gpa, first);
-    while (true) {
+    parser.skipContinuationIndent();
+    while (parser.current().tag != .r_paren) {
         parser.skipContinuationIndent();
         const member = if (is_type) try parseType(parser) else try parseExpressionPrecedence(parser, 0);
         try parser.scratch_stack.append(parser.gpa, member);
@@ -923,6 +965,7 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
         .keyword_false => try parseTokenNode(parser, .keyword_false, .bool_literal),
         .keyword_none => try parseTokenNode(parser, .keyword_none, .none_literal),
         .keyword_panic => try parsePanic(parser),
+        .keyword_ref => try parseReferenceType(parser),
         .keyword_if => try parseIfExpr(parser),
         .keyword_loop => try parseKeywordBody(parser, .keyword_loop, .loop),
         .keyword_for => try parseFor(parser),
@@ -2711,6 +2754,14 @@ test "required expression failures stop at one diagnostic" {
     };
     for (cases) |case| {
         try testExpectDiagnosticTag(case.source, case.kind);
+    }
+}
+
+test "parse report releases initial tokenization allocations on OOM" {
+    for ([_]usize{ 0, 1 }) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        try std.testing.expectError(error.OutOfMemory, parseReport(failing.allocator(), 0, "const value = 123\n"));
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
 }
 

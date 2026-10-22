@@ -11,6 +11,9 @@ pub const profiling = @import("src/profiling.zig");
 pub const query = @import("src/query/engine.zig");
 pub const queries = @import("src/queries.zig");
 pub const query_disk_cache = @import("src/query_disk_cache.zig");
+pub const query_artifact = @import("src/query_artifact.zig");
+pub const standard_bundle_loader = @import("src/standard_bundle.zig");
+pub const standard_bundle = @embedFile("standard_bundle");
 pub const runtime = @import("src/runtime.zig");
 pub const structures = @import("src/structures.zig");
 

@@ -567,13 +567,12 @@ test "adapter feasibility type factories select owned or borrowed delivery" {
 }
 
 test "adapter feasibility structural type construction and callable inference limits" {
-    try Fixture.expectAnySourceDiagnostic(
+    try Fixture.expectParity(
         \\func Pair(static A: type, static B: type) type -> (A, B)
         \\func run() int
         \\    const pair: Pair(int, int) = (12, 30)
         \\    return pair.0 + pair.1
-        \\_ = run()
-    , .tuple_requires_expected_type);
+    , 42);
     const declarations =
         \\struct Source
         \\    value: int

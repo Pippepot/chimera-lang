@@ -1,5 +1,1 @@
-func recurse(depth: int) never
-  if depth > 0 -> recurse(depth - 1)
-  panic "recursion complete"
-
-recurse(3)
+print(123)

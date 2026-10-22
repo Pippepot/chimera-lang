@@ -62,6 +62,8 @@ pub struct List(T: type)
     pub func iter(ref self: List(T)) SpanIterator(T)
         var view = self.span()
         return view.iter()
+    pub func consume_iter(deinit self: List(T)) ListIterator(T)
+        return ListIterator(T){storage = self.storage^, first = 0, limit = self.initialized}
     pub fallible slice(ref self: List(T), bounds: Range) Span(T)
         var view = self.span()
         return view.slice?(bounds)
@@ -106,11 +108,44 @@ pub struct List(T: type)
         index < self.initialized
         return unsafe_borrow(T, self.storage, index)
 
+    pub fallible remove(mut self: List(T), index: int) T
+        index >= 0
+        index < self.initialized
+        const result = unsafe_take(T, self.storage, index)
+        var position = index
+        loop
+            const next = position + 1
+            if next >= self.initialized -> break
+            const item = unsafe_take(T, self.storage, next)
+            initialize_collection_element(T, self.storage, position, item^)
+            position = next
+        self.initialized -= 1
+        return result^
+
     pub overload [](get, slice)
 
     pub fallible []=(mut self: List(T), index: int, var item: T) unit
         ref element = self.get?(index)
         element = item^
+
+pub struct ListIterator(T: type)
+    copy = none
+    storage: Allocation(T)
+    first: int
+    limit: int
+    drop = func(deinit self: ListIterator(T))
+        var position = self.limit
+        loop
+            if position == self.first -> break
+            position -= 1
+            unsafe_destroy(T, self.storage, position)
+        deallocate(T, self.storage^)
+
+    pub func next(mut self: ListIterator(T)) T | End
+        if self.first >= self.limit -> return End{}
+        const item = unsafe_take(T, self.storage, self.first)
+        self.first += 1
+        return item^
 
 func allocate_literal(static T: type, count: int) Allocation(T)
     if const storage = allocate(T, count) -> return storage^
@@ -129,6 +164,12 @@ extern func static_iteration_item(static T: type, imm item: T) unit
 
 func collection_array_iterator(static T: type, static N: int, ref value: Array(T, N)) SpanIterator(T)
     return SpanIterator(T){source = Span(T){data = array_cursor(T, N, value), size = N}, position = 0}
+
+fallible destructure_list(static T: type, static N: int, deinit value: List(T)) Array(T, N)
+    var owner = value^
+    owner.initialized == N
+    owner.initialized = 0
+    return [unsafe_take(T, owner.storage, index) static for index in 0..N]
 
 func new_collection_list(static T: type, static capacity: int) List(T)
     return List(T){storage = allocate_literal(T, capacity), initialized = 0}

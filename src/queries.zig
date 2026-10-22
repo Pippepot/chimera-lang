@@ -141,6 +141,62 @@ pub const StandardFile = struct {
     pub const Value = structures.FileId;
 };
 
+/// The embedded bundle is valid only for the closed compiler-owned library.
+/// Unrelated module changes can recheck this fact without invalidating std.
+pub const StandardLibraryUnchanged = struct {
+    pub const profile_category: profiling.Category = .declarations;
+    pub const disk_boundary = true;
+    pub const Input = void;
+    pub const Output = ?[standard_library.paths.len]structures.FileId;
+
+    pub fn run(ctx: anytype, _: Input) anyerror!Output {
+        @setEvalBranchQuota(100_000);
+        var files: [standard_library.paths.len]structures.FileId = undefined;
+        const catalog = ctx.input(ModuleCatalog, {}) catch |err| switch (err) {
+            error.InputNotFound => return null,
+            else => return err,
+        };
+        inline for (standard_library.paths, 0..) |path, index| {
+            const registered = ctx.input(StandardFile, index) catch |err| switch (err) {
+                error.InputNotFound => return null,
+                else => return err,
+            };
+            const file = registered.*;
+            files[index] = file;
+            const module = try ctx.intern(ModulePaths, .{ .path = standard_library.standardModulePath(path) });
+            if (std.mem.indexOfScalar(structures.ModuleId, catalog.*, module) == null) return null;
+            if (!try matches(SourceText, ctx, file, standard_library.source(path))) return null;
+            if (!try matches(SourcePath, ctx, file, "$std/" ++ path)) return null;
+            if (!try matches(FileModule, ctx, file, module)) return null;
+            var members: [standard_library.paths.len]structures.FileId = undefined;
+            var count: usize = 0;
+            inline for (standard_library.paths, 0..) |other, other_index| {
+                if (comptime std.mem.eql(u8, standard_library.standardModulePath(path), standard_library.standardModulePath(other))) {
+                    const other_file = ctx.input(StandardFile, other_index) catch |err| switch (err) {
+                        error.InputNotFound => return null,
+                        else => return err,
+                    };
+                    members[count] = other_file.*;
+                    count += 1;
+                }
+            }
+            std.mem.sort(structures.FileId, members[0..count], {}, std.sort.asc(structures.FileId));
+            if (!try matches(ModuleMembers, ctx, module, members[0..count])) return null;
+        }
+        const prelude = try ctx.intern(ModulePaths, .{ .path = standard_library.File.prelude.modulePath() });
+        if (!try matches(StandardPreludeModule, ctx, {}, prelude)) return null;
+        return files;
+    }
+
+    fn matches(comptime I: type, ctx: anytype, key: I.Key, expected: I.Value) !bool {
+        const actual = ctx.input(I, key) catch |err| switch (err) {
+            error.InputNotFound => return false,
+            else => return err,
+        };
+        return value_operations.equal(I.Value, actual.*, expected);
+    }
+};
+
 pub fn standardFileKey(comptime path: []const u8) StandardFile.Key {
     return comptime blk: {
         for (standard_library.paths, 0..) |candidate, index| {
@@ -178,6 +234,7 @@ pub const DiscoverItems = struct {
         var has_duplicates = false;
         for (tree.items) |item| {
             if (item.loc.kind == .top_level_entry or item.parent != null or item.qualified_owner != null) continue;
+            if (item.loc.name == .converter) continue;
             if (!(try names.getOrPut(item.loc.name.text())).found_existing) continue;
             has_duplicates = true;
             std.debug.assert(ast_value.nodes[item.declaration].tag == .static_binding);
@@ -285,7 +342,7 @@ fn sortIds(comptime Id: type, ids: []Id) void {
 }
 
 pub fn internVariantType(ctx: anytype, members: []const structures.TypeId) !structures.InternVariantResult {
-    std.debug.assert(members.len >= 2);
+    std.debug.assert(members.len >= 1);
 
     var canonical: std.ArrayList(structures.TypeId) = .empty;
     defer canonical.deinit(ctx.allocator());
@@ -565,7 +622,7 @@ pub fn TypeFacts(comptime Context: type) type {
         }
 
         pub fn internTuple(self: @This(), members: []const structures.MemberSpec) !structures.TypeId {
-            std.debug.assert(members.len >= 2);
+            std.debug.assert(members.len >= 1);
             return .fromInterned(try self.ctx.intern(Types, .{ .tuple = .{ .members = members } }));
         }
 
@@ -1326,9 +1383,10 @@ pub fn AnalysisContext(comptime Context: type) type {
             const Member = struct { factory: []const u8, name: []const u8, behavior: structures.CallBehavior };
             const members = [_]Member{
                 .{ .factory = "Box", .name = "new", .behavior = .box_new },
-                .{ .factory = "List", .name = "new", .behavior = .list_new },
                 .{ .factory = "List", .name = "append", .behavior = .list_append },
                 .{ .factory = "List", .name = "reserve", .behavior = .list_reserve },
+                .{ .factory = "List", .name = "remove", .behavior = .list_remove },
+                .{ .factory = "List", .name = "consume_iter", .behavior = .list_consume },
             };
             for (members) |member| {
                 if (!std.mem.eql(u8, location.name.text(), member.name)) continue;
@@ -2974,7 +3032,7 @@ pub const ResolvePreludeImports = struct {
         defer names.deinit();
         const prelude_declarations = (try ctx.get(ModuleDeclarations, prelude)).* orelse return null;
         for (prelude_declarations.entries) |entry| {
-            if (entry.is_public and !std.mem.startsWith(u8, entry.name.text(), "$converter")) try names.put(entry.name.text(), {});
+            if (entry.is_public and entry.name != .converter) try names.put(entry.name.text(), {});
         }
         for (members) |prelude_file| {
             const collected = (try ctx.get(CollectFileImports, prelude_file)).* orelse return null;
@@ -3317,7 +3375,12 @@ fn validatedFunctionSignature(ctx: anytype, instance: structures.InstanceId) !?s
     }
     if (semantic.isExternalFunction(parsed, resolved.declaration) and !try validExternalSignature(ctx, instance, resolved.file_id, span, header)) return null;
     const analysis_context: AnalysisContext(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id, .instance = instance };
-    const library_issue = intrinsics.signatureIssue(analysis_context.facts(), try analysis_context.callBehavior(instance.item), header) catch |err| switch (err) {
+    const behavior = try analysis_context.callBehavior(instance.item);
+    const iteration_end = if (behavior == .list_consume) analysis_context.iterationEndType() catch |err| switch (err) {
+        error.Unavailable => return null,
+        else => return err,
+    } else null;
+    const library_issue = intrinsics.signatureIssue(analysis_context.facts(), behavior, header, iteration_end) catch |err| switch (err) {
         error.Unavailable => return null,
         else => return err,
     };
@@ -4093,6 +4156,7 @@ const ReferenceInference = struct {
     allocator: std.mem.Allocator,
     entries: std.ArrayList(Entry) = .empty,
     component: ?[]const structures.InstanceId = null,
+    recursive: bool = false,
 
     fn request(self: *ReferenceInference, ctx: anytype, instance: structures.InstanceId) !?structures.ReferenceContract {
         if (self.component) |component| {
@@ -4210,6 +4274,7 @@ pub const InferReferenceContract = struct {
             if (unchanged) return try value_operations.Owned(structures.ReferenceContract).clone(ctx.allocator(), seed.initial_contract);
             return analyzeFunctionBody(ctx, true, instance, false, &inference);
         }
+        inference.recursive = true;
         while (true) {
             var changed = false;
             const count = inference.entries.items.len;
@@ -4322,7 +4387,7 @@ fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: str
         signature.parameters,
         signature.return_type,
         signature.is_fallible,
-        .{ .publish_instruction_spans = true, .allow_type_values = allow_type_values, .builtin_body = builtin_body, .consuming_converter = consuming_converter, .result_mode = signature.result_mode, .infer_reference_contract = reference_inference != null },
+        .{ .publish_instruction_spans = true, .allow_type_values = allow_type_values, .builtin_body = builtin_body, .consuming_converter = consuming_converter, .result_mode = signature.result_mode, .infer_reference_contract = reference_inference != null, .widen_reference_indices = if (reference_inference) |inference| inference.recursive else false },
         analysis_context,
         unresolved,
     );
@@ -4479,7 +4544,7 @@ pub const ValidateModuleGraph = struct {
                 const parsed = (try ctx.get(ParseFile, file)).* orelse return false;
                 const source = (try ctx.input(SourceText, file)).*;
                 for (tree.items, index.ids()) |item, item_id| {
-                    if (item.loc.kind != .function or !std.mem.startsWith(u8, item.loc.name.text(), "$converter")) continue;
+                    if (item.loc.kind != .function or item.loc.name != .converter) continue;
                     const analysis: AnalysisContext(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = file, .instance = .{ .item = item_id } };
                     if (try availableSemanticValue(ctx, file, null, semantic.validateConverterDeclaration(&parsed, source, item.declaration, analysis)) == null) return false;
                 }
