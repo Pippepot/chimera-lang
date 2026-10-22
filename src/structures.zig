@@ -7,8 +7,6 @@ const value_operations = @import("value.zig");
 // independent from parser/query/analyzer/codegen modules so shared result types
 // can be imported without creating compiler dependency cycles.
 
-/// Compare slice contents using fieldwise equality, ignoring struct padding.
-/// Elements with owned slices still need their own content comparison.
 pub const Token = struct {
     tag: Tag,
     loc: Location,
@@ -113,16 +111,11 @@ pub const Token = struct {
     };
 
     pub const keywords = std.StaticStringMap(Tag).initComptime(blk: {
-        const info = @typeInfo(Tag).@"enum";
-        var entries: [info.field_names.len]struct { []const u8, Tag } = undefined;
-        var count: usize = 0;
-        for (info.field_names, info.field_values) |name, value| {
-            if (std.mem.startsWith(u8, name, "keyword_")) {
-                entries[count] = .{ name["keyword_".len..], @fromBackingInt(value) };
-                count += 1;
-            }
+        var entries: []const struct { []const u8, Tag } = &.{};
+        for (std.enums.values(Tag)) |tag| {
+            if (std.mem.startsWith(u8, @tagName(tag), "keyword_")) entries = entries ++ .{.{ @tagName(tag)["keyword_".len..], tag }};
         }
-        break :blk entries[0..count].*;
+        break :blk entries;
     });
 
     pub fn getKeyword(bytes: []const u8) ?Tag {
@@ -176,11 +169,8 @@ pub const Token = struct {
     });
 
     pub fn spelling(tag: Tag) ?[]const u8 {
-        for (punctuation.keys(), punctuation.values()) |text, candidate| {
-            if (candidate == tag) return text;
-        }
-        for (keywords.keys(), keywords.values()) |text, candidate| {
-            if (candidate == tag) return text;
+        inline for (.{ punctuation, keywords }) |spellings| {
+            for (spellings.keys(), spellings.values()) |text, candidate| if (candidate == tag) return text;
         }
         return null;
     }
@@ -382,11 +372,7 @@ pub const Ast = struct {
             if (left.tag != right.tag or left.token_index != right.token_index or left.is_static_struct != right.is_static_struct or left.is_converter != right.is_converter) return false;
             switch (left.dataTag() orelse return false) {
                 .none => {},
-                .node => if (left.data.node != right.data.node) return false,
-                .node_node => if (!std.meta.eql(left.data.node_node, right.data.node_node)) return false,
-                .field => if (!std.meta.eql(left.data.field, right.data.field)) return false,
-                .signature => if (!std.meta.eql(left.data.signature, right.data.signature)) return false,
-                .ref => if (!std.meta.eql(left.data.ref, right.data.ref)) return false,
+                inline else => |tag| if (!std.meta.eql(@field(left.data, @tagName(tag)), @field(right.data, @tagName(tag)))) return false,
             }
         }
         return std.mem.eql(Node.Index, a.node_refs, b.node_refs);
@@ -432,19 +418,10 @@ pub const Operation = enum {
     @"[]",
     @"[]=",
 
-    const names = std.StaticStringMap(Operation).initComptime(blk: {
-        var entries: [std.enums.values(Operation).len - 1]struct { []const u8, Operation } = undefined;
-        var index: usize = 0;
-        for (std.enums.values(Operation)) |operation| {
-            if (operation == .unary_minus) continue;
-            entries[index] = .{ operation.spelling(), operation };
-            index += 1;
-        }
-        break :blk entries;
-    });
-
+    /// Operations are named by their spelling; unary minus is spelled `-` with one operand.
     pub fn fromName(name: []const u8, operands: ?usize) ?Operation {
-        const operation = names.get(name) orelse return null;
+        const operation = std.meta.stringToEnum(Operation, name) orelse return null;
+        if (operation == .unary_minus) return null;
         if (operation == .@"-" and operands == 1) return .unary_minus;
         return operation;
     }
@@ -756,15 +733,9 @@ pub const CompileTimeValue = union(enum) {
 
         pub fn scalarTypeId(self: @This()) ?TypeId {
             return switch (self) {
-                .int => .int,
-                .int_literal => .int_literal,
-                .string_literal => .string_literal,
-                .storage_cursor => |cursor| cursor.type_id,
-                .byte => .byte,
-                .bool => .bool,
-                .unit => .unit,
-                .none => .none,
-                .function_ref => |reference| reference.type_id,
+                // Primitive values are named after their types.
+                inline .int, .int_literal, .string_literal, .byte, .bool, .unit, .none => |_, tag| @field(TypeId, @tagName(tag)),
+                inline .storage_cursor, .function_ref => |typed| typed.type_id,
                 .structure, .variant => null,
             };
         }
@@ -807,9 +778,9 @@ pub const CompileTimeCallOutcome = union(enum) {
     execution_error,
 };
 
-/// Uncatchable control requested by compile-time execution and handled by the
-/// embedding compiler driver rather than rendered as a source diagnostic.
-pub const CompilerControl = union(enum) {
+/// Uncatchable process exit requested by compile-time execution and handled by
+/// the embedding compiler driver rather than rendered as a source diagnostic.
+pub const CompilerControl = struct {
     exit: i32,
 };
 
@@ -1104,8 +1075,6 @@ pub const FunctionBranch = struct {
     arguments: FunctionValueRange,
 };
 
-pub const CallOutcome = enum(u8) { failure = 0, success = 1 };
-
 pub const FunctionTerminator = union(enum) {
     branch: FunctionBranch,
     predicate_branch: struct {
@@ -1157,16 +1126,9 @@ pub const FunctionTerminator = union(enum) {
     }
 
     fn callSuccessors(call: *@FieldType(FunctionTerminator, "fallible_call")) [2]?*FunctionBlockId {
-        var targets: [2]?*FunctionBlockId = .{ null, null };
-        var count: usize = 0;
-        if (call.call.return_type != .never) {
-            targets[count] = &call.success;
-            count += 1;
-        }
-        if (call.failure) |*failure| {
-            targets[count] = failure;
-        }
-        return targets;
+        const failure: ?*FunctionBlockId = if (call.failure) |*failure| failure else null;
+        if (call.call.return_type == .never) return .{ failure, null };
+        return .{ &call.success, failure };
     }
 };
 
@@ -1372,52 +1334,34 @@ pub const FunctionInstruction = union(enum) {
         return switch (self.*) {
             .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage => .{ null, null },
             .variant_tag, .negi, .byte_to_int => |*operand| .{ operand, null },
-            .variant_coerce, .variant_extract, .callable_coerce => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
+            inline .variant_coerce, .variant_extract, .callable_coerce, .static_conversion => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
             .storage_projection => |*operation| .{ &operation.owner, null },
             .allocation_element => |*operation| .{ &operation.allocation, &operation.index },
             .array_element => |*operation| .{ &operation.array, &operation.index },
-            .borrow_box, .borrow_read, .storage_cursor => |*operation| .{ &operation.source, null },
+            inline .borrow_box, .borrow_read, .storage_cursor, .borrow_address => |*operation| .{ &operation.source, null },
             .cursor_offset, .cursor_element => |*operation| .{ &operation.cursor, &operation.index },
-            .borrow_address => |*operation| .{ &operation.source, null },
             .borrow_write => |*operation| .{ &operation.reference, &operation.value },
             .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null },
             .field_access => |*operation| .{ &operation.operand, null },
             .initializer_capture_write => |*operation| .{ &operation.value, null },
             .call => |*call| call.operands(),
-            .static_conversion => |*conversion| .{ &conversion.operand, if (conversion.destination) |*destination| destination else null },
             .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs },
         };
     }
 
     pub fn resultType(self: FunctionInstruction) TypeId {
         return switch (self) {
-            .const_int, .variant_tag, .negi, .addi, .subi, .muli, .divsi, .byte_to_int => .int,
-            .const_int_literal => .int_literal,
-            .const_string_literal => .string_literal,
-            .const_static_string => |constant| constant.type_id,
-            .const_storage_cursor => |cursor| cursor.type_id,
-            .storage_cursor => |operation| operation.type_id,
-            .cursor_offset, .cursor_element => |operation| operation.type_id,
-            .const_byte => .byte,
-            .const_bool => .bool,
-            .const_type => .type,
-            .const_unit => .unit,
-            .const_none => .none,
-            .function_ref => |reference| reference.type_id,
-            .initializer_ref => |reference| reference.type_id,
-            .variant_coerce, .variant_extract, .callable_coerce => |operation| if (operation.destination == null) operation.target_type else .unit,
+            // Each primitive constant is named after the type of its value.
+            inline .const_int, .const_int_literal, .const_string_literal, .const_byte, .const_bool, .const_type, .const_unit, .const_none => |_, tag| @field(TypeId, @tagName(tag)["const_".len..]),
+            .variant_tag, .negi, .addi, .subi, .muli, .divsi, .byte_to_int => .int,
+            .borrow_write, .initializer_capture_write => .unit,
             .local_storage, .result_storage => |type_id| type_id,
-            .storage_projection => |operation| operation.type_id,
-            .allocation_element => |operation| operation.type_id,
-            .array_element => |operation| operation.type_id,
-            .borrow_box, .borrow_read => |operation| operation.type_id,
-            .borrow_address => |operation| operation.type_id,
-            .borrow_write => .unit,
-            .value_copy => |operation| if (operation.destination == null) operation.type_id else .unit,
             .field_access => |operation| operation.field_type,
-            .initializer_capture_write => .unit,
+            inline .const_static_string, .const_storage_cursor, .storage_cursor, .cursor_offset, .cursor_element, .function_ref, .initializer_ref, .storage_projection, .allocation_element, .array_element, .borrow_box, .borrow_read, .borrow_address => |operation| operation.type_id,
+            // Results written to a destination leave only unit in their own value.
+            .variant_coerce, .variant_extract, .callable_coerce => |operation| if (operation.destination == null) operation.target_type else .unit,
+            inline .value_copy, .static_conversion => |operation| if (operation.destination == null) operation.type_id else .unit,
             .call => |call| if (call.destination == null) call.return_type else .unit,
-            .static_conversion => |conversion| if (conversion.destination == null) conversion.type_id else .unit,
         };
     }
 };
@@ -1482,14 +1426,9 @@ pub const ReferenceContract = struct {
             const second = @field(right, name);
             if (first.len != second.len) return false;
             for (first) |entry| {
-                var found = false;
                 for (second) |candidate| {
-                    if (same(left, entry, right, candidate)) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) return false;
+                    if (same(left, entry, right, candidate)) break;
+                } else return false;
             }
         }
         return true;
@@ -1511,11 +1450,7 @@ pub const ReferenceContract = struct {
     }
 
     pub fn samePath(left: @This(), a: FunctionValueRange, right: @This(), b: FunctionValueRange) bool {
-        const left_path = left.paths[a.start..a.end];
-        const right_path = right.paths[b.start..b.end];
-        if (left_path.len != right_path.len) return false;
-        for (left_path, right_path) |x, y| if (!std.meta.eql(x, y)) return false;
-        return true;
+        return value_operations.equal([]const ReferencePathStep, left.paths[a.start..a.end], right.paths[b.start..b.end]);
     }
 };
 
@@ -1737,11 +1672,6 @@ pub const Diagnostic = struct {
         trivial_drop,
     };
 
-    pub const MissingStructInitializerField = struct {
-        type_id: TypeId,
-        field_index: u32,
-    };
-
     pub const Kind = union(enum) {
         expected_token: struct {
             expected: Token.Tag,
@@ -1852,7 +1782,6 @@ pub const Diagnostic = struct {
         list_cannot_store_borrow_element: TypeId,
         list_requires_automatic_drop: TypeId,
         list_requires_direct_move: TypeId,
-        borrow_write_cannot_store_borrow: TypeId,
         borrow_write_requires_automatic_drop: TypeId,
         borrow_write_requires_direct_move: TypeId,
         box_requires_automatic_drop: TypeId,
@@ -1866,7 +1795,7 @@ pub const Diagnostic = struct {
         struct_initializer_not_struct: TypeId,
         unknown_struct_field,
         duplicate_struct_initializer_field,
-        missing_struct_initializer_field: MissingStructInitializerField,
+        missing_struct_initializer_field: struct { type_id: TypeId, field_index: u32 },
         struct_initializer_field_type_mismatch: TypeMismatch,
         field_access_not_struct: TypeId,
         private_struct_field: TypeId,
@@ -1877,7 +1806,6 @@ pub const Diagnostic = struct {
         float_type_not_supported,
         unknown_type,
         unknown_value,
-        assignment_target_not_local,
         assignment_to_immutable,
         assignment_type_mismatch: TypeMismatch,
         integer_literal_not_decimal,
@@ -1895,8 +1823,6 @@ pub const Diagnostic = struct {
         value_not_callable,
         duplicate_variant_member_type,
         local_type_mismatch: TypeMismatch,
-        negation_operand_not_int: TypeId,
-        arithmetic_operand_not_int: TypeId,
         comparison_operand_not_int: TypeId,
         equality_operand_not_supported: TypeId,
         equality_operand_type_mismatch: TypeMismatch,

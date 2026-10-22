@@ -81,7 +81,11 @@ fn renderSsaFunction(
             try renderInstruction(db, ssa, instruction_index, writer);
         }
         switch (block.terminator) {
-            .branch => |branch| try renderBranch(db, ssa, "br", branch, writer),
+            .branch => |branch| {
+                try writer.writeAll("    br ");
+                try renderBranchTarget(db, ssa, branch, writer);
+                try writer.writeByte('\n');
+            },
             .predicate_branch => |predicate| {
                 try writer.print("    pbr {s} %{d}, %{d}, ", .{
                     @tagName(predicate.operation),
@@ -111,12 +115,6 @@ fn renderSsaFunction(
             .diverge => try writer.writeAll("    diverge\n"),
         }
     }
-    try writer.writeByte('\n');
-}
-
-fn renderBranch(db: *query.Database, ssa: *const structures.FunctionBodyAnalysis, name: []const u8, branch: structures.FunctionBranch, writer: *std.Io.Writer) !void {
-    try writer.print("    {s} ", .{name});
-    try renderBranchTarget(db, ssa, branch, writer);
     try writer.writeByte('\n');
 }
 

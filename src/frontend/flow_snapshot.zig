@@ -68,30 +68,27 @@ pub fn Buffer(comptime Element: type, comptime initial: Element) type {
             return @min(self.len, (index / page_size + 1) * page_size);
         }
 
+        /// The first index from `start` whose page `other` does not share.
+        fn nextUnshared(self: Self, other: Self, start: usize) usize {
+            var index = start;
+            while (index < self.len and self.sharesPage(other, index)) index = self.pageEnd(index);
+            return index;
+        }
+
         pub fn eql(self: Self, other: Self) bool {
             if (self.len != other.len) return false;
-            var index: usize = 0;
-            while (index < self.len) {
-                if (self.sharesPage(other, index)) {
-                    index = self.pageEnd(index);
-                    continue;
-                }
+            var index = self.nextUnshared(other, 0);
+            while (index < self.len) : (index = self.nextUnshared(other, index + 1)) {
                 if (!std.meta.eql(self.get(index), other.get(index))) return false;
-                index += 1;
             }
             return true;
         }
 
         pub fn merge(self: *Self, allocator: std.mem.Allocator, other: Self, comptime combine: fn (Element, Element) Element) !void {
             std.debug.assert(self.len == other.len);
-            var index: usize = 0;
-            while (index < self.len) {
-                if (self.sharesPage(other, index)) {
-                    index = self.pageEnd(index);
-                    continue;
-                }
+            var index = self.nextUnshared(other, 0);
+            while (index < self.len) : (index = self.nextUnshared(other, index + 1)) {
                 try self.set(allocator, index, combine(self.get(index), other.get(index)));
-                index += 1;
             }
         }
 

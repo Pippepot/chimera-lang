@@ -8,6 +8,22 @@ Settle missing semantics before implementation. Each milestone covers
 diagnostics, execution, ownership, and incremental/cache behavior. Legacy parity
 is not a goal.
 
+## Top priority: scalar-flow performance regression
+
+- Eliminate the remaining roughly 8-12% scalar/128-branch typing regression
+  against commit `4556095` before starting the next language milestone.
+- Reproduce with `zig build flow-benchmark --seed=0 -Doptimize=fast`.
+  Alternate baseline and current binaries on the same pinned CPU over repeated
+  trials; compare scalar and owning cases across all branch counts.
+- Isolate the remaining allocation/page-fault and scalar-expression evaluation
+  costs. The unresolved graph and snapshot footprints are unchanged, but clearing
+  the nullable value buffer incurs additional demand-page faults. Scalar-argument
+  helper inlining alone does not remove the regression; the complete cause and
+  fix remain unverified.
+- Require no repeatable scalar/128 slowdown or adjacent benchmark regressions,
+  unchanged compiler behavior, relevant tests, the routine safe suite, formatting
+  checks, and `git diff --check` before closing this priority.
+
 ## Ordered milestones
 
 ### 4. List mutation

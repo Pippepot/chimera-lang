@@ -21,15 +21,6 @@ const GenerationBits = struct {
         return (generation_count + 63) / 64;
     }
 
-    fn clear(bits: []u64) void {
-        @memset(bits, 0);
-    }
-
-    fn copy(destination: []u64, source: []const u64) void {
-        std.debug.assert(destination.len == source.len);
-        @memcpy(destination, source);
-    }
-
     fn contains(bits: []const u64, generation: GenerationId) bool {
         const index = @backingInt(generation);
         return bits[index / 64] & (@as(u64, 1) << @intCast(index % 64)) != 0;
@@ -155,8 +146,7 @@ pub const Solver = struct {
         self.control_flow.solve(self.ownership_edges, self.reachable, self.dirty_blocks, self, false, stepRepresentations);
         self.validateRepresentations();
         self.control_flow.solve(self.ownership_edges, self.reachable, self.dirty_blocks, self, true, stepDemand);
-        const entry_demand = self.blockSet(self.live_in, self.entry);
-        for (entry_demand) |word| std.debug.assert(word == 0);
+        std.debug.assert(std.mem.allEqual(u64, self.blockSet(self.live_in, self.entry), 0));
         try self.planEndings(endings);
         self.validatePathComplete(endings.items);
     }
@@ -168,9 +158,7 @@ pub const Solver = struct {
         self.reachable[@backingInt(self.entry)] = true;
         try worklist.append(self.gpa, self.entry);
         while (worklist.pop()) |block| {
-            const terminator = self.blocks[@backingInt(block)].terminator orelse unreachable;
-            const successor_count = terminator.successorCount();
-            for (0..successor_count) |ordinal| {
+            for (0..(self.blocks[@backingInt(block)].terminator orelse unreachable).successorCount()) |ordinal| {
                 const edge = self.findEdge(block, @intCast(ordinal));
                 const successor_index = @backingInt(edge.successor);
                 std.debug.assert(successor_index < self.blocks.len);
@@ -184,32 +172,23 @@ pub const Solver = struct {
     fn stepDemand(self: *Solver, block_index: usize) bool {
         const block_id: structures.FunctionBlockId = @fromBackingInt(@intCast(block_index));
         const block_value = self.blocks[block_index];
-        GenerationBits.clear(self.scratch);
-        const terminator = block_value.terminator orelse unreachable;
-        for (0..terminator.successorCount()) |ordinal| {
+        @memset(self.scratch, 0);
+        for (0..(block_value.terminator orelse unreachable).successorCount()) |ordinal| {
             const edge = self.findEdge(block_id, @intCast(ordinal));
             std.debug.assert(self.reachable[@backingInt(edge.successor)]);
-            GenerationBits.copy(self.edge_scratch, self.blockSet(self.live_in, edge.successor));
+            @memcpy(self.edge_scratch, self.blockSet(self.live_in, edge.successor));
             self.remapEdgeDemand(self.edge_scratch, edge, true);
             GenerationBits.intersectWith(self.edge_scratch, self.blockSet(self.available_out, block_id));
             GenerationBits.unionWith(self.scratch, self.edge_scratch);
         }
-        GenerationBits.copy(self.blockSet(self.live_out, block_id), self.scratch);
+        @memcpy(self.blockSet(self.live_out, block_id), self.scratch);
         self.scanEffectsBackward(self.scratch, block_value.terminator_effects.items);
-        var item_index = block_value.items.items.len;
-        while (item_index > 0) {
-            item_index -= 1;
-            switch (block_value.items.items[item_index]) {
-                .instruction => {},
-                .boundary => |boundary| self.scanEffectsBackward(
-                    self.scratch,
-                    self.boundaries[@backingInt(boundary)].effects.items,
-                ),
-            }
-        }
-        if (std.mem.eql(u64, self.blockSet(self.live_in, block_id), self.scratch)) return false;
-        GenerationBits.copy(self.blockSet(self.live_in, block_id), self.scratch);
-        return true;
+        var items = std.mem.reverseIterator(block_value.items.items);
+        while (items.next()) |item| switch (item) {
+            .instruction => {},
+            .boundary => |boundary| self.scanEffectsBackward(self.scratch, self.boundaries[@backingInt(boundary)].effects.items),
+        };
+        return publishChanged(u64, self.blockSet(self.live_in, block_id), self.scratch);
     }
 
     fn stepAvailability(self: *Solver, block_index: usize) bool {
@@ -223,8 +202,6 @@ pub const Solver = struct {
     fn stepForward(self: *Solver, block_index: usize, comptime representations: bool) bool {
         const Fact = if (representations) ?structures.FunctionValueId else u64;
         const scratch = if (representations) self.representation_scratch else self.scratch;
-        const matrix_in = if (representations) self.representations_in else self.available_in;
-        const matrix_out = if (representations) self.representations_out else self.available_out;
         const block_value = self.blocks[block_index];
         const block_id: structures.FunctionBlockId = @fromBackingInt(@intCast(block_index));
         @memset(scratch, if (representations) null else 0);
@@ -236,8 +213,8 @@ pub const Solver = struct {
                 if (representations) {
                     self.joinEdgeRepresentations(block_value, edge);
                 } else {
-                    GenerationBits.copy(self.edge_scratch, self.blockSet(self.available_out, edge.predecessor));
-                    self.remapEdgeAvailability(self.edge_scratch, edge);
+                    @memcpy(self.edge_scratch, self.blockSet(self.available_out, edge.predecessor));
+                    self.remapEdgeAvailability(self.edge_scratch, edge, null);
                     GenerationBits.unionWith(scratch, self.edge_scratch);
                 }
             }
@@ -246,17 +223,14 @@ pub const Solver = struct {
             const generation = self.block_argument_generations[argument] orelse continue;
             scratch[@backingInt(generation)] = @fromBackingInt(@intCast(argument));
         };
-        const input = if (representations) self.blockRepresentations(matrix_in, block_id) else self.blockSet(matrix_in, block_id);
-        @memcpy(input, scratch);
+        @memcpy(if (representations) self.blockRepresentations(self.representations_in, block_id) else self.blockSet(self.available_in, block_id), scratch);
         for (block_value.items.items) |item| switch (item) {
             .instruction => {},
             .boundary => |boundary| self.scanForward(scratch, self.boundaries[@backingInt(boundary)].effects.items, representations),
         };
         self.scanForward(scratch, block_value.terminator_effects.items, representations);
-        const output = if (representations) self.blockRepresentations(matrix_out, block_id) else self.blockSet(matrix_out, block_id);
-        if (std.mem.eql(Fact, output, scratch)) return false;
-        @memcpy(output, scratch);
-        return true;
+        const output = if (representations) self.blockRepresentations(self.representations_out, block_id) else self.blockSet(self.available_out, block_id);
+        return publishChanged(Fact, output, scratch);
     }
 
     fn scanForward(self: *const Solver, facts: anytype, effects: []const Effect, comptime representations: bool) void {
@@ -266,8 +240,8 @@ pub const Solver = struct {
     fn joinEdgeRepresentations(self: *Solver, block_value: BuildBlock, edge: *const OwnershipEdge) void {
         @memcpy(self.edge_representation_scratch, self.blockRepresentations(self.representations_out, edge.predecessor));
         self.remapEdgeRepresentations(self.edge_representation_scratch, edge);
-        GenerationBits.copy(self.edge_scratch, self.blockSet(self.available_out, edge.predecessor));
-        self.remapEdgeAvailability(self.edge_scratch, edge);
+        @memcpy(self.edge_scratch, self.blockSet(self.available_out, edge.predecessor));
+        self.remapEdgeAvailability(self.edge_scratch, edge, null);
         for (self.edge_scratch, 0..) |available_word, word_index| {
             var remaining_word = available_word;
             while (remaining_word != 0) {
@@ -350,10 +324,15 @@ pub const Solver = struct {
         return null;
     }
 
-    fn remapEdgeAvailability(self: *const Solver, available: []u64, edge: *const OwnershipEdge) void {
+    /// With planned endings, a source ended on the edge does not reach its destination.
+    fn remapEdgeAvailability(self: *const Solver, available: []u64, edge: *const OwnershipEdge, endings: ?[]const PlannedEnding) void {
         const mappings = self.ownership_forwards[edge.mappings.start..edge.mappings.end];
         for (mappings) |mapping| switch (mapping) {
             .forward => |forward| {
+                if (endings) |planned| if (hasEnding(forward.source, edgeLocation(edge), planned)) {
+                    GenerationBits.remove(available, forward.destination);
+                    continue;
+                };
                 const source_available = GenerationBits.contains(available, forward.source);
                 GenerationBits.remove(available, forward.source);
                 if (source_available) GenerationBits.insert(available, forward.destination) else GenerationBits.remove(available, forward.destination);
@@ -398,31 +377,18 @@ pub const Solver = struct {
         for (self.blocks, 0..) |block_value, block_index| {
             if (!self.reachable[block_index]) continue;
             const block_id: structures.FunctionBlockId = @fromBackingInt(@intCast(block_index));
-            try self.planEdges(block_id, block_value.terminator orelse unreachable, endings);
-            GenerationBits.copy(self.scratch, self.blockSet(self.live_out, block_id));
-            try self.planEffectsBackward(
-                self.scratch,
-                block_value.terminator_effects.items,
-                null,
-                block_id,
-                block_value.terminator orelse unreachable,
-                endings,
-            );
-            var item_index = block_value.items.items.len;
-            while (item_index > 0) {
-                item_index -= 1;
-                switch (block_value.items.items[item_index]) {
-                    .instruction => {},
-                    .boundary => |boundary| try self.planEffectsBackward(
-                        self.scratch,
-                        self.boundaries[@backingInt(boundary)].effects.items,
-                        boundary,
-                        block_id,
-                        block_value.terminator orelse unreachable,
-                        endings,
-                    ),
-                }
-            }
+            const terminator = block_value.terminator orelse unreachable;
+            try self.planEdges(block_id, terminator, endings);
+            // Terminator effects end on every outgoing edge; boundary effects end at their boundary.
+            var edge_locations: [2]CleanupLocation = undefined;
+            for (0..terminator.successorCount()) |ordinal| edge_locations[ordinal] = edgeLocation(self.findEdge(block_id, @intCast(ordinal)));
+            @memcpy(self.scratch, self.blockSet(self.live_out, block_id));
+            try self.planEffectsBackward(self.scratch, block_value.terminator_effects.items, edge_locations[0..terminator.successorCount()], endings);
+            var items = std.mem.reverseIterator(block_value.items.items);
+            while (items.next()) |item| switch (item) {
+                .instruction => {},
+                .boundary => |boundary| try self.planEffectsBackward(self.scratch, self.boundaries[@backingInt(boundary)].effects.items, &.{.{ .boundary = boundary }}, endings),
+            };
             std.debug.assert(std.mem.eql(u64, self.scratch, self.blockSet(self.live_in, block_id)));
         }
         self.finishEndings(endings);
@@ -438,146 +404,82 @@ pub const Solver = struct {
         const demanded_on_some_edge = self.blockSet(self.live_out, predecessor);
         const representations = self.blockRepresentations(self.representations_out, predecessor);
         for (0..terminator.successorCount()) |ordinal| {
-            const successor_ordinal: u2 = @intCast(ordinal);
-            const edge = self.findEdge(predecessor, successor_ordinal);
-            GenerationBits.copy(self.edge_scratch, self.blockSet(self.live_in, edge.successor));
+            const edge = self.findEdge(predecessor, @intCast(ordinal));
+            @memcpy(self.edge_scratch, self.blockSet(self.live_in, edge.successor));
             self.remapEdgeDemand(self.edge_scratch, edge, false);
             GenerationBits.intersectWith(self.edge_scratch, available);
-            const location: CleanupLocation = .{ .edge = .{
-                .predecessor = predecessor,
-                .successor_ordinal = successor_ordinal,
-            } };
             for (available, demanded_on_some_edge, self.edge_scratch, 0..) |available_word, demanded_word, successor_word, word_index| {
                 var ending_word = available_word & demanded_word & ~successor_word;
                 while (ending_word != 0) {
                     const generation_index = word_index * 64 + @ctz(ending_word);
-                    const generation: GenerationId = @fromBackingInt(@intCast(generation_index));
-                    try self.recordEnding(
-                        endings,
-                        generation,
-                        representations[generation_index] orelse unreachable,
-                        null,
-                        location,
-                    );
+                    try self.recordEnding(endings, .{
+                        .generation = @fromBackingInt(@intCast(generation_index)),
+                        .cleanup_value = representations[generation_index] orelse unreachable,
+                        .location = edgeLocation(edge),
+                    });
                     ending_word &= ending_word - 1;
                 }
             }
             for (self.ownership_forwards[edge.mappings.start..edge.mappings.end]) |mapping| switch (mapping) {
                 .produce => |destination| {
                     if (GenerationBits.contains(self.blockSet(self.live_in, edge.successor), destination)) continue;
-                    try self.recordEnding(
-                        endings,
-                        destination,
-                        self.blockRepresentations(self.representations_in, edge.successor)[@backingInt(destination)] orelse unreachable,
-                        null,
-                        .{ .block_entry = edge.successor },
-                    );
+                    try self.recordEnding(endings, .{
+                        .generation = destination,
+                        .cleanup_value = self.blockRepresentations(self.representations_in, edge.successor)[@backingInt(destination)] orelse unreachable,
+                        .location = .{ .block_entry = edge.successor },
+                    });
                 },
                 .forward, .unowned => {},
             };
         }
     }
 
+    /// An undemanded effect ends its generation at each of `locations`.
     fn planEffectsBackward(
         self: *Solver,
         demand: []u64,
         effects: []const Effect,
-        boundary: ?BoundaryId,
-        block: structures.FunctionBlockId,
-        terminator: structures.FunctionTerminator,
+        locations: []const CleanupLocation,
         endings: *std.ArrayList(PlannedEnding),
     ) !void {
-        var effect_index = effects.len;
-        while (effect_index > 0) {
-            effect_index -= 1;
-            switch (effects[effect_index].operation orelse continue) {
-                .define => |definition| {
-                    if (GenerationBits.contains(demand, definition.generation)) {
-                        GenerationBits.remove(demand, definition.generation);
-                    } else {
-                        try self.recordAfterEffect(
-                            endings,
-                            definition.generation,
-                            definition.value,
-                            null,
-                            boundary,
-                            block,
-                            terminator,
-                        );
-                    }
-                },
-                .use, .update => |use| {
-                    if (!GenerationBits.contains(demand, use.generation)) {
-                        try self.recordAfterEffect(
-                            endings,
-                            use.generation,
-                            use.cleanup_value,
-                            use.cleanup_condition,
-                            boundary,
-                            block,
-                            terminator,
-                        );
-                    }
-                    GenerationBits.insert(demand, use.generation);
-                },
-                .consume => |generation| GenerationBits.insert(demand, generation),
-            }
-        }
+        var reversed = std.mem.reverseIterator(effects);
+        while (reversed.next()) |effect| switch (effect.operation orelse continue) {
+            .define => |definition| {
+                if (GenerationBits.contains(demand, definition.generation)) {
+                    GenerationBits.remove(demand, definition.generation);
+                } else for (locations) |location| {
+                    try self.recordEnding(endings, .{ .generation = definition.generation, .cleanup_value = definition.value, .location = location });
+                }
+            },
+            .use, .update => |use| {
+                if (!GenerationBits.contains(demand, use.generation)) for (locations) |location| {
+                    try self.recordEnding(endings, .{
+                        .generation = use.generation,
+                        .cleanup_value = use.cleanup_value,
+                        .cleanup_condition = use.cleanup_condition,
+                        .location = location,
+                    });
+                };
+                GenerationBits.insert(demand, use.generation);
+            },
+            .consume => |generation| GenerationBits.insert(demand, generation),
+        };
     }
 
-    fn recordAfterEffect(
-        self: *Solver,
-        endings: *std.ArrayList(PlannedEnding),
-        generation: GenerationId,
-        cleanup_value: structures.FunctionValueId,
-        cleanup_condition: ?structures.FunctionValueId,
-        boundary: ?BoundaryId,
-        block: structures.FunctionBlockId,
-        terminator: structures.FunctionTerminator,
-    ) !void {
-        if (boundary) |boundary_id| {
-            try self.recordEnding(
-                endings,
-                generation,
-                cleanup_value,
-                cleanup_condition,
-                .{ .boundary = boundary_id },
-            );
-            return;
-        }
-        for (0..terminator.successorCount()) |ordinal| {
-            try self.recordEnding(
-                endings,
-                generation,
-                cleanup_value,
-                cleanup_condition,
-                .{ .edge = .{ .predecessor = block, .successor_ordinal = @intCast(ordinal) } },
-            );
-        }
-    }
-
-    fn recordEnding(
-        self: *Solver,
-        endings: *std.ArrayList(PlannedEnding),
-        generation: GenerationId,
-        cleanup_value: structures.FunctionValueId,
-        cleanup_condition: ?structures.FunctionValueId,
-        location: CleanupLocation,
-    ) !void {
-        try endings.append(self.gpa, .{
-            .generation = generation,
-            .cleanup_value = cleanup_value,
-            .cleanup_condition = cleanup_condition orelse self.generations[@backingInt(generation)].cleanup_condition,
-            .location = location,
-        });
+    fn recordEnding(self: *Solver, endings: *std.ArrayList(PlannedEnding), ending: PlannedEnding) !void {
+        var planned = ending;
+        planned.cleanup_condition = ending.cleanup_condition orelse self.generations[@backingInt(ending.generation)].cleanup_condition;
+        try endings.append(self.gpa, planned);
     }
 
     fn finishEndings(self: *const Solver, endings: *std.ArrayList(PlannedEnding)) void {
         std.mem.sort(PlannedEnding, endings.items, self.generations, struct {
             fn lessThan(generations: []const Generation, left: PlannedEnding, right: PlannedEnding) bool {
-                const location_order = compareLocations(left.location, right.location);
-                if (location_order != 0) return location_order < 0;
-                return generations[@backingInt(left.generation)].start_order > generations[@backingInt(right.generation)].start_order;
+                return switch (compareLocations(left.location, right.location)) {
+                    .lt => true,
+                    .gt => false,
+                    .eq => generations[@backingInt(left.generation)].start_order > generations[@backingInt(right.generation)].start_order,
+                };
             }
         }.lessThan);
         // Start orders are unique, so repeated generation/location pairs are adjacent.
@@ -599,24 +501,15 @@ pub const Solver = struct {
         endings.shrinkRetainingCapacity(unique_count);
     }
 
-    fn compareLocations(left: CleanupLocation, right: CleanupLocation) i2 {
-        const left_tag = @backingInt(left);
-        const right_tag = @backingInt(right);
-        if (left_tag != right_tag) return compareU32(left_tag, right_tag);
+    fn compareLocations(left: CleanupLocation, right: CleanupLocation) std.math.Order {
+        const tag_order = std.math.order(@backingInt(left), @backingInt(right));
+        if (tag_order != .eq) return tag_order;
         return switch (left) {
-            .boundary => |left_boundary| compareU32(@backingInt(left_boundary), @backingInt(right.boundary)),
-            .edge => |left_edge| {
-                const right_edge = right.edge;
-                const block_order = compareU32(@backingInt(left_edge.predecessor), @backingInt(right_edge.predecessor));
-                if (block_order != 0) return block_order;
-                return compareU32(left_edge.successor_ordinal, right_edge.successor_ordinal);
-            },
-            .block_entry => |left_block| compareU32(@backingInt(left_block), @backingInt(right.block_entry)),
+            .boundary => |boundary| std.math.order(@backingInt(boundary), @backingInt(right.boundary)),
+            .edge => |edge| std.math.order(@backingInt(edge.predecessor), @backingInt(right.edge.predecessor)).differ() orelse
+                std.math.order(edge.successor_ordinal, right.edge.successor_ordinal),
+            .block_entry => |block| std.math.order(@backingInt(block), @backingInt(right.block_entry)),
         };
-    }
-
-    fn compareU32(left: u32, right: u32) i2 {
-        return if (left < right) -1 else if (left > right) 1 else 0;
     }
 
     fn validatePathComplete(
@@ -633,58 +526,27 @@ pub const Solver = struct {
             for (self.blocks, 0..) |block_value, block_index| {
                 if (!self.reachable[block_index]) continue;
                 const block_id: structures.FunctionBlockId = @fromBackingInt(@intCast(block_index));
-                GenerationBits.clear(self.scratch);
+                @memset(self.scratch, 0);
                 if (block_id != self.entry) {
                     var incoming = self.control_flow.blocks[block_index].first_incoming;
                     while (incoming) |edge_index| : (incoming = self.control_flow.previous_incoming[edge_index]) {
                         const edge = &self.ownership_edges[edge_index];
                         if (!self.reachable[@backingInt(edge.predecessor)]) continue;
-                        GenerationBits.copy(self.edge_scratch, self.blockSet(self.live_out, edge.predecessor));
-                        self.remapOpenEdge(self.edge_scratch, edge, endings);
-                        self.applyEndings(
-                            self.edge_scratch,
-                            .{ .edge = .{ .predecessor = edge.predecessor, .successor_ordinal = edge.successor_ordinal } },
-                            endings,
-                            false,
-                        );
-                        self.applyEndings(
-                            self.edge_scratch,
-                            .{ .block_entry = block_id },
-                            endings,
-                            false,
-                        );
+                        @memcpy(self.edge_scratch, self.blockSet(self.live_out, edge.predecessor));
+                        self.crossOpenEdge(self.edge_scratch, edge, endings, false);
                         GenerationBits.unionWith(self.scratch, self.edge_scratch);
                     }
                 }
-                if (!std.mem.eql(u64, self.blockSet(self.live_in, block_id), self.scratch)) {
-                    GenerationBits.copy(self.blockSet(self.live_in, block_id), self.scratch);
-                    changed = true;
-                }
-                for (block_value.items.items) |item| switch (item) {
-                    .instruction => {},
-                    .boundary => |boundary| {
-                        self.scanEffectsForward(self.scratch, self.boundaries[@backingInt(boundary)].effects.items);
-                        self.applyEndings(
-                            self.scratch,
-                            .{ .boundary = boundary },
-                            endings,
-                            false,
-                        );
-                    },
-                };
-                self.scanEffectsForward(self.scratch, block_value.terminator_effects.items);
-                if (!std.mem.eql(u64, self.blockSet(self.live_out, block_id), self.scratch)) {
-                    GenerationBits.copy(self.blockSet(self.live_out, block_id), self.scratch);
-                    changed = true;
-                }
+                if (publishChanged(u64, self.blockSet(self.live_in, block_id), self.scratch)) changed = true;
+                self.scanOpenBlock(self.scratch, block_value, endings, false);
+                if (publishChanged(u64, self.blockSet(self.live_out, block_id), self.scratch)) changed = true;
             }
         }
         for (self.blocks, 0..) |block, block_index| {
             if (!self.reachable[block_index]) continue;
             switch (block.terminator orelse unreachable) {
                 .return_unit, .return_value, .return_failure => {
-                    const open = self.blockSet(self.live_out, @fromBackingInt(@intCast(block_index)));
-                    for (open) |word| std.debug.assert(word == 0);
+                    std.debug.assert(std.mem.allEqual(u64, self.blockSet(self.live_out, @fromBackingInt(@intCast(block_index))), 0));
                 },
                 .branch, .predicate_branch, .fallible_call, .diverge => {},
             }
@@ -699,63 +561,31 @@ pub const Solver = struct {
         for (self.blocks, 0..) |block_value, block_index| {
             if (!self.reachable[block_index]) continue;
             const block_id: structures.FunctionBlockId = @fromBackingInt(@intCast(block_index));
-            GenerationBits.copy(self.scratch, self.blockSet(self.live_in, block_id));
-            for (block_value.items.items) |item| switch (item) {
-                .instruction => {},
-                .boundary => |boundary| {
-                    self.scanEffectsForward(self.scratch, self.boundaries[@backingInt(boundary)].effects.items);
-                    self.applyEndings(
-                        self.scratch,
-                        .{ .boundary = boundary },
-                        endings,
-                        true,
-                    );
-                },
-            };
-            self.scanEffectsForward(self.scratch, block_value.terminator_effects.items);
+            @memcpy(self.scratch, self.blockSet(self.live_in, block_id));
+            self.scanOpenBlock(self.scratch, block_value, endings, true);
             for (0..(block_value.terminator orelse unreachable).successorCount()) |ordinal| {
-                const edge = self.findEdge(block_id, @intCast(ordinal));
-                GenerationBits.copy(self.edge_scratch, self.scratch);
-                self.remapOpenEdge(self.edge_scratch, edge, endings);
-                self.applyEndings(
-                    self.edge_scratch,
-                    .{ .edge = .{ .predecessor = block_id, .successor_ordinal = @intCast(ordinal) } },
-                    endings,
-                    true,
-                );
-                self.applyEndings(
-                    self.edge_scratch,
-                    .{ .block_entry = edge.successor },
-                    endings,
-                    true,
-                );
+                @memcpy(self.edge_scratch, self.scratch);
+                self.crossOpenEdge(self.edge_scratch, self.findEdge(block_id, @intCast(ordinal)), endings, true);
             }
         }
     }
 
-    fn remapOpenEdge(
-        self: *const Solver,
-        open: []u64,
-        edge: *const OwnershipEdge,
-        endings: []const PlannedEnding,
-    ) void {
-        const location: CleanupLocation = .{ .edge = .{
-            .predecessor = edge.predecessor,
-            .successor_ordinal = edge.successor_ordinal,
-        } };
-        for (self.ownership_forwards[edge.mappings.start..edge.mappings.end]) |mapping| switch (mapping) {
-            .forward => |forward| {
-                if (hasEnding(forward.source, location, endings)) {
-                    GenerationBits.remove(open, forward.destination);
-                    continue;
-                }
-                const source_open = GenerationBits.contains(open, forward.source);
-                GenerationBits.remove(open, forward.source);
-                if (source_open) GenerationBits.insert(open, forward.destination) else GenerationBits.remove(open, forward.destination);
+    /// Follows an edge's ownership mappings, then applies the endings planned on it and at its successor.
+    fn crossOpenEdge(self: *const Solver, open: []u64, edge: *const OwnershipEdge, endings: []const PlannedEnding, validate_existing: bool) void {
+        self.remapEdgeAvailability(open, edge, endings);
+        self.applyEndings(open, edgeLocation(edge), endings, validate_existing);
+        self.applyEndings(open, .{ .block_entry = edge.successor }, endings, validate_existing);
+    }
+
+    fn scanOpenBlock(self: *const Solver, open: []u64, block: BuildBlock, endings: []const PlannedEnding, validate_existing: bool) void {
+        for (block.items.items) |item| switch (item) {
+            .instruction => {},
+            .boundary => |boundary| {
+                self.scanEffectsForward(open, self.boundaries[@backingInt(boundary)].effects.items);
+                self.applyEndings(open, .{ .boundary = boundary }, endings, validate_existing);
             },
-            .produce => |destination| GenerationBits.insert(open, destination),
-            .unowned => |destination| GenerationBits.remove(open, destination),
         };
+        self.scanEffectsForward(open, block.terminator_effects.items);
     }
 
     fn applyEndings(
@@ -780,31 +610,37 @@ pub const Solver = struct {
     }
 
     fn endingsAtLocation(location: CleanupLocation, endings: []const PlannedEnding) []const PlannedEnding {
-        const Compare = struct {
+        const start, const end = std.sort.equalRange(PlannedEnding, endings, location, struct {
             fn order(needle: CleanupLocation, ending: PlannedEnding) std.math.Order {
-                return std.math.order(compareLocations(needle, ending.location), @as(i2, 0));
+                return compareLocations(needle, ending.location);
             }
-        };
-        const start = std.sort.lowerBound(PlannedEnding, endings, location, Compare.order);
-        const end = start + std.sort.upperBound(PlannedEnding, endings[start..], location, Compare.order);
+        }.order);
         return endings[start..end];
     }
 
     fn scanEffectsBackward(_: *const Solver, demand: []u64, effects: []const Effect) void {
-        var effect_index = effects.len;
-        while (effect_index > 0) {
-            effect_index -= 1;
-            switch (effects[effect_index].operation orelse continue) {
-                .define => |definition| GenerationBits.remove(demand, definition.generation),
-                .use, .update => |use| GenerationBits.insert(demand, use.generation),
-                .consume => |generation| GenerationBits.insert(demand, generation),
-            }
-        }
+        var reversed = std.mem.reverseIterator(effects);
+        while (reversed.next()) |effect| switch (effect.operation orelse continue) {
+            .define => |definition| GenerationBits.remove(demand, definition.generation),
+            .use, .update => |use| GenerationBits.insert(demand, use.generation),
+            .consume => |generation| GenerationBits.insert(demand, generation),
+        };
     }
 
     fn findEdge(self: *const Solver, predecessor: structures.FunctionBlockId, successor_ordinal: u2) *const OwnershipEdge {
         const edge_index = self.control_flow.blocks[@backingInt(predecessor)].outgoing[successor_ordinal] orelse unreachable;
         return &self.ownership_edges[edge_index];
+    }
+
+    fn edgeLocation(edge: *const OwnershipEdge) CleanupLocation {
+        return .{ .edge = .{ .predecessor = edge.predecessor, .successor_ordinal = edge.successor_ordinal } };
+    }
+
+    /// Replaces a published fact row and reports whether it changed.
+    fn publishChanged(comptime Fact: type, published: []Fact, facts: []const Fact) bool {
+        if (std.mem.eql(Fact, published, facts)) return false;
+        @memcpy(published, facts);
+        return true;
     }
 
     fn blockSet(self: *const Solver, matrix: []u64, block: structures.FunctionBlockId) []u64 {
@@ -1234,13 +1070,11 @@ fn testEndingDeduplication(gpa: std.mem.Allocator) !void {
         };
         for ([_]usize{ 4, 1, 3, 0, 4, 5, 2, 5, 1, 0, 2, 3 }) |index| {
             const ending = expected[index];
-            try solver.recordEnding(
-                &endings,
-                ending.generation,
-                @fromBackingInt(@intCast(10 + @backingInt(ending.generation))),
-                null,
-                ending.location,
-            );
+            try solver.recordEnding(&endings, .{
+                .generation = ending.generation,
+                .cleanup_value = @fromBackingInt(@intCast(10 + @backingInt(ending.generation))),
+                .location = ending.location,
+            });
         }
         solver.finishEndings(&endings);
         try std.testing.expectEqual(expected.len, endings.items.len);

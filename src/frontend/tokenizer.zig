@@ -60,7 +60,6 @@ pub const Tokenizer = struct {
 
     const State = enum {
         start,
-        expect_newline,
         identifier,
         quoted_literal,
         quoted_literal_backslash,
@@ -176,13 +175,7 @@ pub const Tokenizer = struct {
 
         state: switch (State.start) {
             .start => switch (self.current()) {
-                0 => {
-                    if (self.index == self.buffer.len) {
-                        return self.eofOrDedent();
-                    } else {
-                        continue :state .invalid;
-                    }
-                },
+                0 => if (self.index == self.buffer.len) return self.eofOrDedent() else continue :state .invalid,
                 '\n', '\r' => {
                     if (newlineLength(self)) |token_count| {
                         self.index += token_count;
@@ -210,28 +203,19 @@ pub const Tokenizer = struct {
                     result.tag = .identifier;
                     continue :state .identifier;
                 },
-                '=' => {
-                    result.tag = .equal;
-                    continue :state .equal;
-                },
-                '|' => result.tag = self.binaryOperator(.pipe, .pipe_equal),
+                '=' => continue :state .equal,
+                '-' => continue :state .minus,
                 inline '(', ')', '[', ']', ';', ',', '?', ':', '{', '}', '~' => |byte| {
                     result.tag = comptime Token.punctuation.get(&.{byte}).?;
                     self.index += 1;
                 },
-                '%' => result.tag = self.binaryOperator(.percent, .percent_equal),
-                '*' => result.tag = self.binaryOperator(.asterisk, .asterisk_equal),
-                '+' => result.tag = self.binaryOperator(.plus, .plus_equal),
+                inline '|', '%', '*', '+', '^', '/', '&' => |byte| result.tag = self.binaryOperator(
+                    comptime Token.punctuation.get(&.{byte}).?,
+                    comptime Token.punctuation.get(&.{ byte, '=' }).?,
+                ),
                 '<' => continue :state .angle_bracket_left,
                 '>' => continue :state .angle_bracket_right,
-                '^' => result.tag = self.binaryOperator(.caret, .caret_equal),
                 '.' => continue :state .period,
-                '-' => {
-                    result.tag = .minus;
-                    continue :state .minus;
-                },
-                '/' => result.tag = self.binaryOperator(.slash, .slash_equal),
-                '&' => result.tag = self.binaryOperator(.ampersand, .ampersand_equal),
                 '0'...'9' => {
                     result.tag = .number_literal;
                     self.index += 1;
@@ -241,36 +225,12 @@ pub const Tokenizer = struct {
                 else => continue :state .invalid,
             },
 
-            .expect_newline => {
-                self.index += 1;
-                switch (self.current()) {
-                    0 => {
-                        if (self.index == self.buffer.len) {
-                            result.tag = .invalid;
-                        } else {
-                            continue :state .invalid;
-                        }
-                    },
-                    '\n' => {
-                        self.index += 1;
-                        self.indent = 0;
-                        self.at_line_start = true;
-                        if (try checkIndentation(self)) |tok| return tok;
-                        result.loc.start = self.index;
-                        continue :state .start;
-                    },
-                    else => continue :state .invalid,
-                }
-            },
-
             .invalid => {
                 self.index += 1;
                 switch (self.current()) {
                     0 => if (self.index == self.buffer.len) {
                         result.tag = .invalid;
-                    } else {
-                        continue :state .invalid;
-                    },
+                    } else continue :state .invalid,
                     '\n' => result.tag = .invalid,
                     else => continue :state .invalid,
                 }
@@ -289,7 +249,7 @@ pub const Tokenizer = struct {
                 }
             },
 
-            .quoted_literal => {
+            inline .quoted_literal, .quoted_literal_backslash => |literal| {
                 self.index += 1;
                 switch (self.current()) {
                     0 => {
@@ -297,26 +257,14 @@ pub const Tokenizer = struct {
                         result.tag = .invalid;
                     },
                     '\n' => result.tag = .invalid,
-                    '\\' => continue :state .quoted_literal_backslash,
-                    '\'', '"' => {
-                        if (self.current() != self.buffer[result.loc.start]) continue :state .quoted_literal;
+                    0x01...0x09, 0x0b...0x1f, 0x7f => continue :state .invalid,
+                    else => |byte| {
+                        // An escaped byte never closes the literal.
+                        if (literal == .quoted_literal_backslash) continue :state .quoted_literal;
+                        if (byte == '\\') continue :state .quoted_literal_backslash;
+                        if (byte != self.buffer[result.loc.start]) continue :state .quoted_literal;
                         self.index += 1;
                     },
-                    0x01...0x09, 0x0b...0x1f, 0x7f => continue :state .invalid,
-                    else => continue :state .quoted_literal,
-                }
-            },
-
-            .quoted_literal_backslash => {
-                self.index += 1;
-                switch (self.current()) {
-                    0 => {
-                        if (self.index != self.buffer.len) continue :state .invalid;
-                        result.tag = .invalid;
-                    },
-                    '\n' => result.tag = .invalid,
-                    0x01...0x09, 0x0b...0x1f, 0x7f => continue :state .invalid,
-                    else => continue :state .quoted_literal,
                 }
             },
 
@@ -379,73 +327,39 @@ pub const Tokenizer = struct {
             .line_comment => {
                 self.index += 1;
                 switch (self.current()) {
-                    0 => {
-                        if (self.index != self.buffer.len) {
-                            continue :state .invalid;
-                        } else return self.eofOrDedent();
-                    },
-                    '\n' => {
-                        self.index += 1;
-                        self.indent = 0;
-                        self.at_line_start = true;
-                        if (try checkIndentation(self)) |tok| return tok;
-                        result.loc.start = self.index;
-                        continue :state .start;
-                    },
-                    '\r' => continue :state .expect_newline,
+                    0 => if (self.index == self.buffer.len) return self.eofOrDedent() else continue :state .invalid,
+                    // The start state validates and consumes the line ending.
+                    '\n', '\r' => continue :state .start,
                     0x01...0x09, 0x0b...0x0c, 0x0e...0x1f, 0x7f => continue :state .invalid,
                     else => continue :state .line_comment,
                 }
             },
 
-            .int => switch (self.current()) {
-                '.' => if (self.previous_tag != .period) {
+            inline .int, .float => |number| switch (self.current()) {
+                '.' => if (number == .int and self.previous_tag != .period) {
                     continue :state .int_period;
                 },
                 '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
                     self.index += 1;
-                    continue :state .int;
+                    continue :state if (number == .int) .int else .float;
                 },
-                'e', 'E', 'p', 'P' => continue :state .int_exponent,
+                'e', 'E', 'p', 'P' => continue :state if (number == .int) .int_exponent else .float_exponent,
                 else => {},
             },
-            .int_exponent => {
+            inline .int_exponent, .float_exponent => |exponent| {
                 self.index += 1;
-                switch (self.current()) {
-                    '-', '+' => {
-                        self.index += 1;
-                        continue :state .float;
-                    },
-                    else => continue :state .int,
+                if (self.current() == '-' or self.current() == '+') {
+                    self.index += 1;
+                    continue :state .float;
                 }
+                continue :state if (exponent == .int_exponent) .int else .float;
             },
             .int_period => {
                 self.index += 1;
                 switch (self.current()) {
-                    '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
-                        self.index += 1;
-                        continue :state .float;
-                    },
-                    'e', 'E', 'p', 'P' => continue :state .float_exponent,
+                    // Leave a period that starts no fraction or exponent for the next token.
+                    '_', 'a'...'z', 'A'...'Z', '0'...'9' => continue :state .float,
                     else => self.index -= 1,
-                }
-            },
-            .float => switch (self.current()) {
-                '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
-                    self.index += 1;
-                    continue :state .float;
-                },
-                'e', 'E', 'p', 'P' => continue :state .float_exponent,
-                else => {},
-            },
-            .float_exponent => {
-                self.index += 1;
-                switch (self.current()) {
-                    '-', '+' => {
-                        self.index += 1;
-                        continue :state .float;
-                    },
-                    else => continue :state .float,
                 }
             },
         }

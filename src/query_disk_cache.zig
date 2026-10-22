@@ -8,6 +8,10 @@ const standard_library = @import("standard_library");
 
 const format = "CHIQRY40";
 const max_records = 1_000_000;
+// Snapshot records name their interner, input, or query boundary by type name.
+const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
+const persisted_inputs = .{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile };
+const persisted_query_dependencies = .{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.ConversionCandidates, queries.InferReferenceContract, queries.AnalyzeFunctionInstance };
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
     var writer: codec.Writer = .{ .allocator = allocator };
@@ -35,7 +39,7 @@ pub fn restoreInterns(db: *query.Database, allocator: std.mem.Allocator, payload
 }
 
 fn restoreNamedIntern(name: []const u8, db: *query.Database, reader: *codec.Reader, index: usize) !void {
-    inline for (.{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings }) |I| {
+    inline for (interners) |I| {
         if (std.mem.eql(u8, name, @typeName(I))) return restoreIntern(I, db, reader, index);
     }
     return error.InvalidCache;
@@ -95,29 +99,17 @@ fn restoreQuery(comptime Q: type, db: *query.Database, reader: *codec.Reader) !u
         var transferred = false;
         defer if (!transferred) codec.freeValue(Q.Output, reader.allocator, &output);
         if (output == null) return error.InvalidCache;
-        const dep_count = try readCount(reader);
-        var deps: std.ArrayList(query.PersistedInputRef) = .empty;
-        defer deps.deinit(reader.allocator);
-        var query_deps: std.ArrayList(query.PersistedQueryRef) = .empty;
-        defer query_deps.deinit(reader.allocator);
         var valid = try validateIds(Q.Input, db, input) and
             try validateIds(Q.Output, db, output) and
             try validOutput(Q, db, output);
-        for (0..dep_count) |_| {
-            const matched = try restoreNamedInput(db, reader, valid);
-            if (matched) |dep| {
-                try deps.append(reader.allocator, dep);
-            } else valid = false;
-        }
-        const query_dep_count = try readCount(reader);
-        for (0..query_dep_count) |_| {
-            const matched = try restoreNamedQueryDependency(db, reader, valid);
-            if (matched) |dep| {
-                try query_deps.append(reader.allocator, dep);
-            } else valid = false;
-        }
+        var input_deps: std.ArrayList(query.PersistedInputRef) = .empty;
+        defer input_deps.deinit(reader.allocator);
+        var query_deps: std.ArrayList(query.PersistedQueryRef) = .empty;
+        defer query_deps.deinit(reader.allocator);
+        try restoreDependencies(query.PersistedInputRef, persisted_inputs, db, reader, &valid, &input_deps);
+        try restoreDependencies(query.PersistedQueryRef, persisted_query_dependencies, db, reader, &valid, &query_deps);
         if (valid) {
-            try db.importCompletedQuery(Q, input, output, deps.items, query_deps.items);
+            try db.importCompletedQuery(Q, input, output, input_deps.items, query_deps.items);
             transferred = true;
             imported_count += 1;
         }
@@ -125,38 +117,32 @@ fn restoreQuery(comptime Q: type, db: *query.Database, reader: *codec.Reader) !u
     return imported_count;
 }
 
-fn restoreNamedInput(db: *query.Database, reader: *codec.Reader, check: bool) !?query.PersistedInputRef {
+/// Reads every recorded dependency. Each still matches against the current
+/// database only while the record remains valid.
+fn restoreDependencies(comptime Ref: type, comptime candidates: anytype, db: *query.Database, reader: *codec.Reader, valid: *bool, matched: *std.ArrayList(Ref)) !void {
+    const count = try readCount(reader);
+    for (0..count) |_| {
+        const dependency = try restoreDependency(Ref, candidates, db, reader, valid.*);
+        if (dependency) |match| {
+            try matched.append(reader.allocator, match);
+        } else valid.* = false;
+    }
+}
+
+fn restoreDependency(comptime Ref: type, comptime candidates: anytype, db: *query.Database, reader: *codec.Reader, check: bool) !?Ref {
     const name = try reader.read([]const u8);
     defer reader.allocator.free(name);
-    inline for (.{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile }) |I| {
-        if (std.mem.eql(u8, name, @typeName(I))) return restoreInput(I, db, reader, check);
+    inline for (candidates) |T| {
+        if (std.mem.eql(u8, name, @typeName(T))) {
+            const is_input = Ref == query.PersistedInputRef;
+            const key = try reader.read(if (is_input) T.Key else T.Input);
+            var digest: [32]u8 = undefined;
+            @memcpy(&digest, try reader.take(digest.len));
+            if (!check or !(try validateIds(@TypeOf(key), db, key))) return null;
+            return if (is_input) db.matchPersistedInput(T, key, digest) else db.matchPersistedQuery(T, key, digest);
+        }
     }
     return error.InvalidCache;
-}
-
-fn restoreNamedQueryDependency(db: *query.Database, reader: *codec.Reader, check: bool) !?query.PersistedQueryRef {
-    const name = try reader.read([]const u8);
-    defer reader.allocator.free(name);
-    inline for (.{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.ConversionCandidates, queries.InferReferenceContract, queries.AnalyzeFunctionInstance }) |Q| {
-        if (std.mem.eql(u8, name, @typeName(Q))) return restoreQueryDependency(Q, db, reader, check);
-    }
-    return error.InvalidCache;
-}
-
-fn restoreQueryDependency(comptime Q: type, db: *query.Database, reader: *codec.Reader, check: bool) !?query.PersistedQueryRef {
-    const input = try reader.read(Q.Input);
-    var digest: [32]u8 = undefined;
-    @memcpy(&digest, try reader.take(digest.len));
-    if (!check or !(try validateIds(Q.Input, db, input))) return null;
-    return db.matchPersistedQuery(Q, input, digest);
-}
-
-fn restoreInput(comptime I: type, db: *query.Database, reader: *codec.Reader, check: bool) !?query.PersistedInputRef {
-    const key = try reader.read(I.Key);
-    var digest: [32]u8 = undefined;
-    @memcpy(&digest, try reader.take(digest.len));
-    if (!check or !(try validateIds(I.Key, db, key))) return null;
-    return db.matchPersistedInput(I, key, digest);
 }
 
 fn readCount(reader: *codec.Reader) !usize {
@@ -225,9 +211,7 @@ fn validRuntimeValue(db: *query.Database, value: structures.CompileTimeValue) !b
 }
 
 fn validVariantRuntime(db: *query.Database, type_id: structures.TypeId, variant: @FieldType(structures.CompileTimeValue.RuntimeValue, "variant")) !bool {
-    const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
-    const members = (try types.variantMembers(type_id)) orelse return false;
-    if (std.mem.indexOfScalar(structures.TypeId, members, variant.member_type) == null) return false;
+    if (!try hasVariantMember(queries.TypeFacts(*query.Database){ .ctx = db }, type_id, variant.member_type)) return false;
     const payload = (try db.lookupInternedAs(queries.CompileTimeValues, variant.payload)) orelse return false;
     return switch (payload.*) {
         .type => variant.member_type == .type,
@@ -255,9 +239,9 @@ fn persistedCursorAccess(db: *query.Database, type_id: structures.TypeId) !?stru
 
 fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     if (T == u8) return true;
-    if (T == structures.ModuleId) return (try db.lookupInternedAs(queries.ModulePaths, value)) != null;
-    if (T == structures.ItemId) return (try db.lookupInternedAs(queries.ItemLocations, value)) != null;
-    if (T == structures.FunctionOverloadId) return (try db.lookupInternedAs(queries.FunctionOverloads, value)) != null;
+    inline for (interners) |I| {
+        if (T == I.Id) return (try db.lookupInternedAs(I, value)) != null;
+    }
     if (T == structures.StaticStorageCursor) {
         const access = (try persistedCursorAccess(db, value.type_id)) orelse return false;
         if (value.data) |identity| {
@@ -267,11 +251,6 @@ fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
         }
         return value.offset == 0 and !access.reference;
     }
-    if (T == structures.ByteStringId) return (try db.lookupInternedAs(queries.ByteStrings, value)) != null;
-    if (T == structures.CompileTimeValueId) return (try db.lookupInternedAs(queries.CompileTimeValues, value)) != null;
-    if (T == structures.CompileTimeBindingsId) return (try db.lookupInternedAs(queries.CompileTimeBindings, value)) != null;
-    if (T == structures.CompileTimeValueTupleId) return (try db.lookupInternedAs(queries.CompileTimeValueTuples, value)) != null;
-    if (T == structures.InternedTypeId) return (try db.lookupInternedAs(queries.Types, value)) != null;
     if (T == structures.TypeId) {
         if (value.isPrimitive()) return true;
         const interned = value.interned() orelse return false;
@@ -279,28 +258,16 @@ fn validateIds(comptime T: type, db: *query.Database, value: T) anyerror!bool {
     }
     return switch (@typeInfo(T)) {
         .optional => |info| if (value) |present| try validateIds(info.child, db, present) else true,
-        .@"struct" => |info| blk: {
-            inline for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, attrs| {
-                if (!attrs.@"comptime" and !(try validateIds(FieldType, db, @field(value, field_name)))) break :blk false;
-            }
-            break :blk true;
-        },
+        .@"struct" => |info| inline for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, attrs| {
+            if (!attrs.@"comptime" and !(try validateIds(FieldType, db, @field(value, field_name)))) break false;
+        } else true,
         .@"union" => switch (value) {
             inline else => |payload| try validateIds(@TypeOf(payload), db, payload),
         },
-        .array => |info| blk: {
-            for (value) |element| {
-                if (!(try validateIds(info.child, db, element))) break :blk false;
-            }
-            break :blk true;
-        },
-        .pointer => |info| blk: {
-            if (info.size != .slice) @compileError("unexpected pointer in persisted value");
-            for (value) |element| {
-                if (!(try validateIds(info.child, db, element))) break :blk false;
-            }
-            break :blk true;
-        },
+        // Persisted pointers are owned slices; the codec rejects any other shape.
+        .array, .pointer => for (value) |element| {
+            if (!(try validateIds(@TypeOf(element), db, element))) break false;
+        } else true,
         else => true,
     };
 }
@@ -338,8 +305,8 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
             .cursor_offset, .cursor_element => |operation| {
                 if (body.valueType(operation.index) != .int) return false;
                 const source = (try types.storageCursorAccess(body.valueType(operation.cursor))) orelse return false;
-                const target = if (instruction == .cursor_element) (try types.borrowElement(operation.type_id)) orelse return false else (try types.storageCursorAccess(operation.type_id)) orelse return false;
-                if (source != target) return false;
+                const target = if (instruction == .cursor_element) try types.borrowElement(operation.type_id) else try types.storageCursorAccess(operation.type_id);
+                if (source != (target orelse return false)) return false;
             },
             .byte_to_int => |source| if (body.valueType(source) != .byte) return false,
             .variant_extract => |operation| if (operation.tag_mapping == null and try types.variantMembers(operation.target_type) != null) return false,
@@ -388,8 +355,7 @@ fn validReferencePath(db: *query.Database, types: anytype, initial: structures.T
                 type_id = try types.fieldStorageType(definition.fields[index]);
             },
             .variant => |member| {
-                const members = (try types.variantMembers(type_id)) orelse return false;
-                if (std.mem.indexOfScalar(structures.TypeId, members, member) == null) return false;
+                if (!try hasVariantMember(types, type_id, member)) return false;
                 type_id = member;
             },
             .element => type_id = (try referencePathElement(db, types, type_id)) orelse return false,
@@ -454,8 +420,7 @@ fn validBorrowFields(types: anytype, body: structures.FunctionBodyAnalysis, oper
             type_id = definition.fields[field_index].type_id;
         },
         .variant => |member| {
-            const members = (try types.variantMembers(type_id)) orelse return false;
-            if (std.mem.indexOfScalar(structures.TypeId, members, member) == null) return false;
+            if (!try hasVariantMember(types, type_id, member)) return false;
             type_id = member;
         },
     };
@@ -488,11 +453,13 @@ fn validStorageProjection(types: anytype, body: structures.FunctionBodyAnalysis,
             const definition = (try types.structDefinition(type_id)) orelse return false;
             return field < definition.fields.len and try types.fieldStorageType(definition.fields[field]) == operation.type_id;
         },
-        .variant => {
-            const members = (try types.variantMembers(type_id)) orelse return false;
-            return std.mem.indexOfScalar(structures.TypeId, members, operation.type_id) != null;
-        },
+        .variant => return hasVariantMember(types, type_id, operation.type_id),
     }
+}
+
+fn hasVariantMember(types: anytype, type_id: structures.TypeId, member: structures.TypeId) !bool {
+    const members = (try types.variantMembers(type_id)) orelse return false;
+    return std.mem.indexOfScalar(structures.TypeId, members, member) != null;
 }
 
 fn validRange(range: structures.FunctionValueRange, length: usize) bool {
@@ -503,35 +470,48 @@ fn validValue(value: structures.FunctionValueId, body: structures.FunctionBodyAn
     return @backingInt(value) < body.valueCount();
 }
 
-fn validUse(use: structures.FunctionValueUse, body: structures.FunctionBodyAnalysis) bool {
-    return validValue(use.value, body) and valueRepresentation(body, use.value) != .initializer and
-        (use.variant_tag_mapping == null or validRange(use.variant_tag_mapping.?, body.variant_coercion_tags.len));
+fn validOrdinaryValue(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
+    return validValue(value, body) and valueRepresentation(body, value) != .initializer;
 }
 
-fn validOrdinaryValue(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
-    if (!validValue(value, body)) return false;
-    const representation = valueRepresentation(body, value);
-    return representation != .initializer;
+fn validInitializerValue(value: structures.FunctionValueId, body: structures.FunctionBodyAnalysis) bool {
+    return validValue(value, body) and valueRepresentation(body, value) == .initializer;
+}
+
+fn validTagMapping(mapping: ?structures.FunctionValueRange, body: structures.FunctionBodyAnalysis) bool {
+    return mapping == null or validRange(mapping.?, body.variant_coercion_tags.len);
+}
+
+fn validUse(use: structures.FunctionValueUse, body: structures.FunctionBodyAnalysis) bool {
+    return validOrdinaryValue(use.value, body) and validTagMapping(use.variant_tag_mapping, body);
+}
+
+/// Only calls may pass initializer handles as operands.
+fn validOperands(operands: [2]?*const structures.FunctionValueId, initializers_allowed: bool, body: structures.FunctionBodyAnalysis) bool {
+    for (operands) |operand| if (operand) |value| {
+        if (!validValue(value.*, body)) return false;
+        if (!initializers_allowed and valueRepresentation(body, value.*) == .initializer) return false;
+    };
+    return true;
 }
 
 fn validCallArgument(argument: structures.FunctionCallArgument, body: structures.FunctionBodyAnalysis) bool {
     return switch (argument) {
         .prepared => |use| validUse(use, body),
         .deinit, .borrowed => |value| validOrdinaryValue(value, body),
-        .initializer => |value| validValue(value, body) and valueRepresentation(body, value) == .initializer,
+        .initializer => |value| validInitializerValue(value, body),
     };
 }
 
 fn validCall(call: structures.FunctionCall, body: structures.FunctionBodyAnalysis) bool {
     if (!validRange(call.arguments, body.call_arguments.len)) return false;
     if (call.destination) |destination| if (!validOrdinaryValue(destination, body) or body.valueType(destination) != call.return_type) return false;
-    if (call.target == .indirect and !validOrdinaryValue(call.target.indirect, body)) return false;
-    if (call.target == .initializer) {
-        const value = call.target.initializer;
-        if (!validValue(value, body)) return false;
-        return call.arguments.start == call.arguments.end and valueRepresentation(body, value) == .initializer and body.valueType(value) == call.return_type;
-    }
-    return true;
+    return switch (call.target) {
+        .direct => true,
+        .indirect => |value| validOrdinaryValue(value, body),
+        .initializer => |value| call.arguments.start == call.arguments.end and
+            validInitializerValue(value, body) and body.valueType(value) == call.return_type,
+    };
 }
 
 fn valueRepresentation(body: structures.FunctionBodyAnalysis, value: structures.FunctionValueId) structures.ValueRepresentation {
@@ -543,10 +523,10 @@ fn valueRepresentation(body: structures.FunctionBodyAnalysis, value: structures.
     };
 }
 
+/// Block ranges and successor targets are validated before branches.
 fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyAnalysis) bool {
-    if (@backingInt(branch.target) >= body.blocks.len or !validRange(branch.arguments, body.branch_arguments.len)) return false;
+    if (!validRange(branch.arguments, body.branch_arguments.len)) return false;
     const target = body.blocks[@backingInt(branch.target)];
-    if (target.argument_start > target.argument_end or target.argument_end > body.block_arguments.len) return false;
     if (branch.arguments.end - branch.arguments.start != target.argument_end - target.argument_start) return false;
     for (body.branch_arguments[branch.arguments.start..branch.arguments.end], body.block_arguments[target.argument_start..target.argument_end]) |use, argument| {
         if (argument.representation == .initializer) return false;
@@ -554,10 +534,6 @@ fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyA
         if (argument.representation == .storage and (use.coerce_to != null or use.variant_tag_mapping != null)) return false;
     }
     return true;
-}
-
-fn validVariantOperation(operation: structures.VariantOperation, body: structures.FunctionBodyAnalysis) bool {
-    return operation.tag_mapping == null or validRange(operation.tag_mapping.?, body.variant_coercion_tags.len);
 }
 
 fn validReferenceContract(contract: structures.ReferenceContract, parameter_count: usize) bool {
@@ -586,6 +562,10 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     if (body.valueCount() > std.math.maxInt(u32)) return false;
     if (body.instruction_spans.len != 0 and body.instruction_spans.len != body.instructions.len) return false;
     if (body.terminator_spans.len != 0 and body.terminator_spans.len != body.blocks.len) return false;
+    for (body.blocks) |block| {
+        if (block.argument_start > block.argument_end or block.argument_end > body.block_arguments.len or
+            block.instruction_start > block.instruction_end or block.instruction_end > body.instructions.len) return false;
+    }
     for (body.branch_arguments) |use| if (!validUse(use, body)) return false;
     for (body.call_arguments) |argument| if (!validCallArgument(argument, body)) return false;
     for (body.initializer_captures) |capture| if (!validValue(capture, body)) return false;
@@ -593,7 +573,7 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         if (!region.is_initializer_region or !validFunctionBody(region)) return false;
     }
     const entry = body.blocks[@backingInt(body.entry)];
-    if (entry.argument_start != 0 or entry.argument_end > body.block_arguments.len) return false;
+    if (entry.argument_start != 0) return false;
     if (body.parameter_modes.len != entry.argument_end - entry.argument_start) return false;
     if (!validReferenceContract(body.reference_contract, body.parameter_modes.len)) return false;
     for (body.parameter_modes, body.block_arguments[entry.argument_start..entry.argument_end]) |mode, argument| {
@@ -611,16 +591,12 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
             (argument.representation != .storage and argument.representation != .initializer))) return false;
     }
     for (body.block_arguments[entry.argument_end..]) |argument| if (argument.representation == .initializer) return false;
-    for (body.instructions) |original| {
-        var instruction = original;
-        for (instruction.operands()) |operand| if (operand) |value| {
-            if (!validValue(value.*, body)) return false;
-            if (valueRepresentation(body, value.*) == .initializer and instruction != .call) return false;
-        };
+    for (body.instructions) |instruction| {
+        if (!validOperands(instruction.operands(), instruction == .call, body)) return false;
         const valid = switch (instruction) {
             .initializer_ref => |reference| validInitializerReference(reference, body),
-            .variant_coerce => |operation| operation.tag_mapping != null and validVariantOperation(operation, body),
-            .variant_extract, .callable_coerce => |operation| validVariantOperation(operation, body),
+            .variant_coerce => |operation| operation.tag_mapping != null and validTagMapping(operation.tag_mapping, body),
+            .variant_extract, .callable_coerce => |operation| validTagMapping(operation.tag_mapping, body),
             .result_storage => |type_id| type_id == body.return_type,
             .borrow_address => |operation| validRange(operation.fields, body.borrow_fields.len),
             .initializer_capture_write => |operation| body.is_initializer_region and
@@ -631,13 +607,8 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         if (!valid) return false;
     }
     for (body.blocks) |block| {
-        if (block.argument_start > block.argument_end or block.argument_end > body.block_arguments.len or
-            block.instruction_start > block.instruction_end or block.instruction_end > body.instructions.len) return false;
+        if (!validOperands(block.terminator.operands(), block.terminator == .fallible_call, body)) return false;
         var terminator = block.terminator;
-        for (terminator.operands()) |operand| if (operand) |value| {
-            if (!validValue(value.*, body)) return false;
-            if (valueRepresentation(body, value.*) == .initializer and terminator != .fallible_call) return false;
-        };
         for (terminator.successors()) |successor| if (successor) |target| {
             if (@backingInt(target.*) >= body.blocks.len) return false;
         };
@@ -647,8 +618,7 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         const valid = switch (block.terminator) {
             .fallible_call => |branch| validCall(branch.call, body) and
                 validFallibleTargets(branch.call, branch.success, branch.failure, body),
-            .return_value => |use| validUse(use, body) and validOrdinaryValue(use.value, body) and
-                (use.coerce_to orelse body.valueType(use.value)) == body.return_type,
+            .return_value => |use| validUse(use, body) and (use.coerce_to orelse body.valueType(use.value)) == body.return_type,
             .return_failure => body.is_fallible,
             .return_unit => body.return_type == .unit,
             .branch, .predicate_branch, .diverge => true,
@@ -671,17 +641,17 @@ fn validInitializerReference(reference: @FieldType(structures.FunctionInstructio
     return true;
 }
 
+/// A failure target is already a validated successor; a success target is
+/// one only when the call can return.
 fn validFallibleTargets(call: structures.FunctionCall, success: structures.FunctionBlockId, failure: ?structures.FunctionBlockId, body: structures.FunctionBodyAnalysis) bool {
     if (@backingInt(success) >= body.blocks.len) return false;
     const success_block = body.blocks[@backingInt(success)];
-    if (success_block.argument_start > success_block.argument_end or success_block.argument_end > body.block_arguments.len or
-        success_block.argument_end - success_block.argument_start != 1) return false;
+    if (success_block.argument_end - success_block.argument_start != 1) return false;
     const result = body.block_arguments[success_block.argument_start];
     if (result.representation != .value or result.type_id != (if (call.destination == null) call.return_type else .unit)) return false;
     if (failure) |target| {
-        if (@backingInt(target) >= body.blocks.len) return false;
         const block = body.blocks[@backingInt(target)];
-        if (block.argument_end > body.block_arguments.len or block.argument_end != block.argument_start) return false;
+        if (block.argument_end != block.argument_start) return false;
     }
     return true;
 }

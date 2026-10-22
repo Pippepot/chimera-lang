@@ -36,9 +36,7 @@ fn buildIdDigest() ?Key {
                 var hasher = Sha256.init(.{});
                 hasher.update("chi compiler build ID");
                 hasher.update(bytes[desc_start..desc_end]);
-                var result: Key = undefined;
-                hasher.final(&result);
-                return result;
+                return hasher.finalResult();
             }
             offset = std.mem.alignForward(usize, desc_end, 4);
         }
@@ -75,9 +73,7 @@ pub fn compilerDigest(io: std.Io) !Key {
         if (n == 0) continue;
         compiler_hasher.update(buffer[0..n]);
     }
-    var compiler_digest: Key = undefined;
-    compiler_hasher.final(&compiler_digest);
-    return compiler_digest;
+    return compiler_hasher.finalResult();
 }
 
 /// The executable result depends on all source and module inputs. Hash the
@@ -96,9 +92,7 @@ pub fn key(compiler_digest: Key, source_path: []const u8, source: []const u8, fi
     }
     addLength(&hasher, module_paths.len);
     for (module_paths) |path| addBytes(&hasher, path);
-    var result: Key = undefined;
-    hasher.final(&result);
-    return result;
+    return hasher.finalResult();
 }
 
 /// A query snapshot survives source edits while file IDs retain their path
@@ -113,9 +107,7 @@ pub fn querySnapshotKey(compiler_digest: Key, source_path: []const u8, files: an
         addBytes(&hasher, file.path);
         addBytes(&hasher, file.module_path);
     }
-    var result: Key = undefined;
-    hasher.final(&result);
-    return result;
+    return hasher.finalResult();
 }
 
 fn entryPath(gpa: std.mem.Allocator, directory: []const u8, digest: Key) ![]u8 {

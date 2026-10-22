@@ -64,13 +64,12 @@ pub const TimingLog = struct {
         try writer.print("  {s:>9}  {s:>9}  {s:>5}\n", .{ "wall ms", "thread ms", "%" });
         for (stages) |stage| {
             const duration = stage.duration.toNanoseconds();
-            const share = fraction(duration, compile);
             const thread = if (stage.work) |work| threadNanoseconds(work) else 0;
             try writeTimingRow(writer, label_width, .{
                 .label = stage.label,
                 .wall = duration,
                 .thread = if (thread != 0) thread else null,
-                .share = share,
+                .share = fraction(duration, compile),
                 .bar = true,
             });
             const work = stage.work orelse continue;
@@ -152,14 +151,9 @@ fn threadNanoseconds(work: profiling.Snapshot) i96 {
     return nanoseconds;
 }
 
-const WorkOrder = struct {
-    work: *const profiling.Snapshot,
-    rows: []const WorkRow,
-
-    fn slower(self: WorkOrder, lhs: usize, rhs: usize) bool {
-        return workCounter(self.work.*, self.rows[lhs]).nanoseconds > workCounter(self.work.*, self.rows[rhs]).nanoseconds;
-    }
-};
+fn slowerWork(work: *const profiling.Snapshot, lhs: WorkRow, rhs: WorkRow) bool {
+    return workCounter(work.*, lhs).nanoseconds > workCounter(work.*, rhs).nanoseconds;
+}
 
 fn writeWorkRows(
     writer: *std.Io.Writer,
@@ -169,16 +163,15 @@ fn writeWorkRows(
     depth: usize,
     stage_thread: i96,
 ) std.Io.Writer.Error!void {
-    var order: [work_rows.len]usize = undefined;
+    var sorted: [work_rows.len]WorkRow = undefined;
     var count: usize = 0;
-    for (rows, 0..) |row, index| {
+    for (rows) |row| {
         if (!hasWork(work, row)) continue;
-        order[count] = index;
+        sorted[count] = row;
         count += 1;
     }
-    std.mem.sort(usize, order[0..count], WorkOrder{ .work = &work, .rows = rows }, WorkOrder.slower);
-    for (order[0..count]) |index| {
-        const row = rows[index];
+    std.mem.sort(WorkRow, sorted[0..count], &work, slowerWork);
+    for (sorted[0..count]) |row| {
         const counter = workCounter(work, row);
         try writeTimingRow(writer, label_width, .{
             .label = row.label,
@@ -299,28 +292,27 @@ pub const MemoryTracker = struct {
     }
 
     pub fn print(self: *const MemoryTracker, writer: *std.Io.Writer) !void {
-        const rows = [_]struct { label: []const u8, bytes: usize }{
-            .{ .label = "peak live", .bytes = self.peak.load(.monotonic) },
-            .{ .label = "total allocated", .bytes = self.total.load(.monotonic) },
-            .{ .label = "still live", .bytes = self.live.load(.monotonic) },
+        var buffers: [4][32]u8 = undefined;
+        const rows = [_]struct { label: []const u8, value: []const u8 }{
+            .{ .label = "peak live", .value = try formatByteSize(&buffers[0], self.peak.load(.monotonic)) },
+            .{ .label = "total allocated", .value = try formatByteSize(&buffers[1], self.total.load(.monotonic)) },
+            .{ .label = "still live", .value = try formatByteSize(&buffers[2], self.live.load(.monotonic)) },
+            .{ .label = "allocations", .value = try std.fmt.bufPrint(&buffers[3], "{d}", .{self.allocations.load(.monotonic)}) },
         };
-        var buffer: [32]u8 = undefined;
-
         var label_width: usize = 0;
         var value_width: usize = 0;
-        for (rows) |row| {
-            label_width = @max(label_width, row.label.len);
-            value_width = @max(value_width, displayWidth(try formatByteSize(&buffer, row.bytes)));
-        }
+        for (rows) |row| label_width = @max(label_width, row.label.len);
+        // Byte sizes align with each other; the allocation count does not widen them.
+        for (rows[0..3]) |row| value_width = @max(value_width, displayWidth(row.value));
 
         try writer.writeAll("memory\n");
         for (rows) |row| {
-            try writeRow(writer, row.label, label_width, try formatByteSize(&buffer, row.bytes), value_width);
+            try writer.writeAll("  ");
+            try writePadded(writer, row.label, label_width, .left);
+            try writer.writeAll("  ");
+            try writePadded(writer, row.value, value_width, .right);
             try writer.writeByte('\n');
         }
-        const allocations = try std.fmt.bufPrint(&buffer, "{d}", .{self.allocations.load(.monotonic)});
-        try writeRow(writer, "allocations", label_width, allocations, value_width);
-        try writer.writeByte('\n');
     }
 
     fn grow(self: *MemoryTracker, bytes: usize) void {
@@ -390,22 +382,8 @@ fn writeShareBar(writer: *std.Io.Writer, share: f64) std.Io.Writer.Error!void {
     try writer.writeAll(partial_share_blocks[eighths % partial_share_blocks.len]);
 }
 
-fn writeRow(
-    writer: *std.Io.Writer,
-    label: []const u8,
-    label_width: usize,
-    value: []const u8,
-    value_width: usize,
-) !void {
-    try writer.writeAll("  ");
-    try writePadded(writer, label, label_width, .left);
-    try writer.writeAll("  ");
-    try writePadded(writer, value, value_width, .right);
-}
-
 fn writePadded(writer: *std.Io.Writer, text: []const u8, width: usize, alignment: enum { left, right }) !void {
-    const text_width = displayWidth(text);
-    const padding = if (text_width < width) width - text_width else 0;
+    const padding = width -| displayWidth(text);
     if (alignment == .right) try writer.splatByteAll(' ', padding);
     try writer.writeAll(text);
     if (alignment == .left) try writer.splatByteAll(' ', padding);
@@ -424,34 +402,19 @@ const LineInfo = struct {
 };
 
 fn lineInfoForOffset(source: []const u8, offset: usize) LineInfo {
-    const safe_offset = @min(offset, source.len);
-    var line: usize = 1;
-    var column: usize = 1;
-    var line_start: usize = 0;
-
-    for (source[0..safe_offset], 0..) |byte, index| {
-        if (byte == '\n') {
-            line += 1;
-            column = 1;
-            line_start = index + 1;
-        } else {
-            column += 1;
-        }
-    }
-
-    const line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len;
+    const prefix = source[0..@min(offset, source.len)];
+    const line_start = if (std.mem.findScalarLast(u8, prefix, '\n')) |newline| newline + 1 else 0;
     return .{
-        .line = line,
-        .column = column,
+        .line = std.mem.countScalar(u8, prefix, '\n') + 1,
+        .column = prefix.len - line_start + 1,
         .line_start = line_start,
-        .line_end = line_end,
+        .line_end = std.mem.indexOfScalarPos(u8, source, line_start, '\n') orelse source.len,
     };
 }
 
+/// Empty spans and spans outside the line still get one caret.
 fn highlightLen(span: structures.SourceSpan, line_start: usize, line_end: usize) usize {
-    const start = @max(span.start, line_start);
-    const end = @min(span.end, line_end);
-    return if (end > start) end - start else 1;
+    return @max(1, @min(span.end, line_end) -| @max(span.start, line_start));
 }
 
 fn writeType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) !void {
@@ -461,10 +424,7 @@ fn writeType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId)
 }
 
 pub fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) anyerror!void {
-    switch (type_id) {
-        .int, .int_literal, .string_literal, .byte, .bool, .unit, .none, .never, .type => return writer.writeAll(@tagName(type_id)),
-        _ => {},
-    }
+    if (type_id.isPrimitive()) return writer.writeAll(@tagName(type_id));
     if (try types.arrayType(type_id)) |array| {
         try writer.writeAll("Array(");
         try writeTypeInner(types, writer, array.element_type);
@@ -510,14 +470,14 @@ pub fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structure
     const members = (try types.variantMembers(type_id)) orelse unreachable;
     for (members, 0..) |member, index| {
         if (index != 0) try writer.writeAll(" | ");
-        if (try types.callable(member) != null) {
-            try writer.writeByte('(');
-            try writeTypeInner(types, writer, member);
-            try writer.writeByte(')');
-        } else {
-            try writeTypeInner(types, writer, member);
-        }
+        try writeGroupedType(types, writer, member, try types.callable(member) != null);
     }
+}
+
+fn writeGroupedType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId, grouped: bool) anyerror!void {
+    if (grouped) try writer.writeByte('(');
+    try writeTypeInner(types, writer, type_id);
+    if (grouped) try writer.writeByte(')');
 }
 
 /// Shared source-style callable identity, including inherited and own static arguments.
@@ -562,9 +522,7 @@ fn writeStaticValue(types: anytype, writer: *std.Io.Writer, id: structures.Compi
 
 fn writeStaticRuntime(types: anytype, writer: *std.Io.Writer, runtime: structures.CompileTimeValue.Runtime) anyerror!void {
     switch (runtime.value) {
-        .int => |value| try writer.print("{d}", .{value}),
-        .int_literal => |value| try writer.print("{d}", .{value}),
-        .byte => |value| try writer.print("{d}", .{value}),
+        inline .int, .int_literal, .byte => |value| try writer.print("{d}", .{value}),
         .bool => |value| try writer.writeAll(if (value) "true" else "false"),
         .unit => try writer.writeAll("()"),
         .none => try writer.writeAll("none"),
@@ -590,15 +548,11 @@ fn writeStaticCursor(types: anytype, writer: *std.Io.Writer, cursor: structures.
 }
 
 fn writeStaticAggregate(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId, values: []const structures.CompileTimeValueId) anyerror!void {
-    if (try types.arrayType(type_id) != null) {
-        try writer.writeByte('[');
+    const brackets: ?*const [2]u8 = if (try types.arrayType(type_id) != null) "[]" else if (try types.tupleMembers(type_id) != null) "()" else null;
+    if (brackets) |pair| {
+        try writer.writeByte(pair[0]);
         try writeStaticArguments(types, writer, values);
-        return writer.writeByte(']');
-    }
-    if (try types.tupleMembers(type_id) != null) {
-        try writer.writeByte('(');
-        try writeStaticArguments(types, writer, values);
-        return writer.writeByte(')');
+        return writer.writeByte(pair[1]);
     }
     try writeTypeInner(types, writer, type_id);
     try writer.writeByte('{');
@@ -614,10 +568,7 @@ fn writeStaticAggregate(types: anytype, writer: *std.Io.Writer, type_id: structu
 
 fn writeReferenceType(types: anytype, writer: *std.Io.Writer, type_id: structures.TypeId) anyerror!void {
     try writer.writeAll("ref ");
-    const grouped = try types.variantMembers(type_id) != null or try types.callable(type_id) != null;
-    if (grouped) try writer.writeByte('(');
-    try writeTypeInner(types, writer, type_id);
-    if (grouped) try writer.writeByte(')');
+    try writeGroupedType(types, writer, type_id, try types.variantMembers(type_id) != null or try types.callable(type_id) != null);
 }
 
 fn writeTypedMessage(types: anytype, writer: *std.Io.Writer, prefix: []const u8, type_id: structures.TypeId, suffix: []const u8) !void {
@@ -626,19 +577,17 @@ fn writeTypedMessage(types: anytype, writer: *std.Io.Writer, prefix: []const u8,
     try writer.writeAll(suffix);
 }
 
-fn writeMismatch(types: anytype, writer: *std.Io.Writer, prefix: []const u8, mismatch: structures.Diagnostic.TypeMismatch) !void {
-    try writer.writeAll(prefix);
-    try writer.writeAll("expected ");
-    try writeType(types, writer, mismatch.expected);
-    try writer.writeAll(", found ");
-    try writeType(types, writer, mismatch.found);
+fn writeTypePair(types: anytype, writer: *std.Io.Writer, prefix: []const u8, first: structures.TypeId, separator: []const u8, second: structures.TypeId) !void {
+    try writeTypedMessage(types, writer, prefix, first, separator);
+    try writeType(types, writer, second);
+}
+
+fn writeMismatch(types: anytype, writer: *std.Io.Writer, comptime prefix: []const u8, mismatch: structures.Diagnostic.TypeMismatch) !void {
+    try writeTypePair(types, writer, prefix ++ "expected ", mismatch.expected, ", found ", mismatch.found);
 }
 
 fn writeToken(writer: *std.Io.Writer, tag: structures.Token.Tag) !void {
-    if (structures.Token.spelling(tag)) |text| {
-        try writer.print("`{s}`", .{text});
-        return;
-    }
+    if (structures.Token.spelling(tag)) |text| return writer.print("`{s}`", .{text});
     switch (tag) {
         .invalid => try writer.writeAll("an invalid token"),
         .eof => try writer.writeAll("end of file"),
@@ -652,31 +601,32 @@ fn writeToken(writer: *std.Io.Writer, tag: structures.Token.Tag) !void {
     }
 }
 
+fn writeTokenMessage(writer: *std.Io.Writer, prefix: []const u8, tag: structures.Token.Tag, suffix: []const u8) !void {
+    try writer.writeAll(prefix);
+    try writeToken(writer, tag);
+    try writer.writeAll(suffix);
+}
+
 fn writeSourceLabel(writer: *std.Io.Writer, label: []const u8, source: []const u8, span: ?structures.SourceSpan) !void {
     try writer.writeAll(label);
-    const focus = span orelse return;
-    const start = @min(focus.start, source.len);
-    const end = @min(@max(focus.end, start), source.len);
-    if (end == start or std.mem.indexOfScalar(u8, source[start..end], '\n') != null) return;
-    try writer.print(": `{s}`", .{source[start..end]});
+    const text = spanText(source, span orelse return);
+    if (text.len == 0 or std.mem.indexOfScalar(u8, text, '\n') != null) return;
+    try writer.print(": `{s}`", .{text});
+}
+
+fn spanText(source: []const u8, span: structures.SourceSpan) []const u8 {
+    const start = @min(span.start, source.len);
+    return source[start..@min(@max(span.end, start), source.len)];
 }
 
 fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, span: ?structures.SourceSpan, kind: structures.Diagnostic.Kind) !void {
     switch (kind) {
         .expected_token => |payload| {
-            try writer.writeAll("expected ");
-            try writeToken(writer, payload.expected);
-            try writer.writeAll(", found ");
+            try writeTokenMessage(writer, "expected ", payload.expected, ", found ");
             try writeToken(writer, payload.found);
         },
-        .invalid_expression => |tag| {
-            try writer.writeAll("expected an expression, found ");
-            try writeToken(writer, tag);
-        },
-        .unsupported_syntax => |tag| {
-            try writeToken(writer, tag);
-            try writer.writeAll(" syntax is not implemented yet");
-        },
+        .invalid_expression => |tag| try writeTokenMessage(writer, "expected an expression, found ", tag, ""),
+        .unsupported_syntax => |tag| try writeTokenMessage(writer, "", tag, " syntax is not implemented yet"),
         .unexpected_indented_block => try writer.writeAll("unexpected indented block; the previous expression does not introduce a block"),
         .indented_block_after_inline_body => try writer.writeAll("indented block cannot follow an inline function body; `->` starts the body, and the return type goes before it"),
         .duplicate_top_level_declaration => try writeSourceLabel(writer, "top-level name is already declared", source, span),
@@ -701,12 +651,10 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .empty_overload => try writer.writeAll("an overload declaration requires at least one function"),
         .invalid_overload_candidate => try writer.writeAll("overload alternatives must name function declarations"),
         .duplicate_overload_candidate => try writer.writeAll("function is already included in this overload set"),
-        .no_matching_overload => |expected| {
-            if (expected) |type_id| {
-                try writer.writeAll("no overload matches the required function type ");
-                try writeType(types, writer, type_id);
-            } else try writer.writeAll("no overload matches the argument types and count");
-        },
+        .no_matching_overload => |expected| if (expected) |type_id|
+            try writeTypedMessage(types, writer, "no overload matches the required function type ", type_id, "")
+        else
+            try writer.writeAll("no overload matches the argument types and count"),
         .ambiguous_overload => try writer.writeAll("multiple overloads match; name an implementation explicitly"),
         .overload_requires_callable_context => try writer.writeAll("an overload reference requires a function-type annotation"),
         .struct_member_not_supported => try writer.writeAll("struct bodies support fields, namespace declarations, and `move`, `copy`, or `drop` properties"),
@@ -742,11 +690,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .type_factory_requires_call => try writeSourceLabel(writer, "call this type-producing function to obtain a type", source, span),
         .generic_struct_requires_specialization => {
             try writer.writeAll("struct must be specialized before initialization");
-            if (span) |focus| {
-                const start = @min(focus.start, source.len);
-                const end = @min(@max(focus.end, start), source.len);
-                try writer.print("; write `{s}(...){{...}}`", .{source[start..end]});
-            }
+            if (span) |focus| try writer.print("; write `{s}(...){{...}}`", .{spanText(source, focus)});
         },
         .function_annotation_not_supported => try writer.writeAll("type annotations on function bindings are not supported yet"),
         .parameter_mode_not_supported => try writer.writeAll("this parameter access mode is not supported yet"),
@@ -798,19 +742,9 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .consumed_storage_in_use => try writer.writeAll("cannot overwrite storage retained by a pending `deinit` argument; replace it after the call completes"),
         .borrow_outlives_source => try writer.writeAll("borrow cannot outlive the value or storage it references"),
         .compile_time_only_type => |type_id| try writeTypedMessage(types, writer, "compile-time-only type ", type_id, " cannot be materialized during runtime execution"),
-        .ambiguous_conversion => |mismatch| {
-            try writer.writeAll("multiple conversions apply from ");
-            try writeType(types, writer, mismatch.found);
-            try writer.writeAll(" to ");
-            try writeType(types, writer, mismatch.expected);
-        },
+        .ambiguous_conversion => |mismatch| try writeTypePair(types, writer, "multiple conversions apply from ", mismatch.found, " to ", mismatch.expected),
         .invalid_converter => try writer.writeAll("converter must have one immutable runtime source or one compile-time-only static source and an infallible result"),
-        .ambiguous_variant_member => |mismatch| {
-            try writer.writeAll("both owned and reference alternatives accept ");
-            try writeType(types, writer, mismatch.found);
-            try writer.writeAll(" in ");
-            try writeType(types, writer, mismatch.expected);
-        },
+        .ambiguous_variant_member => |mismatch| try writeTypePair(types, writer, "both owned and reference alternatives accept ", mismatch.found, " in ", mismatch.expected),
         .invalid_converter_owner => try writer.writeAll("converter must be declared in the defining module of its source or target type"),
         .tuple_requires_expected_type => try writer.writeAll("tuple construction requires an expected tuple type"),
         .tuple_member_count_mismatch => |counts| try writer.print("tuple expects {d} members, found {d}", .{ counts.expected, counts.found }),
@@ -827,15 +761,11 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .list_cannot_store_borrow_element => |type_id| try writeTypedMessage(types, writer, "List cannot store values containing Ref yet; element type is ", type_id, ""),
         .list_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "List requires an automatically droppable element type; found ", type_id, ""),
         .list_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "List requires a directly movable element type for relocation; found ", type_id, ""),
-        .borrow_write_cannot_store_borrow => |type_id| try writeTypedMessage(types, writer, "write cannot replace a value containing Ref yet; pointee type is ", type_id, ""),
         .borrow_write_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "write requires an automatically droppable pointee type; found ", type_id, ""),
         .borrow_write_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "write requires a directly movable pointee type; found ", type_id, ""),
         .box_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "Box requires an automatically droppable element type; found ", type_id, ""),
         .box_extraction_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "cannot extract a non-directly-movable value from Box; found ", type_id, ""),
-        .value_requires_explicit_drop => |type_id| {
-            try writeType(types, writer, type_id);
-            try writer.writeAll(" must be transferred with `^` or passed to a `deinit` parameter before this scope ends");
-        },
+        .value_requires_explicit_drop => |type_id| try writeTypedMessage(types, writer, "", type_id, " must be transferred with `^` or passed to a `deinit` parameter before this scope ends"),
         .invalid_collection_sequence => try writer.writeAll("collection_sequence must contain one owned List value matching its element type"),
         .collection_requires_static_count => try writer.writeAll("Array construction requires a statically known element count; use List for runtime-sized results"),
         .collection_size_out_of_range => try writer.writeAll("collection element count exceeds the supported range"),
@@ -858,7 +788,6 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .float_type_not_supported => try writer.writeAll("the `float` type is not supported yet"),
         .unknown_type => try writeSourceLabel(writer, "unknown type", source, span),
         .unknown_value => try writeSourceLabel(writer, "unknown value", source, span),
-        .assignment_target_not_local => try writer.writeAll("assignment target must be a writable place; bind an indexed element with `ref` before assigning its fields"),
         .assignment_to_immutable => try writeSourceLabel(writer, "cannot assign to immutable binding", source, span),
         .assignment_type_mismatch => |mismatch| try writeMismatch(types, writer, "assignment type mismatch: ", mismatch),
         .integer_literal_not_decimal => try writer.writeAll("integer literal must use decimal notation"),
@@ -871,18 +800,11 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .query_operand_not_bool => |found| try writeTypedMessage(types, writer, "query `?` requires bool, found ", found, ""),
         .inspection_type_not_supported => try writer.writeAll("this inspection type is not supported yet"),
         .variant_inspection_operand_not_variant => |found| try writeTypedMessage(types, writer, "variant inspection requires a variant value, found ", found, ""),
-        .iterator_result_requires_end => |mismatch| {
-            try writer.writeAll("next must return an item variant with owned ");
-            try writeType(types, writer, mismatch.expected);
-            try writer.writeAll(", found ");
-            try writeType(types, writer, mismatch.found);
-        },
+        .iterator_result_requires_end => |mismatch| try writeTypePair(types, writer, "next must return an item variant with owned ", mismatch.expected, ", found ", mismatch.found),
         .condition_binding_must_be_immutable => try writer.writeAll("an `if` binding must use `const`, not `var`"),
         .value_not_callable => try writeSourceLabel(writer, "value is not callable", source, span),
         .duplicate_variant_member_type => try writer.writeAll("variant contains the same member type more than once"),
         .local_type_mismatch => |mismatch| try writeMismatch(types, writer, "initializer type mismatch: ", mismatch),
-        .negation_operand_not_int => |found| try writeTypedMessage(types, writer, "negation requires `int`, found ", found, ""),
-        .arithmetic_operand_not_int => |found| try writeTypedMessage(types, writer, "arithmetic requires `int`, found ", found, ""),
         .comparison_operand_not_int => |found| try writeTypedMessage(types, writer, "comparison requires `int`, found ", found, ""),
         .equality_operand_not_supported => |found| try writeTypedMessage(types, writer, "equality is not supported for ", found, ""),
         .equality_operand_type_mismatch => |mismatch| try writeMismatch(types, writer, "equality operand type mismatch: ", mismatch),
@@ -919,34 +841,21 @@ pub fn renderDiagnostic(
     diagnostic: structures.Diagnostic,
 ) !void {
     const file = sourceFor(sources, diagnostic.file_id);
-    const source_path = file.path;
-    const source = file.source;
     const is_note = std.meta.activeTag(diagnostic.kind) == .compile_time_call_trace;
     const label = if (is_note) "\x1b[36mnote:\x1b[0m" else "\x1b[31merror:\x1b[0m";
-    if (diagnostic.span) |span| {
-        const info = lineInfoForOffset(source, span.start);
-        try writer.print("{s} {s}:{d}:{d}: ", .{
-            label,
-            source_path,
-            info.line,
-            info.column,
-        });
-        try writeKindMessage(types, writer, source, diagnostic.span, diagnostic.kind);
-        try writer.writeByte('\n');
-        try writer.writeAll(source[info.line_start..info.line_end]);
-        try writer.writeByte('\n');
-        try writer.splatByteAll(' ', info.column - 1);
-        try writer.writeByte('^');
-        const highlight_len = highlightLen(span, info.line_start, info.line_end);
-        if (highlight_len > 1) try writer.splatByteAll('~', highlight_len - 1);
-        try writer.writeByte('\n');
-        try writeFunctionContext(types, writer, diagnostic.instance);
-        return;
-    }
-
-    try writer.print("{s} {s}: ", .{ label, source_path });
-    try writeKindMessage(types, writer, source, diagnostic.span, diagnostic.kind);
+    const info: ?LineInfo = if (diagnostic.span) |span| lineInfoForOffset(file.source, span.start) else null;
+    try writer.print("{s} {s}:", .{ label, file.path });
+    if (info) |line| try writer.print("{d}:{d}:", .{ line.line, line.column });
+    try writer.writeByte(' ');
+    try writeKindMessage(types, writer, file.source, diagnostic.span, diagnostic.kind);
     try writer.writeByte('\n');
+    if (info) |line| {
+        try writer.print("{s}\n", .{file.source[line.line_start..line.line_end]});
+        try writer.splatByteAll(' ', line.column - 1);
+        try writer.writeByte('^');
+        try writer.splatByteAll('~', highlightLen(diagnostic.span.?, line.line_start, line.line_end) - 1);
+        try writer.writeByte('\n');
+    }
     try writeFunctionContext(types, writer, diagnostic.instance);
 }
 
@@ -968,10 +877,9 @@ pub fn renderDiagnostics(
         if (std.meta.activeTag(diagnostic.kind) == .compile_time_call_trace) continue;
         try renderDiagnostic(types, writer, sources, diagnostic);
     }
-    var index = diagnostics.len;
-    while (index > 0) {
-        index -= 1;
-        const diagnostic = diagnostics[index];
+    // Call traces render from the failure outward.
+    var traces = std.mem.reverseIterator(diagnostics);
+    while (traces.next()) |diagnostic| {
         if (std.meta.activeTag(diagnostic.kind) != .compile_time_call_trace) continue;
         try renderDiagnostic(types, writer, sources, diagnostic);
     }

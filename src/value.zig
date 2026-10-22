@@ -137,9 +137,7 @@ pub fn equal(comptime T: type, a: T, b: T) bool {
             if (a == null or b == null) return a == null and b == null;
             return equal(info.child, a.?, b.?);
         },
-        .array => |info| {
-            for (a, b) |left, right| if (!equal(info.child, left, right)) return false;
-        },
+        .array => |info| return equal([]const info.child, &a, &b),
         .pointer => |info| {
             if (info.size != .slice) @compileError("content equality requires slices, not pointers");
             if (info.child == u8) return std.mem.eql(u8, a, b);

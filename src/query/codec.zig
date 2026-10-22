@@ -11,13 +11,8 @@ pub const Writer = struct {
     }
 
     fn writeInt(self: *Writer, comptime T: type, value: T) !void {
-        const U = @Int(.unsigned, @sizeOf(T) * 8);
         var encoded: [@sizeOf(T)]u8 = undefined;
-        const widened: U = if (@typeInfo(T).int.signedness == .signed)
-            @bitCast(@as(@Int(.signed, @sizeOf(T) * 8), value))
-        else
-            value;
-        std.mem.writeInt(U, &encoded, widened, .little);
+        std.mem.writeInt(StorageInt(T), &encoded, value, .little);
         try self.bytes.appendSlice(self.allocator, &encoded);
     }
 
@@ -75,14 +70,8 @@ pub const Reader = struct {
     }
 
     fn readInt(self: *Reader, comptime T: type) error{InvalidCache}!T {
-        const U = @Int(.unsigned, @sizeOf(T) * 8);
         const bytes: *const [@sizeOf(T)]u8 = @ptrCast(try self.take(@sizeOf(T)));
-        const raw = std.mem.readInt(U, bytes, .little);
-        const result = if (@typeInfo(T).int.signedness == .signed)
-            std.math.cast(T, @as(@Int(.signed, @sizeOf(T) * 8), @bitCast(raw)))
-        else
-            std.math.cast(T, raw);
-        return result orelse error.InvalidCache;
+        return std.math.cast(T, std.mem.readInt(StorageInt(T), bytes, .little)) orelse error.InvalidCache;
     }
 
     pub fn read(self: *Reader, comptime T: type) anyerror!T {
@@ -178,6 +167,12 @@ pub const Reader = struct {
         return self.offset == self.bytes.len;
     }
 };
+
+/// Integers occupy their whole in-memory size; reading rejects values that
+/// overflow the persisted type.
+fn StorageInt(comptime T: type) type {
+    return @Int(@typeInfo(T).int.signedness, @sizeOf(T) * 8);
+}
 
 pub const freeValue = @import("../value.zig").free;
 

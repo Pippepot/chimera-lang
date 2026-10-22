@@ -37,20 +37,16 @@ const RunOutcome = union(enum) {
     rejected,
 };
 
-fn trySetDebugFlag(flags: *DebugFlags, name: []const u8) bool {
-    inline for (@typeInfo(DebugFlags).@"struct".field_names) |field_name| {
-        if (std.mem.eql(u8, name, field_name)) {
-            @field(flags, field_name) = true;
-            return true;
-        }
-    }
-    return false;
-}
-
 fn printError(writer: *std.Io.Writer, comptime format: []const u8, args: anytype) !void {
     try writer.writeAll("\x1b[31merror:\x1b[0m ");
     try writer.print(format, args);
     try writer.writeByte('\n');
+}
+
+fn exitWithError(errors: *std.Io.Writer, comptime format: []const u8, args: anytype) !noreturn {
+    try printError(errors, format, args);
+    try errors.flush();
+    std.process.exit(1);
 }
 
 fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
@@ -62,10 +58,10 @@ fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
 }
 
 const CommandLine = struct {
-    debug_flags: DebugFlags,
-    worker_count: ?usize,
-    disk_cache_enabled: bool,
-    positional: []const []const u8,
+    debug_flags: DebugFlags = .{},
+    worker_count: ?usize = null,
+    disk_cache_enabled: bool = false,
+    positional: []const []const u8 = &.{},
 };
 
 const ParsedCommandLine = union(enum) {
@@ -74,36 +70,39 @@ const ParsedCommandLine = union(enum) {
 };
 
 fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?ParsedCommandLine {
-    var flags: DebugFlags = .{};
-    var worker_count: ?usize = null;
-    var disk_cache_enabled = false;
+    var command_line: CommandLine = .{};
     var valid = true;
     var index: usize = 0;
     while (index < args.len) : (index += 1) {
         if (std.mem.eql(u8, args[index], "-h") or std.mem.eql(u8, args[index], "--help")) {
-            if (!valid) return null;
-            return .help;
+            return if (valid) .help else null;
         } else if (std.mem.startsWith(u8, args[index], "--debug=")) {
             var names = std.mem.splitScalar(u8, args[index]["--debug=".len..], ',');
             while (names.next()) |name| {
-                if (trySetDebugFlag(&flags, name)) continue;
-                try printError(errors, "unknown debug flag '{s}'", .{name});
-                valid = false;
+                const flag = std.meta.stringToEnum(std.meta.FieldEnum(DebugFlags), name) orelse {
+                    try printError(errors, "unknown debug flag '{s}'", .{name});
+                    valid = false;
+                    continue;
+                };
+                switch (flag) {
+                    inline else => |field| @field(command_line.debug_flags, @tagName(field)) = true,
+                }
             }
         } else if (std.mem.startsWith(u8, args[index], "--workers=")) {
-            worker_count = std.fmt.parseUnsigned(usize, args[index]["--workers=".len..], 10) catch null;
-            if (worker_count == null or worker_count.? > 64) {
+            command_line.worker_count = std.fmt.parseUnsigned(usize, args[index]["--workers=".len..], 10) catch null;
+            if (command_line.worker_count == null or command_line.worker_count.? > 64) {
                 try printError(errors, "worker count must be between 0 and 64", .{});
                 valid = false;
             }
         } else if (std.mem.eql(u8, args[index], "--disk-cache")) {
-            disk_cache_enabled = true;
+            command_line.disk_cache_enabled = true;
         } else {
             break;
         }
     }
     if (!valid or index == args.len) return null;
-    return .{ .run = .{ .debug_flags = flags, .worker_count = worker_count, .disk_cache_enabled = disk_cache_enabled, .positional = args[index..] } };
+    command_line.positional = args[index..];
+    return .{ .run = command_line };
 }
 
 fn buildWithStageTimings(db: *query.Database, io: std.Io, timings: *diagnostics.TimingLog) !void {
@@ -217,26 +216,22 @@ fn compileAndRun(
     defer gpa.free(compiler_controls);
     timings.mark(io, "collect diagnostics");
 
+    // Display paths and their list live until diagnostics and debug output finish.
+    var render_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer render_arena.deinit();
+    const render_allocator = render_arena.allocator();
     var render_sources: std.ArrayList(diagnostics.DiagnosticSource) = .empty;
-    defer {
-        for (render_sources.items, 0..) |source, index| {
-            if (index != 0 and index <= input.source_files.len) gpa.free(source.path);
-        }
-        render_sources.deinit(gpa);
-    }
-    try render_sources.append(gpa, .{ .file_id = file_id, .path = input.source_path, .source = input.source });
-    for (input.source_files) |file| {
-        const path = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(input.source_path) orelse ".", file.path });
-        errdefer gpa.free(path);
-        try render_sources.append(gpa, .{ .file_id = source_registry.fileId(file.path).?, .path = path, .source = file.source });
-    }
-    for (modules.standard_sources) |source| {
-        try render_sources.append(gpa, .{
-            .file_id = source_registry.fileId(source.registry_path).?,
-            .path = source.display_path,
-            .source = source.source,
-        });
-    }
+    try render_sources.append(render_allocator, .{ .file_id = file_id, .path = input.source_path, .source = input.source });
+    for (input.source_files) |file| try render_sources.append(render_allocator, .{
+        .file_id = source_registry.fileId(file.path).?,
+        .path = try std.fs.path.join(render_allocator, &.{ std.fs.path.dirname(input.source_path) orelse ".", file.path }),
+        .source = file.source,
+    });
+    for (modules.standard_sources) |source| try render_sources.append(render_allocator, .{
+        .file_id = source_registry.fileId(source.registry_path).?,
+        .path = source.display_path,
+        .source = source.source,
+    });
     if (input.debug_flags.ast) {
         for (render_sources.items) |source| {
             if ((try db.get(queries.ParseFile, source.file_id)).*) |parsed| {
@@ -246,12 +241,7 @@ fn compileAndRun(
         }
     }
     if (executable_result.* == null) {
-        if (compiler_controls.len != 0) {
-            const status = switch (compiler_controls[0]) {
-                .exit => |value| value,
-            };
-            return .{ .compiler_exit = @truncate(@as(u32, @bitCast(status))) };
-        }
+        if (compiler_controls.len != 0) return .{ .compiler_exit = @truncate(@as(u32, @bitCast(compiler_controls[0].exit))) };
         std.debug.assert(emitted.len != 0);
         try output.flush();
         timings.mark(io, "debug output");
@@ -326,36 +316,19 @@ pub fn main(init: std.process.Init) !void {
 
     const started = std.Io.Clock.awake.now(io);
     const source_path = command_line.positional[0];
-    const source = std.Io.Dir.cwd().readFileAlloc(
-        io,
-        source_path,
-        gpa,
-        .limited(std.math.maxInt(usize)),
-    ) catch |read_error| {
-        try printError(errors, "failed to read '{s}': {s}", .{ source_path, @errorName(read_error) });
-        try errors.flush();
-        std.process.exit(1);
-    };
+    const source = std.Io.Dir.cwd().readFileAlloc(io, source_path, gpa, .limited(std.math.maxInt(usize))) catch |read_error|
+        try exitWithError(errors, "failed to read '{s}': {s}", .{ source_path, @errorName(read_error) });
     defer gpa.free(source);
 
     const entry_dir_path = std.fs.path.dirname(source_path) orelse ".";
     const entry_name = std.fs.path.basename(source_path);
-    var entry_dir = std.Io.Dir.cwd().openDir(io, entry_dir_path, .{ .iterate = true }) catch |dir_error| {
-        try printError(errors, "failed to open '{s}': {s}", .{ entry_dir_path, @errorName(dir_error) });
-        try errors.flush();
-        std.process.exit(1);
-    };
+    var entry_dir = std.Io.Dir.cwd().openDir(io, entry_dir_path, .{ .iterate = true }) catch |dir_error|
+        try exitWithError(errors, "failed to open '{s}': {s}", .{ entry_dir_path, @errorName(dir_error) });
     defer entry_dir.close(io);
-    const catalog = modules.collectModuleFiles(arena, io, entry_dir, entry_name) catch |walk_error| {
-        try printError(errors, "failed to list '{s}': {s}", .{ entry_dir_path, @errorName(walk_error) });
-        try errors.flush();
-        std.process.exit(1);
-    };
-    const source_files = modules.readSources(io, arena, entry_dir, catalog.files) catch |read_error| {
-        try printError(errors, "failed to read sources under '{s}': {s}", .{ entry_dir_path, @errorName(read_error) });
-        try errors.flush();
-        std.process.exit(1);
-    };
+    const catalog = modules.collectModuleFiles(arena, io, entry_dir, entry_name) catch |walk_error|
+        try exitWithError(errors, "failed to list '{s}': {s}", .{ entry_dir_path, @errorName(walk_error) });
+    const source_files = modules.readSources(io, arena, entry_dir, catalog.files) catch |read_error|
+        try exitWithError(errors, "failed to read sources under '{s}': {s}", .{ entry_dir_path, @errorName(read_error) });
     const cache_directory = if (command_line.disk_cache_enabled)
         try std.fs.path.join(arena, &.{ entry_dir_path, ".chi-cache" })
     else

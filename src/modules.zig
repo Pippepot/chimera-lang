@@ -64,15 +64,8 @@ pub fn modulePath(gpa: std.mem.Allocator, dir_path: []const u8) ![]u8 {
 }
 
 fn isModuleSegment(name: []const u8) bool {
-    if (name.len == 0 or structures.Token.getKeyword(name) != null) return false;
-    for (name, 0..) |c, i| {
-        const valid = switch (c) {
-            'a'...'z', 'A'...'Z', '_' => true,
-            '0'...'9' => i != 0,
-            else => false,
-        };
-        if (!valid) return false;
-    }
+    if (name.len == 0 or std.ascii.isDigit(name[0]) or structures.Token.getKeyword(name) != null) return false;
+    for (name) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
     return true;
 }
 
@@ -86,10 +79,7 @@ pub fn collectModuleFiles(
     defer walker.deinit();
     var files: std.ArrayList(DiscoveredFile) = .empty;
     errdefer {
-        for (files.items) |file| {
-            gpa.free(file.path);
-            gpa.free(file.module_path);
-        }
+        for (files.items) |*file| value_operations.free(DiscoveredFile, gpa, file);
         files.deinit(gpa);
     }
     var modules: std.ArrayList([]u8) = .empty;
@@ -114,8 +104,7 @@ pub fn collectModuleFiles(
         if (std.mem.eql(u8, entry.path, entry_name)) continue;
         const path = try gpa.dupe(u8, entry.path);
         errdefer gpa.free(path);
-        const dir_path = std.fs.path.dirname(entry.path) orelse "";
-        const module_path = try modulePath(gpa, dir_path);
+        const module_path = try modulePath(gpa, std.fs.path.dirname(entry.path) orelse "");
         errdefer gpa.free(module_path);
         try files.append(gpa, .{ .path = path, .module_path = module_path });
     }
@@ -192,10 +181,10 @@ pub const SourceRegistry = struct {
         }
         try current.put(gpa, entry_module, .empty);
         try current.getPtr(entry_module).?.append(gpa, 0);
+        // Catalogued directories are modules even without member files.
         for (module_paths) |path| {
             const module = try db.intern(queries.ModulePaths, .{ .path = path });
-            const slot = try current.getOrPut(gpa, module);
-            if (!slot.found_existing) slot.value_ptr.* = .empty;
+            _ = try current.getOrPutValue(gpa, module, .empty);
         }
         for (files) |file| try self.registerFile(db, gpa, &current, file);
         for (standard_sources, 0..) |file, index| {
@@ -248,9 +237,8 @@ pub const SourceRegistry = struct {
         try putInput(db, queries.SourceText, id, file.source);
         try putInput(db, queries.SourcePath, id, file.path);
         try putInput(db, queries.FileModule, id, module);
-        const slot = try current.getOrPut(gpa, module);
-        if (!slot.found_existing) slot.value_ptr.* = .empty;
-        try slot.value_ptr.append(gpa, id);
+        const members = try current.getOrPutValue(gpa, module, .empty);
+        try members.value_ptr.append(gpa, id);
     }
 };
 

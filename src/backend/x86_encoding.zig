@@ -177,24 +177,16 @@ const forms = blk: {
     break :blk result;
 };
 
+/// Every encodable form, each operation's forms in order full, small, zero.
 pub const patterns = blk: {
-    var count = forms.len;
-    for (forms) |form| count += @as(usize, @intFromBool(form.small != null)) + @intFromBool(form.zero != null);
-    var result: [count]Encoding = undefined;
-    var index: usize = 0;
-    for (forms) |form| {
-        result[index] = form.full;
-        index += 1;
-        if (form.small) |small| {
-            result[index] = small;
-            index += 1;
-        }
-        if (form.zero) |zero| {
-            result[index] = zero;
-            index += 1;
-        }
-    }
-    break :blk result;
+    var result: [3 * forms.len]Encoding = undefined;
+    var count: usize = 0;
+    for (forms) |form| for ([_]?Encoding{ form.full, form.small, form.zero }) |maybe_pattern| if (maybe_pattern) |pattern| {
+        result[count] = pattern;
+        count += 1;
+    };
+    const used = result[0..count].*;
+    break :blk used;
 };
 
 pub fn encoding(operation: Operation) Encoding {
