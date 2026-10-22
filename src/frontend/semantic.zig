@@ -38,6 +38,7 @@ pub const UnresolvedBody = struct {
     assignment_fields: []FieldName = &.{},
     binding_patterns: []BindingPattern = &.{},
     binding_pattern_children: []u32 = &.{},
+    match_arms: []MatchArm = &.{},
     root_block: BlockId,
 
     pub const ValueId = enum(u32) { _ };
@@ -89,6 +90,12 @@ pub const UnresolvedBody = struct {
         pub const Sequence = struct { children: structures.FunctionValueRange, storage: LocalId, storage_read: ValueId };
     };
     pub const PatternBinding = struct { pattern: u32, value: ValueId, span: structures.SourceSpan };
+    pub const MatchArm = struct {
+        pattern: union(enum) { any, type: structures.TypeId, literal: ValueUse },
+        binding: ?ConditionBinding,
+        body: BlockId,
+        span: structures.SourceSpan,
+    };
     pub const Statement = union(enum) {
         discard: ValueUse,
         lifetime_extend: ValueUse,
@@ -210,6 +217,12 @@ pub const UnresolvedBody = struct {
                 condition: ConditionId,
                 then_block: BlockId,
                 else_block: BlockId,
+            },
+            match: struct {
+                subject: ValueUse,
+                carrier: LocalId,
+                read: ValueId,
+                arms: structures.FunctionValueRange,
             },
             loop: BlockId,
             scope: BlockId,
@@ -340,6 +353,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         assignment_fields: std.ArrayList(UnresolvedBody.FieldName) = .empty,
         binding_patterns: std.ArrayList(UnresolvedBody.BindingPattern) = .empty,
         binding_pattern_children: std.ArrayList(u32) = .empty,
+        match_arms: std.ArrayList(UnresolvedBody.MatchArm) = .empty,
         loop_depth: u32 = 0,
         can_return: bool = false,
         returns_type: bool = false,
@@ -895,6 +909,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => return self.appendAssignment(index),
                 .as => return self.appendExtraction(index),
                 .@"if", .if_else => return self.appendIf(index, result_is_type),
+                .match_expr => return self.appendMatch(index, result_is_type),
                 .loop => return self.appendLoop(index, result_is_type),
                 .for_loop => return self.appendFor(index),
                 .static_binding, .namespace_declaration => return self.reject(index, .nested_declaration_not_supported),
@@ -1422,6 +1437,62 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
 
             try self.declare(name, .{ .place = .{ .id = local, .mutable = node.tag == .ref_binding } });
             return condition;
+        }
+
+        fn appendMatch(self: *Self, index: structures.Node.Index, result_is_type: bool) !ValueId {
+            const parts = self.ast.nodeList(index);
+            std.debug.assert(parts.len >= 2);
+            const subject = try self.appendUse(parts[0], false);
+            const carrier = self.newLocal();
+            const read = try self.appendExpression(index, .{ .local_read = carrier });
+            var arms: std.ArrayList(UnresolvedBody.MatchArm) = .empty;
+            defer arms.deinit(self.gpa);
+            const scope = self.local_names.items.len;
+            defer self.restoreScope(scope);
+            for (parts[1..]) |arm_index| {
+                const arm = self.ast.nodes[arm_index.index()];
+                var pattern_index = arm.data.node_node.a;
+                var capture_index: ?structures.Node.Index = null;
+                if (self.ast.nodes[pattern_index.index()].tag == .match_capture) {
+                    const capture = self.ast.nodes[pattern_index.index()];
+                    pattern_index = capture.data.node_node.a;
+                    capture_index = capture.data.node_node.b;
+                }
+                const pattern = self.ast.nodes[pattern_index.index()];
+                if (pattern.tag == .param and capture_index == null) capture_index = pattern_index;
+                const pattern_test: @FieldType(UnresolvedBody.MatchArm, "pattern") = switch (pattern.tag) {
+                    .param => .any,
+                    .match_type => .{ .type = try self.bindingType(pattern.data.node) },
+                    else => .{ .literal = try self.appendUse(pattern_index, false) },
+                };
+                var binding: ?UnresolvedBody.ConditionBinding = null;
+                if (capture_index) |capture_node| {
+                    const capture = self.ast.nodes[capture_node.index()];
+                    const name = tokenText(self.ast, self.source, capture.token_index);
+                    if (!std.mem.eql(u8, name, "_")) {
+                        if (try self.nameIsVisible(name)) return self.reject(capture_node, .duplicate_local_binding);
+                        const local = self.newLocal();
+                        const reference = capture.data.node_node.a != .null and self.ast.tokens[self.ast.nodes[capture.data.node_node.a.index()].token_index].tag == .keyword_ref;
+                        binding = .{ .local = local, .annotation_type = null, .span = tokenSpan(self.ast, capture.token_index), .mode = if (reference) .reference else .owned };
+                        try self.declare(name, .{ .place = .{ .id = local, .mutable = reference } });
+                    }
+                }
+                try arms.append(self.gpa, .{
+                    .pattern = pattern_test,
+                    .binding = binding,
+                    .body = try self.buildBranch(arm.data.node_node.b, result_is_type),
+                    .span = nodeFocusSpan(self.ast, arm_index),
+                });
+                self.restoreScope(scope);
+            }
+            const start: u32 = @intCast(self.match_arms.items.len);
+            try self.match_arms.appendSlice(self.gpa, arms.items);
+            return self.appendExpression(index, .{ .match = .{
+                .subject = subject,
+                .carrier = carrier,
+                .read = read,
+                .arms = .{ .start = start, .end = @intCast(self.match_arms.items.len) },
+            } });
         }
 
         fn appendPatternExtraction(self: *Self, index: structures.Node.Index) !ValueId {

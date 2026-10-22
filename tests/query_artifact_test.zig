@@ -282,7 +282,7 @@ test "truncated std indexes release installation state and permit retry" {
     try std.testing.expectEqual(@as(usize, 0), loader.stats().functions);
 }
 
-test "portable artifacts recompute variant tags when canonical member order changes" {
+test "portable artifacts recompute conditional and match tags when canonical member order changes" {
     const allocator = std.testing.allocator;
     const library: modules.SourceFile = .{ .path = "lib/choice.chi", .module_path = "lib", .source =
         \\pub struct A
@@ -294,8 +294,12 @@ test "portable artifacts recompute variant tags when canonical member order chan
         \\pub func answer(choice: A | B) int
         \\    if const selected = choice as A -> return selected.value
         \\    return 0
+        \\pub func match_answer(choice: A | B) int
+        \\    return match choice
+        \\        is B as selected -> selected.value
+        \\        is A -> 0
     };
-    const entry = "import lib\nexit(lib.answer(lib.A{value = 42}))";
+    const entry = "import lib\nexit(lib.answer(lib.A{value = 19}) + lib.match_answer(lib.B{value = 23}))";
     const first = try sources.SourceFixture.initFiles(entry, &.{library});
     defer first.deinit();
     try first.expectExit(0, 42);

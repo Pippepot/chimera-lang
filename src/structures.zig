@@ -285,6 +285,10 @@ pub const Node = struct {
         collection_for,
         collection_if,
         tuple_literal,
+        match_expr,
+        match_arm,
+        match_type,
+        match_capture,
         _,
     };
 
@@ -313,11 +317,11 @@ pub const Node = struct {
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .fail_expr, .access, .implicit_static, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
-            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .reference_type, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread => .node,
-            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .func, .param, .type_func, .@"if", .collection_if => .node_node,
+            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .reference_type, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread, .match_type => .node,
+            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .func, .param, .type_func, .@"if", .collection_if, .match_arm, .match_capture => .node_node,
             .struct_field => .field,
             .signature => .signature,
-            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .binding_tuple, .binding_sequence, .import, .selective_import, .overload => .ref,
+            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .binding_tuple, .binding_sequence, .import, .selective_import, .overload, .match_expr => .ref,
             else => null,
         };
     }
@@ -1737,6 +1741,13 @@ pub const Diagnostic = struct {
         invalid_expression: Token.Tag,
         unsupported_syntax: Token.Tag,
         unexpected_indented_block,
+        match_multiple_captures,
+        match_capture_must_be_immutable,
+        match_requires_arm,
+        match_redundant_arm,
+        match_not_exhaustive: TypeId,
+        match_pattern_incompatible: TypeMismatch,
+        match_literal_ambiguous: TypeId,
         indented_block_after_inline_body,
         duplicate_top_level_declaration,
         declaration_cycle,

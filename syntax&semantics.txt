@@ -2111,9 +2111,36 @@ const maybe: int | unit = if 1 < 2 -> 1
 # Bare identifier: match anything and bind it immutably in the arm.
 # 'pattern as name': also bind the complete value matched by the pattern.
 # 'is Type': type pattern, distinct from an identifier binding.
+# Captures own immutable values like const bindings: an existing place supplies
+# a copy, while a fresh or explicitly transferred owner supplies ownership.
+# `ref name` and `pattern as ref name` instead alias the matched place under
+# ordinary permission and lifetime rules. There is one capture per matched
+# value: `x as y` and chained `as` captures are errors. Further copies or aliases
+# are explicit ordinary bindings in the arm body. `as _` binds nothing.
+# Capturing a whole variant preserves its stored alternatives; owning logical
+# type extraction copies a selected reference referent, never consumes it.
+# A type capture has the pattern's structural intersection with the original
+# subject type, not a residual type after preceding arms. Reference capture
+# cannot alias a subset variant with a different layout.
+# The subject evaluates once without an arm-result expected type. Tests inspect
+# without consuming on mismatch. The first matching arm runs; body failure
+# propagates rather than trying another arm. Subject failure runs no arm, and
+# a none pattern matches successful none data, not an earlier failure.
+# Literal patterns use built-in value equality, not user equality or arbitrary
+# converters. Supported domains are int, byte, bool, unit, none, compile-time
+# integer literals, and registered String/StaticString/StringView text. A literal
+# selects one compatible logical type; int wins over byte as in construction.
+# Other multiple compatible types are ambiguous. Text compares decoded UTF-8
+# bytes including NUL, without copying the subject. Byte literals require 0..255.
+# Coverage uses the typed domain and prior patterns, independently of constant
+# folding. Bool, byte, unit, and none have finite domains. Integer and text
+# literal lists require a catch-all or type pattern for the remaining values.
 # Every match must be exhaustive; a fully covered arm is an error.
 # Arm values join like conditional branches. Pattern bindings do not refine
 # the original value's binding.
+# Ordinary transfer, explicit-drop, reference escape, and ASAP cleanup rules
+# apply on every selected arm and nonlocal exit; cleanup is not delayed to the
+# lexical end of an arm. Failed tests retain the subject for subsequent arms.
 match n
     2 -> 3
     10 as x ->

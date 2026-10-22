@@ -1541,6 +1541,24 @@ pub fn AnalysisContext(comptime Context: type) type {
             return (try self.ctx.get(TextType, .StaticString)).* orelse error.Unavailable;
         }
 
+        pub fn isMatchTextType(self: @This(), type_id: structures.TypeId) !bool {
+            inline for (std.meta.tags(TextType.Name)) |name| {
+                const text_type = (try self.ctx.get(TextType, name)).* orelse return error.Unavailable;
+                if (type_id == text_type) return true;
+            }
+            return false;
+        }
+
+        pub fn matchTextFunction(self: @This(), type_id: structures.TypeId) !structures.InstanceId {
+            const item = (try standardFunction(self.ctx, .text, "match_literal")) orelse return error.Unavailable;
+            const argument = try self.internCompileTimeValue(.{ .type = type_id });
+            return self.specializeFunction(.{ .item = item }, &.{argument});
+        }
+
+        pub fn byteIntFunction(self: @This()) !structures.InstanceId {
+            return .{ .item = (try standardFunction(self.ctx, .text, "byte_int")) orelse return error.Unavailable };
+        }
+
         pub fn isStaticString(self: @This(), type_id: structures.TypeId) !bool {
             return self.facts().isStaticString(type_id);
         }

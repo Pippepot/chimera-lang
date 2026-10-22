@@ -390,13 +390,16 @@ Run the List mutation and consuming traversal suite with
 Run the focused overload suite with
 `zig build test --seed=0 -Dtest-source=tests/overload_test.zig`.
 
+Run the match syntax, coverage, capture, ownership, and native/compile-time parity
+suite with `zig build test --seed=0 -Dtest-source=tests/match_test.zig`.
+
 These entrypoints supply required module imports. Both suite modes run inline
-tests once through `test_sources.zig` and sixteen standalone suites (seventeen default
+tests once through `test_sources.zig` and seventeen standalone suites (eighteen default
 roots total): `tests/array_test.zig`, `tests/collection_test.zig`, `tests/converter_test.zig`, `tests/codegen_test.zig`,
 `tests/comptime_interpreter_test.zig`, `tests/modules_test.zig`, `tests/overload_test.zig`,
 `tests/query_disk_cache_test.zig`, `tests/query_artifact_test.zig`, `tests/query_test.zig`, `tests/reference_test.zig`,
 `tests/text_test.zig`, `tests/panic_test.zig`, `tests/iteration_test.zig`,
-`tests/list_test.zig`, and `tests/tuple_test.zig`.
+`tests/list_test.zig`, `tests/tuple_test.zig`, and `tests/match_test.zig`.
 Each runs in its own binary's directory.
 Run portable artifact remapping and std reuse checks with
 `zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/query_artifact_test.zig`.
@@ -415,7 +418,7 @@ caches compilation but reruns tests. The `safe` mode speeds up allocation checks
 with a slower first compile.
 
 For quick test iteration, omit `-Doptimize=safe` and select the affected
-suite with `-Dtest-source`. The full suite builds sixteen separate test binaries;
+suite with `-Dtest-source`. The full suite builds eighteen separate test binaries;
 its compilation cost is different from building the CLI once.
 
 Use focused checks during edits; run the routine suite once for changes spanning

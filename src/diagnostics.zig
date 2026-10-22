@@ -627,6 +627,22 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         },
         .invalid_expression => |tag| try writeTokenMessage(writer, "expected an expression, found ", tag, ""),
         .unsupported_syntax => |tag| try writeTokenMessage(writer, "", tag, " syntax is not implemented yet"),
+        .match_multiple_captures => try writer.writeAll("a match pattern may bind its value only once; add further bindings in the arm body"),
+        .match_capture_must_be_immutable => try writer.writeAll("a match capture must use `const` or `ref`, not `var`"),
+        .match_requires_arm => try writer.writeAll("a match requires at least one arm"),
+        .match_redundant_arm => try writer.writeAll("this match arm is fully covered by preceding arms"),
+        .match_not_exhaustive => |type_id| {
+            try writer.writeAll("match is not exhaustive; uncovered values remain in ");
+            try writeType(types, writer, type_id);
+        },
+        .match_pattern_incompatible => |mismatch| {
+            try writer.writeAll("match pattern is incompatible with the subject: ");
+            try writeTypePair(types, writer, "expected ", mismatch.expected, ", found ", mismatch.found);
+        },
+        .match_literal_ambiguous => |type_id| {
+            try writer.writeAll("literal pattern has more than one matching type in ");
+            try writeType(types, writer, type_id);
+        },
         .unexpected_indented_block => try writer.writeAll("unexpected indented block; the previous expression does not introduce a block"),
         .indented_block_after_inline_body => try writer.writeAll("indented block cannot follow an inline function body; `->` starts the body, and the return type goes before it"),
         .duplicate_top_level_declaration => try writeSourceLabel(writer, "top-level name is already declared", source, span),

@@ -40,6 +40,7 @@ const ParserState = struct {
     /// Parsing stops at its first error.
     failure: ?ParseDiagnostic = null,
     continuation_dedents: std.DynamicBitSetUnmanaged,
+    match_arm_header: ?u32 = null,
 
     pub fn deinit(self: *@This()) void {
         self.gpa.free(self.tokens);
@@ -191,9 +192,7 @@ const ParserState = struct {
 
     pub fn fail(self: *@This(), kind: structures.Diagnostic.Kind) error{ParseError} {
         std.debug.assert(self.failure == null);
-        const tag = self.current().tag;
-        const diagnostic = if (tag == .keyword_match) structures.Diagnostic.Kind{ .unsupported_syntax = tag } else kind;
-        self.failure = .{ .kind = diagnostic, .token_index = self.index };
+        self.failure = .{ .kind = kind, .token_index = self.index };
         return error.ParseError;
     }
 
@@ -201,6 +200,16 @@ const ParserState = struct {
     pub fn currentStartsLine(self: *@This()) bool {
         const previous_end = self.tokens[self.index - 1].loc.end;
         return std.mem.indexOfScalar(u8, self.source[previous_end..self.current().loc.start], '\n') != null;
+    }
+
+    fn atMatchArmBoundary(self: *@This()) bool {
+        const header = self.match_arm_header orelse return false;
+        const token = self.current();
+        if (self.lineIndent(self.index) > self.lineIndent(header)) return false;
+        var previous = self.index;
+        while (previous != 0 and (self.tokens[previous - 1].tag == .indent or self.tokens[previous - 1].tag == .dedent)) previous -= 1;
+        if (previous == 0) return false;
+        return std.mem.indexOfScalar(u8, self.source[self.tokens[previous - 1].loc.end..token.loc.start], '\n') != null;
     }
 };
 
@@ -359,6 +368,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_false,
         .keyword_none,
         .keyword_if,
+        .keyword_match,
         .keyword_loop,
         .keyword_for,
         .keyword_sizeof,
@@ -630,6 +640,92 @@ fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
     return try parser.addNode(.{ .tag = .@"if", .token_index = token_index, .data = .{ .node_node = .{ .a = condition, .b = then_body } } });
 }
 
+fn parseMatchExpr(parser: *ParserState) ParseError!Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_match);
+    const subject = try parseRequiredExpression(parser);
+    const indent = try parser.expectBodyIndent(token_index);
+    const stack_top = parser.scratch_stack.items.len;
+    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
+    try parser.scratch_stack.append(parser.gpa, subject);
+    while (parser.eat(.dedent) == null and parser.current().tag != .eof) {
+        if (closesIndentedBody(parser, indent)) break;
+        const arm_index = parser.index;
+        const pattern = try parseMatchPattern(parser);
+        _ = try parser.expect(.arrow);
+        const body = try parseMatchArmBody(parser, arm_index);
+        try parser.scratch_stack.append(parser.gpa, try parser.addNode(.{
+            .tag = .match_arm,
+            .token_index = arm_index,
+            .data = .{ .node_node = .{ .a = pattern, .b = body } },
+        }));
+    }
+    if (parser.scratch_stack.items.len == stack_top + 1) return parser.fail(.match_requires_arm);
+    return parser.addNode(.{ .tag = .match_expr, .token_index = token_index, .data = try parser.listToSpan(parser.scratch_stack.items[stack_top..]) });
+}
+
+fn parseMatchArmBody(parser: *ParserState, header: u32) ParseError!Node.Index {
+    const parent = parser.match_arm_header;
+    parser.match_arm_header = header;
+    defer parser.match_arm_header = parent;
+    if (parser.current().tag == .indent) return parseBlock(parser, try parser.expectBodyIndent(header));
+    if (parser.atMatchArmBoundary()) return parser.fail(.{ .invalid_expression = parser.current().tag });
+    return parseRequiredExpression(parser);
+}
+
+fn parseMatchCapture(parser: *ParserState) ParseError!Node.Index {
+    const mode_index = parser.index;
+    const mode = parser.eatAny(&.{ .keyword_const, .keyword_ref, .keyword_var });
+    if (mode != null and mode.?.tag == .keyword_var) return parser.fail(.match_capture_must_be_immutable);
+    const access = if (mode != null)
+        try parser.addNode(.{ .tag = .access, .token_index = mode_index, .data = .{ .none = {} } })
+    else
+        Node.Index.null;
+    const name_index = parser.index;
+    _ = try parser.expect(.identifier);
+    return parser.addNode(.{ .tag = .param, .token_index = name_index, .data = .{ .node_node = .{ .a = access, .b = .null } } });
+}
+
+fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
+    const token_index = parser.index;
+    var pattern = switch (parser.current().tag) {
+        .keyword_is => type_pattern: {
+            parser.index += 1;
+            break :type_pattern try parser.addNode(.{ .tag = .match_type, .token_index = token_index, .data = .{ .node = try parseType(parser) } });
+        },
+        .identifier, .keyword_const, .keyword_ref, .keyword_var => try parseMatchCapture(parser),
+        .number_literal => try parseTokenNode(parser, .number_literal, .number_literal),
+        .string_literal => try parseTokenNode(parser, .string_literal, .string_literal),
+        .keyword_true, .keyword_false => literal: {
+            parser.index += 1;
+            break :literal try parser.addNode(.{ .tag = .bool_literal, .token_index = token_index, .data = .{ .none = {} } });
+        },
+        .keyword_none => try parseTokenNode(parser, .keyword_none, .none_literal),
+        .minus => negative: {
+            parser.index += 1;
+            const number = try parseTokenNode(parser, .number_literal, .number_literal);
+            break :negative try parser.addNode(.{ .tag = .neg, .token_index = token_index, .data = .{ .node = number } });
+        },
+        .l_paren => unit: {
+            parser.index += 1;
+            _ = try parser.expect(.r_paren);
+            break :unit try parser.addNode(.{ .tag = .unit_literal, .token_index = token_index, .data = .{ .none = {} } });
+        },
+        else => return parser.fail(.{ .invalid_expression = parser.current().tag }),
+    };
+    if (parser.eat(.keyword_as) != null) {
+        const capture = try parseMatchCapture(parser);
+        if (parser.nodes.items[pattern.index()].tag == .param) {
+            const token = parser.tokens[parser.nodes.items[pattern.index()].token_index];
+            if (!std.mem.eql(u8, parser.source[token.loc.start..token.loc.end], "_"))
+                return parser.fail(.match_multiple_captures);
+        }
+        pattern = try parser.addNode(.{ .tag = .match_capture, .token_index = token_index, .data = .{ .node_node = .{ .a = pattern, .b = capture } } });
+    }
+    if (parser.current().tag == .keyword_as) return parser.fail(.match_multiple_captures);
+    return pattern;
+}
+
 fn parseFunction(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
     const external = parser.eat(.keyword_extern) != null;
@@ -849,6 +945,7 @@ fn parseExpressionPrecedence(parser: *ParserState, min_precedence: u8) ParseErro
         try parseUnary(parser);
 
     while (binaryOpInfo(parser.current().tag)) |op_info| {
+        if (parser.atMatchArmBoundary()) break;
         if (op_info.precedence < min_precedence) break;
         if (op_info.tag == .range) {
             lhs = try parseRange(parser, lhs);
@@ -864,7 +961,7 @@ fn parseExpressionPrecedence(parser: *ParserState, min_precedence: u8) ParseErro
         lhs = try parser.addNode(.{ .tag = op_info.tag, .token_index = operator_index, .data = .{ .node_node = .{ .a = lhs, .b = rhs } } });
     }
 
-    if (min_precedence == 0 and parser.current().tag == .pipe) return parseVariantMembers(parser, token_index, lhs, false);
+    if (min_precedence == 0 and parser.current().tag == .pipe and !parser.atMatchArmBoundary()) return parseVariantMembers(parser, token_index, lhs, false);
     return lhs;
 }
 
@@ -925,6 +1022,7 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
     var lhs = try parsePrimary(parser);
 
     while (true) {
+        if (parser.atMatchArmBoundary()) break;
         switch (parser.current().tag) {
             .l_paren => lhs = try parseCall(parser, lhs),
             .question_mark => lhs = if (parser.tokens[parser.index + 1].tag == .l_paren)
@@ -967,6 +1065,7 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
         .keyword_panic => try parsePanic(parser),
         .keyword_ref => try parseReferenceType(parser),
         .keyword_if => try parseIfExpr(parser),
+        .keyword_match => try parseMatchExpr(parser),
         .keyword_loop => try parseKeywordBody(parser, .keyword_loop, .loop),
         .keyword_for => try parseFor(parser),
         .keyword_comptime => try parseKeywordBody(parser, .keyword_comptime, .comptime_expr),

@@ -8,6 +8,76 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "match snapshots recompute coverage captures and ownership capabilities" {
+    const source =
+        \\struct Item
+        \\    copy = trivial
+        \\    value: int
+        \\func run() int
+        \\    const owner: Item | none = Item{value = 42}
+        \\    return match owner
+        \\        none -> 90
+        \\        is Item as selected -> selected.value
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const missing = try std.mem.replaceOwned(u8, std.testing.allocator, source, "        none -> 90\n", "");
+    defer std.testing.allocator.free(missing);
+    try fixture.db.setInput(queries.SourceText, 0, missing);
+    try fixture.expectDiagnostic(.match_not_exhaustive);
+    const redundant = try std.mem.replaceOwned(u8, std.testing.allocator, source, "        none -> 90\n", "        none -> 90\n        none -> 91\n");
+    defer std.testing.allocator.free(redundant);
+    try fixture.db.setInput(queries.SourceText, 0, redundant);
+    try fixture.expectDiagnostic(.match_redundant_arm);
+    const copyless = try std.mem.replaceOwned(u8, std.testing.allocator, source, "copy = trivial", "copy = none");
+    defer std.testing.allocator.free(copyless);
+    try fixture.db.setInput(queries.SourceText, 0, copyless);
+    try fixture.expectDiagnostic(.type_not_copyable);
+    const borrowed = try std.mem.replaceOwned(u8, std.testing.allocator, copyless, "as selected", "as ref selected");
+    defer std.testing.allocator.free(borrowed);
+    try fixture.db.setInput(queries.SourceText, 0, borrowed);
+    try fixture.expectExit(42);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "match snapshots preserve cleanup and reference-valued result joins" {
+    const declarations =
+        \\struct Tracked
+        \\    copy = none
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Tracked) -> self.trace.value += 1
+        \\func produce(ref trace: int) Tracked | none -> Tracked{trace = Ref.from(trace)}
+        \\func select(ref owner: int, flag: bool) ref int
+        \\    return match flag
+        \\        true -> owner
+        \\        false -> owner
+        \\func run() int
+        \\    var trace = 0
+        \\    const result = match produce(trace)
+        \\        none -> 90
+        \\        is Tracked -> 41
+        \\    ref selected = select(trace, true)
+        \\    selected += result
+        \\    return trace
+    ;
+    for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)" }) |entry| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "{s}\n{s}", .{ declarations, entry });
+        defer std.testing.allocator.free(source);
+        const fixture = try Fixture.restore(source);
+        defer fixture.db.deinit();
+        try fixture.expectExit(42);
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "self.trace.value += 1", "self.trace.value += 2");
+        defer std.testing.allocator.free(changed);
+        try fixture.db.setInput(queries.SourceText, 0, changed);
+        try fixture.expectExit(43);
+        try fixture.db.setInput(queries.SourceText, 0, source);
+        try fixture.expectExit(42);
+    }
+}
+
 test "List mutation snapshots preserve slot filters and recompute removal indices" {
     const declarations =
         \\fallible remove(mut values: List(Ref(int)), index: int) Ref(int) -> values.remove?(index)

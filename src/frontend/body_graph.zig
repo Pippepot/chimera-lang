@@ -12,6 +12,8 @@ pub const Generation = struct {
     requires_explicit_drop: bool,
     cleanup_fields: bool,
     cleanup_condition: ?structures.FunctionValueId = null,
+    lifetime_origin: ?GenerationId = null,
+    cleanup_members: ?[]const structures.TypeId = null,
     missing_fields: []const []const u32 = &.{},
 };
 

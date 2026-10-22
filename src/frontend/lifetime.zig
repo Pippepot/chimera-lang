@@ -478,11 +478,18 @@ pub const Solver = struct {
                 return switch (compareLocations(left.location, right.location)) {
                     .lt => true,
                     .gt => false,
-                    .eq => generations[@backingInt(left.generation)].start_order > generations[@backingInt(right.generation)].start_order,
+                    .eq => {
+                        const left_generation = generations[@backingInt(left.generation)];
+                        const right_generation = generations[@backingInt(right.generation)];
+                        const left_start = generations[@backingInt(left_generation.lifetime_origin orelse left.generation)].start_order;
+                        const right_start = generations[@backingInt(right_generation.lifetime_origin orelse right.generation)].start_order;
+                        if (left_start != right_start) return left_start > right_start;
+                        return left_generation.start_order > right_generation.start_order;
+                    },
                 };
             }
         }.lessThan);
-        // Start orders are unique, so repeated generation/location pairs are adjacent.
+        // Unique generation orders break ties between refinements of one owner.
         var unique_count: usize = 0;
         for (endings.items) |ending| {
             if (unique_count > 0) {

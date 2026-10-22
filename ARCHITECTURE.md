@@ -76,8 +76,20 @@ This is a high-level map of the compiler's ownership and stage boundaries. [synt
 - `AnalyzeFunctionInstance(InstanceId)` owns all runtime bodies, including unspecialized declarations. `AnalysisContext` supplies source-dependent resolution, visibility, and specialization. Its `TypeFacts` view owns context-free structural traversal, borrow containment and storage reachability, and ownership lookups; diagnostics and cache validation use it directly. `HostTypes` adds physical layout for codegen; compile-time interpretation uses its own call executor. These adapters derive existing query facts without adding caches.
 - `src/intrinsics.zig` owns compiler-supported intrinsic signatures, result and parameter modes, standard storage shapes, library capability policy, and effect classification without importing queries. Query adapters resolve registered identities and dependent type facts, then publish validation results and diagnostics. Typing, interpretation, and native emission consume validated contracts rather than separately checking source shapes. Logical field types and owned versus reference storage are validated independently.
 - Typing chooses type-specific operations and explicit coercions before publication. Selected user-defined conversions use ordinary calls with ordinary destinations, reference origins, and cleanup. Joins, ownership uses, and fallible success/failure paths are represented in the graph; later stages do not rediscover their legality or build another general-purpose lowering IR. Source evaluation order is preserved.
+- Match retains its subject and flat arm patterns in the query-local semantic
+  graph until typing resolves logical pattern types, literal domains, coverage,
+  and captures. Typing lowers it directly to ordinary tag/value tests, branches,
+  extraction, and result joins before lifetime analysis. The retained carrier
+  preserves physical variant storage; path-local generations restrict cleanup
+  to feasible stored members without changing its layout or the capture's
+  declared intersection type. Refinements retain the original object's age for
+  cleanup ordering; feasible cleanup members survive copying, moving,
+  representation changes, ordinary joins, and loop-carried ownership. An empty
+  feasible set describes an unreachable ownership path, not a source type
+  refinement. No match operation or coverage state reaches published IR,
+  interpretation, codegen, or persistence.
 - Failure scopes retain local-availability masks rather than full resumable flow snapshots. Joins derive values and flow facts from incoming exits and apply the scope mask independently. A single non-loop exit reuses its block and state when scope, destination, and ownership-generation normalization are already satisfied; suspended result blocks resume through the ordinary block lifecycle. Branches with no continuation do not create an unreachable result join. Branch resumption and loop backedges still retain full flow snapshots.
-- Expression evaluation shares one dispatcher for access context, optional construction destination, and discarded results. Unevaluated type discovery and executed calls share member classification while retaining their separate evaluation and signature demands.
+- Expression evaluation shares one dispatcher for access context, optional construction destination, discarded results, and reference-valued results. Reference requests propagate through control-flow bodies and join actual reference addresses rather than borrowing copied result storage. Unevaluated type discovery and executed calls share member classification while retaining their separate evaluation and signature demands.
 - Ranges lower to ordinary direct standard-library constructor calls. Missing
 	endpoints become ordinary none expressions. One Range type retains raw
 	`int | none` bounds and inclusivity; only traversal constructs normalized

@@ -10,15 +10,7 @@ is not a goal.
 
 ## Ordered phases
 
-### 1. Match
-
-- Evaluate the subject once; support literal, wildcard, binding,
-  `pattern as name`, and `is Type` patterns with exhaustiveness and redundancy
-  diagnostics.
-- Define copying, borrowing, consumption, and arm-exit cleanup for subjects and
-  bindings, including noncopyable payloads and unmatched alternatives.
-
-### 2. Algorithms and iterator adapters
+### 1. Algorithms and iterator adapters
 
 - Start with `swap`, `reverse`, and `sort`, independently of Map/Set. Settle
   element capabilities, comparator access/fallibility, stability, failure
@@ -34,14 +26,14 @@ is not a goal.
   construction. Define End-only support, sticky exhaustion, and explicit-drop
   cleanup; keep predicate rejection distinct from producer/callback failure.
 
-### 3. Collections
+### 2. Collections
 
 - Map/Set: hashing, equality, key mutation, ownership, and ordered variants,
   building on tuples and iteration. Queue/Stack may reuse List.
 - Enum-indexed arrays: domain coverage, storage order, and initialization;
   reuse those decisions for an efficient standard-library `EnumSet[T]`.
 
-### 4. Optimization (implementation TBD)
+### 3. Optimization (implementation TBD)
 
 - Establish representative generated-program runtime and code-size baselines,
   tracking compiler time and memory costs separately.

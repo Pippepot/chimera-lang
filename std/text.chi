@@ -176,6 +176,9 @@ fallible equal_bytes(imm left: BytesView, imm right: BytesView) unit
                 continue
         panic "invalid text equality byte access"
 
+fallible match_literal(static T: type, imm value: T, imm literal: StaticString) unit
+    equal_bytes?(value.as_bytes(), literal.as_bytes())
+
 pub converter(imm value: StaticString) String -> String{storage = value}
 pub converter(imm value: StaticString) StringView -> value.view()
 pub converter(imm value: StaticString) BytesView -> value.as_bytes()

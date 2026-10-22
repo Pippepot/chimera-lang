@@ -318,7 +318,7 @@ test "indexed remainder assignment uses checked getter and owned replacement" {
     , 42);
 }
 
-test "missing operations and unimplemented syntax report the actual source construct" {
+test "missing operations report the actual source construct" {
     const source = "struct Label\n    pub value: int\nconst label = Label{value = 1}\nif label == label -> exit(42)";
     const fixture = try Fixture.init(source);
     defer fixture.deinit();
@@ -332,7 +332,6 @@ test "missing operations and unimplemented syntax report the actual source const
         defer testing.allocator.free(rejected);
         try Fixture.expectSourceDiagnostic(rejected, .missing_operation);
     }
-    try Fixture.expectSourceDiagnostic("const result = match 1\n    _ -> 42\nexit(result)", .unsupported_syntax);
 }
 
 const physics = modules.SourceFile{ .path = "physics/body.chi", .module_path = "physics", .source =
