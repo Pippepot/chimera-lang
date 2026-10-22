@@ -313,6 +313,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         const StateFields = flow_snapshot.Buffer(Availability, .available);
         const StateInitializers = flow_snapshot.Buffer(InitAvailability, .absent);
         const StateConsumptions = flow_snapshot.Buffer(bool, false);
+        fn stateValue(values: StateValues, index: usize) ?*const Value {
+            return if (values.getPtr(index).*) |*entry| entry else null;
+        }
         const State = struct {
             values: StateValues,
             availability: StateAvailability,
@@ -1759,11 +1762,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const source_operation = self.expressionOperation(id);
             var context: ValueContext = if (request.destination) |destination| .{ .expected_type = destination.storage.type_id, .access = .initialize, .fresh_destination = destination.storage } else request.value;
             if (context.expected_type == null) if (source_operation) |operation| {
-                if (operation == .annotation) context.expected_type = operation.annotation.type_id;
-                if (operation == .string_literal and context.allow_converters) context.expected_type = try self.analysis_context.stringType();
+                if (operation.* == .annotation) context.expected_type = operation.annotation.type_id;
+                if (operation.* == .string_literal and context.allow_converters) context.expected_type = try self.analysis_context.stringType();
             };
             if (try self.captureExpectedVariant(id, context)) |captured| return captured;
-            const contextual_collection = source_operation != null and source_operation.? == .collection_literal;
+            const contextual_collection = source_operation != null and source_operation.?.* == .collection_literal;
             if (context.allow_converters and !contextual_collection) if (try self.prepareConversion(id, context)) |converted| {
                 self.values[index] = converted;
                 try self.rememberCleanupOrigins(converted);
@@ -1776,7 +1779,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             }
             if (context.access == .borrow) std.debug.assert(context.expected_type != null);
             if (context.fresh_destination != null) std.debug.assert(context.access == .consume or context.access == .initialize);
-            if (context.access == .consume and (source_operation == null or source_operation.? != .call)) {
+            if (context.access == .consume and (source_operation == null or source_operation.?.* != .call)) {
                 var fields: std.ArrayList(PlaceField) = .empty;
 
                 if (try self.resolveBorrowPlace(id, &fields)) |place| {
@@ -1999,7 +2002,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .struct_init => |initializer| if (initializer.target == .concrete) initializer.target.concrete else discovered_type orelse return null,
                 .array_init => |initializer| initializer.type_id,
                 .annotation => |annotation| annotation.type_id,
-                .local_read => |local| if (self.local_values.get(@backingInt(local))) |resolved| resolved.type_id else return null,
+                .local_read => |local| if (stateValue(self.local_values, @backingInt(local))) |resolved| resolved.type_id else return null,
                 .call, .field_access => discovered_type orelse return null,
                 else => return null,
             };
@@ -2303,10 +2306,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         /// Parameters have no source expression.
-        fn expressionOperation(self: *const Self, id: semantic.UnresolvedBody.ValueId) ?Expression.Operation {
+        fn expressionOperation(self: *const Self, id: semantic.UnresolvedBody.ValueId) ?*const Expression.Operation {
             const index = @backingInt(id);
             if (index < self.unresolved.parameter_count) return null;
-            return self.unresolved.expressions[index - self.unresolved.parameter_count].operation;
+            return &self.unresolved.expressions[index - self.unresolved.parameter_count].operation;
         }
 
         fn valueSpan(self: *const Self, id: semantic.UnresolvedBody.ValueId) structures.SourceSpan {
@@ -2333,11 +2336,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn constructsDirectly(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: structures.TypeId) !bool {
             if (self.values[@backingInt(id)] != null) return false;
             const operation = self.expressionOperation(id) orelse return false;
-            if (operation != .struct_init and !try self.usesIndirectStorage(expected_type)) return false;
-            if (operation == .struct_init or operation == .array_init or operation == .call) if (try self.unevaluatedType(id, null)) |source_type| {
+            if (operation.* != .struct_init and !try self.usesIndirectStorage(expected_type)) return false;
+            if (operation.* == .struct_init or operation.* == .array_init or operation.* == .call) if (try self.unevaluatedType(id, null)) |source_type| {
                 if (source_type != expected_type and source_type != .never and !try semantic.canWidenTo(self.analysis_context, source_type, expected_type)) return false;
             };
-            return switch (operation) {
+            return switch (operation.*) {
                 .struct_init, .array_init, .collection_literal, .tuple_literal, .call, .if_else, .loop, .scope, .annotation, .local_transfer, .field_transfer => true,
                 else => false,
             };
@@ -2550,7 +2553,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         /// Comprehensions and spreads emit any number of elements through a collection sink.
         fn emitsElements(self: *Self, id: semantic.UnresolvedBody.ValueId) bool {
             const operation = self.expressionOperation(id) orelse return false;
-            return operation == .collection_comprehension or operation == .collection_spread;
+            return operation.* == .collection_comprehension or operation.* == .collection_spread;
         }
 
         /// Upper bounds become unknown instead of overflowing.
@@ -2563,7 +2566,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             for (self.unresolved.call_arguments[elements.start..elements.end]) |element| {
                 const operation = self.expressionOperation(element.value);
                 var added: u32 = 1;
-                if (operation) |entry| switch (entry) {
+                if (operation) |entry| switch (entry.*) {
                     .collection_comprehension => return null,
                     .collection_spread => |spread| {
                         const type_id = (try self.unevaluatedType(spread.source.value, null)) orelse try self.inferArgumentType(spread.source);
@@ -2723,7 +2726,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             var origins: ?u32 = null;
             var index: u32 = 0;
             for (self.unresolved.call_arguments[elements.start..elements.end]) |source| {
-                if (self.expressionOperation(source.value)) |entry| if (entry == .collection_spread) {
+                if (self.expressionOperation(source.value)) |entry| if (entry.* == .collection_spread) {
                     const spread = entry.collection_spread;
                     const spread_scope = try self.openBoundary(source.span);
                     const source_value = try self.value(spread.source.value);
@@ -3066,7 +3069,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn inferInitializerArgumentType(self: *Self, raw: semantic.UnresolvedBody.ValueUse, expected_type: ?structures.TypeId) anyerror!structures.TypeId {
-            if (self.expressionOperation(raw.value)) |operation| if (operation == .collection_literal) {
+            if (self.expressionOperation(raw.value)) |operation| if (operation.* == .collection_literal) {
                 if (expected_type != null and try self.analysis_context.collectionSequenceElement(expected_type.?) != null) {
                     const construction = try self.analysis_context.initializerConstruction(expected_type.?);
                     const previous_policy = self.collection_allocation_fallible;
@@ -4430,7 +4433,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         const StructTypeResult = union(enum) { diverged: Value, type_id: structures.TypeId };
 
         fn inPlaceStructFieldType(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: ?structures.TypeId) anyerror!StructTypeResult {
-            if (self.expressionOperation(id)) |operation| if (operation == .struct_init) {
+            if (self.expressionOperation(id)) |operation| if (operation.* == .struct_init) {
                 const initializer = operation.struct_init;
                 const type_id = switch (try self.structInitType(initializer)) {
                     .diverged => |diverged| return .{ .diverged = diverged },
@@ -4478,7 +4481,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .collection_literal => |literal| try self.collectionType(literal.elements, expected_type, self.valueSpan(id)),
                 .collection_comprehension, .collection_emit, .collection_spread, .collection_iteration => .unit,
                 .tuple_literal => try self.expectedTupleType(expected_type, self.valueSpan(id)),
-                .local_read, .local_transfer => |local| if (self.local_values.get(@backingInt(local)) == null) null else try self.placeRootType(.{ .local = local }),
+                .local_read, .local_transfer => |local| if (stateValue(self.local_values, @backingInt(local)) == null) null else try self.placeRootType(.{ .local = local }),
                 .field_transfer => |transfer| blk: {
                     if (self.local_values.get(@backingInt(transfer.target)) == null) break :blk null;
                     var type_id = try self.placeRootType(.{ .local = transfer.target });
@@ -4707,7 +4710,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn overloadArgumentType(self: *Self, argument: semantic.UnresolvedBody.ValueUse, expected_type: ?structures.TypeId, discovered_type: ?*?structures.TypeId) anyerror!?structures.TypeId {
-            if (self.expressionOperation(argument.value)) |operation| switch (operation) {
+            if (self.expressionOperation(argument.value)) |operation| switch (operation.*) {
                 .overloaded_function => |overload| {
                     const expected = expected_type orelse return null;
                     const callable = (try self.analysis_context.facts().callable(expected)) orelse return null;
@@ -5934,7 +5937,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn placeRootType(self: *Self, root: @FieldType(BorrowPlace, "root")) !structures.TypeId {
             return switch (root) {
-                .local => |local| if (self.locals.items(.reference)[@backingInt(local)]) (try self.analysis_context.facts().borrowElement(self.local_values.get(@backingInt(local)).?.type_id)).? else self.local_values.get(@backingInt(local)).?.type_id,
+                .local => |local| if (self.locals.items(.reference)[@backingInt(local)]) (try self.analysis_context.facts().borrowElement(stateValue(self.local_values, @backingInt(local)).?.type_id)).? else stateValue(self.local_values, @backingInt(local)).?.type_id,
                 .parameter => |parameter| self.values[@backingInt(parameter)].?.type_id,
                 .reference => |reference| (try self.analysis_context.facts().borrowElement(reference.type_id)).?,
             };
@@ -8733,13 +8736,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 const original_identity = output.binding_identity;
                 for (exits, incoming, 0..) |exit, *generation, index| {
                     const incoming_state = self.states.items[@backingInt(exit.state)];
-                    const current = incoming_state.values.get(slot).?;
+                    const current = stateValue(incoming_state.values, slot).?;
                     std.debug.assert(output.type_id == current.type_id);
                     generation.* = if (incoming_state.availability.get(slot) == .transferred) null else current.owned_generation;
                     changed = changed or output.id != current.id;
                     if (current.representation == .storage) output.representation = .storage;
                     if (index == 0) continue;
-                    try self.mergeValueReferences(&output, output, current);
+                    try self.mergeValueReferences(&output, output, current.*);
                     output.storage_identity = try self.joinBindingIdentities(output.storage_identity orelse output.binding_identity, current.storage_identity orelse current.binding_identity);
                     output.variant_identity = try self.joinBindingIdentities(output.variant_identity orelse output.binding_identity, current.variant_identity orelse current.binding_identity);
                     output.binding_identity = try self.joinBindingIdentities(output.binding_identity, current.binding_identity);
@@ -8788,7 +8791,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (incoming.values.len < end or !first.values.sharesPage(incoming.values, slot) or !first.availability.sharesPage(incoming.availability, slot)) return slot;
             }
             for (slot..end) |index| {
-                const value_in_state = state.values.get(index) orelse continue;
+                const value_in_state = stateValue(state.values, index) orelse continue;
                 if (state.availability.get(index) != .available) return slot;
                 if (!self.generationMatchesType(value_in_state.owned_generation, value_in_state.type_id)) return slot;
             }
@@ -8800,8 +8803,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (!baseline.eql(incoming.availability)) return false;
             for (0..incoming.values.len) |index| {
                 const availability = incoming.availability.get(index);
-                if (availability == .unbound and incoming.values.get(index) != null) return false;
-                if (availability == .transferred) if (incoming.values.get(index)) |resolved| {
+                if (availability == .unbound and stateValue(incoming.values, index) != null) return false;
+                if (availability == .transferred) if (stateValue(incoming.values, index)) |resolved| {
                     if (resolved.owned_generation != null) return false;
                 };
             }
@@ -8866,20 +8869,30 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn normalizeJoinFields(self: *Self, exits: []FlowExit, policy: JoinPolicy) !void {
-            locals: for (0..self.local_values.len) |slot| {
+            var slot: usize = 0;
+            locals: while (slot < self.local_values.len) : (slot += 1) {
+                const first_availability = self.states.items[@backingInt(exits[0].state)].availability;
+                const shared = for (exits[1..]) |exit| {
+                    if (!first_availability.sharesPage(self.states.items[@backingInt(exit.state)].availability, slot)) break false;
+                } else true;
+                if (shared) {
+                    slot = first_availability.pageEnd(slot) - 1;
+                    continue;
+                }
                 if (self.is_initializer_region and self.captured_locals[slot] != null) continue;
                 var transferred = false;
                 var available = false;
-                var owns_value = false;
                 for (exits) |exit| switch (self.states.items[@backingInt(exit.state)].availability.get(slot)) {
                     .transferred => transferred = true,
-                    .available => {
-                        available = true;
-                        owns_value = owns_value or self.states.items[@backingInt(exit.state)].values.get(slot).?.owned_generation != null;
-                    },
+                    .available => available = true,
                     else => continue :locals,
                 };
-                if (!transferred or !available or !owns_value) continue;
+                if (!transferred or !available) continue;
+                const owns_value = for (exits) |exit| {
+                    const state = self.states.items[@backingInt(exit.state)];
+                    if (state.availability.get(slot) == .available and stateValue(state.values, slot).?.owned_generation != null) break true;
+                } else false;
+                if (!owns_value) continue;
                 for (exits) |*exit| {
                     if (self.states.items[@backingInt(exit.state)].availability.get(slot) != .available) continue;
                     exit.* = try self.endBeforeJoin(exit.*, .{ .local = @fromBackingInt(@intCast(slot)) });

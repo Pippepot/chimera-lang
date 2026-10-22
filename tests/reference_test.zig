@@ -2,6 +2,46 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const Fixture = test_sources.SourceFixture;
 
+test "branch joins normalize transferred owners without disturbing shared availability pages" {
+    const source = comptime block: {
+        @setEvalBranchQuota(100_000);
+        var declarations: []const u8 =
+            \\struct Trace
+            \\    value: int
+            \\struct Item
+            \\    copy = none
+            \\    ref trace: Trace
+            \\    value: int
+            \\    drop = func(deinit self: Item) -> self.trace.value += 1
+            \\func consume(var item: Item) -> return
+            \\func probe(mut trace: Trace, flag: bool)
+            \\
+        ;
+        for (0..32) |index| {
+            declarations = declarations ++ std.fmt.comptimePrint("    var item{d} = Item{{trace = trace, value = 1}}\n", .{index});
+        }
+        declarations = declarations ++
+            \\    if flag -> consume(item17^)
+            \\    if trace.value <> 1 -> panic "join did not end exactly one owner"
+            \\
+        ;
+        for (0..32) |index| {
+            if (index == 17) continue;
+            declarations = declarations ++ std.fmt.comptimePrint("    _ = item{d}.value\n", .{index});
+        }
+        break :block declarations ++
+            \\func run() int
+            \\    var trace = Trace{value = 0}
+            \\    probe(trace, true)
+            \\    if trace.value <> 32 -> return 90
+            \\    trace.value = 0
+            \\    probe(trace, false)
+            \\    return trace.value + 10
+        ;
+    };
+    try Fixture.expectParity(source, 42);
+}
+
 test "large nested calls preserve arguments across temporary storage growth" {
     const source = comptime block: {
         @setEvalBranchQuota(100_000);

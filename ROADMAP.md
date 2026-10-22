@@ -10,16 +10,21 @@ is not a goal.
 
 ## Top priority: scalar-flow performance regression
 
-- Eliminate the remaining roughly 8-12% scalar/128-branch typing regression
-  against commit `4556095` before starting the next language milestone.
+- Eliminate the scalar/128-branch typing regression against commit `4556095`
+  before starting the next language milestone. The
+  [causal diagnosis](docs/COMPILER.md#scalar128-allocation-order-diagnosis)
+  identifies the parser's allocation-order change; the correction has only
+  been tested in isolated worktrees, so this priority remains open.
 - Reproduce with `zig build flow-benchmark --seed=0 -Doptimize=fast`.
   Alternate baseline and current binaries on the same pinned CPU over repeated
   trials; compare scalar and owning cases across all branch counts.
-- Isolate the remaining allocation/page-fault and scalar-expression evaluation
-  costs. The unresolved graph and snapshot footprints are unchanged, but clearing
-  the nullable value buffer incurs additional demand-page faults. Scalar-argument
-  helper inlining alone does not remove the regression; the complete cause and
-  fix remain unverified.
+- Restore tokenizer initialization before token-buffer allocation, or preserve
+  its allocation/reuse behavior with a cleaner foundation. Allocating tokens
+  first changes scratch-page residency before the typing timer starts.
+  Forward and reverse single-hunk ablations transfer the scalar/128 slowdown
+  without changing the graph, value-buffer size, or recorded typing allocation
+  requests. Do not pursue another scalar-evaluation or value-cache rewrite
+  without new evidence.
 - Require no repeatable scalar/128 slowdown or adjacent benchmark regressions,
   unchanged compiler behavior, relevant tests, the routine safe suite, formatting
   checks, and `git diff --check` before closing this priority.

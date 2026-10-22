@@ -511,6 +511,64 @@ retained snapshot footprints, with unchanged benchmark sources and lifetime
 tables. Existing cold-compilation budgets remain unmet on this machine in both
 the baseline and the retained implementation.
 
+The [scalar-flow regression comparison](../benchmarks/flow_regression.csv)
+uses Zig 0.17 with LLVM (`-Doptimize=fast`) on an AMD Ryzen 7 5800H, pinned to
+CPU 4. Each variant has fifteen alternating process trials with the unchanged
+five-sample flow fixtures. `baseline` is commit `4556095`, `prior` is commit
+`7cb3afd`, and `flow_reads` adds const flow-value reads and shared-availability
+page skipping to `prior`. Rows record the median and range of trial medians;
+all graph and retained-memory counters are unchanged.
+
+That comparison left the roadmap's performance gate open: scalar/128 was
+11.8% slower than `baseline`, despite scalar/256 improving 6.3% and scalar/512
+improving 16.0%. Absolute times and percentages vary between measurement rounds;
+use matched trials rather than comparing absolute times from different rounds.
+
+### Scalar/128 allocation-order diagnosis
+
+The causal change is in parser preparation, not a larger typed graph.
+`4556095` initializes the tokenizer before allocating its token buffer;
+`7cb3afd` moves token-buffer allocation first. The intervening tokenizer
+allocation changes arena growth and reuse. Parsing is outside the typing
+timer, but it determines which scratch pages have already been touched when
+typing starts. Equal retained footprints do not imply equal demand-page costs.
+
+[Matched instrumentation](../benchmarks/scalar_allocation_order.csv) records
+fifteen rotating process trials per variant on the same CPU and backend as
+above. Each trial retains the original scalar/8 and scalar/32 prefix, five
+timed databases, and a separate sixth footprint database. Per-sample phase
+timings and Linux thread minor faults are aggregated as trial medians, then
+medians across trials.
+
+All four variants have 1,667 nullable value slots of 172 bytes each
+(286,724 bytes), 1,666 unresolved expressions of 112 bytes each, and the same
+4,043 recorded query-scratch allocation requests totaling 4,866,315 bytes
+during typing. Their scratch capacity and used-byte totals before typing
+also match. However, the resident-page counts summed over scratch chunks are
+348 with tokenizer-first allocation and 189 with tokens-first allocation.
+Clearing the value buffer incurs zero minor faults in the former and 70 in
+the latter. Restoring only the allocation order in `7cb3afd` restores the
+baseline residency and timing; reversing it in `4556095` reproduces the
+residency change and slowdown.
+
+The [uninstrumented full-matrix confirmation](../benchmarks/flow_parser_order.csv)
+uses fifteen rotating process trials per variant with the unchanged benchmark,
+including all scalar and owning sizes. Scalar/128 medians in that matched round:
+
+| Variant | Typing time | Versus `4556095` |
+| --- | ---: | ---: |
+| `baseline` (`4556095`) | 3.023 ms | baseline |
+| `prior` (`7cb3afd`) | 3.391 ms | +12.2% |
+| `parser_order` (only allocation order restored) | 3.058 ms | +1.2% |
+| `flow_reads` (pending flow optimization) | 3.250 ms | +7.5% |
+| `flow_reads_parser_order` (both changes) | 2.846 ms | -5.8% |
+
+All graph and retained-memory counters match across every run. The
+allocation-order correction is a diagnostic ablation, not yet applied to
+the main worktree. The roadmap gate remains open until the production change
+passes behavioral tests and adjacent-case performance verification. These
+typing-only results do not establish an end-to-end compilation speedup.
+
 For cold multi-file worker scaling and warm and edited disk cache reuse against
 uncached runs, build an optimized compiler and run the generated benchmark fixture.
 The `fast` mode strips debug symbols; the linker build ID keeps compiler identity

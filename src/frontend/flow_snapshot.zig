@@ -24,9 +24,13 @@ pub fn Buffer(comptime Element: type, comptime initial: Element) type {
         }
 
         pub inline fn get(self: Self, index: usize) Element {
+            return self.getPtr(index).*;
+        }
+
+        pub inline fn getPtr(self: Self, index: usize) *const Element {
             std.debug.assert(index < self.len);
-            const page = self.leafPage(index) orelse return initial;
-            return page.values[index % page_size];
+            const page = self.leafPage(index) orelse return &initial;
+            return &page.values[index % page_size];
         }
 
         inline fn leafPage(self: Self, index: usize) ?*Page {
@@ -112,6 +116,8 @@ test "persistent flow state isolates writes, restores defaults, and shares untou
     try live.set(allocator, 0, 1);
     try live.set(allocator, 512, 9);
     const first = live.snapshot();
+    const first_value = first.getPtr(0);
+    const default_value = first.getPtr(32);
     try live.set(allocator, 32, 7);
     var second = live.snapshot();
     try std.testing.expect(first.sharesPage(second, 0));
@@ -126,6 +132,8 @@ test "persistent flow state isolates writes, restores defaults, and shares untou
     try std.testing.expectEqual(@as(?u32, 9), first.get(512));
     try std.testing.expectEqual(@as(?u32, 9), live.get(512));
     try std.testing.expectEqual(@as(?u32, 11), second.get(512));
+    try std.testing.expectEqual(@as(?u32, 1), first_value.*);
+    try std.testing.expectEqual(@as(?u32, null), default_value.*);
     var joined = first.snapshot();
     try joined.merge(allocator, second, struct {
         fn combine(left: ?u32, right: ?u32) ?u32 {
