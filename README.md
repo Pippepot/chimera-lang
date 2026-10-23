@@ -141,6 +141,21 @@ const positives = [x for x in evens if x > 0]
 a List. Use `List(int).collect?([x for x in evens if x > 0])` when allocation
 failure should propagate as ordinary failure.
 
+Ranges use `..` for an exclusive end and `..=` for an inclusive end. Prefix `^n`
+counts back from the collection's initialized length:
+
+```chi
+const values = [10, 20, 30, 40]
+const last = values[^1]
+const tail = values[^2..]
+const middle = values[1..=^2]
+const prefix = values[..^1]
+```
+
+`^0` is the past-end boundary, valid for exclusive slices but not element access.
+Invalid distances fail instead of wrapping or clamping. Postfix `value^` still
+transfers ownership.
+
 ## Make change visible
 
 ```chi
@@ -198,7 +213,9 @@ and priorities.
 
 ## Go deeper
 
-- [Compiler guide](docs/COMPILER.md): running, debugging, testing, and benchmarking.
+- [Compiler guide](docs/COMPILER.md): running, debugging, and testing.
+- [Benchmarks](benchmarks/README.md): measurement protocols and commit history.
 - [Language specification](syntax&semantics.txt): detailed rules and examples,
   including planned features.
 - [Compiler architecture](ARCHITECTURE.md): how the implementation fits together.
+- [Query flow](PROGRAM_FLOW.md): demand, recomputation, and result lifetimes.

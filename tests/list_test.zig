@@ -396,6 +396,23 @@ test "List removal preserves order and bounds failures preserve contents" {
     , 42);
 }
 
+test "List filled copies one value into every slot" {
+    try expectCalculation(
+        \\struct Item
+        \\    value: int
+        \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
+        \\fallible calculate() int
+        \\    if List(int).filled(0, -1) -> return 90
+        \\    const empty = List(int).filled?(0, 0)
+        \\    if empty.len() <> 0 -> return 91
+        \\    const source = Item{value = 13}
+        \\    const values = List(Item).filled?(source, 2)
+        \\    if values.len() <> 2 -> return 92
+        \\    if values.capacity() <> 2 -> return 93
+        \\    return values[0].value + values[1].value + source.value + 1
+    , 42);
+}
+
 test "List consuming traversal cleans current and remaining items on early break" {
     try Fixture.expectParity(
         \\struct Item

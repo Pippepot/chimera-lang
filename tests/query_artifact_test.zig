@@ -155,7 +155,7 @@ test "bundled std preserves panic traces after file renumbering" {
     defer allocator.free(result.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 134 }, result.term);
     try std.testing.expectEqualStrings("", result.stdout);
-    try std.testing.expect(std.mem.startsWith(u8, result.stderr, "panic: range iteration requires both endpoints\n"));
+    try std.testing.expect(std.mem.startsWith(u8, result.stderr, "panic: range iteration requires both endpoints as absolute integers\n"));
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "$std/range.chi:") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "at <entry> (fresh.chi:") != null);
     // The failing library function and its dependencies remain precompiled.

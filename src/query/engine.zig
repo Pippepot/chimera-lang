@@ -1109,14 +1109,23 @@ pub const Database = struct {
         for (entry.memo.input_deps.items) |input_entry| {
             if (input_entry.changed_at > verified_at) return true;
         }
-        for (entry.memo.deps.entries.items) |dependency| {
-            const dep = dependency.entry;
+        const dependencies = entry.memo.deps.entries.items;
+        var next: usize = 0;
+        while (next < dependencies.len) {
+            {
+                db.lock();
+                defer db.unlock();
+                while (next < dependencies.len) : (next += 1) {
+                    const dep = dependencies[next].entry;
+                    if (!settledLocked(db, dep)) break;
+                    // A recovered child can equal its old memo while the parent still
+                    // holds a fallback computed during that child's failure.
+                    if (dep.last_failed_at) |failed_at| if (failed_at >= verified_at) return true;
+                    if (dep.changed_at > verified_at) return true;
+                }
+            }
             // Let Q.run handle dependency errors again, just as on first demand.
-            db.verifyDependency(entry, dep, worker_index) catch return true;
-            // A recovered child can equal its old memo while the parent still
-            // holds a fallback computed during that child's failure.
-            if (dep.last_failed_at) |failed_at| if (failed_at >= verified_at) return true;
-            if (dep.changed_at > verified_at) return true;
+            if (next < dependencies.len) db.verifyDependency(entry, dependencies[next].entry, worker_index) catch return true;
         }
         return false;
     }
@@ -1125,8 +1134,9 @@ pub const Database = struct {
         {
             db.lock();
             defer db.unlock();
+            if (settledLocked(db, dep)) return;
             std.debug.assert(entry.verification_dependency == null);
-            if (!settledLocked(db, dep) and db.reachesLocked(dep, entry)) return error.QueryCycle;
+            if (db.reachesLocked(dep, entry)) return error.QueryCycle;
             // Only the dependency currently being verified is an active wait.
             // Other old edges may disappear when this entry recomputes.
             entry.verification_dependency = dep;

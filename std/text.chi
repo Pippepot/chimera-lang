@@ -1,6 +1,6 @@
 import std.memory.{Allocation, Span, List, Box, Ref, allocate, deallocate, unsafe_initialize}
 import std.array.{Array, collection_literal}
-import std.range.{Range}
+import std.range.{Range, FromEnd}
 
 pub extern func byte_int(value: byte) int
 extern fallible io_write(descriptor: int, imm data: Span(byte)) int
@@ -17,8 +17,10 @@ pub struct BytesView
     pub func as_span(imm self: BytesView) Span(byte) -> self.data.as_imm()
     pub fallible write_to(imm self: BytesView, descriptor: int) int -> io_write?(descriptor, self.data)
     pub func byte_length(imm self: BytesView) int -> self.data.len()
-    pub fallible get(imm self: BytesView, index: int) ref byte -> self.data.get?(index)
-    pub overload [](get, slice)
+    fallible get_at(imm self: BytesView, index: int) ref byte -> self.data.get?(index)
+    fallible get_from_end(imm self: BytesView, index: FromEnd) ref byte -> self.data.get?(index)
+    pub overload get(get_at, get_from_end)
+    pub overload [](get_at, get_from_end, slice)
     pub fallible slice(imm self: BytesView, bounds: Range) BytesView
         return BytesView{data = self.data.slice?(bounds)}
     pub fallible validate_utf8(imm self: BytesView) StringView

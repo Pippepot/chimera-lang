@@ -1,39 +1,44 @@
 import std.iteration.{End}
 import std.text.{String}
 
+pub struct FromEnd
+    copy = trivial
+    distance: int
+
+    pub fallible resolve(self: FromEnd, length: int) int
+        length >= 0
+        self.distance >= 0
+        self.distance <= length
+        return length - self.distance
+
+pub func from_end(distance: int) FromEnd -> FromEnd{distance = distance}
+
 pub struct Range
     copy = fieldwise
-    pub first: int | none
-    pub limit: int | none
+    pub first: int | FromEnd | none
+    pub limit: int | FromEnd | none
     inclusive: bool
 
     pub func iter(self: Range) RangeIterator
         if const sequence = self.sequence() -> return sequence.iter()
-        panic "range iteration requires both endpoints"
+        panic "range iteration requires both endpoints as absolute integers"
     pub func reversed(self: Range) RangeSequence
         if const sequence = self.sequence() -> return sequence.reversed()
-        panic "range reversal requires both endpoints"
+        panic "range reversal requires both endpoints as absolute integers"
     pub fallible step_by(self: Range, factor: int) RangeSequence -> self.sequence?().step_by?(factor)
 
     pub fallible resolve(self: Range, length: int) (int, int)
         length >= 0
-        var start = 0
-        if const value = self.first as int -> start = value
-        var end = length
-        if const value = self.limit as int
-            value >= 0
-            if self.inclusive?
-                start <= value
-                value < length
-                end = value + 1
-            else
-                value <= length
-                end = value
-        else
-            not self.inclusive?
+        const start = resolve_bound?(self.first, length, 0)
+        const limit = resolve_bound?(self.limit, length, length)
         start >= 0
-        start <= end
-        return (start, end)
+        start <= limit
+        if self.inclusive?
+            not (self.limit is none)
+            limit < length
+            return (start, limit + 1)
+        limit <= length
+        return (start, limit)
 
     fallible sequence(self: Range) RangeSequence
         const first = self.first as int
@@ -109,10 +114,10 @@ pub struct RangeIterator
         self.started = true
         return self.value
 
-pub func exclusive(first: int | none, limit: int | none) Range
+pub func exclusive(first: int | FromEnd | none, limit: int | FromEnd | none) Range
     return Range{first = first, limit = limit, inclusive = false}
 
-pub func inclusive(first: int | none, limit: int | none) Range
+pub func inclusive(first: int | FromEnd | none, limit: int | FromEnd | none) Range
     return Range{first = first, limit = limit, inclusive = true}
 
 pub converter(imm value: Range) String
@@ -121,11 +126,22 @@ pub converter(imm value: Range) String
 
 fallible format_range(imm value: Range) String
     var result = String.empty()
-    if const number = value.first as int -> result.append?(String(number))
+    append_bound?(result, value.first)
     result.append?("..")
-    if value.inclusive? -> result.append?("^")
-    if const number = value.limit as int -> result.append?(String(number))
+    if value.inclusive? -> result.append?("=")
+    append_bound?(result, value.limit)
     return result^
+
+fallible resolve_bound(bound: int | FromEnd | none, length: int, omitted: int) int
+    if const value = bound as int -> return value
+    if const value = bound as FromEnd -> return value.resolve?(length)
+    return omitted
+
+fallible append_bound(mut result: String, bound: int | FromEnd | none)
+    if const value = bound as int -> result.append?(String(value))
+    else if const value = bound as FromEnd
+        result.append?("^")
+        result.append?(String(value.distance))
 
 func not_direction(value: bool) bool
     if value? -> return false

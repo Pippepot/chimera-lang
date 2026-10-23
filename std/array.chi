@@ -1,5 +1,5 @@
 import std.memory.{Span, SpanIterator}
-import std.range.{Range}
+import std.range.{Range, FromEnd}
 
 pub struct collection_literal(T: type, N: int)
     move = none
@@ -16,14 +16,18 @@ pub struct Array(T: type, N: int)
         var view = self.span()
         return view.slice?(bounds)
 
-    pub fallible get(ref self: Array(T, N), index: int) ref T
+    fallible get_at(ref self: Array(T, N), index: int) ref T
         index >= 0
         index < N
         return array_borrow(T, N, self, index)
 
-    pub overload [](get, slice)
+    fallible get_from_end(ref self: Array(T, N), index: FromEnd) ref T
+        return self.get_at?(index.resolve?(N))
 
-    pub fallible []=(mut self: Array(T, N), index: int, var value: T) unit
+    pub overload get(get_at, get_from_end)
+    pub overload [](get_at, get_from_end, slice)
+
+    pub fallible []=(static Index: type, mut self: Array(T, N), index: Index, var value: T) unit where Index is int or Index is FromEnd
         ref element = self.get?(index)
         element = value^
 

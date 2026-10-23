@@ -1348,7 +1348,7 @@ pub fn compileExternalPanic(signature: structures.FunctionSignature, types: anyt
     const newline_address = try emitPanicText(&encoder, 1);
     const newline_write = try encoder.patchable(.call_relative);
     const trace = try encoder.patchable(.jmp);
-    const writer = encoder.code.items.len;
+    const writer = try encoder.position();
     try emitPanicWriter(&encoder);
     for ([_]u32{ prefix_write, message_write, newline_write }) |call| try encoder.patch(call, writer);
     try encoder.patchHere(prefix_address);
@@ -1404,7 +1404,7 @@ fn emitPanicText(encoder: *X86Encoder, size: i32) !u32 {
 fn emitPanicWriter(encoder: *X86Encoder) !void {
     try encoder.emit(.test_edx);
     const empty = try encoder.patchable(.je);
-    const retry = encoder.code.items.len;
+    const retry = try encoder.position();
     try encoder.immediate(.mov_eax, 1);
     try encoder.immediate(.mov_edi, 2);
     try encoder.emit(.syscall);
@@ -1427,11 +1427,11 @@ fn emitPanicWriter(encoder: *X86Encoder) !void {
 fn emitPanicTrace(encoder: *X86Encoder) !u32 {
     try encoder.emit(.mov_r12_rsp);
     try encoder.immediate(.mov_r15d, 1024);
-    const frame = encoder.code.items.len;
+    const frame = try encoder.position();
     try encoder.emit(.mov_r13_r12);
     try encoder.emit(.add_r12_8);
     const table_address = try encoder.patchable(.mov_r14);
-    const search = encoder.code.items.len;
+    const search = try encoder.position();
     try encoder.emit(.mov_rax_r14);
     try encoder.emit(.test_rax);
     const unknown = try encoder.patchable(.je);
@@ -1549,7 +1549,7 @@ pub fn compileExternalByteIo(read: bool, signature: structures.FunctionSignature
     try encoder.immediate(.cmp_eax, 0);
     const empty = try encoder.patchable(.je);
     try encoder.emit(.mov_edx_eax);
-    const retry = encoder.code.items.len;
+    const retry = try encoder.position();
     try encoder.offset(.mov_edi_rsp, 8 + arguments[0].stack);
     if (read) {
         try encoder.offset(.mov_eax_rsp, 8 + arguments[2].stack);
@@ -1638,6 +1638,20 @@ pub fn buildExecutable(
     try image.immediate(.mov_eax, linux_exit_syscall);
     try image.emit(.syscall);
 
+    const needs_panic_trace = for (functions) |function| {
+        if (function.artifact.panic_trace_offset != null) break true;
+    } else false;
+    var bulk_capacity = image.code.items.len;
+    for (functions) |function| {
+        bulk_capacity = try std.math.add(usize, bulk_capacity, function.artifact.required_alignment - 1);
+        bulk_capacity = try std.math.add(usize, bulk_capacity, function.artifact.code.len);
+        if (needs_panic_trace) for (function.artifact.trace_sites) |site| {
+            bulk_capacity = try std.math.add(usize, bulk_capacity, site.label.len);
+            bulk_capacity = try std.math.add(usize, bulk_capacity, @sizeOf([4]u64));
+        };
+    }
+    try image.code.ensureTotalCapacity(gpa, bulk_capacity);
+
     const function_offsets = try gpa.alloc(usize, functions.len);
     defer gpa.free(function_offsets);
     for (functions, function_offsets) |function, *function_offset| {
@@ -1648,9 +1662,6 @@ pub fn buildExecutable(
     }
     try image.patch(entry_call, function_offsets[entry_index]);
 
-    const needs_panic_trace = for (functions) |function| {
-        if (function.artifact.panic_trace_offset != null) break true;
-    } else false;
     if (needs_panic_trace) try appendPanicTrace(&image, functions, function_offsets);
 
     // Data follows code in the read-only load segment. Intern by content across
@@ -1784,12 +1795,15 @@ fn writeElfHeaders(image: []u8) void {
 const X86Encoder = struct {
     gpa: std.mem.Allocator,
     code: std.ArrayList(u8) = .empty,
+    label_end: usize = 0,
+    last_store: struct { operation: x86.Operation, offset: u32, end: usize } = .{ .operation = .ret, .offset = 0, .end = 0 },
 
     fn deinit(self: *X86Encoder) void {
         self.code.deinit(self.gpa);
     }
 
-    fn position(self: *const X86Encoder) error{FunctionTooLarge}!u32 {
+    fn position(self: *X86Encoder) error{FunctionTooLarge}!u32 {
+        self.label_end = self.code.items.len;
         return std.math.cast(u32, self.code.items.len) orelse error.FunctionTooLarge;
     }
 
@@ -1805,7 +1819,12 @@ const X86Encoder = struct {
 
     fn offset(self: *X86Encoder, operation: x86.Operation, value: u32) !void {
         std.debug.assert(x86.encoding(operation).operand == .u32);
+        const store = self.last_store;
+        const reload: x86.Operation = if (store.operation == .mov_rsp_eax) .mov_eax_rsp else .mov_rax_rsp;
+        if (store.end == self.code.items.len and self.label_end != store.end and store.offset == value and operation == reload) return;
         try x86.append(&self.code, self.gpa, operation, value);
+        if (operation == .mov_rsp_eax or operation == .mov_rsp_rax)
+            self.last_store = .{ .operation = operation, .offset = value, .end = self.code.items.len };
     }
 
     fn absolute(self: *X86Encoder, operation: x86.Operation, value: u64) !void {
@@ -1868,31 +1887,46 @@ const X86Encoder = struct {
     }
 
     fn integerBinary(self: *X86Encoder, comptime operation: std.meta.Tag(structures.FunctionInstruction), rhs: ValueLocation) !void {
+        if (operation == .divsi) return self.divide(rhs);
         const encoding: struct { immediate: x86.Operation, stack: x86.Operation, indirect: x86.Operation } = switch (operation) {
             .addi => .{ .immediate = .add_eax, .stack = .add_eax_rsp, .indirect = .add_eax_rcx },
             .subi => .{ .immediate = .sub_eax, .stack = .sub_eax_rsp, .indirect = .sub_eax_rcx },
             .muli => .{ .immediate = .imul_eax, .stack = .imul_eax_rsp, .indirect = .imul_eax_rcx },
-            .divsi => .{ .immediate = .mov_ecx, .stack = .idiv_rsp, .indirect = .idiv_rcx },
             else => comptime unreachable,
         };
         switch (rhs) {
-            .immediate => |value| {
-                try self.immediate(encoding.immediate, value);
-                if (operation == .divsi) {
-                    try self.emit(.cdq);
-                    try self.emit(.idiv_ecx);
-                }
-            },
-            .stack, .incoming_argument => |stack_offset| {
-                if (operation == .divsi) try self.emit(.cdq);
-                try self.offset(encoding.stack, stack_offset);
-            },
+            .immediate => |value| try self.immediate(encoding.immediate, value),
+            .stack, .incoming_argument => |stack_offset| try self.offset(encoding.stack, stack_offset),
             .indirect => |stack_offset| {
                 try self.offset(.mov_rcx_rsp, stack_offset);
-                if (operation == .divsi) try self.emit(.cdq);
                 try self.emit(encoding.indirect);
             },
             .eax, .return_buffer, .discarded => unreachable,
         }
+    }
+
+    fn divide(self: *X86Encoder, rhs: ValueLocation) !void {
+        switch (rhs) {
+            .immediate => |value| {
+                if (value == -1) return self.emit(.neg_eax);
+                try self.immediate(.mov_ecx, value);
+                try self.emit(.cdq);
+                return self.emit(.idiv_ecx);
+            },
+            .stack, .incoming_argument => |stack_offset| try self.offset(.mov_ecx_rsp, stack_offset),
+            .indirect => |stack_offset| {
+                try self.offset(.mov_rcx_rsp, stack_offset);
+                try self.emit(.mov_ecx_rcx);
+            },
+            .eax, .return_buffer, .discarded => unreachable,
+        }
+        try self.immediate(.cmp_ecx, -1);
+        const quotient = try self.patchable(.jne);
+        try self.emit(.neg_eax);
+        const done = try self.patchable(.jmp);
+        try self.patchHere(quotient);
+        try self.emit(.cdq);
+        try self.emit(.idiv_ecx);
+        try self.patchHere(done);
     }
 };

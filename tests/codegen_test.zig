@@ -1064,6 +1064,19 @@ test "ordinary function compilation cleans up allocation failure" {
     try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
 }
 
+test "executable bulk reservation cleans up allocation failure" {
+    const entry: structures.InstanceId = .{ .item = @fromBackingInt(0) };
+    const code: [4096]u8 = @splat(0xC3);
+    const functions = [_]codegen.ReachableFunction{.{ .instance = entry, .artifact = .{
+        .code = &code,
+        .required_alignment = 1,
+    } }};
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    try std.testing.expectError(error.OutOfMemory, codegen.buildExecutable(entry, &functions, failing.allocator()));
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+}
+
 test "executable builder resolves a direct call to its callee's file offset" {
     const entry_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(1)) };
     const callee_id: structures.InstanceId = .{ .item = @fromBackingInt(@intCast(0)) };

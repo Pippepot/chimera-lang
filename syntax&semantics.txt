@@ -12,13 +12,14 @@
 
 
 # Types and evaluation
-# int: signed 32-bit integer; +, -, *, and negation wrap modulo 2^32. Signed
-# division truncates toward zero. Division by zero or the unrepresentable
-# min-int / -1 quotient is an execution error; at compile time it is a source
-# error at the executed division.
-# Remainder (%) follows truncating division: a nonzero remainder has the sign
-# of its left operand. min-int % -1 is zero. Remainder by zero is an execution
-# error, reported at the executed operation at compile time.
+# int: signed 32-bit integer; +, -, *, /, and negation wrap modulo 2^32.
+# Signed division truncates toward zero, so min-int / -1 wraps to min-int.
+# Division by zero is an execution error; at compile time it is a source error
+# at the executed division.
+# Remainder (%) satisfies left == (left / right) * right + left % right under
+# wrapping: a nonzero remainder has the sign of its left operand, and
+# min-int % -1 is zero. Remainder by zero is an execution error, reported at
+# the executed operation at compile time.
 # byte: distinct unsigned 8-bit integer, values 0 through 255, size and
 # alignment 1. It has trivial move, copy, and drop, but no arithmetic or
 # comparison operations yet.
@@ -189,7 +190,7 @@ const subtract: func(imm int, imm int) int = int.-
 # bytes as a decimal collection rather than assuming UTF-8. Box and Ref format
 # their contents as Box(value) and Ref(value). These generic converters require
 # String conversion of an element expression. Range formats omitted bounds with
-# .. or ..^, matching source syntax. Converters borrow their inputs, never copy
+# .. or ..=, matching source syntax. Converters borrow their inputs, never copy
 # or consume elements, and panic on allocation failure. They also execute at
 # compile time within the ordinary storage-publication boundary.
 # A collection literal can initialize String directly, as in String([1, 2]);
@@ -507,6 +508,8 @@ const computed_block = comptime
 # allocation failure through the declared fallible API. Compiler memory used
 # to interpret values is an implementation resource: exhausting it is the
 # infrastructure failure described above, not an allocation-provider refusal.
+# Optimization may remove an allocation and its matching deallocation when the
+# storage is otherwise unobserved; the removed request cannot then be refused.
 # Allocation failure skips deferred initialization. Construction failure cleans
 # completed subobjects and releases storage as required by the owning library
 # declaration; captured writes and completed transfers are not rolled back.
@@ -567,12 +570,44 @@ func double(a: int) int -> a * 2
 
 # Function references are values and may be bound, passed, returned, and called.
 # Callable types contain each parameter's access mode and type, the return type,
-# and fallibility. Parameter names are not part of type identity. Functions do
-# not capture local bindings.
+# and fallibility. Parameter names are not part of type identity. Plain function
+# references do not capture local bindings; capturing closures are planned below.
 func choose() func(int) int -> double
 func apply(operation: func(int) int, value: int) int -> operation(value)
 const operation = choose()
 exit(apply(operation, 21))
+
+# Closures (planned)
+# A capturing closure has a concrete environment containing its captures and
+# code operating on that environment. Capture ownership, permission, lifetime,
+# and invalidation follow ordinary value and reference rules. Borrowing a value
+# does not extend its lifetime, even when the closure itself is heap allocated.
+# Captures determine the environment's ownership capabilities; closures do not
+# inherit the trivial move/copy/drop guarantees of plain function references.
+# A concrete closure can live inline and pass through generic APIs without heap
+# allocation. Returning an owning closure by value can construct its environment
+# directly in the caller's destination. Explicit Box construction instead puts
+# the environment in owned heap storage; closure creation does not implicitly box.
+# Allocations performed by captured values or their construction remain ordinary
+# effects, independently of the environment's storage.
+# Plain function references remain distinct from capturing closure types.
+# Owning type-erased callbacks are deferred, not an implicit conversion or an
+# allocation requirement of closures. Capture syntax/defaults, invocation access
+# and consumption modes, and generic callable inspection remain to be settled.
+# These illustrative examples assume offset is captured by value, not a default
+# capture policy. Capturing function expressions are not implemented yet.
+func stack_example() int
+    const offset = 10
+    const add = func(value: int) int -> value + offset
+    return add(32)
+
+fallible heap_example() int
+    const offset = 10
+    const boxed = Box.new?(
+        func(value: int) int -> value + offset
+    )
+    ref add = boxed.borrow()
+    return add(32)
 
 # Explicit overload sets
 # An overload declaration binds a module or type-namespace name to a nonempty
@@ -646,8 +681,9 @@ exit(0)
 # demanded bodies retain ordinary source validation.
 # Native traces use read-only metadata and existing return addresses, adding no
 # instructions to successful calls. They stop at entry or an unknown call site
-# and report at most 1024 frames. Source paths, lines, columns, and callable names
-# are retained in the executable. Compile-time messages may borrow local storage;
+# and report at most 1024 frames. Calls removed by inlining still report their
+# frames: trace metadata maps each code address to its inlined call chain.
+# Source paths, lines, columns, and callable names are retained in the executable. Compile-time messages may borrow local storage;
 # the diagnostic snapshots their bytes before that storage is released.
 func invalid_state() never -> panic "invalid state"
 # panic
@@ -1246,6 +1282,9 @@ fallible forward_initializer(static T: type, init item: T) T
 # std.memory.List(T) owns Allocation(T) and a contiguous initialized prefix
 # of length elements within capacity allocated slots. Creation is fallible;
 # negative capacity fails. Zero capacity still owns a distinct allocation.
+# List(T).filled(imm value: T, count: int) is fallible and requires copyable T.
+# It allocates exactly count slots once, then constructs each element by one
+# ordinary copy of value, which is not consumed. Negative count fails.
 # Destroying a List destroys only the initialized prefix, in reverse order,
 # then deallocates the storage. Its allocation and counters are not exposed for
 # external mutation. Only directly movable, automatically droppable elements
@@ -1664,6 +1703,22 @@ reassigned = int_or_float_value
 
 # Variants never narrow implicitly. Control flow does not refine existing
 # bindings; extraction or a pattern introduces a separate narrowed binding.
+
+# Inline named variant cases (planned)
+# A variant declaration may introduce named cases alongside ordinary type
+# alternatives. A case without a payload annotation has an implicit unit payload
+# and requires no payload storage; the variant may still need a discriminant.
+# Named cases have distinct identities even when their payload types coincide.
+# A payload-free case is neither bare unit nor bare none, so it does not itself
+# introduce failure-to-none conversion. Existing type alternatives remain ordinary
+# members rather than becoming wrapped cases.
+# Informative errors use ordinary variants and payloads, not a new payload-carrying
+# failure effect. Declaration syntax below is a sketch; case construction,
+# matching, visibility, and identity across aliases/composed variants remain open.
+static Error =
+    .Oom
+    .Message: String
+    CustomErrorType
 
 
 # Converters
@@ -2109,7 +2164,20 @@ const maybe: int | unit = if 1 < 2 -> 1
 # Match
 # Literal: match an equal value. '_': match anything without binding.
 # Bare identifier: match anything and bind it immutably in the arm.
-# 'pattern as name': also bind the complete value matched by the pattern.
+# Tuple: match the stated arity and apply each element pattern recursively.
+# (x, y) captures two elements; (0, y) tests one and captures the other;
+# (x, _) ignores the second without copying it. (x) groups a pattern and
+# (x,) matches a singleton tuple. () still matches unit, not an empty tuple.
+# Tuple patterns do not positionally destructure nominal structs.
+# A bare pattern name always introduces a new arm-local capture; it never
+# tests equality against an outer name. Duplicate names and shadowing are
+# source errors. Sibling arms can independently reuse the same names.
+# Tuple captures have their elements' logical types; corresponding captures
+# across compatible tuple alternatives must agree. No variant-of-tuples to
+# tuple-of-variants distribution is inferred. Reference storage and authority
+# remain independent of those logical element types.
+# Existing scalar/type 'pattern as name' also binds the matched value.
+# Tuple captures use element names; whole-tuple 'as name' is not supported.
 # 'is Type': type pattern, distinct from an identifier binding.
 # Captures own immutable values like const bindings: an existing place supplies
 # a copy, while a fresh or explicitly transferred owner supplies ownership.
@@ -2141,6 +2209,36 @@ const maybe: int | unit = if 1 < 2 -> 1
 # Ordinary transfer, explicit-drop, reference escape, and ASAP cleanup rules
 # apply on every selected arm and nonlocal exit; cleanup is not delayed to the
 # lexical end of an arm. Failed tests retain the subject for subsequent arms.
+# An arm can follow its pattern with and and an ordinary condition expression.
+# All captures become visible only after the complete pattern matches, then
+# remain visible in its condition and selected body. Conditions short-circuit
+# with ordinary success/failure semantics; bool values require explicit ?.
+# Nested ordinary failure rejects the arm after attempt-local cleanup. Body
+# failure never retries. Side effects outside protected storage persist.
+# A guarded arm does not establish exhaustive coverage. An unconstrained,
+# unguarded tuple pattern covers its compatible tuple alternatives; partial
+# element patterns require an unconditional remainder unless existing scalar
+# coverage already proves the domain complete.
+# Captures from borrowed places make their actual copies after structural
+# success and before conditions, including custom copy hooks. Conditions and
+# body inspect the same copied object. Rejected conditions clean those copies
+# up normally and can therefore run copy/drop hooks on several attempts.
+# Fresh/transferred tuple fields remain in place while testing; ownership
+# partitions only when an arm selects. ref captures alias without copying,
+# including for borrowed noncopyable fields. Ignored owners retain cleanup and
+# explicit-drop obligations. No capture copies or owners are acquired on a
+# structural mismatch.
+# During dispatch, conditions cannot consume, mutate, or invalidate the retained
+# subject, its projected referents, or their prepared captures through any alias.
+# Unrelated writes and I/O are permitted. Normal reference permissions resume
+# in the selected body. A capture requiring a consuming representation change
+# is unavailable for condition reads until selection; no temporary substitute
+# or implicit clone is used. Ordinary const declarations and if are unchanged.
+match point
+    (0, 0) -> origin()
+    (x, y) and x > y -> above(x, y)
+    (x, y) -> remaining(x, y)
+
 match n
     2 -> 3
     10 as x ->
@@ -2179,28 +2277,39 @@ loop
 
 
 # Ranges and for iteration
-# a..b excludes b; a..^b includes b. Endpoints are evaluated exactly once,
-# left to right. Arithmetic binds more tightly than a
-# range; a range binds more tightly than comparisons. The result is an ordinary
+# a..b excludes b; a..=b includes b. Endpoints are evaluated exactly once,
+# left to right. Arithmetic binds more tightly than a range; a range binds more
+# tightly than comparisons. The result is an ordinary
 # reusable std.range.Range value, not an active cursor or a collection of
-# items. Both endpoint fields have type int | none, so their presence can vary
-# at runtime without changing the range type. Original endpoints and inclusivity
-# are retained rather than normalized.
+# items. Both endpoint fields have type int | std.range.FromEnd | none, so their
+# presence and absolute or relative form can vary at runtime without changing
+# the range type. Original endpoints and inclusivity are retained rather than
+# normalized. String conversion uses .. or ..= and retains ^ on relative bounds.
 # ..b, a.., and .. use none for omitted bounds; explicit none endpoints are
 # equivalent. A trailing .. at the end of a line omits the upper bound.
 # Inclusive syntax requires an upper endpoint. Iteration requires two int
-# endpoints; omitted bounds do not imply an unbounded iteration sequence.
-# Iteration and reversal panic for missing endpoints; step_by fails.
+# endpoints; omitted or relative bounds cannot supply an iteration length.
+# Iteration and reversal panic for missing or relative endpoints; step_by fails.
 # These finite integer ranges initially iterate upward. A start greater than
-# the end produces an empty iteration; x..x is empty and x..^x contains exactly x.
+# the end produces an empty iteration; x..x is empty and x..=x contains exactly x.
 # This does not make reversed bounds valid for slicing.
 #
-# End-relative indices and slice bounds use explicit length arithmetic:
-# values[values.len() - 1], values[values.len() - n..], and
-# values[..values.len() - n]. Standard integer indexing rejects negative indices;
-# there is no dedicated from-end syntax, bound type, or factory. These expressions
-# use ordinary integer arithmetic and the same bounds and failure rules as other
-# indexing and slicing expressions.
+# Prefix ^n constructs an ordinary std.range.FromEnd value, equivalent to
+# std.range.from_end(n), independently of caller imports or shadowing. It evaluates
+# its operand once and binds like other unary operators: use ^(n + 1) to include
+# arithmetic in the distance. Postfix value^ remains ownership transfer.
+# Construction stores the distance; applying it checks 0 <= n <= length before
+# subtracting, then resolves to length - n. Invalid distances fail without
+# wrapping or clamping. Standard integer indexing still rejects negative indices.
+# values[^1] selects the last element, values[^n..] the last n elements, and
+# values[..^n] excludes the last n elements. values[1..=^1] includes the last
+# element. ^0 denotes the past-end boundary: valid as an exclusive slice bound,
+# invalid as an element index or inclusive upper bound. Relative positions and
+# stored ranges resolve anew against each receiver's current initialized length,
+# never its capacity. Range.resolve?(length) explicitly resolves a stored range
+# to absolute, exclusive (start, limit) bounds.
+# The old inclusive spelling ..^ is not an alias for ..=: it now means an
+# exclusive range with a relative upper bound.
 #
 # Array, List, Span, BytesView, and StringView accept slice(bounds). Omitted
 # starts resolve to zero and omitted exclusive ends to initialized length.
@@ -2211,9 +2320,12 @@ loop
 # and out-of-bounds inputs fail rather than clamp. Slices own only a view handle,
 # preserve backing permissions and lifetimes, and expose no spare capacity.
 # Text slice positions are byte offsets; StringView also checks UTF-8 boundaries.
-# Brackets select integer element indexing or range slicing through explicit
-# standard-library overload sets. StringView supports range slicing, not integer
-# element indexing. No standard range setter or bulk slice assignment is defined.
+# Array, List, Span, and BytesView accept integer or FromEnd element indices
+# through get and brackets; Array, List, and Span also accept them for element
+# assignment. Explicit standard-library overload sets select element indexing or
+# range slicing. StringView supports range slicing, not element indexing. Relative
+# text distances count bytes, not characters; UTF-8 boundary checks still apply.
+# No standard range setter or bulk slice assignment is defined.
 #
 # reversed() reverses the actual sequence, including a stepped sequence.
 # step_by?(positive_factor) selects the first item and then every factor-th item

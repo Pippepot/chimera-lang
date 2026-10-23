@@ -5,7 +5,7 @@ const Fixture = test_sources.SourceFixture;
 test "pull standard cursors deliver items and End directly" {
     try Fixture.expectParity(
         \\fallible calculate() int
-        \\    var cursor = (2..^3).iter()
+        \\    var cursor = (2..=3).iter()
         \\    var sum = 0
         \\    if const first = cursor.next() as int -> sum += first
         \\    else
@@ -185,7 +185,7 @@ test "pull for integrates range and collection factories" {
         \\        item += 1
         \\        sum += item
         \\    if values[0] <> 7 -> return 91
-        \\    for item in 2..^5 -> sum -= item
+        \\    for item in 2..=5 -> sum -= item
         \\    return sum - 31
         \\func run() int
         \\    if const result = calculate() -> return result
@@ -383,7 +383,7 @@ test "pull for exhaustion identity is independent of caller scope" {
         \\    value: int
         \\func run() int
         \\    var sum = 0
-        \\    for value in 1..^3 -> sum += value
+        \\    for value in 1..=3 -> sum += value
         \\    return sum * 7
     , 42);
     try Fixture.expectAnySourceDiagnostic(
@@ -399,7 +399,7 @@ test "pull for exhaustion identity is independent of caller scope" {
         \\import std.exit.{exit}
         \\func run() int
         \\    var sum = 0
-        \\    for value in 1..^3 -> sum += value
+        \\    for value in 1..=3 -> sum += value
         \\    return sum * 7
     , 42);
 }
@@ -421,7 +421,7 @@ test "pull generic map handles owned and borrowed inputs without metadata" {
         \\func scale(value: int) int -> value * 7
         \\func read(item: Item) int -> item.value
         \\func run() int
-        \\    var mapped = Mapped(RangeIterator, int, int){source = (1..^3).iter(), callback = scale}
+        \\    var mapped = Mapped(RangeIterator, int, int){source = (1..=3).iter(), callback = scale}
         \\    var sum = 0
         \\    loop
         \\        if const item = mapped.next() as int -> sum += item
@@ -557,7 +557,7 @@ test "adapter feasibility type factories select owned or borrowed delivery" {
             .predicate = if (borrowed) "item.value > 0" else "item > 0",
             .source_type = if (borrowed) "SpanIterator(Item)" else "RangeIterator",
             .borrowed = if (borrowed) "true" else "false",
-            .source = if (borrowed) "values.iter()" else "(1..^2).iter()",
+            .source = if (borrowed) "values.iter()" else "(1..=2).iter()",
             .sum = if (borrowed) "item.value += 1\n            total += item.value" else "total += item",
             .scale = if (borrowed) "1" else "14",
         });
@@ -824,7 +824,7 @@ test "pull generic mixed zip composes nested owned and reference tuples" {
         \\func run() int
         \\    var item = Item{value = 30}
         \\    const other = Item{value = 7}
-        \\    var inner = Zip(RangeIterator, Once(Item), int, Item){left = (12..^12).iter(), right = Once(Item){source = Ref.from(item), ready = true}}
+        \\    var inner = Zip(RangeIterator, Once(Item), int, Item){left = (12..=12).iter(), right = Once(Item){source = Ref.from(item), ready = true}}
         \\    var nested = NestedZip(RangeIterator, Once(Item), Once(Item), int, Item, Item){left = inner^, right = Once(Item){source = Ref.from(other), ready = true}}
         \\    const result = nested.next()
         \\    if const pair = result as ((int, ref Item), ref Item)
@@ -985,7 +985,7 @@ test "pull generic zip rejects actual retained-view invalidation not unrelated m
 test "ranges construct ordinary cursors with native and comptime parity" {
     try Fixture.expectParity(
         \\func run() int
-        \\    const bounds = 2..^5
+        \\    const bounds = 2..=5
         \\    var cursor = bounds.iter()
         \\    var result = 0
         \\    loop
@@ -1016,15 +1016,46 @@ test "ranges retain one value type while endpoint presence changes at runtime" {
     , 42);
 }
 
-test "open range stepping fails and infallible traversal panics" {
+test "end relative ranges resolve stored bounds with checked native and comptime parity" {
+    try Fixture.expectParity(
+        \\fallible calculate() int
+        \\    const distance = ^2
+        \\    const bounds = 1..distance
+        \\    const first = bounds.resolve?(5)
+        \\    const second = bounds.resolve?(8)
+        \\    first.0 == 1 and first.1 == 3
+        \\    second.0 == 1 and second.1 == 6
+        \\    const suffix = (^2..).resolve?(5)
+        \\    suffix.0 == 3 and suffix.1 == 5
+        \\    const included = (..=^1).resolve?(5)
+        \\    included.0 == 0 and included.1 == 5
+        \\    const empty = (^0..).resolve?(0)
+        \\    empty.0 == 0 and empty.1 == 0
+        \\    if (..=^0).resolve(5) -> return 90
+        \\    if (^6..).resolve(5) -> return 91
+        \\    if (..^(-1)).resolve(5) -> return 92
+        \\    if (^(-2147483648)..).resolve(5) -> return 93
+        \\    if (..^2147483647).resolve(5) -> return 94
+        \\    if (3..^3).resolve(5) -> return 95
+        \\    if bounds.step_by(1) -> return 96
+        \\    String(bounds) == "1..^2"
+        \\    String(^2..=^1) == "^2..=^1"
+        \\    return 42
+        \\func run() int
+        \\    if const result = calculate() -> return result
+        \\    return 97
+    , 42);
+}
+
+test "unresolved range stepping fails and infallible traversal panics" {
     try Fixture.expectParity(
         \\func run() int
-        \\    const ranges = [(..3), (2..), (..)]
+        \\    const ranges = [(..3), (2..), (..), (^1..2), (1..^1), (^2..^1)]
         \\    for bounds in ranges
         \\        if const sequence = bounds.step_by(1) -> return 90
         \\    return 42
     , 42);
-    for ([_][]const u8{ "..3", "2..", ".." }) |bounds| {
+    for ([_][]const u8{ "..3", "2..", "..", "^1..2", "1..^1", "^2..^1" }) |bounds| {
         for ([_][]const u8{ "iter", "reversed" }) |method| {
             const source = try std.testing.allocator.print("const bounds = {s}\n_ = bounds.{s}()\nexit(90)", .{ bounds, method });
             defer std.testing.allocator.free(source);
@@ -1044,7 +1075,7 @@ test "for ranges lower through ordinary loops with parity" {
     try Fixture.expectParity(
         \\func run() int
         \\    var result = 0
-        \\    for value in 2..^5
+        \\    for value in 2..=5
         \\        result += value
         \\    return result * 3
     , 42);
@@ -1053,17 +1084,17 @@ test "for ranges lower through ordinary loops with parity" {
 test "for range endpoints empty ranges and signed boundaries have parity" {
     const cases = [_]struct { range: []const u8, count: []const u8, sum: []const u8 }{
         .{ .range = "0..4", .count = "4", .sum = "6" },
-        .{ .range = "0..^4", .count = "5", .sum = "10" },
+        .{ .range = "0..=4", .count = "5", .sum = "10" },
         .{ .range = "2..2", .count = "0", .sum = "0" },
-        .{ .range = "2..^2", .count = "1", .sum = "2" },
+        .{ .range = "2..=2", .count = "1", .sum = "2" },
         .{ .range = "3..2", .count = "0", .sum = "0" },
-        .{ .range = "3..^2", .count = "0", .sum = "0" },
-        .{ .range = "2147483647..^2147483647", .count = "1", .sum = "2147483647" },
-        .{ .range = "2147483646..^2147483647", .count = "2", .sum = "-3" },
+        .{ .range = "3..=2", .count = "0", .sum = "0" },
+        .{ .range = "2147483647..=2147483647", .count = "1", .sum = "2147483647" },
+        .{ .range = "2147483646..=2147483647", .count = "2", .sum = "-3" },
         .{ .range = "2147483646..2147483647", .count = "1", .sum = "2147483646" },
-        .{ .range = "-2147483648..^-2147483648", .count = "1", .sum = "-2147483648" },
+        .{ .range = "-2147483648..=-2147483648", .count = "1", .sum = "-2147483648" },
         .{ .range = "-2147483648..-2147483646", .count = "2", .sum = "1" },
-        .{ .range = "-2..^2", .count = "5", .sum = "0" },
+        .{ .range = "-2..=2", .count = "5", .sum = "0" },
     };
     for (cases) |case| {
         const source = try test_sources.renderTemplate(std.testing.allocator,
@@ -1149,7 +1180,7 @@ test "for borrows existing cursors and resumes after early break" {
 test "for range values are reusable rather than shared cursors" {
     try Fixture.expectParity(
         \\func run() int
-        \\    const bounds = 1..^3
+        \\    const bounds = 1..=3
         \\    var sum = 0
         \\    for value in bounds -> sum += value
         \\    for value in bounds -> sum += value
@@ -1165,7 +1196,7 @@ test "for evaluates range endpoints once from left to right" {
         \\func run() int
         \\    var trace = 0
         \\    var sum = 0
-        \\    for value in endpoint(trace, 1, 2)..^endpoint(trace, 2, 5)
+        \\    for value in endpoint(trace, 1, 2)..=endpoint(trace, 2, 5)
         \\        sum += value
         \\    if trace <> 12 -> return 90
         \\    return sum * 3
@@ -1448,7 +1479,7 @@ test "range stepping and reversal compose as sequence operations" {
         .{ .expression = "(0..10).step_by?(2).step_by?(2)", .digits = "48", .count = "3" },
         .{ .expression = "(0..10).reversed().step_by?(2).step_by?(2)", .digits = "951", .count = "3" },
         .{ .expression = "(3..3).reversed().step_by?(2)", .digits = "0", .count = "0" },
-        .{ .expression = "(3..^3).reversed().step_by?(2147483647)", .digits = "3", .count = "1" },
+        .{ .expression = "(3..=3).reversed().step_by?(2147483647)", .digits = "3", .count = "1" },
         .{ .expression = "(0..10).step_by?(2147483647)", .digits = "0", .count = "1" },
     };
     for (cases) |case| {
@@ -1486,7 +1517,7 @@ test "range stepping rejects zero and negative factors" {
 test "range stepping supports distances and composed strides wider than int" {
     try Fixture.expectParity(
         \\fallible calculate() int
-        \\    const complete = -2147483648..^2147483647
+        \\    const complete = -2147483648..=2147483647
         \\    const huge = complete.step_by?(2147483647).step_by?(2)
         \\    var count = 0
         \\    var sum = 0
@@ -1552,7 +1583,7 @@ test "range wide boundary matrix matches independent selected sequences" {
                     selected_count += 1;
                 }
                 if (reverse_result) std.mem.reverse(i64, expected[0..selected_count]);
-                try checks.writer.print("    check?({d}, ({d}..{s}{d})", .{ selected_count, first, if (inclusive) "^" else "", limit });
+                try checks.writer.print("    check?({d}, ({d}..{s}{d})", .{ selected_count, first, if (inclusive) "=" else "", limit });
                 if (reverse_source) try checks.writer.writeAll(".reversed()");
                 try checks.writer.print(".step_by?({d})", .{initial_factor});
                 if (reverse_middle) try checks.writer.writeAll(".reversed()");
@@ -1759,11 +1790,11 @@ test "range progression matrix matches explicit small integer sequences" {
         \\        else expected += stride
         \\    cursor.next() is End
         \\fallible calculate() int
-        \\    for first in -4..^4
-        \\        for limit in -4..^4
-        \\            for stride in 1..^4
+        \\    for first in -4..=4
+        \\        for limit in -4..=4
+        \\            for stride in 1..=4
         \\                const exclusive = (first..limit).step_by?(stride)
-        \\                const inclusive = (first..^limit).step_by?(stride)
+        \\                const inclusive = (first..=limit).step_by?(stride)
         \\                check?(exclusive, first, limit - 1, stride, false)
         \\                check?(inclusive, first, limit, stride, false)
         \\                if first < limit
@@ -1825,7 +1856,7 @@ test "for gives explicit iterator factories precedence over cursor fallback" {
         \\    calls: Ref(int)
         \\    pub func iter(ref self: Source) RangeIterator
         \\        self.calls.value += 1
-        \\        const values = 20..^22
+        \\        const values = 20..=22
         \\        return values.iter()
         \\    pub func next(mut self: Source) int | End -> 99
         \\func run() int

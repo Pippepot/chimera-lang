@@ -894,6 +894,10 @@ pub fn AnalysisContext(comptime Context: type) type {
             return standardFunction(self.ctx, .range, if (inclusive) "inclusive" else "exclusive");
         }
 
+        pub fn fromEndConstructor(self: @This()) !?structures.ItemId {
+            return standardFunction(self.ctx, .range, "from_end");
+        }
+
         pub fn iterationEndType(self: @This()) !structures.TypeId {
             const item = (try standardDeclaration(self.ctx, .iteration, "End", structures.ModuleScope.resolveStatic)) orelse return error.Unavailable;
             const value = (try self.staticItem(.{ .item = item })) orelse return error.Unavailable;
@@ -3857,7 +3861,6 @@ fn emitComptimeExecutionIssue(
             .panic => |message| .{ .compile_time_panic = message },
             .call_cycle => .compile_time_call_cycle,
             .division_by_zero => .compile_time_division_by_zero,
-            .integer_overflow => .compile_time_integer_overflow,
             .unsupported_operation => .compile_time_unsupported_operation,
             .escaping_storage => .compile_time_escaping_storage,
         },
@@ -4819,9 +4822,11 @@ test "inline array namespace signatures and externs use typed builtin bodies" {
             const len_signature = (try ctx.get(FunctionInstanceSignature, len)).*.?;
             try std.testing.expect(!len_signature.is_fallible);
             try std.testing.expectEqual(structures.TypeId.int, len_signature.return_type);
-            for ([_][]const u8{"get"}) |name| {
-                const member = (try analysis.typeNamespaceMember(type_id, name, .{ .start = 0, .end = 0 })).?;
+            const getter = (try analysis.typeNamespaceCallMember(type_id, "get", 2, .{ .start = 0, .end = 0 })).?;
+            const getters = try analysis.functionOverloads(getter.overloaded_function);
+            for (getters.candidates) |member| {
                 const signature = (try ctx.get(FunctionInstanceSignature, member)).*.?;
+                if (signature.parameters[1].type_id != .int) continue;
                 try std.testing.expect(signature.is_fallible);
                 try std.testing.expectEqual(structures.CallBehavior.ordinary, try analysis.callBehavior(member.item));
                 try std.testing.expectEqual(@as(usize, 2), signature.parameters.len);
@@ -4831,7 +4836,8 @@ test "inline array namespace signatures and externs use typed builtin bodies" {
                 try std.testing.expectEqual(structures.TypeId.int, signature.parameters[1].type_id);
                 try std.testing.expectEqual(structures.TypeId.int, signature.return_type);
                 try std.testing.expectEqual(structures.ResultMode.reference, signature.result_mode);
-            }
+                break;
+            } else return error.ExpectedIntegerGetter;
             for ([_]standard_library.External{ .array_filled, .array_borrow }) |symbol| {
                 const item = (try standardFunction(ctx, .array, @tagName(symbol))).?;
                 const instance: structures.InstanceId = .{ .item = item, .specialization = namespace.specialization };

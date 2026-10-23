@@ -524,7 +524,7 @@ test "range iteration snapshots restore runtime and compile-time results and rec
     const source =
         \\func run() int
         \\    var total = 36
-        \\    for value in (0..^3).reversed() -> total += value
+        \\    for value in (0..=3).reversed() -> total += value
         \\    return total
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -532,11 +532,11 @@ test "range iteration snapshots restore runtime and compile-time results and rec
     const fixture = try Fixture.restore(source);
     defer fixture.db.deinit();
     try fixture.expectExit(42);
-    const exclusive = try std.mem.replaceOwned(u8, std.testing.allocator, source, "0..^3", "0..3");
+    const exclusive = try std.mem.replaceOwned(u8, std.testing.allocator, source, "0..=3", "0..3");
     defer std.testing.allocator.free(exclusive);
     try fixture.db.setInput(queries.SourceText, 0, exclusive);
     try fixture.expectExit(36);
-    const longer = try std.mem.replaceOwned(u8, std.testing.allocator, source, "0..^3", "0..^4");
+    const longer = try std.mem.replaceOwned(u8, std.testing.allocator, source, "0..=3", "0..=4");
     defer std.testing.allocator.free(longer);
     try fixture.db.setInput(queries.SourceText, 0, longer);
     try fixture.expectExit(50);
@@ -572,7 +572,7 @@ test "cursor iteration snapshots track method edits explicit factories and missi
     try fixture.expectExit(48);
     const factory = try std.mem.replaceOwned(u8, std.testing.allocator, source, "    pub func next",
         \\    pub func iter(ref self: Cursor) RangeIterator
-        \\        const values = 0..^3
+        \\        const values = 0..=3
         \\        return values.iter()
         \\    pub func next
     );
@@ -767,12 +767,18 @@ test "range snapshots restore raw bounds and recompute runtime endpoint presence
     try fixture.expectExit(42);
     const cases = [_]struct { bounds: []const u8, status: u8 }{
         .{ .bounds = "2..4", .status = 66 },
+        .{ .bounds = "1..^2", .status = 42 },
+        .{ .bounds = "^4..^2", .status = 42 },
+        .{ .bounds = "^4..=^3", .status = 42 },
+        .{ .bounds = "..^0", .status = 12 },
         .{ .bounds = "..2", .status = 6 },
         .{ .bounds = "1..", .status = 46 },
         .{ .bounds = "..", .status = 12 },
         .{ .bounds = "3..1", .status = 138 },
-        .{ .bounds = "0..^2147483647", .status = 138 },
-        .{ .bounds = "1..^none", .status = 138 },
+        .{ .bounds = "0..=2147483647", .status = 138 },
+        .{ .bounds = "1..=none", .status = 138 },
+        .{ .bounds = "1..=^0", .status = 138 },
+        .{ .bounds = "^6..", .status = 138 },
     };
     for (cases) |case| {
         const replacement = try std.fmt.allocPrint(std.testing.allocator, "static bounds = {s}", .{case.bounds});

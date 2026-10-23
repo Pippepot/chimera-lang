@@ -2,15 +2,22 @@
 set -euo pipefail
 shopt -s nullglob globstar
 
+format=text
+if [[ ${1:-} == --json ]]; then
+    format=json
+    shift
+fi
+
 if (($#)); then
     zig_files=("$@")
 else
     zig_files=( test_sources.zig src/**/*.zig tests/**/*.zig )
 fi
 
-python3 - "${zig_files[@]}" <<'PY'
+python3 - "$format" "${zig_files[@]}" <<'PY'
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -133,8 +140,12 @@ def count_file(path: str) -> Counts:
     return counts
 
 
-paths = sys.argv[1:]
+output_format = sys.argv[1]
+paths = sys.argv[2:]
 if not paths:
+    if output_format == "json":
+        print(json.dumps({"code": 0, "test": 0, "total": 0}))
+        raise SystemExit(0)
     print("No Zig files found.")
     raise SystemExit(0)
 
@@ -146,6 +157,11 @@ for path in paths:
     for part in Path(path).parts:
         parent = parent.children.setdefault(part, TreeNode(part))
         parent.counts.add(counts)
+
+if output_format == "json":
+    print(json.dumps({"code": tree.counts.code, "test": tree.counts.test,
+                      "total": tree.counts.code + tree.counts.test}))
+    raise SystemExit(0)
 
 rows: list[tuple[str, Counts]] = []
 

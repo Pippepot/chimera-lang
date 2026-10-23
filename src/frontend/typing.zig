@@ -72,6 +72,8 @@ pub const BodyMeasurements = struct {
     overload_argument_discoveries: usize = 0,
     unevaluated_type_visits: usize = 0,
     type_only_regions: usize = 0,
+    region_capture_buffer_growths: usize = 0,
+    inference_capture_values: usize = 0,
 };
 
 pub fn emitSemanticIssue(ctx: anytype, file_id: structures.FileId, issue: semantic.Issue) !void {
@@ -204,7 +206,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         const ReferenceRefresh = union(enum) { value: *?u32, slots: *?u32 };
         const ReferenceEffectSite = union(enum) { instruction: u31, terminator: EffectId };
         const ReferenceEffects = struct { writes: ?u32 = null, storage_invalidations: ?u32 = null };
-        const ReferenceExclusion = struct { reference: ?u32, invalidation: ?u32, span: structures.SourceSpan };
+        const ReferenceExclusion = struct { reference: ?u32, invalidation: ?u32, span: structures.SourceSpan, match_testing: bool = false };
+        const MatchTestingScope = struct { parent: ?*MatchTestingScope, origins: ?u32 = null, locals: std.ArrayList(semantic.UnresolvedBody.LocalId) = .empty };
         const ReferenceWrite = struct {
             origins: ?u32,
             written_type: structures.TypeId,
@@ -360,6 +363,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             origins: u32,
             span: structures.SourceSpan,
             location: PendingReferenceUseLocation,
+            match_testing: bool = false,
         };
         const PendingReferenceInvalidation = struct {
             origins: u32,
@@ -468,7 +472,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             destination: GenerationId,
         };
         const GenerationOrigin = enum { none, define, produce, phi };
-        const LocalMetadata = struct { mutable: bool = false, reference: bool = false, can_deinit: bool = false, mut_parameter: ?u32 = null };
+        const LocalMetadata = struct { mutable: bool = false, reference: bool = false, can_deinit: bool = false, mut_parameter: ?u32 = null, match_body_only: bool = false };
 
         ctx: Context,
         gpa: std.mem.Allocator,
@@ -544,6 +548,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         pending_initializer_owners: std.ArrayList(Value) = .empty,
         initializer_owners: std.ArrayList(struct { initializer: structures.FunctionValueId, owner: Value }) = .empty,
         pending_initializer_locals: std.ArrayList(semantic.UnresolvedBody.LocalId) = .empty,
+        match_testing_scope: ?*MatchTestingScope = null,
         replacement_targets: std.ArrayList(ReplacementTarget) = .empty,
         pending_deinit_places: std.ArrayList(OwnedPlace) = .empty,
         pending_deinit_fields: std.ArrayList(PlaceField) = .empty,
@@ -990,15 +995,6 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn buildPrimitiveRemainder(self: *Self) !void {
             const left = self.values[0].?.id;
             const right = self.values[1].?.id;
-            const minus_one = try self.appendInstruction(.{ .const_int = -1 });
-            const zero = try self.newEmptyBlock();
-            const divide = try self.newEmptyBlock();
-            // Every integer has remainder zero with -1, including minInt.
-            // Avoid the overflowing division in that case.
-            self.branchOn(.eqi, right, minus_one.id, zero, divide);
-            self.enterBlock(zero);
-            try self.returnValue(try self.appendInstruction(.{ .const_int = 0 }), .{ .start = 0, .end = 0 });
-            self.enterBlock(divide);
             const quotient = try self.appendInstruction(.{ .divsi = .{ .lhs = left, .rhs = right } });
             const product = try self.appendInstruction(.{ .muli = .{ .lhs = quotient.id, .rhs = right } });
             try self.returnValue(try self.appendInstruction(.{ .subi = .{ .lhs = left, .rhs = product.id } }), .{ .start = 0, .end = 0 });
@@ -2281,6 +2277,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn readLocal(self: *Self, local: semantic.UnresolvedBody.LocalId, span: structures.SourceSpan) !Value {
             const index = @backingInt(local);
+            if (self.locals.items(.match_body_only)[index]) return self.reject(span, .match_capture_unavailable_in_condition);
             try self.requireAvailablePlace(local, &.{}, span);
             if (self.locals.items(.reference)[index]) {
                 const reference = self.state.values.get(index).?;
@@ -2302,8 +2299,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn borrowLocalValue(self: *Self, local: semantic.UnresolvedBody.LocalId) Value {
             var value_to_read = self.state.values.get(@backingInt(local)).?;
             value_to_read.writable = self.locals.items(.mutable)[@backingInt(local)];
-            value_to_read.borrowed_generation = value_to_read.owned_generation;
-            value_to_read.borrowed_cleanup_value = value_to_read.id;
+            value_to_read.borrowed_generation = value_to_read.owned_generation orelse value_to_read.borrowed_generation;
+            value_to_read.borrowed_cleanup_value = if (value_to_read.owned_generation != null) value_to_read.id else value_to_read.borrowed_cleanup_value orelse value_to_read.id;
             value_to_read.owned_generation = null;
             value_to_read.borrowed_type = value_to_read.type_id;
             value_to_read.borrow_root = local;
@@ -2827,7 +2824,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn inferCollectionEmission(self: *Self, raw: semantic.UnresolvedBody.ValueUse, expected: ?structures.TypeId) anyerror!CollectionEmissionShape {
             var region = self.initializerRegion(.unit);
             region.type_check_only = true;
-            _ = try self.bindRegionCaptures(&region);
+            try self.bindInferenceCaptures(&region, raw.value);
             var emission: CollectionEmission = .{ .expected = expected };
             region.collection_emission = &emission;
             _ = try region.value(raw.value);
@@ -3077,6 +3074,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn validateInitializerWrite(self: *Self, local: semantic.UnresolvedBody.LocalId, span: structures.SourceSpan) !void {
+            var testing = self.match_testing_scope;
+            while (testing) |scope| : (testing = scope.parent) {
+                if (std.mem.indexOfScalar(semantic.UnresolvedBody.LocalId, scope.locals.items, local) != null)
+                    return self.reject(span, .match_guard_invalidates_subject);
+            }
+            if (self.match_testing_scope != null and self.state.values.get(@backingInt(local)) != null)
+                try self.checkMatchTestingWrite(try self.sourceReferenceOrigins(self.borrowLocalValue(local)), span);
             if (std.mem.indexOfScalar(semantic.UnresolvedBody.LocalId, self.pending_initializer_locals.items, local) != null)
                 return self.reject(span, .initializer_capture_conflict);
         }
@@ -3117,6 +3121,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn validateInitializerReferenceWrite(self: *Self, reference: Value, span: structures.SourceSpan) !void {
+            try self.checkMatchTestingWrite(reference.reference_origins, span);
             if (self.is_initializer_region and reference.reference_origins != null) try self.capture_reference_writes.append(self.gpa, reference);
             if (self.pending_initializer_owners.items.len == 0) return;
             var incomplete = false;
@@ -3234,12 +3239,160 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             locals: std.ArrayList(?semantic.UnresolvedBody.LocalId) = .empty,
         };
 
+        const InferenceDependencies = struct {
+            parent: *Self,
+            values: []bool,
+            locals: []bool,
+            blocks: []bool,
+            conditions: []bool,
+
+            fn visit(self: *@This(), item: anytype) anyerror!void {
+                const Item = @TypeOf(item);
+                const Body = semantic.UnresolvedBody;
+                if (Item == Body.ValueId) {
+                    const index = @backingInt(item);
+                    if (self.values[index]) return;
+                    self.values[index] = true;
+                    if (self.parent.values[index]) |cached| if (cached.borrow_root) |local| try self.visit(local);
+                    if (index < self.parent.unresolved.parameter_count) return;
+                    return self.visit(self.parent.unresolved.expressions[index - self.parent.unresolved.parameter_count].operation);
+                }
+                if (Item == Body.LocalId) {
+                    self.locals[@backingInt(item)] = true;
+                    return;
+                }
+                if (Item == Body.BlockId) {
+                    const index = @backingInt(item);
+                    if (self.blocks[index]) return;
+                    self.blocks[index] = true;
+                    const unresolved_block = self.parent.unresolved.blocks[index];
+                    for (self.parent.unresolved.statements[unresolved_block.statements.start..unresolved_block.statements.end]) |statement| try self.visit(statement);
+                    return self.visit(unresolved_block.result);
+                }
+                if (Item == Body.ConditionId) {
+                    const index = @backingInt(item);
+                    if (self.conditions[index]) return;
+                    self.conditions[index] = true;
+                    return self.visit(self.parent.unresolved.conditions[index]);
+                }
+                if (Item == Body.Call) {
+                    try self.visit(item.target);
+                    if (item.target == .member) {
+                        for (self.parent.unresolved.method_call_arguments[item.arguments.start..item.arguments.end]) |argument| try self.visit(argument.value);
+                    } else try self.arguments(item.arguments);
+                    return;
+                }
+                if (Item == Body.PatternBinding) {
+                    try self.visit(item.value);
+                    return self.visit(self.parent.unresolved.binding_patterns[item.pattern]);
+                }
+                if (Item == Body.BindingPattern) {
+                    try self.visit(item.carrier);
+                    try self.visit(item.read);
+                    try self.visit(item.position);
+                    switch (item.shape) {
+                        .name => |name| try self.visit(name.local),
+                        .tuple => |children| try self.patterns(children),
+                        .sequence => |sequence| {
+                            try self.visit(sequence.storage);
+                            try self.visit(sequence.storage_read);
+                            try self.patterns(sequence.children);
+                        },
+                    }
+                    return;
+                }
+                if (Item == Body.MatchArm) {
+                    try self.visit(self.parent.unresolved.match_patterns[item.pattern]);
+                    try self.visit(item.condition);
+                    return self.visit(item.body);
+                }
+                if (Item == Body.MatchPattern) {
+                    try self.visit(item.carrier);
+                    try self.visit(item.read);
+                    try self.visit(item.binding);
+                    switch (item.shape) {
+                        .tuple => |children| {
+                            for (self.parent.unresolved.match_pattern_children[children.start..children.end]) |index| try self.visit(self.parent.unresolved.match_patterns[index]);
+                        },
+                        else => try self.visit(item.shape),
+                    }
+                    return;
+                }
+                if (Item == Expression.Operation) {
+                    switch (item) {
+                        .struct_init => |initializer| {
+                            for (self.parent.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end]) |field| try self.visit(field.value);
+                            return;
+                        },
+                        .array_init => |initializer| return self.arguments(initializer.elements),
+                        .collection_literal => |literal| {
+                            try self.visit(literal.sink);
+                            try self.arguments(literal.elements);
+                            return self.arguments(literal.sink_reads);
+                        },
+                        .tuple_literal => |elements| return self.arguments(elements),
+                        .match => |expression_match| {
+                            try self.visit(expression_match.subject);
+                            try self.visit(expression_match.carrier);
+                            try self.visit(expression_match.read);
+                            for (self.parent.unresolved.match_arms[expression_match.arms.start..expression_match.arms.end]) |arm| try self.visit(arm);
+                            return;
+                        },
+                        else => {},
+                    }
+                }
+                switch (@typeInfo(Item)) {
+                    .@"struct" => |info| inline for (info.field_names) |name| try self.visit(@field(item, name)),
+                    .@"union" => switch (item) {
+                        inline else => |payload| try self.visit(payload),
+                    },
+                    .optional => if (item) |payload| try self.visit(payload),
+                    else => {},
+                }
+            }
+
+            fn arguments(self: *@This(), range: structures.FunctionValueRange) !void {
+                for (self.parent.unresolved.call_arguments[range.start..range.end]) |argument| try self.visit(argument);
+            }
+
+            fn patterns(self: *@This(), range: structures.FunctionValueRange) !void {
+                for (self.parent.unresolved.binding_pattern_children[range.start..range.end]) |index| try self.visit(self.parent.unresolved.binding_patterns[index]);
+            }
+        };
+
+        fn bindInferenceCaptures(self: *Self, region: *Self, value_id: semantic.UnresolvedBody.ValueId) !void {
+            const value_end = self.values.len;
+            const local_end = value_end + self.state.values.len;
+            const block_end = local_end + self.unresolved.blocks.len;
+            const marks = try self.gpa.alloc(bool, block_end + self.unresolved.conditions.len);
+            defer self.gpa.free(marks);
+            @memset(marks, false);
+            var dependencies: InferenceDependencies = .{
+                .parent = self,
+                .values = marks[0..value_end],
+                .locals = marks[value_end..local_end],
+                .blocks = marks[local_end..block_end],
+                .conditions = marks[block_end..],
+            };
+            try dependencies.visit(value_id);
+            const captures = try self.bindSelectedRegionCaptures(region, &dependencies);
+            if (self.options.measurements) |measurements| measurements.inference_capture_values += captures.values.items.len;
+        }
+
         fn appendRegionCapture(self: *Self, captures: *RegionCaptures, capture: struct {
             source: Value,
             local: ?semantic.UnresolvedBody.LocalId = null,
             mode: structures.ParameterMode = .imm,
         }) !u32 {
             const gpa = self.gpa;
+            if (self.options.measurements) |measurements| {
+                if (captures.values.items.len == captures.values.capacity or
+                    captures.locals.items.len == captures.locals.capacity or
+                    self.block_arguments.items.len == self.block_arguments.capacity or
+                    self.block_argument_generations.items.len == self.block_argument_generations.capacity or
+                    self.parameter_modes.items.len == self.parameter_modes.capacity)
+                    measurements.region_capture_buffer_growths += 1;
+            }
             const argument = try self.appendBlockArgument(capture.source.type_id, null);
             self.block_arguments.items[argument].representation = .storage;
             try self.parameter_modes.append(gpa, capture.mode);
@@ -3257,11 +3410,39 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn bindRegionCaptures(self: *Self, region: *Self) !RegionCaptures {
+            return self.bindSelectedRegionCaptures(region, null);
+        }
+
+        fn bindSelectedRegionCaptures(self: *Self, region: *Self, dependencies: ?*const InferenceDependencies) !RegionCaptures {
             const gpa = self.gpa;
             var captures: RegionCaptures = .{};
             const parameters = try gpa.alloc(structures.CallableParameter, self.unresolved.parameter_count);
 
             for (parameters, self.block_arguments.items[0..parameters.len]) |*parameter, source| parameter.* = .{ .mode = if (source.representation == .initializer) .init else .imm, .type_id = source.type_id };
+            var capture_count = parameters.len;
+            var transfer_count: usize = 0;
+            for (self.values[parameters.len..], parameters.len..) |source, index| {
+                if (dependencies) |selected| if (!selected.values[index]) continue;
+                capture_count += @intFromBool(source != null);
+            }
+            for (0..self.state.values.len) |index| {
+                if (dependencies) |selected| if (!selected.locals[index]) continue;
+                if (self.state.values.get(index) == null) continue;
+                capture_count += 1;
+                transfer_count += @intFromBool(self.locals.items(.mut_parameter)[index] == null);
+            }
+            for (self.field_places) |place| {
+                const index = @backingInt(place.local);
+                if (dependencies) |selected| if (!selected.locals[index]) continue;
+                if (self.state.values.get(index) != null and self.locals.items(.mut_parameter)[index] == null) transfer_count += 1;
+            }
+            capture_count += transfer_count;
+            try captures.values.ensureTotalCapacity(gpa, capture_count);
+            try captures.locals.ensureTotalCapacity(gpa, capture_count);
+            try region.block_arguments.ensureTotalCapacity(gpa, capture_count);
+            try region.block_argument_generations.ensureTotalCapacity(gpa, capture_count);
+            try region.parameter_modes.ensureTotalCapacity(gpa, capture_count);
+            try region.capture_transfers.ensureTotalCapacity(gpa, transfer_count);
             try region.init(parameters);
             region.captured_values = try gpa.alloc(bool, self.values.len);
             @memset(region.captured_values, false);
@@ -3284,12 +3465,14 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 } else region.values[index] = null;
             }
             for (self.values[parameters.len..], parameters.len..) |maybe_source, index| {
+                if (dependencies) |selected| if (!selected.values[index]) continue;
                 const source = maybe_source orelse continue;
                 const argument = try region.appendRegionCapture(&captures, .{ .source = source, .local = source.borrow_root });
                 region.values[index] = .{ .id = @fromBackingInt(@intCast(argument)), .type_id = source.type_id, .borrowed_type = source.type_id, .reference_origins = if (try self.analysis_context.canStoreBorrow(source.type_id)) try region.addReferenceOrigin(null, .{ .parameter = argument }) else null };
                 region.captured_values[index] = true;
             }
             for (0..self.state.values.len) |index| {
+                if (dependencies) |selected| if (!selected.locals[index]) continue;
                 var source = self.state.values.get(index) orelse continue;
                 source.borrow_root = @fromBackingInt(@intCast(index));
                 const argument = try region.appendRegionCapture(&captures, .{ .source = source, .local = @fromBackingInt(@intCast(index)) });
@@ -3303,8 +3486,14 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 region.captured_locals[index] = argument;
             }
             region.state.field_availability = self.state.field_availability.snapshot();
-            for (0..self.state.values.len) |index| try self.appendTransferCapture(region, &captures, @fromBackingInt(@intCast(index)), null);
-            for (self.field_places, 0..) |place, field| try self.appendTransferCapture(region, &captures, place.local, field);
+            for (0..self.state.values.len) |index| {
+                if (dependencies) |selected| if (!selected.locals[index]) continue;
+                try self.appendTransferCapture(region, &captures, @fromBackingInt(@intCast(index)), null);
+            }
+            for (self.field_places, 0..) |place, field| {
+                if (dependencies) |selected| if (!selected.locals[@backingInt(place.local)]) continue;
+                try self.appendTransferCapture(region, &captures, place.local, field);
+            }
             region.blocks.items[0].argument_end = @intCast(captures.values.items.len);
             return captures;
         }
@@ -3347,7 +3536,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             region.options.infer_return_type = initializer_boundary or self.options.infer_return_type;
             region.options.allow_type_values = self.options.allow_type_values;
             region.type_check_only = true;
-            _ = try self.bindRegionCaptures(&region);
+            try self.bindInferenceCaptures(&region, raw.value);
             region.current_boundary = try region.newBoundary(raw.span);
             // Type the whole expression for inference without publishing or
             // executing its IR. The specialized call then checks ownership and
@@ -4113,6 +4302,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn includeReferenceWrite(self: *Self, effects: *ReferenceEffects, origins: ?u32, type_id: structures.TypeId, ends_lifetime: bool) !void {
+            try self.checkMatchTestingWrite(origins, self.activeLifetimeSpan());
             effects.writes = try self.mergeReferenceOrigins(effects.writes, origins);
             const capabilities = (try self.analysis_context.facts().ownershipCapabilities(type_id)) orelse return error.Unavailable;
             if (ends_lifetime or capabilities.needs_automatic_drop or try self.analysis_context.facts().variantMembers(type_id) != null)
@@ -4523,8 +4713,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                             return self.reject(span, if (origin.deferred_capture) .initializer_capture_conflict else .borrow_outlives_source);
                         }
                     }
-                    generation = state.values.get(slot).?.owned_generation;
-                    cleanup_value = state.values.get(slot).?.id;
+                    const owner = state.values.get(slot).?;
+                    generation = owner.owned_generation orelse owner.borrowed_generation;
+                    cleanup_value = if (owner.owned_generation != null) owner.id else owner.borrowed_cleanup_value orelse owner.id;
                 }
                 if (generation) |available_generation| try effects.append(self.gpa, .{ .use = .{
                     .generation = available_generation,
@@ -6114,6 +6305,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const start: u32 = @intCast(fields.items.len);
             var source_fields: std.ArrayList(semantic.UnresolvedBody.FieldName) = .empty;
             const source_root = (try self.appendSourcePlaceFields(value_id, &source_fields)) orelse return null;
+            if (source_root == .local and self.locals.items(.match_body_only)[@backingInt(source_root.local)])
+                return self.reject(self.valueSpan(value_id), .match_capture_unavailable_in_condition);
             const root: @FieldType(BorrowPlace, "root") = switch (source_root) {
                 .local => |local| if (self.locals.items(.reference)[@backingInt(local)]) .{ .reference = self.state.values.get(@backingInt(local)).? } else .{ .local = local },
                 .parameter => |parameter| .{ .parameter = parameter },
@@ -8440,6 +8633,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn predicateFlow(self: *Self, operation: structures.PredicateOperation, lhs: structures.FunctionValueId, rhs: structures.FunctionValueId) !ConditionFlow {
             const success = try self.newEmptyBlock();
             const failure = try self.newEmptyBlock();
+            try self.moveCurrentBoundaryEffectsToTerminator();
             self.branchOn(operation, lhs, rhs, success, failure);
             const state = try self.captureState();
             return .{ .success = .{ .block = success, .state = state }, .failure = .{ .block = failure, .state = state } };
@@ -8470,6 +8664,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn knownCondition(self: *Self, matches: bool) !ConditionFlow {
             const next = try self.newEmptyBlock();
+            try self.moveCurrentBoundaryEffectsToTerminator();
             self.terminate(.{ .branch = self.emptyBranch(next) });
             const exit: FlowExit = .{ .block = next, .state = try self.captureState() };
             return if (matches) .{ .success = exit, .failure = null } else .{ .success = null, .failure = exit };
@@ -8489,6 +8684,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn successfulValueCondition(self: *Self, constructed: Value, binding: ?semantic.UnresolvedBody.ConditionBinding) !ConditionFlow {
             if (constructed.type_id == .never) return .{ .success = null, .failure = null, .diverged = constructed };
             const next = try self.newEmptyBlock();
+            try self.moveCurrentBoundaryEffectsToTerminator();
             self.terminate(.{ .branch = self.emptyBranch(next) });
             return .{ .success = .{ .block = next, .state = try self.captureState(), .binding = if (binding) |value_binding| .{ .call = value_binding } else null, .constructed = constructed }, .failure = null };
         }
@@ -8713,6 +8909,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             success: structures.FunctionBlockId,
             failure: structures.FunctionBlockId,
         ) !void {
+            try self.moveCurrentBoundaryEffectsToTerminator();
             var remaining = try self.countMembers(members, target, target_members);
             if (remaining == 0 or remaining == members.len)
                 return self.terminate(.{ .branch = self.emptyBranch(if (remaining == 0) failure else success) });
@@ -9248,7 +9445,17 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 none,
             },
         };
-        const MatchPattern = union(enum) { any, type: structures.TypeId, literal: MatchLiteral };
+        const MatchPattern = struct {
+            source: u32,
+            input_type: structures.TypeId,
+            member: ?structures.TypeId = null,
+            shape: union(enum) {
+                any,
+                type: structures.TypeId,
+                literal: MatchLiteral,
+                tuple: []const MatchPattern,
+            },
+        };
         const MatchDomain = struct {
             member: structures.TypeId,
             whole: bool = false,
@@ -9309,62 +9516,195 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             return .{ .type_id = type_id, .value = literal };
         }
 
+        fn matchInputMembers(self: *Self, type_id: structures.TypeId) ![]const structures.TypeId {
+            if (try self.analysis_context.facts().variantMembers(type_id)) |members| return members;
+            return self.gpa.dupe(structures.TypeId, &.{type_id});
+        }
+
+        fn matchLiteralAccepts(self: *Self, raw: semantic.UnresolvedBody.ValueUse, type_id: structures.TypeId) !bool {
+            const operation = self.expressionOperation(raw.value) orelse unreachable;
+            for (try self.matchInputMembers(type_id)) |member| {
+                const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
+                const compatible = switch (operation.*) {
+                    .integer_literal, .int_literal_value => logical == .int or logical == .byte or logical == .int_literal,
+                    .boolean => logical == .bool,
+                    .unit => logical == .unit,
+                    .none => logical == .none,
+                    .string_literal => !logical.isPrimitive() and try self.analysis_context.isMatchTextType(logical),
+                    else => unreachable,
+                };
+                if (compatible) return true;
+            }
+            return false;
+        }
+
+        fn resolveMatchPatterns(self: *Self, id: u32, type_id: structures.TypeId) anyerror![]const MatchPattern {
+            const source = self.unresolved.match_patterns[id];
+            const members = try self.matchInputMembers(type_id);
+            var patterns: std.ArrayList(MatchPattern) = .empty;
+            switch (source.shape) {
+                .any => try patterns.append(self.gpa, .{ .source = id, .input_type = type_id, .shape = .any }),
+                .type => |target| {
+                    const targets = try self.analysis_context.facts().variantMembers(target);
+                    for (members) |member| {
+                        const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
+                        if (includesType(target, targets, logical))
+                            try patterns.append(self.gpa, .{ .source = id, .input_type = type_id, .member = member, .shape = .{ .type = target } });
+                    }
+                },
+                .literal => |raw| {
+                    if (try self.matchLiteralAccepts(raw, type_id)) {
+                        const literal = try self.matchLiteral(raw, members, type_id);
+                        for (members) |member| if ((try self.analysis_context.facts().memberSpec(member)).type_id == literal.type_id)
+                            try patterns.append(self.gpa, .{ .source = id, .input_type = type_id, .member = member, .shape = .{ .literal = literal } });
+                    }
+                },
+                .tuple => |range| try self.resolveTupleMatchPatterns(&patterns, id, type_id, members, range),
+            }
+            return patterns.toOwnedSlice(self.gpa);
+        }
+
+        fn resolveTupleMatchPatterns(self: *Self, patterns: *std.ArrayList(MatchPattern), id: u32, type_id: structures.TypeId, members: []const structures.TypeId, range: structures.FunctionValueRange) anyerror!void {
+            const children = self.unresolved.match_pattern_children[range.start..range.end];
+            for (members) |member| {
+                const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
+                const fields = (try self.analysis_context.facts().tupleMembers(logical)) orelse continue;
+                if (fields.len != children.len) continue;
+                var combinations: std.ArrayList([]const MatchPattern) = .empty;
+                try combinations.append(self.gpa, &.{});
+                for (children, fields) |child, field| {
+                    const alternatives = try self.resolveMatchPatterns(child, field.type_id);
+                    var next: std.ArrayList([]const MatchPattern) = .empty;
+                    for (combinations.items) |prefix| for (alternatives) |alternative| {
+                        const combination = try self.gpa.alloc(MatchPattern, prefix.len + 1);
+                        @memcpy(combination[0..prefix.len], prefix);
+                        combination[prefix.len] = alternative;
+                        try next.append(self.gpa, combination);
+                    };
+                    combinations = next;
+                }
+                for (combinations.items) |combination|
+                    try patterns.append(self.gpa, .{ .source = id, .input_type = type_id, .member = member, .shape = .{ .tuple = combination } });
+            }
+        }
+
         fn matchPatternSelects(self: *Self, pattern: MatchPattern, member: structures.TypeId) !bool {
+            if (pattern.member) |selected| return selected == member;
             const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
-            return switch (pattern) {
+            return switch (pattern.shape) {
                 .any => true,
                 .type => |target| includesType(target, try self.analysis_context.facts().variantMembers(target), logical),
                 .literal => |literal| logical == literal.type_id,
+                .tuple => unreachable,
             };
+        }
+
+        fn matchPatternCoversType(self: *Self, id: u32, type_id: structures.TypeId) anyerror!bool {
+            const pattern = self.unresolved.match_patterns[id];
+            switch (pattern.shape) {
+                .any => return true,
+                .type => |target| {
+                    const members = try self.matchInputMembers(type_id);
+                    return try self.countMembers(members, target, try self.analysis_context.facts().variantMembers(target)) == members.len;
+                },
+                .literal => return type_id == .unit or type_id == .none,
+                .tuple => |range| return self.tupleMatchCoversType(range, type_id),
+            }
+        }
+
+        fn tupleMatchCoversType(self: *Self, range: structures.FunctionValueRange, type_id: structures.TypeId) anyerror!bool {
+            const children = self.unresolved.match_pattern_children[range.start..range.end];
+            for (try self.matchInputMembers(type_id)) |member| {
+                const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
+                const fields = (try self.analysis_context.facts().tupleMembers(logical)) orelse return false;
+                if (fields.len != children.len) return false;
+                for (fields, children) |field, child|
+                    if (!try self.matchPatternCoversType(child, field.type_id)) return false;
+            }
+            return true;
+        }
+
+        fn matchCaptureType(self: *Self, pattern: MatchPattern) !structures.TypeId {
+            return switch (pattern.shape) {
+                .any => pattern.input_type,
+                .type => |target| try intersectTypes(self.analysis_context, try self.matchInputMembers(pattern.input_type), target, self.gpa),
+                .literal => |literal| literal.type_id,
+                .tuple => (try self.analysis_context.facts().memberSpec(pattern.member.?)).type_id,
+            };
+        }
+
+        fn validateMatchCaptureTypes(self: *Self, pattern: MatchPattern, types: []?structures.TypeId) anyerror!void {
+            const source = self.unresolved.match_patterns[pattern.source];
+            if (source.binding) |binding| {
+                const actual = try self.matchCaptureType(pattern);
+                const slot = &types[@backingInt(binding.local)];
+                if (slot.*) |previous| {
+                    if (previous != actual) return self.reject(binding.span, .match_tuple_capture_type_ambiguous);
+                } else slot.* = actual;
+            }
+            if (pattern.shape == .tuple) for (pattern.shape.tuple) |child|
+                try self.validateMatchCaptureTypes(child, types);
         }
 
         fn resolveMatchArms(self: *Self, source: @FieldType(Expression.Operation, "match"), type_id: structures.TypeId, members: []const structures.TypeId) ![]const ResolvedMatchArm {
             const domains = try self.gpa.alloc(MatchDomain, members.len);
             for (members, domains) |member, *domain| domain.* = .{ .member = member };
+            const capture_types = try self.gpa.alloc(?structures.TypeId, self.unresolved.local_count);
+            @memset(capture_types, null);
             var resolved: std.ArrayList(ResolvedMatchArm) = .empty;
             for (self.unresolved.match_arms[source.arms.start..source.arms.end]) |arm| {
-                const pattern: MatchPattern = switch (arm.pattern) {
-                    .any => .any,
-                    .type => |target| .{ .type = target },
-                    .literal => |raw| .{ .literal = try self.matchLiteral(raw, members, type_id) },
-                };
-                var selected: std.ArrayList(structures.TypeId) = .empty;
-                var remaining: std.ArrayList(structures.TypeId) = .empty;
-                var compatible = false;
-                for (domains) |*domain| {
-                    if (try self.matchPatternSelects(pattern, domain.member)) {
-                        compatible = true;
-                        var covered = domain.whole;
-                        if (pattern == .literal) {
-                            for (domain.literals.items) |literal| if (std.meta.eql(literal, pattern.literal.value)) {
+                const patterns = try self.resolveMatchPatterns(arm.pattern, type_id);
+                if (patterns.len == 0) {
+                    const raw = self.unresolved.match_patterns[arm.pattern];
+                    if (raw.shape == .literal) _ = try self.matchLiteral(raw.shape.literal, members, type_id);
+                    if (raw.shape == .type) return self.reject(arm.span, .{ .match_pattern_incompatible = self.typeMismatch(type_id, raw.shape.type) });
+                    return self.reject(arm.span, .match_tuple_pattern_incompatible);
+                }
+                var before: std.ArrayList(structures.TypeId) = .empty;
+                for (domains) |domain| if (!domain.whole) try before.append(self.gpa, domain.member);
+                const first = resolved.items.len;
+                for (patterns) |pattern| {
+                    try self.validateMatchCaptureTypes(pattern, capture_types);
+                    var selected: std.ArrayList(structures.TypeId) = .empty;
+                    for (domains) |domain| {
+                        if (domain.whole or !try self.matchPatternSelects(pattern, domain.member)) continue;
+                        if (pattern.shape == .literal) {
+                            var covered = false;
+                            for (domain.literals.items) |literal| if (std.meta.eql(literal, pattern.shape.literal.value)) {
                                 covered = true;
                                 break;
                             };
-                        }
-                        if (!covered) {
-                            try selected.append(self.gpa, domain.member);
-                            if (pattern == .literal) {
-                                try domain.literals.append(self.gpa, pattern.literal.value);
-                                const finite_size: ?usize = switch (pattern.literal.type_id) {
-                                    .bool => 2,
-                                    .byte => 256,
-                                    .unit, .none => 1,
-                                    else => null,
-                                };
-                                if (finite_size) |size| domain.whole = domain.literals.items.len == size;
-                            } else domain.whole = true;
-                        }
+                            if (!covered) try selected.append(self.gpa, domain.member);
+                        } else try selected.append(self.gpa, domain.member);
                     }
-                    if (!domain.whole) try remaining.append(self.gpa, domain.member);
+                    if (selected.items.len == 0) continue;
+                    try resolved.append(self.gpa, .{ .source = arm, .pattern = pattern, .members = try selected.toOwnedSlice(self.gpa), .remaining = before.items });
                 }
-                if (!compatible) return self.reject(arm.span, .{ .match_pattern_incompatible = self.typeMismatch(type_id, pattern.type) });
-                if (selected.items.len == 0) return self.reject(arm.span, .match_redundant_arm);
-                try resolved.append(self.gpa, .{
-                    .source = arm,
-                    .pattern = pattern,
-                    .members = try selected.toOwnedSlice(self.gpa),
-                    .remaining = try remaining.toOwnedSlice(self.gpa),
-                });
+                if (resolved.items.len == first) return self.reject(arm.span, .match_redundant_arm);
+                if (arm.condition == null) for (domains) |*domain| {
+                    if (domain.whole) continue;
+                    var compatible = false;
+                    for (patterns) |pattern| if (try self.matchPatternSelects(pattern, domain.member)) {
+                        compatible = true;
+                        break;
+                    };
+                    if (!compatible) continue;
+                    const first_pattern = patterns[0];
+                    if (first_pattern.shape == .literal) {
+                        const literal = first_pattern.shape.literal;
+                        try domain.literals.append(self.gpa, literal.value);
+                        const size: ?usize = switch (literal.type_id) {
+                            .bool => 2,
+                            .byte => 256,
+                            .unit, .none => 1,
+                            else => null,
+                        };
+                        if (size) |finite| domain.whole = domain.literals.items.len == finite;
+                    } else if (try self.matchPatternCoversType(arm.pattern, (try self.analysis_context.facts().memberSpec(domain.member)).type_id)) domain.whole = true;
+                };
+                var remaining: std.ArrayList(structures.TypeId) = .empty;
+                for (domains) |domain| if (!domain.whole) try remaining.append(self.gpa, domain.member);
+                resolved.items[resolved.items.len - 1].remaining = try remaining.toOwnedSlice(self.gpa);
             }
             for (domains) |domain| if (!domain.whole)
                 return self.reject(self.valueSpan(source.subject.value), .{ .match_not_exhaustive = (try self.analysis_context.facts().memberSpec(domain.member)).type_id });
@@ -9374,7 +9714,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn refineVariantOwner(self: *Self, source: Value, members: []const structures.TypeId) !Value {
             const previous = source.owned_generation orelse return source;
             const metadata = self.generations.items[@backingInt(previous)];
-            const original = metadata.cleanup_members orelse (try self.analysis_context.facts().variantMembers(source.type_id)).?;
+            const original = metadata.cleanup_members orelse (try self.analysis_context.facts().variantMembers(source.type_id)) orelse return source;
             if (std.mem.eql(structures.TypeId, original, members)) return source;
             std.debug.assert(members.len != 0);
             var feasible: std.ArrayList(structures.TypeId) = .empty;
@@ -9460,120 +9800,330 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             }
         }
 
-        fn matchTest(self: *Self, source: @FieldType(Expression.Operation, "match"), arm: ResolvedMatchArm, members: []const structures.TypeId, success: structures.FunctionBlockId, failure: ?structures.FunctionBlockId) !void {
-            try self.moveCurrentBoundaryEffectsToTerminator();
-            if (failure == null or arm.pattern == .any) {
-                self.terminate(.{ .branch = self.emptyBranch(success) });
-                return;
+        const PreparedMatchPattern = struct {
+            pattern: MatchPattern,
+            owned: bool,
+            product_owned: bool = false,
+            pending_capture: bool = false,
+            children: []PreparedMatchPattern = &.{},
+        };
+
+        fn checkMatchTestingWrite(self: *Self, origins: ?u32, span: structures.SourceSpan) !void {
+            if (origins == null) return;
+            var current = self.match_testing_scope;
+            while (current) |scope| : (current = scope.parent) {
+                try self.reference_exclusions.append(self.gpa, .{ .reference = scope.origins, .invalidation = origins, .span = span, .match_testing = true });
             }
-            const operand = try self.readLocal(source.carrier, source.subject.span);
-            try self.recordUse(operand);
-            try self.moveCurrentBoundaryEffectsToTerminator();
-            const variant = try self.analysis_context.facts().variantMembers(operand.type_id);
-            const target = switch (arm.pattern) {
-                .any => unreachable,
-                .type => |type_id| type_id,
-                .literal => |literal| literal.type_id,
-            };
-            const literal_block = if (arm.pattern == .literal and variant != null) try self.newEmptyBlock() else success;
-            if (variant != null) {
-                try self.branchOnMembers(operand, members, target, try self.analysis_context.facts().variantMembers(target), literal_block, failure.?);
-                if (arm.pattern == .type) return;
-                self.enterBlock(literal_block);
-            } else if (arm.pattern == .type) {
-                self.terminate(.{ .branch = self.emptyBranch(success) });
-                return;
-            }
-            var selected = operand;
-            if (variant != null) {
-                const reference = try self.captureReference(.{ .value = source.read, .span = source.subject.span });
-                const binding: semantic.UnresolvedBody.ConditionBinding = .{ .local = source.carrier, .annotation_type = null, .span = arm.source.span, .mode = .reference };
-                const projected = try self.extractReferenceBinding(.{
-                    .binding = binding,
-                    .operand = reference,
-                    .target_type = try self.analysis_context.facts().referenceType(target),
-                }, arm.source.span);
-                selected = try self.readReference(projected, target);
-            }
-            try self.matchLiteralTest(selected, arm.pattern.literal, success, failure.?, arm.source.span);
         }
 
-        fn bindMatchCapture(self: *Self, source: @FieldType(Expression.Operation, "match"), arm: ResolvedMatchArm, subject_type: structures.TypeId, members: []const structures.TypeId) !void {
-            const binding = arm.source.binding orelse return;
-            const target = switch (arm.pattern) {
-                .any => subject_type,
-                .type => |type_id| try intersectTypes(self.analysis_context, members, type_id, self.gpa),
-                .literal => |literal| literal.type_id,
-            };
-            const variant = try self.analysis_context.facts().variantMembers(subject_type);
-            const scope = try self.openBoundary(binding.span);
-            defer self.current_boundary = scope.parent;
-            var captured = if (binding.mode == .reference) reference: {
-                const carrier_reference = try self.captureReference(.{ .value = source.read, .span = binding.span });
-                if (arm.pattern == .any or variant == null) break :reference carrier_reference;
-                break :reference try self.extractReferenceBinding(.{
-                    .binding = binding,
-                    .operand = carrier_reference,
-                    .target_type = try self.analysis_context.facts().referenceType(target),
-                }, binding.span);
-            } else owned: {
-                const operand = if (self.locals.items(.reference)[@backingInt(source.carrier)])
-                    try self.readLocal(source.carrier, binding.span)
-                else
-                    try self.takeIteratorCarrier(source.carrier, binding.span);
-                if (arm.pattern == .any or variant == null or operand.type_id == target)
-                    break :owned try self.ownValue(operand, binding.span);
-                break :owned try self.extractVariantBinding(.{ .binding = binding, .operand = operand, .target_type = target }, binding.span);
-            };
-            if (binding.mode != .reference) if (try self.analysis_context.facts().variantMembers(captured.type_id)) |captured_members| {
-                var feasible: std.ArrayList(structures.TypeId) = .empty;
-                for (captured_members) |member| {
-                    const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
-                    for (arm.members) |selected| {
-                        if ((try self.analysis_context.facts().memberSpec(selected)).type_id != logical) continue;
-                        try feasible.append(self.gpa, member);
-                        break;
+        fn matchProjectedOrigins(self: *Self, pattern: MatchPattern, incoming: ?u32, protected: *?u32) anyerror!void {
+            var selected = incoming;
+            if (pattern.member) |member| {
+                const spec = try self.analysis_context.facts().memberSpec(member);
+                if (try self.analysis_context.facts().variantMembers(pattern.input_type) != null)
+                    selected = try self.transformReferenceOrigins(incoming, .{ .select = .{ .variant = member } });
+                if (spec.kind == .reference)
+                    protected.* = try self.mergeReferenceOrigins(protected.*, selected);
+            }
+            if (pattern.shape != .tuple) return;
+            const logical = (try self.analysis_context.facts().memberSpec(pattern.member.?)).type_id;
+            const fields = (try self.analysis_context.facts().tupleMembers(logical)).?;
+            for (fields, pattern.shape.tuple, 0..) |field, child, index| {
+                const child_source = self.unresolved.match_patterns[child.source];
+                if (child_source.shape == .any and child_source.binding == null) continue;
+                const origins = try self.transformReferenceOrigins(selected, .{ .select = .{ .field = @intCast(index) } });
+                if (field.kind == .reference)
+                    protected.* = try self.mergeReferenceOrigins(protected.*, origins);
+                try self.matchProjectedOrigins(child, origins, protected);
+            }
+        }
+
+        fn recordMatchDispatchUse(self: *Self, origins: ?u32, span: structures.SourceSpan) !void {
+            const protected = origins orelse return;
+            const boundary = try self.newBoundary(span);
+            const location = try self.appendEffectAt(boundary, null);
+            try self.closeBoundary(boundary);
+            try self.reference_uses.append(self.gpa, .{ .origins = protected, .span = span, .location = location, .match_testing = true });
+            try self.recordReferenceUses(.{ .id = @fromBackingInt(0), .type_id = .unit, .reference_origins = protected }, .retention);
+        }
+
+        fn protectMatchLocal(self: *Self, local: semantic.UnresolvedBody.LocalId) !void {
+            const scope = self.match_testing_scope orelse return;
+            try scope.locals.append(self.gpa, local);
+            if (self.locals.items(.match_body_only)[@backingInt(local)]) return;
+            const origins = if (self.locals.items(.reference)[@backingInt(local)])
+                self.state.values.get(@backingInt(local)).?.reference_origins
+            else
+                try self.sourceReferenceOrigins(self.borrowLocalValue(local));
+            scope.origins = try self.mergeReferenceOrigins(scope.origins, origins);
+        }
+
+        fn installMatchInput(self: *Self, pattern: MatchPattern, incoming: Value, reference: bool) !void {
+            const source = self.unresolved.match_patterns[pattern.source];
+            var value_to_bind = incoming;
+            if (!reference) {
+                value_to_bind.borrowed_generation = incoming.owned_generation orelse incoming.borrowed_generation;
+                value_to_bind.borrowed_cleanup_value = if (incoming.owned_generation != null) incoming.id else incoming.borrowed_cleanup_value;
+                value_to_bind.owned_generation = null;
+            }
+            try self.installLocal(source.carrier, value_to_bind, reference, true);
+            try self.protectMatchLocal(source.carrier);
+        }
+
+        fn matchPatternMemberTest(self: *Self, pattern: MatchPattern, operand: Value, failure: ?structures.FunctionBlockId) !void {
+            const member = pattern.member orelse return;
+            const members = (try self.analysis_context.facts().variantMembers(pattern.input_type)) orelse return;
+            if (failure == null) return;
+            const success = try self.newEmptyBlock();
+            const tag = try self.appendInstruction(.{ .variant_tag = operand.id });
+            const index = std.mem.indexOfScalar(structures.TypeId, members, member) orelse unreachable;
+            const expected = try self.appendInstruction(.{ .const_int = @intCast(index) });
+            try self.moveCurrentBoundaryEffectsToTerminator();
+            self.branchOn(.eqi, tag.id, expected.id, success, failure.?);
+            self.enterBlock(success);
+        }
+
+        fn testMatchPattern(self: *Self, pattern: MatchPattern, incoming: Value, reference: bool, failure: ?structures.FunctionBlockId) anyerror!PreparedMatchPattern {
+            const source = self.unresolved.match_patterns[pattern.source];
+            try self.installMatchInput(pattern, incoming, reference);
+            var prepared: PreparedMatchPattern = .{ .pattern = pattern, .owned = !reference };
+            const operand = try self.readLocal(source.carrier, source.span);
+            try self.recordUse(operand);
+            try self.matchPatternMemberTest(pattern, operand, failure);
+            if (pattern.shape == .any) return prepared;
+            const member = pattern.member.?;
+            const spec = try self.analysis_context.facts().memberSpec(member);
+            const variant = try self.analysis_context.facts().variantMembers(pattern.input_type);
+            const root_reference = try self.captureReference(.{ .value = source.read, .span = source.span });
+            const selected_reference = if (variant != null)
+                try self.extractReferenceMember(root_reference, operand, member, spec.type_id)
+            else
+                root_reference;
+            const selected = if (variant != null) try self.readReference(selected_reference, spec.type_id) else operand;
+            if (pattern.shape == .literal) {
+                if (failure) |rejected| {
+                    const success = try self.newEmptyBlock();
+                    try self.matchLiteralTest(selected, pattern.shape.literal, success, rejected, source.span);
+                    self.enterBlock(success);
+                }
+                return prepared;
+            }
+            if (pattern.shape == .type) return prepared;
+            const fields = (try self.analysis_context.facts().tupleMembers(spec.type_id)).?;
+            prepared.product_owned = !reference and spec.kind == .owned;
+            prepared.children = try self.gpa.alloc(PreparedMatchPattern, pattern.shape.tuple.len);
+            var storage = self.state.values.get(@backingInt(source.carrier)).?;
+            if (prepared.product_owned and variant != null) {
+                const previous = storage;
+                storage = try self.projectStorage(previous, spec.type_id, .variant);
+                storage.reference_origins = try self.transformReferenceOrigins(previous.reference_origins, .{ .select = .{ .variant = member } });
+                storage.borrowed_generation = previous.borrowed_generation;
+                storage.borrowed_cleanup_value = previous.borrowed_cleanup_value;
+            }
+            for (fields, pattern.shape.tuple, prepared.children, 0..) |field, child, *child_prepared, index| {
+                const place: PlaceField = .{ .name = "", .index = @intCast(index), .type_id = field.type_id, .kind = field.kind };
+                if (field.kind == .reference) {
+                    child_prepared.* = try self.testMatchPattern(child, try self.referenceField(selected, place), true, failure);
+                } else if (prepared.product_owned) {
+                    var projected = try self.projectStorage(storage, field.type_id, .{ .field = @intCast(index) });
+                    projected.reference_origins = try self.transformReferenceOrigins(storage.reference_origins, .{ .select = .{ .field = @intCast(index) } });
+                    projected.borrowed_generation = storage.borrowed_generation;
+                    projected.borrowed_cleanup_value = storage.borrowed_cleanup_value;
+                    child_prepared.* = try self.testMatchPattern(child, projected, false, failure);
+                } else {
+                    var projected = try self.projectReference(selected_reference, &.{place});
+                    projected.reference_origins = try self.appendSourcePath(projected.reference_origins, .{ .field = @intCast(index) });
+                    child_prepared.* = try self.testMatchPattern(child, projected, true, failure);
+                }
+            }
+            return prepared;
+        }
+
+        fn refineMatchCapture(self: *Self, captured: Value, pattern: MatchPattern, known_members: ?[]const structures.TypeId) !Value {
+            const captured_members = (try self.analysis_context.facts().variantMembers(captured.type_id)) orelse return captured;
+            const selected = known_members orelse if (pattern.member) |member| &.{member} else return captured;
+            var feasible: std.ArrayList(structures.TypeId) = .empty;
+            for (captured_members) |candidate| {
+                for (selected) |member| {
+                    const matches = if (pattern.shape == .any) candidate == member else (try self.analysis_context.facts().memberSpec(candidate)).type_id == (try self.analysis_context.facts().memberSpec(member)).type_id;
+                    if (!matches) continue;
+                    try feasible.append(self.gpa, candidate);
+                    break;
+                }
+            }
+            return self.refineVariantOwner(captured, feasible.items);
+        }
+
+        fn prepareMatchCaptures(self: *Self, prepared: *PreparedMatchPattern, known_members: ?[]const structures.TypeId) anyerror!void {
+            const pattern = prepared.pattern;
+            const source = self.unresolved.match_patterns[pattern.source];
+            if (source.binding) |binding| {
+                const target = try self.matchCaptureType(pattern);
+                self.locals.items(.match_body_only)[@backingInt(binding.local)] = false;
+                if (binding.mode == .reference) {
+                    var reference = try self.captureReference(.{ .value = source.read, .span = binding.span });
+                    if (reference.type_id != try self.analysis_context.facts().referenceType(target))
+                        reference = try self.extractReferenceBinding(.{ .binding = binding, .operand = reference, .target_type = try self.analysis_context.facts().referenceType(target) }, binding.span);
+                    try self.installLocal(binding.local, reference, true, false);
+                } else {
+                    const borrowed_member = if (pattern.member) |member| (try self.analysis_context.facts().memberSpec(member)).kind == .reference else false;
+                    if (!prepared.owned or (pattern.shape != .any and borrowed_member)) {
+                        const operand = try self.readLocal(source.carrier, binding.span);
+                        var captured = if (operand.type_id == target) try self.ownValue(operand, binding.span) else try self.extractVariantBinding(.{ .binding = binding, .operand = operand, .target_type = target }, binding.span);
+                        captured = try self.refineMatchCapture(captured, pattern, known_members);
+                        try self.installLocal(binding.local, captured, false, false);
+                    } else {
+                        var pending = self.state.values.get(@backingInt(source.carrier)).?;
+                        var body_only = false;
+                        if (pending.type_id != target) {
+                            const spec = try self.analysis_context.facts().memberSpec(pattern.member.?);
+                            if (spec.type_id == target) {
+                                const previous = pending;
+                                pending = try self.projectStorage(previous, target, .variant);
+                                pending.reference_origins = try self.transformReferenceOrigins(previous.reference_origins, .{ .select = .{ .variant = pattern.member.? } });
+                                pending.borrowed_generation = previous.borrowed_generation;
+                                pending.borrowed_cleanup_value = previous.borrowed_cleanup_value;
+                            } else {
+                                pending.type_id = target;
+                                body_only = true;
+                            }
+                        }
+                        try self.installLocal(binding.local, pending, false, false);
+                        self.locals.items(.match_body_only)[@backingInt(binding.local)] = body_only;
+                        prepared.pending_capture = true;
                     }
                 }
-                captured = try self.refineVariantOwner(captured, try feasible.toOwnedSlice(self.gpa));
-            };
-            try self.installLocal(binding.local, captured, binding.mode == .reference, false);
-            try self.closeBoundary(scope.boundary);
+                try self.protectMatchLocal(binding.local);
+            }
+            for (prepared.children) |*child| try self.prepareMatchCaptures(child, null);
+        }
+
+        fn commitMatchPattern(self: *Self, prepared: *PreparedMatchPattern, supplied_owner: ?Value) anyerror!void {
+            const pattern = prepared.pattern;
+            const source = self.unresolved.match_patterns[pattern.source];
+            if (prepared.owned) {
+                if (pattern.shape == .tuple and prepared.product_owned) {
+                    if (supplied_owner) |owner| try self.recordConsume(owner);
+                    try self.state.availability.set(self.gpa, @backingInt(source.carrier), .transferred);
+                } else {
+                    var owned = if (supplied_owner) |owner| owner else try self.defineOwnedValue(self.state.values.get(@backingInt(source.carrier)).?, source.span, false);
+                    if (pattern.member) |member| {
+                        if (try self.analysis_context.facts().variantMembers(owned.type_id) != null)
+                            owned = try self.refineVariantOwner(owned, &.{member});
+                    }
+                    const identity = self.state.values.get(@backingInt(source.carrier)).?.binding_identity;
+                    owned.binding_identity = identity;
+                    try self.state.values.set(self.gpa, @backingInt(source.carrier), owned);
+                    if (prepared.pending_capture) {
+                        const binding = source.binding.?;
+                        const target = try self.matchCaptureType(pattern);
+                        self.locals.items(.match_body_only)[@backingInt(binding.local)] = false;
+                        var captured = if (owned.type_id == target) owned else try self.extractVariantBinding(.{ .binding = binding, .operand = owned, .target_type = target }, binding.span);
+                        captured = try self.refineMatchCapture(captured, pattern, null);
+                        const previous = self.state.values.get(@backingInt(binding.local)).?;
+                        captured.binding_identity = previous.binding_identity;
+                        if (previous.type_id == captured.type_id and previous.representation == .storage and target == (if (pattern.member) |member| (try self.analysis_context.facts().memberSpec(member)).type_id else target)) {
+                            captured.id = previous.id;
+                            captured.representation = previous.representation;
+                        }
+                        try self.state.values.set(self.gpa, @backingInt(binding.local), captured);
+                        try self.unbindLocal(@backingInt(source.carrier));
+                    }
+                }
+            }
+            for (prepared.children) |*child| try self.commitMatchPattern(child, null);
+        }
+
+        fn unbindMatchPattern(self: *Self, prepared: PreparedMatchPattern) anyerror!void {
+            const source = self.unresolved.match_patterns[prepared.pattern.source];
+            if (source.binding) |binding| {
+                self.locals.items(.match_body_only)[@backingInt(binding.local)] = false;
+                try self.unbindLocal(@backingInt(binding.local));
+            }
+            try self.unbindLocal(@backingInt(source.carrier));
+            for (prepared.children) |child| try self.unbindMatchPattern(child);
         }
 
         fn matchValue(self: *Self, source: @FieldType(Expression.Operation, "match"), request: ResultRequest) anyerror!Value {
             const baseline = try self.captureState();
+            const input_scope = try self.openBoundary(source.subject.span);
             try self.bindLocal(.{ .local = source.carrier, .value = source.subject.value, .span = source.subject.span, .mutable = true, .mode = .inferred });
-            if (self.current_block == null) return .{ .id = @fromBackingInt(0), .type_id = .never };
-            const subject = try self.readLocal(source.carrier, source.subject.span);
-            const members = (try self.analysis_context.facts().variantMembers(subject.type_id)) orelse &.{subject.type_id};
-            const arms = try self.resolveMatchArms(source, subject.type_id, members);
-            if (try self.analysis_context.facts().variantMembers(subject.type_id) != null and !self.locals.items(.reference)[@backingInt(source.carrier)]) {
-                for (arms) |arm| if (arm.pattern == .literal) {
-                    _ = try self.pinLocalStorage(source.carrier);
-                    break;
-                };
+            if (self.current_block == null) {
+                self.current_boundary = input_scope.parent;
+                return .{ .id = @fromBackingInt(0), .type_id = .never };
             }
+            try self.closeBoundary(input_scope.boundary);
+            self.current_boundary = input_scope.parent;
+            const subject = try self.readLocal(source.carrier, source.subject.span);
+            const members = try self.matchInputMembers(subject.type_id);
+            const arms = try self.resolveMatchArms(source, subject.type_id, members);
+            var dispatch_origins = if (self.locals.items(.reference)[@backingInt(source.carrier)])
+                self.state.values.get(@backingInt(source.carrier)).?.reference_origins
+            else
+                try self.sourceReferenceOrigins(self.borrowLocalValue(source.carrier));
+            for (members) |member| {
+                if ((try self.analysis_context.facts().memberSpec(member)).kind == .reference)
+                    dispatch_origins = try self.mergeReferenceOrigins(dispatch_origins, try self.transformReferenceOrigins(subject.reference_origins, .{ .select = .{ .variant = member } }));
+            }
+            for (arms) |arm| try self.matchProjectedOrigins(arm.pattern, subject.reference_origins, &dispatch_origins);
+            const checkpoint = try self.appendInstruction(.const_unit);
+            const dispatch_loan = try self.readReferenceOrigins(dispatch_origins, null, @truncate(@backingInt(checkpoint.id)), false);
+            // Tuple alternatives can instantiate one source arm on several
+            // disjoint paths. Cached expressions belong to their path's SSA.
+            const dispatch_values = try self.gpa.dupe(?Value, self.values);
+            defer @memcpy(self.values, dispatch_values);
             var exits: std.ArrayList(FlowExit) = .empty;
+            const outer_testing = self.match_testing_scope;
+            defer self.match_testing_scope = outer_testing;
             for (arms) |arm| {
-                const selected = try self.newEmptyBlock();
+                @memcpy(self.values, dispatch_values);
+                var testing: MatchTestingScope = .{ .parent = outer_testing, .origins = dispatch_origins };
+                self.match_testing_scope = &testing;
+                try self.protectMatchLocal(source.carrier);
+                const before = try self.captureState();
                 const next = if (arm.remaining.len != 0) try self.newEmptyBlock() else null;
-                try self.matchTest(source, arm, members, selected, next);
-                const state = try self.captureState();
-                self.enterBlock(selected);
-                self.restoreState(state);
-                try self.refineMatchCarrier(source.carrier, arm.members);
-                try self.bindMatchCapture(source, arm, subject.type_id, members);
-                var result = try self.blockWithResult(arm.source.body, request);
-                if (self.current_block != null) {
-                    if (result) |selected_result| result = try self.ownValueEscapingSince(selected_result, baseline, arm.source.span);
-                    if (arm.source.binding) |binding| try self.unbindLocal(@backingInt(binding.local));
-                    try self.unbindLocal(@backingInt(source.carrier));
+                const incoming = self.state.values.get(@backingInt(source.carrier)).?;
+                const preparation = try self.openBoundary(arm.source.span);
+                var prepared = try self.testMatchPattern(arm.pattern, incoming, self.locals.items(.reference)[@backingInt(source.carrier)], next);
+                try self.prepareMatchCaptures(&prepared, arm.members);
+                try self.closeBoundary(preparation.boundary);
+                self.current_boundary = preparation.parent;
+                var rejected: ?FlowExit = null;
+                if (arm.source.condition) |condition_id| {
+                    const flow = try self.condition(condition_id);
+                    rejected = flow.failure;
+                    if (flow.success) |success| try self.enterFlowExit(success) else self.current_block = null;
                 }
-                if (try self.valueExit(result)) |exit| try exits.append(self.gpa, exit);
+                self.match_testing_scope = outer_testing;
+                if (self.current_block != null) {
+                    const commit = try self.openBoundary(arm.source.span);
+                    try self.recordUse(try self.readLocal(source.carrier, source.subject.span));
+                    try self.recordMatchDispatchUse(dispatch_loan, arm.source.span);
+                    const owner = if (!self.locals.items(.reference)[@backingInt(source.carrier)])
+                        try self.refineVariantOwner(try self.takeIteratorCarrier(source.carrier, arm.source.span), arm.members)
+                    else
+                        null;
+                    try self.commitMatchPattern(&prepared, owner);
+                    try self.closeBoundary(commit.boundary);
+                    self.current_boundary = commit.parent;
+                    var result = try self.blockWithResult(arm.source.body, request);
+                    if (self.current_block != null) {
+                        if (result) |selected_result| result = try self.ownValueEscapingSince(selected_result, baseline, arm.source.span);
+                        try self.unbindMatchPattern(prepared);
+                        try self.unbindLocal(@backingInt(source.carrier));
+                    }
+                    if (try self.valueExit(result)) |exit| try exits.append(self.gpa, exit);
+                }
                 if (next) |continuation| {
-                    self.enterBlock(continuation);
-                    self.restoreState(state);
+                    var failures: std.ArrayList(FlowExit) = .empty;
+                    try failures.append(self.gpa, .{ .block = continuation, .state = before });
+                    if (rejected) |failure| {
+                        try self.enterFlowExit(failure);
+                        try self.unbindMatchPattern(prepared);
+                        try failures.append(self.gpa, .{ .block = self.suspendBlock(), .state = try self.captureState() });
+                    }
+                    const failure = try self.mergeExits(before, failures.items, null, .condition);
+                    try self.enterFlowExit(failure);
                     try self.refineMatchCarrier(source.carrier, arm.remaining);
                 }
             }
@@ -10210,7 +10760,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 var origins = self.originList(try self.completeReferenceOrigins(use.origins));
                 while (origins.next()) |origin| {
                     if (origin.read == null) continue;
-                    if (try self.referenceCrossesInvalidation(origin, use.location, graph, null)) return self.reject(use.span, if (origin.deferred_capture) .initializer_capture_conflict else .borrow_outlives_source);
+                    if (try self.referenceCrossesInvalidation(origin, use.location, graph, null)) return self.reject(use.span, if (use.match_testing) .match_guard_invalidates_subject else if (origin.deferred_capture) .initializer_capture_conflict else .borrow_outlives_source);
                     if (origin.parameter == null) continue;
                     var effects = self.reference_effects.iterator();
                     while (effects.next()) |entry| {
@@ -10241,7 +10791,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     var mutations = self.originList(invalidations);
                     while (mutations.next()) |mutation| {
                         if (sharesOriginOwner(origin, mutation) and try self.referenceSourcePathsOverlap(origin, mutation))
-                            return self.reject(exclusion.span, .borrow_outlives_source);
+                            return self.reject(exclusion.span, if (exclusion.match_testing) .match_guard_invalidates_subject else .borrow_outlives_source);
                     }
                 }
             }
@@ -10941,6 +11491,53 @@ const TestMeasureBody = struct {
         return measurements;
     }
 };
+
+test "inference captures exclude unrelated live state" {
+    const queries = @import("../queries.zig");
+    const allocator = std.testing.allocator;
+    var source: std.Io.Writer.Allocating = .init(allocator);
+    defer source.deinit();
+    try source.writer.writeAll("fallible materialize(init value: int) int -> value\n");
+    for ([_][]const u8{ "small", "large" }, [_]usize{ 0, 32 }) |name, unused_count| {
+        try source.writer.print("fallible {s}() int\n    var selected = 41\n", .{name});
+        for (0..unused_count) |index| try source.writer.print("    var unused_{d} = {d}\n", .{ index, index });
+        try source.writer.writeAll("    const result = materialize?(selected + 1)\n    return result\n");
+    }
+    const db = try @import("../query/engine.zig").Database.init(allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    try @import("../modules.zig").registerSources(db, allocator, source.written(), &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const small = (try db.get(TestMeasureBody, scope.resolveFunction("small").?)).*;
+    const large = (try db.get(TestMeasureBody, scope.resolveFunction("large").?)).*;
+    try std.testing.expect(small.type_only_regions > 0);
+    try std.testing.expect(small.inference_capture_values > 0);
+    try std.testing.expectEqual(small.inference_capture_values, large.inference_capture_values);
+}
+
+test "initializer captures reserve their complete entry argument range" {
+    const queries = @import("../queries.zig");
+    const allocator = std.testing.allocator;
+    const db = try @import("../query/engine.zig").Database.init(allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    try @import("../modules.zig").registerSources(db, allocator,
+        \\struct Cell
+        \\    value: int
+        \\fallible materialize(init value: Cell) Cell -> value
+        \\fallible probe(imm seed: Cell, mut output: int) int
+        \\    var first = Cell{value = 20 + seed.value}
+        \\    var second = Cell{value = 22}
+        \\    const result = materialize?(materialize?(Cell{value = first.value + second.value}))
+        \\    output = result.value
+        \\    return output
+        \\var output = 0
+        \\if const result = probe(Cell{value = 0}, output) -> exit(result) else exit(99)
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const measured = (try db.get(TestMeasureBody, scope.resolveFunction("probe").?)).*;
+    try std.testing.expect(measured.type_only_regions > 1);
+    try std.testing.expectEqual(@as(usize, 0), measured.region_capture_buffer_growths);
+    try std.testing.expect((try db.get(queries.BuildExecutable, 0)).* != null);
+}
 
 test "call argument failure scopes retain snapshots only for actual exits" {
     const queries = @import("../queries.zig");

@@ -379,6 +379,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .ellipsis2,
         .keyword_not,
         .minus,
+        .caret,
         => {
             const expr = try parseExpressionPrecedence(parser, 0);
             const tag = assignmentTag(parser.current().tag) orelse return expr;
@@ -646,7 +647,10 @@ fn parseMatchExpr(parser: *ParserState) ParseError!Node.Index {
     while (parser.eat(.dedent) == null and parser.current().tag != .eof) {
         if (closesIndentedBody(parser, indent)) break;
         const arm_index = parser.index;
-        const pattern = try parseMatchPattern(parser);
+        var pattern = try parseMatchPattern(parser);
+        if (parser.eat(.keyword_and) != null) {
+            pattern = try parser.addNode(.{ .tag = .match_guard, .token_index = arm_index, .data = .{ .node_node = .{ .a = pattern, .b = try parseRequiredExpression(parser) } } });
+        }
         _ = try parser.expect(.arrow);
         const body = try parseMatchArmBody(parser, arm_index);
         try parser.scratch_stack.append(parser.gpa, try parser.addNode(.{
@@ -669,7 +673,7 @@ fn parseMatchArmBody(parser: *ParserState, header: u32) ParseError!Node.Index {
 }
 
 fn parseMatchCapture(parser: *ParserState) ParseError!Node.Index {
-    const mode = parser.eatAny(&.{ .keyword_const, .keyword_ref, .keyword_var });
+    const mode = parser.eatAny(&.{ .keyword_ref, .keyword_var });
     if (mode != null and mode.?.tag == .keyword_var) return parser.fail(.match_capture_must_be_immutable);
     const name_index = parser.index;
     _ = try parser.expect(.identifier);
@@ -683,7 +687,7 @@ fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
             parser.index += 1;
             break :type_pattern try parser.addNode(.{ .tag = .match_type, .token_index = token_index, .data = .{ .node = try parseType(parser) } });
         },
-        .identifier, .keyword_const, .keyword_ref, .keyword_var => try parseMatchCapture(parser),
+        .identifier, .keyword_ref, .keyword_var => try parseMatchCapture(parser),
         .number_literal => try parseTokenNode(parser, .number_literal, .number_literal),
         .string_literal => try parseTokenNode(parser, .string_literal, .string_literal),
         .keyword_true, .keyword_false => literal: {
@@ -696,14 +700,11 @@ fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
             const number = try parseTokenNode(parser, .number_literal, .number_literal);
             break :negative try parser.addNode(.{ .tag = .neg, .token_index = token_index, .data = .{ .node = number } });
         },
-        .l_paren => unit: {
-            parser.index += 1;
-            _ = try parser.expect(.r_paren);
-            break :unit try parser.addNode(.{ .tag = .unit_literal, .token_index = token_index, .data = .{ .none = {} } });
-        },
+        .l_paren => try parseMatchTuple(parser),
         else => return parser.fail(.{ .invalid_expression = parser.current().tag }),
     };
     if (parser.eat(.keyword_as) != null) {
+        if (parser.nodes.items[pattern.index()].tag == .match_tuple) return parser.fail(.{ .unsupported_syntax = .keyword_as });
         const capture = try parseMatchCapture(parser);
         if (parser.nodes.items[pattern.index()].tag == .param) {
             const token = parser.tokens[parser.nodes.items[pattern.index()].token_index];
@@ -714,6 +715,29 @@ fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
     }
     if (parser.current().tag == .keyword_as) return parser.fail(.match_multiple_captures);
     return pattern;
+}
+
+fn parseMatchTuple(parser: *ParserState) ParseError!Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.l_paren);
+    if (parser.eat(.r_paren) != null)
+        return parser.addNode(.{ .tag = .unit_literal, .token_index = token_index, .data = .{ .none = {} } });
+    const stack_top = parser.scratch_stack.items.len;
+    defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
+    var comma = false;
+    while (true) {
+        parser.skipContinuationIndent();
+        try parser.scratch_stack.append(parser.gpa, try parseMatchPattern(parser));
+        parser.skipContinuationIndent();
+        if (parser.eat(.comma) == null) break;
+        comma = true;
+        parser.skipContinuationIndent();
+        if (parser.current().tag == .r_paren) break;
+    }
+    _ = try parser.expect(.r_paren);
+    const children = parser.scratch_stack.items[stack_top..];
+    if (children.len == 1 and !comma) return children[0];
+    return parser.addNode(.{ .tag = .match_tuple, .token_index = token_index, .data = try parser.listToSpan(children) });
 }
 
 fn parseFunction(parser: *ParserState) !Node.Index {
@@ -951,7 +975,7 @@ fn parseExpressionPrecedence(parser: *ParserState, min_precedence: u8) ParseErro
 fn parseRange(parser: *ParserState, first: ?Node.Index) ParseError!Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.ellipsis2);
-    const inclusive = parser.eat(.caret) != null;
+    const inclusive = parser.eat(.equal) != null;
     const start = first orelse try parser.addNode(.{ .tag = .none_literal, .token_index = token_index, .data = .{ .none = {} } });
     const omitted = parser.currentStartsLine() or switch (parser.current().tag) {
         .number_literal,
@@ -974,9 +998,11 @@ fn parseRange(parser: *ParserState, first: ?Node.Index) ParseError!Node.Index {
         .l_paren,
         .l_bracket,
         .minus,
+        .caret,
         => false,
         else => true,
     };
+    if (omitted and inclusive) return parser.fail(.{ .invalid_expression = parser.current().tag });
     const limit = if (omitted and !inclusive)
         try parser.addNode(.{ .tag = .none_literal, .token_index = token_index, .data = .{ .none = {} } })
     else
@@ -996,6 +1022,11 @@ fn parseUnary(parser: *ParserState) ParseError!Node.Index {
             parser.index += 1;
             const operand = try parseUnary(parser);
             return parser.addNode(.{ .tag = .neg, .token_index = token_index, .data = .{ .node = operand } });
+        },
+        .caret => {
+            parser.index += 1;
+            const operand = try parseUnary(parser);
+            return parser.addNode(.{ .tag = .from_end, .token_index = token_index, .data = .{ .node = operand } });
         },
         else => parsePostfix(parser),
     };
@@ -1512,7 +1543,7 @@ test "parse range endpoints after arithmetic" {
 
 test "parse range inclusive endpoints and transferred endpoints" {
     try testParsing(
-        \\const values = first^..^last
+        \\const values = first^..=last
     ,
         \\const_binding
         \\└─range_inclusive
@@ -1522,9 +1553,28 @@ test "parse range inclusive endpoints and transferred endpoints" {
     );
 }
 
+test "parse range end relative endpoints independently of inclusivity and transfer" {
+    try testParsing(
+        \\const values = first^..=^last
+        \\const prefix = ..^5
+    ,
+        \\const_binding
+        \\└─range_inclusive
+        \\  ├─move_expr
+        \\  │ └─identifier : first
+        \\  └─from_end
+        \\    └─identifier : last
+        \\const_binding
+        \\└─range
+        \\  ├─none_literal : ..
+        \\  └─from_end
+        \\    └─number_literal : 5
+    );
+}
+
 test "parse for binding modes annotations and inline bodies" {
     for ([_][]const u8{ "value", "value: int", "const value", "var value: int", "ref value: int", "_" }) |binding| {
-        const source = try std.testing.allocator.print("for {s} in 0..^3 -> use(value)", .{binding});
+        const source = try std.testing.allocator.print("for {s} in 0..=3 -> use(value)", .{binding});
         defer std.testing.allocator.free(source);
         var report = try parseReport(std.testing.allocator, 0, source);
         defer report.deinit(std.testing.allocator);

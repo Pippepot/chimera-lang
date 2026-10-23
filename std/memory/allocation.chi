@@ -1,7 +1,7 @@
 import std.text.{BytesView}
 import std.array.{Array, collection_literal}
 import std.iteration.{End}
-import std.range.{Range}
+import std.range.{Range, FromEnd}
 import std.memory
 
 pub struct Allocation(T: type)
@@ -56,6 +56,14 @@ pub struct List(T: type)
         const storage = allocate?(T, reserved)
         return List(T){storage = storage^, initialized = 0}
 
+    pub fallible filled(imm value: T, count: int) List(T) where T.copy is func(imm T) T
+        var result = List(T){storage = allocate?(T, count), initialized = 0}
+        loop
+            if result.initialized == count -> break
+            initialize_collection_element(T, result.storage, result.initialized, value)
+            result.initialized += 1
+        return result^
+
     pub func len(imm self: List(T)) int -> self.initialized
     pub func capacity(imm self: List(T)) int -> self.storage.capacity()
     pub func span(ref self: List(T)) Span(T) -> Span(T){data = allocation_cursor(T, self.storage), size = self.initialized}
@@ -103,10 +111,15 @@ pub struct List(T: type)
         unsafe_initialize?(T, self.storage, self.initialized, item^)
         self.initialized += 1
 
-    pub fallible get(ref self: List(T), index: int) ref T
+    fallible get_at(ref self: List(T), index: int) ref T
         index >= 0
         index < self.initialized
         return unsafe_borrow(T, self.storage, index)
+
+    fallible get_from_end(ref self: List(T), index: FromEnd) ref T
+        return self.get_at?(index.resolve?(self.initialized))
+
+    pub overload get(get_at, get_from_end)
 
     pub fallible remove(mut self: List(T), index: int) T
         index >= 0
@@ -122,9 +135,9 @@ pub struct List(T: type)
         self.initialized -= 1
         return result^
 
-    pub overload [](get, slice)
+    pub overload [](get_at, get_from_end, slice)
 
-    pub fallible []=(mut self: List(T), index: int, var item: T) unit
+    pub fallible []=(static Index: type, mut self: List(T), index: Index, var item: T) unit where Index is int or Index is FromEnd
         ref element = self.get?(index)
         element = item^
 
@@ -194,7 +207,8 @@ func append_collection_growing(static T: type, mut result: List(T), init item: T
         if result.initialized == 2147483647 -> panic "List literal capacity exceeded"
         if result.reserve(next) -> ()
         else panic "List literal allocation failed"
-    append_collection_bounded(T, result, item)
+    initialize_collection_element(T, result.storage, result.initialized, item)
+    result.initialized += 1
 
 fallible append_collection_fallible(static T: type, mut result: List(T), init item: T)
     const capacity = result.capacity()
@@ -205,7 +219,8 @@ fallible append_collection_fallible(static T: type, mut result: List(T), init it
             if capacity <= 1073741823 -> next = capacity * 2
             else next = 2147483647
         result.reserve?(next)
-    append_collection_bounded(T, result, item)
+    initialize_collection_element(T, result.storage, result.initialized, item)
+    result.initialized += 1
 
 pub struct Box(T: type)
     allocation: Allocation(T)
@@ -243,12 +258,15 @@ pub struct Span(T: type)
     pub func len(imm self: Span(T)) int -> self.size
     pub func iter(ref self: Span(T)) SpanIterator(T)
         return SpanIterator(T){source = self, position = 0}
-    pub fallible get(ref self: Span(T), index: int) ref T
+    fallible get_at(ref self: Span(T), index: int) ref T
         index >= 0
         index < self.size
         return cursor_element(T, self.data, index)
-    pub overload [](get, slice)
-    pub fallible []=(mut self: Span(T), index: int, var item: T) unit
+    fallible get_from_end(ref self: Span(T), index: FromEnd) ref T
+        return self.get_at?(index.resolve?(self.size))
+    pub overload get(get_at, get_from_end)
+    pub overload [](get_at, get_from_end, slice)
+    pub fallible []=(static Index: type, mut self: Span(T), index: Index, var item: T) unit where Index is int or Index is FromEnd
         ref element = self.get?(index)
         element = item^
     pub fallible slice(ref self: Span(T), bounds: Range) Span(T)

@@ -6,6 +6,8 @@ zig-out/
 .zig-cache/
 .chi-cache/
 .chi-run-*
+.history/
+__pycache__/
 *.qcache
 *.o
 playground

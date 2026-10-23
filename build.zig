@@ -49,8 +49,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "flow_benchmark", .source = "benchmarks/flow_benchmark.zig", .step = "flow-benchmark", .description = "Measure typing snapshots and lifetime tables" },
         .{ .name = "conversion_benchmark", .source = "benchmarks/conversion_benchmark.zig", .step = "conversion-benchmark", .description = "Measure converter discovery and repeated matching" },
         .{ .name = "std_benchmark", .source = "benchmarks/std_benchmark.zig", .step = "std-benchmark", .description = "Compare fresh compilation with source and precompiled std", .bundled_std = true },
-        .{ .name = "prelude_benchmark", .source = "benchmarks/prelude_benchmark.zig", .step = "test-prelude-performance", .description = "Check cold prelude loading and scalar compilation budgets", .optimize = .fast },
-        .{ .name = "prelude_debug_benchmark", .source = "benchmarks/prelude_benchmark.zig", .step = "test-prelude-debug-performance", .description = "Check cold Debug prelude loading and scalar compilation budgets", .optimize = .debug },
+        .{ .name = "history_benchmark", .source = "benchmarks/history_benchmark.zig", .step = "history-benchmark", .description = "Measure versioned end-to-end compiler workloads", .optimize = .fast, .bundled_std = true },
     }) |benchmark| {
         const benchmark_optimize = benchmark.optimize orelse optimize;
         const benchmark_module = b.createModule(.{
@@ -62,7 +61,11 @@ pub fn build(b: *std.Build) void {
         if (benchmark.bundled_std)
             benchmark_module.addAnonymousImport("standard_bundle", .{ .root_source_file = standard_bundle });
         const executable = b.addExecutable(.{ .name = benchmark.name, .root_module = benchmark_module, .use_llvm = benchmark_optimize == .fast });
-        b.step(benchmark.step, benchmark.description).dependOn(&b.addRunArtifact(executable).step);
+        const benchmark_run = b.addRunArtifact(executable);
+        if (std.mem.eql(u8, benchmark.name, "history_benchmark")) {
+            benchmark_run.addPassthruArgs();
+        }
+        b.step(benchmark.step, benchmark.description).dependOn(&benchmark_run.step);
     }
 
     const test_step = b.step("test", "Run compiler tests (allocation-failure sweeps are opt-in)");
@@ -81,9 +84,11 @@ pub fn build(b: *std.Build) void {
     const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
     const test_sources: []const []const u8 = if (selected_test_source) |source| &.{source} else &.{
         "test_sources.zig",
+        "tests/query_engine_test.zig",
         "tests/query_test.zig",
         "tests/codegen_test.zig",
-        "tests/modules_test.zig",
+        "tests/language_test.zig",
+        "tests/operation_test.zig",
         "tests/match_test.zig",
         "tests/overload_test.zig",
         "tests/query_disk_cache_test.zig",

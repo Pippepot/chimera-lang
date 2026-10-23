@@ -108,7 +108,7 @@ test "range string converters preserve independently omitted bounds and inclusiv
     try SourceFixture.expectParity(
         \\func run() int
         \\    if String(-2..4) <> "-2..4" -> return 90
-        \\    if String(1..^3) <> "1..^3" -> return 91
+        \\    if String(1..=3) <> "1..=3" -> return 91
         \\    if String(..3) <> "..3" -> return 92
         \\    if String(2..) <> "2.." -> return 93
         \\    if String(..) <> ".." -> return 94
@@ -674,13 +674,13 @@ test "range slicing preserves reusable empty reversed and inclusive bounds" {
         \\    var view = values.span()
         \\    const bounds = 1..3
         \\    const selected = view.slice?(bounds)
-        \\    const inclusive = view.slice?(1..^2)
+        \\    const inclusive = view.slice?(1..=2)
         \\    const empty = view.slice?(2..2)
         \\    const endpoint = view.slice?(4..4)
         \\    if view.slice(2..1) -> return 91
-        \\    if view.slice(4..^4) -> return 92
+        \\    if view.slice(4..=4) -> return 92
         \\    if inclusive.len() <> 2 -> return 93
-        \\    if view.slice(2..^1) -> return 94
+        \\    if view.slice(2..=1) -> return 94
         \\    var count = 0
         \\    for index in bounds -> count += 1
         \\    return selected[0] + selected[1] + count + empty.len() + endpoint.len()
@@ -688,6 +688,149 @@ test "range slicing preserves reusable empty reversed and inclusive bounds" {
         \\    if const result = inspect() -> return result
         \\    return 90
     , 42);
+}
+
+test "end relative collection indexing and slicing preserve native and comptime behavior" {
+    try SourceFixture.expectParity(
+        \\func distance(ref calls: int) int
+        \\    calls += 1
+        \\    return 1
+        \\fallible inspect() int
+        \\    var values = [10, 20, 30, 40]
+        \\    var calls = 0
+        \\    values[^distance(calls)] += 2
+        \\    calls == 1
+        \\    values[^1] == 42
+        \\    values.get?(^4) == 10
+        \\    var span = values.span()
+        \\    span[^2] = 31
+        \\    span.get?(^2) == 31
+        \\    const prefix = ..^1
+        \\    const suffix = ^2..
+        \\    const selected = values[suffix]
+        \\    selected.len() == 2 and selected[^1] == 42
+        \\    values[prefix].len() == 3
+        \\    values[1..=^1].len() == 3
+        \\    var list: List(int) = [17, 20]
+        \\    list.reserve?(8)
+        \\    list[^1] += 3
+        \\    list.get?(^1) == 23
+        \\    list[prefix].len() == 1
+        \\    list[suffix].len() == 2
+        \\    const bytes: BytesView = "abcd"
+        \\    byte_int(bytes[^1]) == 100
+        \\    byte_int(bytes.get?(^4)) == 97
+        \\    bytes[prefix].byte_length() == 3
+        \\    const text: StringView = "aéz"
+        \\    text[..^1] == "aé"
+        \\    text[^3..^1] == "é"
+        \\    text[..=^1] == text
+        \\    if text[^2..] -> return 90
+        \\    if text[..^2] -> return 91
+        \\    return 42
+        \\func run() int
+        \\    if const result = inspect() -> return result
+        \\    return 92
+    , 42);
+}
+
+test "end relative collection bounds reject invalid distances and accept end boundaries" {
+    try SourceFixture.expectParity(
+        \\fallible inspect() int
+        \\    var values = [10, 20, 30]
+        \\    var list: List(int) = [10, 20, 30]
+        \\    list.reserve?(8)
+        \\    var span = values.span()
+        \\    const bytes: BytesView = "abc"
+        \\    for distance in [-2147483648, -1, 0, 4, 2147483647]
+        \\        if values[^distance] -> return 90
+        \\        if list[^distance] -> return 91
+        \\        if span[^distance] -> return 92
+        \\        if bytes[^distance] -> return 93
+        \\    if list[^4] = 0 -> return 94
+        \\    list[^1] == 30
+        \\    const whole = values[..^0]
+        \\    const empty = values[^0..]
+        \\    whole.len() == 3 and empty.len() == 0
+        \\    if values[..=^0] -> return 95
+        \\    if values[^4..] -> return 96
+        \\    if values[..^4] -> return 97
+        \\    var absent: Array(int, 0) = []
+        \\    absent[^0..^0].len() == 0
+        \\    if absent[^0] -> return 98
+        \\    if absent[^1] -> return 99
+        \\    if absent[..=^0] -> return 100
+        \\    return 42
+        \\func run() int
+        \\    if const result = inspect() -> return result
+        \\    return 101
+    , 42);
+}
+
+test "end relative slicing matches independent absolute endpoint combinations" {
+    try SourceFixture.expectParity(
+        \\fallible inspect() int
+        \\    const values = [2, 4, 6, 8, 10]
+        \\    var accepted = 0
+        \\    var included = 0
+        \\    for absolute_first in [true, false]
+        \\        for absolute_limit in [true, false]
+        \\            for first in -1..=6
+        \\                for limit in -1..=6
+        \\                    const start_bound = if absolute_first? -> first else ^first
+        \\                    const limit_bound = if absolute_limit? -> limit else ^limit
+        \\                    const start = if absolute_first? -> first else 5 - first
+        \\                    const end = if absolute_limit? -> limit else 5 - limit
+        \\                    if const selected = values[start_bound..limit_bound]
+        \\                        start >= 0 and start <= end and end <= 5
+        \\                        selected.len() == end - start
+        \\                        var offset = 0
+        \\                        for value in selected
+        \\                            value == (start + offset + 1) * 2
+        \\                            offset += 1
+        \\                        accepted += 1
+        \\                    else
+        \\                        not (start >= 0 and start <= end and end <= 5)
+        \\                    if const selected = values[start_bound..=limit_bound]
+        \\                        start >= 0 and start <= end and end < 5
+        \\                        selected.len() == end - start + 1
+        \\                        included += 1
+        \\                    else
+        \\                        not (start >= 0 and start <= end and end < 5)
+        \\    accepted == 84 and included == 60
+        \\    return 42
+        \\func run() int
+        \\    if const result = inspect() -> return result
+        \\    return 90
+    , 42);
+}
+
+test "end relative access preserves borrow permissions and invalidation" {
+    const source =
+        \\fallible last(ref values: Array(int, 3)) ref int -> values[^1]
+        \\fallible inspect() int
+        \\    var values = [7, 11, 40]
+        \\    ref item = last?(values)
+        \\    item += 2
+        \\    return values[^1]
+        \\func run() int
+        \\    if const result = inspect() -> return result
+        \\    return 90
+    ;
+    try SourceFixture.expectParity(source, 42);
+    const readonly = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var values", "const values");
+    defer std.testing.allocator.free(readonly);
+    const rejected = try std.fmt.allocPrint(std.testing.allocator, "{s}\nexit(run())", .{readonly});
+    defer std.testing.allocator.free(rejected);
+    try SourceFixture.expectSourceDiagnostic(rejected, .reference_not_writable);
+    try SourceFixture.expectSourceDiagnostic(
+        \\fallible inspect() int
+        \\    var values: List(int) = [40]
+        \\    ref item = values[^1]
+        \\    values.append?(2)
+        \\    return item
+        \\if const result = inspect() -> exit(result)
+    , .borrow_outlives_source);
 }
 
 test "range slicing resolves independently omitted bounds against initialized extents" {
@@ -700,7 +843,7 @@ test "range slicing resolves independently omitted bounds against initialized ex
         \\    const whole = values.slice?(all)
         \\    const head = values.slice?(prefix)
         \\    const tail = values.slice?(suffix)
-        \\    const inclusive = values.slice?(..^2)
+        \\    const inclusive = values.slice?(..=2)
         \\    const explicit_head = values.slice?(none..3)
         \\    const explicit_tail = values.slice?(2..none)
         \\    if whole.len() <> 4 or head.len() <> 3 or tail.len() <> 2 -> return 91
@@ -764,8 +907,8 @@ test "span slicing matches an independent endpoint boundary matrix" {
         \\    const source = values.span()
         \\    var accepted = 0
         \\    var accepted_inclusive = 0
-        \\    for start in 0..^6
-        \\        for limit in 0..^6
+        \\    for start in 0..=6
+        \\        for limit in 0..=6
         \\            if const selected = source.slice(start..limit)
         \\                if start > limit or limit > 5 -> return 90
         \\                if selected.len() <> limit - start -> return 91
@@ -777,13 +920,13 @@ test "span slicing matches an independent endpoint boundary matrix" {
         \\                accepted += 1
         \\            else
         \\                if start <= limit and limit <= 5 -> return 93
-        \\            if const included = source.slice(start..^limit)
+        \\            if const included = source.slice(start..=limit)
         \\                if start > limit or limit >= 5 -> return 95
         \\                if included.len() <> limit - start + 1 -> return 96
         \\                var actual = 0
         \\                for value in included -> actual += value
         \\                var expected = 0
-        \\                for position in start..^limit -> expected += (position + 1) * 2
+        \\                for position in start..=limit -> expected += (position + 1) * 2
         \\                if actual <> expected -> return 97
         \\                accepted_inclusive += 1
         \\            else
@@ -805,8 +948,8 @@ test "span slicing rejects extreme bounds before offset arithmetic" {
         \\    if source.slice(0..-1) -> return 93
         \\    if source.slice(2147483647..0) -> return 94
         \\    if source.slice(0..2147483647) -> return 95
-        \\    if source.slice(1..^2147483647) -> return 96
-        \\    if source.slice(2147483647..^2147483647) -> return 97
+        \\    if source.slice(1..=2147483647) -> return 96
+        \\    if source.slice(2147483647..=2147483647) -> return 97
         \\    if source.slice(-2147483648..2147483647) -> return 98
         \\    if const endpoint = source.slice(3..3)
         \\        if endpoint.get(0) -> return 99
@@ -831,6 +974,16 @@ test "span slicing validates empty zero sized extents without exposing an elemen
         \\        return 94
         \\    var values: Array(Empty, 3) = [Empty{}, Empty{}, Empty{}]
         \\    var source = values.span()
+        \\    if const tail = source[^0..]
+        \\        if tail.len() <> 0 -> return 99
+        \\    else
+        \\        return 100
+        \\    if const complete = source[^3..^0]
+        \\        if complete.len() <> 3 -> return 101
+        \\    else
+        \\        return 102
+        \\    if source.get(^0) -> return 97
+        \\    if not source.get(^1) -> return 98
         \\    if const endpoint = source.slice(3..3)
         \\        if endpoint.get(0) -> return 95
         \\        return 42 + endpoint.len()

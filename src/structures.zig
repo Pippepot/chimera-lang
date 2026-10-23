@@ -252,6 +252,9 @@ pub const Node = struct {
         match_arm,
         match_type,
         match_capture,
+        match_guard,
+        match_tuple,
+        from_end,
         _,
     };
 
@@ -284,12 +287,12 @@ pub const Node = struct {
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .fail_expr, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
-            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .reference_type, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread, .match_type => .node,
-            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .func, .type_func, .@"if", .collection_if, .match_arm, .match_capture => .node_node,
+            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .from_end, .reference_type, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread, .match_type => .node,
+            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .func, .type_func, .@"if", .collection_if, .match_arm, .match_capture, .match_guard => .node_node,
             .param => .parameter,
             .struct_field => .field,
             .signature => .signature,
-            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .binding_tuple, .binding_sequence, .import, .selective_import, .overload, .match_expr => .ref,
+            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .binding_tuple, .binding_sequence, .import, .selective_import, .overload, .match_expr, .match_tuple => .ref,
             else => null,
         };
     }
@@ -1774,12 +1777,16 @@ pub const Diagnostic = struct {
         .unsupported_syntax = Token.Tag,
         .unexpected_indented_block = "unexpected indented block; the previous expression does not introduce a block",
         .match_multiple_captures = "a match pattern may bind its value only once; add further bindings in the arm body",
-        .match_capture_must_be_immutable = "a match capture must use `const` or `ref`, not `var`",
+        .match_capture_must_be_immutable = "a match capture is immutable; use a bare name or `ref`, not `var`",
         .match_requires_arm = "a match requires at least one arm",
         .match_redundant_arm = "this match arm is fully covered by preceding arms",
         .match_not_exhaustive = TypeId,
         .match_pattern_incompatible = TypeMismatch,
         .match_literal_ambiguous = TypeId,
+        .match_tuple_capture_type_ambiguous = "a tuple capture must have the same element type in every matching tuple alternative; use separate type arms",
+        .match_tuple_pattern_incompatible = "no alternative of the matched value has a tuple shape compatible with this pattern",
+        .match_guard_invalidates_subject = "a match condition cannot consume, mutate, or invalidate the retained subject or its captures",
+        .match_capture_unavailable_in_condition = "this capture requires a consuming representation change and is available only in the selected arm body",
         .indented_block_after_inline_body = "indented block cannot follow an inline function body; `->` starts the body, and the return type goes before it",
         .duplicate_top_level_declaration = Message{ .text = "top-level name is already declared", .source_label = true },
         .declaration_cycle = Message{ .text = "declaration depends on itself", .source_label = true },
@@ -1787,7 +1794,6 @@ pub const Diagnostic = struct {
         .compile_time_call_cycle = "compile-time call recursively depends on the same function and arguments",
         .compile_time_unhandled_failure = "compile-time expression failed without handling the failure",
         .compile_time_division_by_zero = "division by zero during compile-time execution",
-        .compile_time_integer_overflow = "integer overflow during compile-time execution",
         .compile_time_unsupported_operation = "operation is not supported during compile-time execution",
         .compile_time_escaping_storage = "evaluation-owned storage cannot escape compile-time execution",
         .compile_time_panic = ByteStringId,

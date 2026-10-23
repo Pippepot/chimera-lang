@@ -380,7 +380,7 @@ test "overload range indexing rejects reversed extreme and invalid UTF8 bounds" 
         \\    if const invalid = values[2..1] -> return 90
         \\    if const invalid = values[-1..2] -> return 91
         \\    if const invalid = values[0..2147483647] -> return 92
-        \\    if const invalid = values[3..^3] -> return 93
+        \\    if const invalid = values[3..=3] -> return 93
         \\    const text = StringView("a\u{e9}z")
         \\    if const invalid = text[1..2] -> return 94
         \\    const selected = text[1..3]
@@ -471,12 +471,12 @@ test "overload range indexing preserves readonly backing and excludes bulk assig
         \\    selected[0] = 42
         \\if run() -> exit(0)
     , .reference_not_writable);
-    try Fixture.expectSourceDiagnostic(
+    try Fixture.expectAnySourceDiagnostic(
         \\fallible run()
         \\    var values = [1, 2, 3]
         \\    values[0..2] = [4, 5]
         \\if run() -> exit(0)
-    , .call_argument_type_mismatch);
+    , .where_condition_failed);
 }
 
 test "overload operator sets include unary and binary forms explicitly" {

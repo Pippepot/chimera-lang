@@ -623,6 +623,8 @@ pub const UnresolvedBody = struct {
     assignment_fields: []FieldName = &.{},
     binding_patterns: []BindingPattern = &.{},
     binding_pattern_children: []u32 = &.{},
+    match_patterns: []MatchPattern = &.{},
+    match_pattern_children: []u32 = &.{},
     match_arms: []MatchArm = &.{},
     root_block: BlockId,
 
@@ -675,9 +677,16 @@ pub const UnresolvedBody = struct {
         pub const Sequence = struct { children: structures.FunctionValueRange, storage: LocalId, storage_read: ValueId };
     };
     pub const PatternBinding = struct { pattern: u32, value: ValueId, span: structures.SourceSpan };
+    pub const MatchPattern = struct {
+        shape: union(enum) { any, type: structures.TypeId, literal: ValueUse, tuple: structures.FunctionValueRange },
+        binding: ?ConditionBinding = null,
+        carrier: LocalId,
+        read: ValueId,
+        span: structures.SourceSpan,
+    };
     pub const MatchArm = struct {
-        pattern: union(enum) { any, type: structures.TypeId, literal: ValueUse },
-        binding: ?ConditionBinding,
+        pattern: u32,
+        condition: ?ConditionId = null,
         body: BlockId,
         span: structures.SourceSpan,
     };
@@ -880,6 +889,8 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         assignment_fields: std.ArrayList(UnresolvedBody.FieldName) = .empty,
         binding_patterns: std.ArrayList(UnresolvedBody.BindingPattern) = .empty,
         binding_pattern_children: std.ArrayList(u32) = .empty,
+        match_patterns: std.ArrayList(UnresolvedBody.MatchPattern) = .empty,
+        match_pattern_children: std.ArrayList(u32) = .empty,
         match_arms: std.ArrayList(UnresolvedBody.MatchArm) = .empty,
         loop_depth: u32 = 0,
         can_return: bool = false,
@@ -1429,6 +1440,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .@"struct" => return self.appendExpression(index, .{ .type_value = try self.analysis_context.generatedStructType(index) }),
                 .identifier => return self.appendIdentifier(index, result_is_type),
                 .neg => return self.appendNegation(index),
+                .from_end => return self.appendFromEnd(index),
                 .add, .sub, .mul, .div, .rem => return self.appendBinary(index),
                 .range, .range_inclusive => return self.appendRange(index),
                 .eq, .ne, .lt, .gt, .le, .ge, .not, .@"and", .@"or", .query, .is => return self.appendExpression(index, .{ .predicate = try self.buildCondition(index) }),
@@ -1784,6 +1796,16 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             } });
         }
 
+        fn appendFromEnd(self: *Self, index: structures.Node.Index) !ValueId {
+            const constructor = (try self.analysis_context.fromEndConstructor()) orelse return error.Unavailable;
+            const distance = try self.appendUse(self.ast.nodes[index.index()].data.node, false);
+            return self.appendExpression(index, .{ .call = .{
+                .target = .{ .direct = .{ .item = constructor } },
+                .arguments = try self.appendArguments(&.{distance}),
+                .span = nodeFocusSpan(self.ast, index),
+            } });
+        }
+
         fn appendPanic(self: *Self, index: structures.Node.Index) !ValueId {
             const message_node = self.ast.nodes[index.index()].data.node;
             const message = if (message_node != .null)
@@ -1975,34 +1997,18 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             for (parts[1..]) |arm_index| {
                 const arm = self.ast.nodes[arm_index.index()];
                 var pattern_index = arm.data.node_node.a;
-                var capture_index: ?structures.Node.Index = null;
-                if (self.ast.nodes[pattern_index.index()].tag == .match_capture) {
-                    const capture = self.ast.nodes[pattern_index.index()];
-                    pattern_index = capture.data.node_node.a;
-                    capture_index = capture.data.node_node.b;
+                var condition_index: ?structures.Node.Index = null;
+                if (self.ast.nodes[pattern_index.index()].tag == .match_guard) {
+                    const header = self.ast.nodes[pattern_index.index()];
+                    pattern_index = header.data.node_node.a;
+                    condition_index = header.data.node_node.b;
                 }
-                const pattern = self.ast.nodes[pattern_index.index()];
-                if (pattern.tag == .param and capture_index == null) capture_index = pattern_index;
-                const pattern_test: @FieldType(UnresolvedBody.MatchArm, "pattern") = switch (pattern.tag) {
-                    .param => .any,
-                    .match_type => .{ .type = try self.bindingType(pattern.data.node) },
-                    else => .{ .literal = try self.appendUse(pattern_index, false) },
-                };
-                var binding: ?UnresolvedBody.ConditionBinding = null;
-                if (capture_index) |capture_node| {
-                    const capture = self.ast.nodes[capture_node.index()];
-                    const name = tokenText(self.ast, self.source, capture.token_index);
-                    if (!std.mem.eql(u8, name, "_")) {
-                        if (try self.nameIsVisible(name)) return self.reject(capture_node, .duplicate_local_binding);
-                        const local = self.newLocal();
-                        const reference = capture.data.parameter.access == .keyword_ref;
-                        binding = .{ .local = local, .annotation_type = null, .span = tokenSpan(self.ast, capture.token_index), .mode = if (reference) .reference else .owned };
-                        try self.declare(name, .{ .place = .{ .id = local, .mutable = reference } });
-                    }
-                }
+                const pattern = try self.buildMatchPattern(pattern_index);
+                try self.declareMatchCaptures(pattern);
+                const condition = if (condition_index) |guard| try self.buildCondition(guard) else null;
                 try arms.append(self.gpa, .{
-                    .pattern = pattern_test,
-                    .binding = binding,
+                    .pattern = pattern,
+                    .condition = condition,
                     .body = try self.buildBranch(arm.data.node_node.b, result_is_type),
                     .span = nodeFocusSpan(self.ast, arm_index),
                 });
@@ -2016,6 +2022,64 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .read = read,
                 .arms = .{ .start = start, .end = @intCast(self.match_arms.items.len) },
             } });
+        }
+
+        fn buildMatchPattern(self: *Self, index: structures.Node.Index) anyerror!u32 {
+            var pattern_index = index;
+            var capture_index: ?structures.Node.Index = null;
+            if (self.ast.nodes[pattern_index.index()].tag == .match_capture) {
+                const capture = self.ast.nodes[pattern_index.index()];
+                pattern_index = capture.data.node_node.a;
+                capture_index = capture.data.node_node.b;
+            }
+            const node = self.ast.nodes[pattern_index.index()];
+            if (node.tag == .param and capture_index == null) capture_index = pattern_index;
+            const carrier = self.newLocal();
+            var pattern: UnresolvedBody.MatchPattern = .{
+                .shape = undefined,
+                .carrier = carrier,
+                .read = try self.appendExpression(pattern_index, .{ .local_read = carrier }),
+                .span = nodeFocusSpan(self.ast, pattern_index),
+            };
+            switch (node.tag) {
+                .param => pattern.shape = .any,
+                .match_type => pattern.shape = .{ .type = try self.bindingType(node.data.node) },
+                .match_tuple => pattern.shape = .{ .tuple = try self.buildMatchTuple(pattern_index) },
+                else => pattern.shape = .{ .literal = try self.appendUse(pattern_index, false) },
+            }
+            if (capture_index) |capture_node| {
+                const capture = self.ast.nodes[capture_node.index()];
+                const name = tokenText(self.ast, self.source, capture.token_index);
+                if (!std.mem.eql(u8, name, "_")) {
+                    const local = self.newLocal();
+                    const reference = capture.data.parameter.access == .keyword_ref;
+                    pattern.binding = .{ .local = local, .annotation_type = null, .span = tokenSpan(self.ast, capture.token_index), .mode = if (reference) .reference else .owned };
+                }
+            }
+            const result: u32 = @intCast(self.match_patterns.items.len);
+            try self.match_patterns.append(self.gpa, pattern);
+            return result;
+        }
+
+        fn declareMatchCaptures(self: *Self, id: u32) anyerror!void {
+            const pattern = self.match_patterns.items[id];
+            if (pattern.binding) |binding| {
+                const name = self.source[binding.span.start..binding.span.end];
+                if (try self.nameIsVisible(name)) return self.rejectIssue(.{ .span = binding.span, .kind = .duplicate_local_binding });
+                try self.declare(name, .{ .place = .{ .id = binding.local, .mutable = binding.mode == .reference } });
+            }
+            if (pattern.shape == .tuple) for (self.match_pattern_children.items[pattern.shape.tuple.start..pattern.shape.tuple.end]) |child|
+                try self.declareMatchCaptures(child);
+        }
+
+        fn buildMatchTuple(self: *Self, index: structures.Node.Index) anyerror!structures.FunctionValueRange {
+            var children: std.ArrayList(u32) = .empty;
+            defer children.deinit(self.gpa);
+            for (self.ast.nodeList(index)) |child|
+                try children.append(self.gpa, try self.buildMatchPattern(child));
+            const start: u32 = @intCast(self.match_pattern_children.items.len);
+            try self.match_pattern_children.appendSlice(self.gpa, children.items);
+            return .{ .start = start, .end = @intCast(self.match_pattern_children.items.len) };
         }
 
         fn appendPatternExtraction(self: *Self, index: structures.Node.Index) !ValueId {
@@ -3369,6 +3433,10 @@ const TestAnalysisContext = struct {
     }
 
     pub fn rangeConstructor(_: @This(), _: bool) !?structures.ItemId {
+        return null;
+    }
+
+    pub fn fromEndConstructor(_: @This()) !?structures.ItemId {
         return null;
     }
 

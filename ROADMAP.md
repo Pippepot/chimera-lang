@@ -14,7 +14,9 @@ is not a goal.
 
 - Start with `swap`, `reverse`, and `sort`, independently of Map/Set. Settle
   element capabilities, comparator access/fallibility, stability, failure
-  guarantees, and mutating versus value-returning APIs.
+  guarantees, ordering laws (including partial versus total ordering), and
+  mutating versus value-returning APIs. Distinguish a negative comparison from
+  operational failure.
 - Before general adapters, settle the required compile-time member descriptors,
   callable result/effect discovery, and tuple/variant builders. Keep logical
   types, whole-result ownership, and member storage kinds separate; descriptors
@@ -28,8 +30,9 @@ is not a goal.
 
 ### 2. Collections
 
-- Map/Set: hashing, equality, key mutation, ownership, and ordered variants,
-  building on tuples and iteration. Queue/Stack may reuse List.
+- Map/Set: key equivalence, equal-key hash consistency, key mutation, ownership,
+  and ordering laws for ordered variants, building on tuples and iteration.
+  Queue/Stack may reuse List.
 - Enum-indexed arrays: domain coverage, storage order, and initialization;
   reuse those decisions for an efficient standard-library `EnumSet[T]`.
 
@@ -48,6 +51,20 @@ is not a goal.
 
 Schedule these when needed; floating point does not gate collections or algorithms.
 
+- Inline named variant cases alongside ordinary type alternatives: payload-free
+  cases use implicit unit without payload storage; named cases remain distinct
+  from bare unit/none and from other cases with the same payload type. Settle
+  construction, matching, visibility, and identity across aliases/composition.
+  Represent informative errors with ordinary variants, not payload-carrying failure.
+- Concrete capturing closures: settle capture syntax/defaults, invocation access
+  and consumption, and generic callable inspection alongside adapter needs.
+  Environments live inline or construct directly in a return destination; Box
+  explicitly selects heap storage. Preserve ordinary ownership and borrow rules;
+  defer owning type erasure and do not introduce implicit environment allocation.
+- Foreign interoperability: define a C ABI boundary, representation/layout,
+  calling conventions, opaque handles, buffer access, callbacks, and ownership
+  obligations separately from compiler-registered externs. Unrestricted raw
+  pointers are not a prerequisite.
 - Numeric foundations: nondecimal/wider literals, byte operations, and named
   wrap/truncate/round/saturate/widen conversions with explicit overflow and
   failure rules. No converters between numeric runtime types.
@@ -68,6 +85,11 @@ Schedule these when needed; floating point does not gate collections or algorith
   contiguous slicing and range traversal. Decide bulk range assignment separately.
 - Failure fallback and guard bindings, only where existing condition bindings
   are insufficient; enum shorthand and smart casts with mutation invalidation.
+- Match extensions beyond tuple patterns and ordinary and conditions: settle
+  nominal record patterns/captures, relative comparisons, and container/range
+  membership separately, preserving ordinary binding and extraction spelling.
+  Settle narrowed header captures and migration of legacy scalar/type `as name`
+  captures separately; tuple capture syntax does not extend that spelling.
 - Generators/yield only if cursor composition proves insufficient; preserve
   ownership, lending, and failure effects.
 - Compile-time allocation publication: serialization, relocation, mutability,
@@ -78,8 +100,11 @@ Schedule these when needed; floating point does not gate collections or algorith
   temporary-projection borrowing and lifetime extension.
 - Shared ownership: atomic counts, synchronization guarantees, and cycle policy;
   no upgradeable weak-reference API.
-- Overloading beyond explicit sets, function literals/closures, `sizeof`, and
-  return inference.
+- Concurrency: thread transfer/sharing, synchronization, atomics, and data-race
+  semantics before concurrent APIs; async remains deferred too.
+- User project tooling: language-level tests and reproducible dependency/package
+  declarations, separately from compiler tests and module discovery.
+- Overloading beyond explicit sets, `sizeof`, and return inference.
 - Additional targets only for concrete use cases: layouts, allocation, access,
   and zero-byte behavior. Start with scalar device buffers; defer raw addresses
   and foreign memory.

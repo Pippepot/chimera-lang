@@ -4,7 +4,6 @@ const structures = @import("../structures.zig");
 pub const ExecutionErrorReason = union(enum) {
     call_cycle,
     division_by_zero,
-    integer_overflow,
     unsupported_operation,
     escaping_storage,
     panic: structures.ByteStringId,
@@ -647,8 +646,7 @@ fn ExecutionFrame(comptime Executor: type) type {
             const lhs = integer(self.slots, operands.lhs);
             const rhs = integer(self.slots, operands.rhs);
             if (rhs == 0) return executionError(.division_by_zero, span);
-            if (lhs == std.math.minInt(i32) and rhs == -1) return executionError(.integer_overflow, span);
-            return .{ .returned = .{ .runtime = .{ .int = @divTrunc(lhs, rhs) } } };
+            return .{ .returned = .{ .runtime = .{ .int = if (rhs == -1) -%lhs else @divTrunc(lhs, rhs) } } };
         }
 
         fn staticConversion(self: *const Self, conversion: @FieldType(structures.FunctionInstruction, "static_conversion"), span: ?structures.SourceSpan) !Result {
