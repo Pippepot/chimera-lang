@@ -41,10 +41,9 @@ is not a goal.
 [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) owns the target IR shape and pass
 design. Remaining slices, in order:
 
-- Split `value_copy` into explicit load, store, and copy operations.
-- Promote non-escaping scalar locals to SSA values with slot effects.
 - Inline small callees bottom-up with call summaries, cost limits, recursive
-  component exclusion, and inline-chain trace metadata.
+  component exclusion, and inline-chain trace metadata, then promote again.
+- Remove empty blocks and jump chains.
 - Scalar replacement of struct and variant slots, then forwarding, dead-store,
   and invariant-hoisting passes over ownership-derived alias facts.
 - Loop normalization, induction variables, bounds-check elimination, and fill

@@ -33,13 +33,16 @@ bufferization role: it gives storage only to values that need an address.
 
 Target shape, in dependency order:
 
-1. **Explicit memory operations.** `value_copy` means load, copy, or store
-   depending on operand representation and destination. Split it into `load`,
-   `store`, and `copy` so effects follow from the tag.
+1. **Memory roles from operands.** `value_copy` loads, copies, or stores
+   depending on whether its operands denote storage. Storage is a property of
+   the operand, not of the copy, so the instruction is not split: separate load,
+   store, and copy tags would duplicate a fact every producer must keep
+   consistent. Passes classify accesses from the operand that owns the fact,
+   for example a `local_storage` slot read as a whole `value_copy` source.
 2. **Promotion.** Non-escaping slots become SSA values; loop-carried values
    become block arguments. Struct slots split per field; variants split into a
-   tag plus payload values. This runs after inlining, which removes the borrows
-   that keep locals in memory.
+   tag plus payload values. Promotion runs again after inlining, which removes
+   the borrows that keep locals in memory.
 3. **Resource effects.** One classification reports pure, read, write,
    allocate, free, may-fail, or call, with the resource: slot, projection path,
    allocation contents, or unknown. Ownership supplies alias facts LLVM must
@@ -86,19 +89,36 @@ summaries -> inline -> promote -> canonicalize -> memory -> loops -> canonicaliz
 
 Register allocation is backend work that becomes worthwhile once values are SSA.
 
+## IR facts passes rely on
+
+- A `fallible_call` delivers its result as the single parameter of its success
+  block; that parameter has no branch argument and is always kept. Fallible
+  edges carry no arguments, so promotion skips a slot whose merge would need
+  one; inserting edge blocks would lift this limit.
+- Values are immutable except through addresses. A value is address-taken when
+  any use is not a known read (initializer captures, borrowed or `deinit` call
+  arguments, storage block parameters, borrows); address-taken values are never
+  aliased or promoted.
+- Typed bodies may keep unreferenced side-table entries; passes visit
+  references through users, never by scanning tables.
+- A slot read before any store on a path is unreachable by typing's definite
+  initialization; promotion supplies a typed zero there.
+
 ## Slices
 
 1. **Boundary and canonicalization (done).** `OptimizeFunctionInstance`,
    constant folding, the algebra table, constant-branch folding, dead pure value
    and unreachable block removal, side-table compaction, a safe-build IR
-   verifier, `--debug=optimized`, and the `optimization` timing row. On memory
-   form it only sees constants and values that are not reloaded from slots.
-2. **Explicit memory operations** (shape 1), touching typing, interpreter, and
-   codegen once.
-3. **Promotion of scalar locals** (shape 2, scalars only) with resource effects
-   for slots.
-4. **Inlining** with call summaries, cost limits, recursive-component
-   exclusion, and inline-chain trace metadata.
+   verifier, `--debug=optimized`, and the `optimization` timing row.
+2. **Editable IR and scalar promotion (done).** An editable function that can
+   add block parameters, branch arguments, and instructions, serialized back
+   with dead block parameters removed. `int`, `bool`, and `byte` slots whose
+   every use is a whole load, a whole store of a plain value, or a branch or
+   return read become SSA values through pruned SSA construction; scalar copies
+   of plain values alias their source.
+3. **Inlining** with call summaries, cost limits, recursive-component
+   exclusion, and inline-chain trace metadata, followed by promotion.
+4. **Control-flow cleanup**: empty-block and jump-chain removal.
 5. **SROA** for structs and variants, then memory passes.
 6. **Loops**: canonical form, induction variables, bounds-check elimination,
    fill and bulk-move idioms lowered to externs.

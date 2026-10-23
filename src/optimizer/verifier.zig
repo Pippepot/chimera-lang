@@ -1,6 +1,6 @@
 const std = @import("std");
 const structures = @import("../structures.zig");
-const compaction = @import("compaction.zig");
+const function_ir = @import("function.zig");
 
 const Body = structures.FunctionBodyAnalysis;
 const ValueId = structures.FunctionValueId;
@@ -16,11 +16,11 @@ pub fn verify(body: *const Body) void {
         std.debug.assert(block.instruction_start <= block.instruction_end);
         std.debug.assert(block.instruction_end <= body.instructions.len);
         instruction_count += block.instruction_end - block.instruction_start;
-        compaction.visitTerminatorReferences(body, &block.terminator, body, checkValue);
+        function_ir.visitTerminatorReferences(body, &block.terminator, body, checkValue);
         verifyTargets(body, block.terminator);
     }
     std.debug.assert(instruction_count == body.instructions.len);
-    for (body.instructions) |*instruction| compaction.visitInstructionReferences(body, instruction, body, checkValue);
+    for (body.instructions) |*instruction| function_ir.visitInstructionReferences(body, instruction, body, checkValue);
     for (body.initializer_regions) |*region| verify(region);
 }
 

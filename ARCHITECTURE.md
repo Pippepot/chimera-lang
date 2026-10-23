@@ -15,7 +15,7 @@ feature catalog. [syntax&semantics.txt](syntax&semantics.txt) owns language rule
 | [src/query/](src/query/) | Stage-independent scheduling, memoization, dependencies, and structural encoding |
 | [src/structures.zig](src/structures.zig) | Shared syntax, identities, types, typed IR, diagnostics, and artifact contracts |
 | [src/frontend/](src/frontend/) | Tokenization, parsing, semantic graphs, typing, references, lifetimes, and interpretation |
-| [src/optimizer/](src/optimizer/) | Typed-IR canonicalization, compaction, and verification for native code |
+| [src/optimizer/](src/optimizer/) | Editable IR, scalar promotion, canonicalization, compaction, and verification for native code |
 | [src/backend/](src/backend/) | Native code generation, x86 encoding, and disassembly |
 | [src/intrinsics.zig](src/intrinsics.zig) | Supported intrinsic signatures, storage shapes, effects, and capability policy |
 | [src/value.zig](src/value.zig) | Opt-in structural copying, equality, hashing, and cleanup |
@@ -166,9 +166,9 @@ type; only codegen consumes it. Interpretation, reference contracts, and
 diagnostics read the typed body, so optimization cannot change them. Passes read
 IR facts, never source constructs or standard library names, and treat
 unrecognized uses as address-taken. Folding shares operation semantics with the
-interpreter. Compaction rebuilds side tables from live users, because typed
-bodies may retain unreferenced side-table entries. Safe builds verify every
-optimized body. [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) owns the design.
+interpreter. Passes edit a scratch function and serialize it back, rebuilding
+side tables from live users because typed bodies may retain unreferenced
+entries. Safe builds verify every optimized body. [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) owns the design.
 
 ## Native Output and Persistence
 

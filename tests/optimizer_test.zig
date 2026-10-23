@@ -100,3 +100,71 @@ test "optimized bodies recompute only when their typed body changes" {
     try testing.expect(identities != recomputed);
     try testing.expectEqual(@as(usize, 1), count(recomputed.*.?, &.{.muli}));
 }
+
+fn countLocalStorage(body: structures.FunctionBodyAnalysis, type_id: structures.TypeId) usize {
+    var total: usize = 0;
+    for (body.instructions) |instruction| {
+        if (instruction == .local_storage and instruction.local_storage == type_id) total += 1;
+    }
+    return total;
+}
+
+const promotion_source =
+    \\func change(ref value: int) unit -> value += 1
+    \\fallible positive(value: int) int
+    \\    if value < 0 -> fail
+    \\    return value
+    \\func sum(limit: int) int
+    \\    var total = 0
+    \\    var index = 0
+    \\    var odd = false
+    \\    loop
+    \\        if index == limit -> break
+    \\        index += 1
+    \\        if odd? -> odd = false else odd = true
+    \\        if odd? -> continue
+    \\        total += index
+    \\    return total
+    \\func merge(flag: bool, var start: int) int
+    \\    var value = start
+    \\    if flag?
+    \\        value = value * 2
+    \\        start = 1
+    \\    else
+    \\        value = value + 3
+    \\    return value + start
+    \\func borrowed(start: int) int
+    \\    var value = start
+    \\    change(value)
+    \\    return value
+    \\fallible checked(start: int) int
+    \\    var value = start
+    \\    var attempts = 0
+    \\    loop
+    \\        attempts += 1
+    \\        if const accepted = positive(value) -> return accepted + attempts
+    \\        value += 5
+    \\func run() int
+    \\    if sum(10) <> 30 -> return 90
+    \\    if merge(true, 4) <> 9 -> return 91
+    \\    if merge(false, 4) <> 11 -> return 92
+    \\    if borrowed(6) <> 7 -> return 93
+    \\    if const value = checked(-12) -> if value == 7 -> return 42
+    \\    return 94
+;
+
+test "promotion turns non-escaping scalar locals into SSA values" {
+    try Fixture.expectParity(promotion_source, 42);
+    const program = try testing.allocator.print("{s}\nexit(run())", .{promotion_source});
+    defer testing.allocator.free(program);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    for ([_][]const u8{ "sum", "merge", "checked" }) |name| {
+        const body = (try optimizedBody(fixture, name)).*.?;
+        try testing.expectEqual(@as(usize, 0), countLocalStorage(body, .int) + countLocalStorage(body, .bool));
+        try testing.expectEqual(@as(usize, 0), count(body, &.{.value_copy}));
+    }
+    const borrowed = (try optimizedBody(fixture, "borrowed")).*.?;
+    try testing.expectEqual(@as(usize, 1), countLocalStorage(borrowed, .int));
+}
