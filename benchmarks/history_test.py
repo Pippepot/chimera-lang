@@ -396,6 +396,37 @@ class HistoryTests(unittest.TestCase):
         self.assertTrue(current["worktree"])
         self.assertEqual(current["snapshot"], "tree")
 
+    def test_new_recording_replaces_temporary_worktree_point(self):
+        for commit, worktree, positions in (("new", True, [0, 1.35]),
+                                             ("new", False, [0, 1]),
+                                             ("abc", False, [0])):
+            with self.subTest(commit=commit, worktree=worktree), tempfile.TemporaryDirectory() as directory:
+                data = Path(directory)
+                first = record()
+                first["benchmarks"][0]["samples"] = samples(include_runtime=True)
+                older = copy.deepcopy(first)
+                older["worktree"] = True
+                older["recorded_at"] = "2026-10-23T12:00:00Z"
+                older["runner"]["host"] = "superseded runner"
+                other = copy.deepcopy(older)
+                other["commit"] = "new"
+                other["recorded_at"] = "2026-10-23T12:30:00Z"
+                current = copy.deepcopy(first)
+                current["commit"] = commit
+                current["worktree"] = worktree
+                current["recorded_at"] = "2026-10-23T13:00:00Z"
+                records = [first, older, other, current]
+                for entry in records:
+                    history.save(data, entry)
+                with patch.object(history, "graph_artifact", return_value="") as graph, \
+                        patch.object(history, "benchmark_overview"):
+                    history.render(data, [("abc", first["commit_date"]), ("new", current["commit_date"])])
+                self.assertEqual(graph.call_count, 4)
+                for call in graph.call_args_list:
+                    plotted = [point[0] for values in call.args[2].values() for point in values]
+                    self.assertEqual(plotted, positions)
+                self.assertEqual(history.read_records(data), records)
+
     def test_report_hides_obsolete_protocol_without_deleting_records(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)

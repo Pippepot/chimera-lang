@@ -261,7 +261,7 @@ test "SSA names use the same source-style specializations as native traces" {
     _ = try fixture.executable(0);
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
-    try test_sources.debug.renderReachableSsa(fixture.db, 0, &.{.{ .file_id = 0, .path = "main.chi", .source = source }}, &output.writer);
+    try test_sources.debug.renderReachableSsa(test_sources.queries.AnalyzeFunctionInstance, fixture.db, 0, &.{.{ .file_id = 0, .path = "main.chi", .source = source }}, &output.writer);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "fn target(7)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "@target(7)(") != null);
 }

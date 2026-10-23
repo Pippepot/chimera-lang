@@ -19,6 +19,7 @@ pub fn renderAst(
 }
 
 pub fn renderReachableSsa(
+    comptime Query: type,
     db: *query.Database,
     file_id: structures.FileId,
     sources: []const diagnostics.DiagnosticSource,
@@ -26,9 +27,9 @@ pub fn renderReachableSsa(
 ) !void {
     const reachable = (try db.get(queries.CollectReachableInstances, file_id)).* orelse unreachable;
 
-    try writer.writeAll("SSA\n");
+    try writer.writeAll(if (Query == queries.OptimizeFunctionInstance) "OPTIMIZED SSA\n" else "SSA\n");
     for (reachable.instances) |instance| {
-        const body = (try db.get(queries.AnalyzeFunctionInstance, instance)).*;
+        const body = (try db.get(Query, instance)).*;
         if (body == null) continue;
         try renderFunctionSource(db, instance, sources, writer);
         try renderSsaFunction(db, instance, &body.?, writer);

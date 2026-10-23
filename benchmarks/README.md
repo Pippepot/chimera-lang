@@ -44,9 +44,12 @@ The graph plots production LOC; raw records retain test and total counts.
 
 Reports follow the selected revision's first-parent ancestry. The horizontal
 axis is commit order, not elapsed time, with at most six date labels. They use
-the latest committed run per revision or uncommitted run per parent; raw records
-retain reruns and snapshot status. A worktree point follows its parent without
-a status label. Incompatible environments remain separate. The dashboard plots
+the latest committed run per revision and a single temporary worktree entry.
+Only the newest recording can contribute a worktree point: another worktree run
+replaces it, even with a different parent, and a committed run clears it. Raw
+records retain all runs and snapshot status; replacement affects the graphs,
+not the saved measurements. The temporary point follows its parent without a
+status label. Incompatible environments remain separate. The dashboard plots
 only the latest compilation workload and compatible runtime workload. Debug and
 obsolete suites remain in raw records without adding duplicate graphs. Compilation
 and runtime have separate identities: replacing compilation workloads does not

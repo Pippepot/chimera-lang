@@ -12,6 +12,7 @@ pub const Category = enum {
     body_freeze,
     type_facts,
     comptime_execution,
+    optimization,
     codegen,
     query_other,
     dependency_wait,

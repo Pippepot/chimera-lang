@@ -36,16 +36,25 @@ is not a goal.
 - Enum-indexed arrays: domain coverage, storage order, and initialization;
   reuse those decisions for an efficient standard-library `EnumSet[T]`.
 
-### 3. Optimization (implementation TBD)
+### 3. Optimization
 
-- Establish representative generated-program runtime and code-size baselines,
-  tracking compiler time and memory costs separately.
-- Choose the implementation from measurements; IR, pipeline placement, passes,
-  and backend strategy remain open. This is separate from the immediate
-  compiler-performance regression gate.
-- Require measurable gains and optimized/unoptimized behavioral comparisons
-  covering evaluation order, failure, ownership/cleanup, diagnostics, and
-  incremental/cache correctness.
+[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) owns the target IR shape and pass
+design. Remaining slices, in order:
+
+- Split `value_copy` into explicit load, store, and copy operations.
+- Promote non-escaping scalar locals to SSA values with slot effects.
+- Inline small callees bottom-up with call summaries, cost limits, recursive
+  component exclusion, and inline-chain trace metadata.
+- Scalar replacement of struct and variant slots, then forwarding, dead-store,
+  and invariant-hoisting passes over ownership-derived alias facts.
+- Loop normalization, induction variables, bounds-check elimination, and fill
+  and bulk-move idioms lowered to externs.
+- Comparison values with `select`, then backend register allocation.
+
+Each slice requires measured runtime or code-size gains, tracks compiler time
+separately, and compares optimized against unoptimized behavior for evaluation
+order, failure, ownership/cleanup, diagnostics, and incremental/cache
+correctness.
 
 ## Independent foundations and ergonomics
 

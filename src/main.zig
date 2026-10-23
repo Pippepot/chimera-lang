@@ -15,6 +15,7 @@ const file_id: structures.FileId = 0;
 const DebugFlags = struct {
     ast: bool = false,
     ssa: bool = false,
+    optimized: bool = false,
     @"asm": bool = false,
     timing: bool = false,
     memory: bool = false,
@@ -52,7 +53,7 @@ fn exitWithError(errors: *std.Io.Writer, comptime format: []const u8, args: anyt
 
 fn printUsage(writer: *std.Io.Writer, executable_name: []const u8) !void {
     try writer.print(
-        "usage: {s} [--debug=ast,ssa,asm,timing,memory] [--workers=N] [--disk-cache] <source-file> [program-args...]\n" ++
+        "usage: {s} [--debug=ast,ssa,optimized,asm,timing,memory] [--workers=N] [--disk-cache] <source-file> [program-args...]\n" ++
             "       {s} [-h|--help]\n",
         .{ executable_name, executable_name },
     );
@@ -135,7 +136,7 @@ fn compileAndRun(
     if (input.debug_flags.timing) timings.enableQueryProfiling(&profile);
     timings.mark(io, "load source");
     const use_cache = input.cache_directory != null and !input.debug_flags.ast and
-        !input.debug_flags.ssa and !input.debug_flags.@"asm";
+        !input.debug_flags.ssa and !input.debug_flags.optimized and !input.debug_flags.@"asm";
     const compiler_digest = if (use_cache) cache.compilerDigest(io) catch null else null;
     const cache_key = if (compiler_digest) |digest|
         cache.key(digest, input.source_path, input.source, input.source_files, input.module_paths)
@@ -199,7 +200,7 @@ fn compileAndRun(
         timings.mark(io, "restore queries");
     }
 
-    const bundled = if (!input.debug_flags.ast and !input.debug_flags.ssa and !input.debug_flags.@"asm")
+    const bundled = if (!input.debug_flags.ast and !input.debug_flags.ssa and !input.debug_flags.optimized and !input.debug_flags.@"asm")
         try standard_bundle.install(db, @embedFile("standard_bundle"))
     else
         null;
@@ -267,7 +268,8 @@ fn compileAndRun(
     std.debug.assert(emitted.len == 0);
     const executable = executable_result.*.?;
 
-    if (input.debug_flags.ssa) try debug.renderReachableSsa(db, file_id, render_sources.items, output);
+    if (input.debug_flags.ssa) try debug.renderReachableSsa(queries.AnalyzeFunctionInstance, db, file_id, render_sources.items, output);
+    if (input.debug_flags.optimized) try debug.renderReachableSsa(queries.OptimizeFunctionInstance, db, file_id, render_sources.items, output);
     if (input.debug_flags.@"asm") try debug.renderAssembly(db, file_id, render_sources.items, executable, gpa, output);
     try output.flush();
     timings.mark(io, "debug output");

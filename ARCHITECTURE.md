@@ -15,6 +15,7 @@ feature catalog. [syntax&semantics.txt](syntax&semantics.txt) owns language rule
 | [src/query/](src/query/) | Stage-independent scheduling, memoization, dependencies, and structural encoding |
 | [src/structures.zig](src/structures.zig) | Shared syntax, identities, types, typed IR, diagnostics, and artifact contracts |
 | [src/frontend/](src/frontend/) | Tokenization, parsing, semantic graphs, typing, references, lifetimes, and interpretation |
+| [src/optimizer/](src/optimizer/) | Typed-IR canonicalization, compaction, and verification for native code |
 | [src/backend/](src/backend/) | Native code generation, x86 encoding, and disassembly |
 | [src/intrinsics.zig](src/intrinsics.zig) | Supported intrinsic signatures, storage shapes, effects, and capability policy |
 | [src/value.zig](src/value.zig) | Opt-in structural copying, equality, hashing, and cleanup |
@@ -158,9 +159,20 @@ failures remain errors; invariant violations use assertions or `unreachable`.
 An infrastructure failure discards fresh state and keeps the last completed memo
 retryable. Do not use an error to discard a source-invalid fact's dependencies.
 
+## Optimization
+
+The optimizer turns a published typed body into an optimized body of the same
+type; only codegen consumes it. Interpretation, reference contracts, and
+diagnostics read the typed body, so optimization cannot change them. Passes read
+IR facts, never source constructs or standard library names, and treat
+unrecognized uses as address-taken. Folding shares operation semantics with the
+interpreter. Compaction rebuilds side tables from live users, because typed
+bodies may retain unreferenced side-table entries. Safe builds verify every
+optimized body. [docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) owns the design.
+
 ## Native Output and Persistence
 
-Codegen consumes trusted typed IR and host layout, producing owned per-function
+Codegen consumes trusted optimized IR and host layout, producing owned per-function
 machine code, symbolic references, constant bytes, and trace metadata. It does
 not compile callees. Reachability supplies a deterministic entry-first closure;
 the linker lays it out and patches relocations. The backend and disassembler

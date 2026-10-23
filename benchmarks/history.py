@@ -393,7 +393,9 @@ def report(data: Path, name: str, title: str, sections: list[str]) -> Path:
 def render(data: Path, history: list[tuple[str, str]]) -> Path:
     records = read_records(data)
     positions = {commit: index for index, (commit, _) in enumerate(history)}
-    records = [record for record in records if record["commit"] in positions]
+    newest_record = max(records, key=lambda record: record["recorded_at"], default=None)
+    records = [record for record in records if record["commit"] in positions
+               and (not record["worktree"] or record is newest_record)]
     records.sort(key=lambda record: record["recorded_at"])
     loc_sections = []
     if records:

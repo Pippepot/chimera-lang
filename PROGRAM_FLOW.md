@@ -16,6 +16,8 @@ flowchart TD
     CR --> SE[SelectEntry]
     CR --> CF[CompileFunction]
     CF --> AF[AnalyzeFunctionInstance]
+    CF --> OF[OptimizeFunctionInstance]
+    OF --> AF
     AF --> FS[FunctionSignature]
     AF --> SC[BuildModuleScope]
     VM --> FI[ResolveFileImports]
@@ -42,8 +44,9 @@ flowchart TD
    before entry compilation. `AnalyzeFunctionInstance` builds typed SSA for each
    demanded runtime instance, including the implicitly fallible top-level entry.
    Reference analysis and lifetime planning finish before publication.
-4. `CompileFunction` checks runtime eligibility and obtains host layout, then
-   emits one artifact without compiling callees. Reachability starts at the
+4. `CompileFunction` checks runtime eligibility on the typed body, obtains host
+   layout, and emits one artifact from `OptimizeFunctionInstance` without
+   compiling callees. Reachability starts at the
    designated entry and follows callable references breadth-first. Unreachable
    bodies remain unanalyzed; a function named `main` has no special role.
 5. `BuildExecutable` links the reachable artifacts and, when needed, panic trace

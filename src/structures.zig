@@ -1093,6 +1093,17 @@ pub const PredicateOperation = enum {
     neb,
     eqt,
     net,
+
+    pub fn holds(self: PredicateOperation, order: std.math.Order) bool {
+        return switch (self) {
+            .lti => order == .lt,
+            .gti => order == .gt,
+            .lei => order != .gt,
+            .gei => order != .lt,
+            .eqi, .eqb, .eqt => order == .eq,
+            .nei, .neb, .net => order != .eq,
+        };
+    }
 };
 
 pub const FunctionBranch = struct {
@@ -1372,6 +1383,16 @@ pub const FunctionInstruction = union(enum) {
             .initializer_capture_write => |*operation| .{ &operation.value, null },
             .call => |*call| call.operands(),
             .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs },
+        };
+    }
+
+    pub fn integerResult(self: FunctionInstruction, lhs: i32, rhs: i32) ?i32 {
+        return switch (self) {
+            .addi => lhs +% rhs,
+            .subi => lhs -% rhs,
+            .muli => lhs *% rhs,
+            .divsi => if (rhs == 0) null else if (rhs == -1) -%lhs else @divTrunc(lhs, rhs),
+            else => unreachable,
         };
     }
 

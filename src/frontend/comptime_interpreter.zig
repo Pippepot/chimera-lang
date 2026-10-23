@@ -454,10 +454,10 @@ fn ExecutionFrame(comptime Executor: type) type {
                 .static_conversion => |conversion| return self.staticConversion(conversion, span),
                 .callable_coerce => |operation| return self.coerceCallable(operation),
                 .negi => |operand| return .{ .returned = .{ .runtime = .{ .int = -%integer(slots, operand) } } },
-                .addi => |operands| return .{ .returned = .{ .runtime = .{ .int = integer(slots, operands.lhs) +% integer(slots, operands.rhs) } } },
-                .subi => |operands| return .{ .returned = .{ .runtime = .{ .int = integer(slots, operands.lhs) -% integer(slots, operands.rhs) } } },
-                .muli => |operands| return .{ .returned = .{ .runtime = .{ .int = integer(slots, operands.lhs) *% integer(slots, operands.rhs) } } },
-                .divsi => |operands| return self.divide(operands, span),
+                .addi, .subi, .muli, .divsi => |operands| {
+                    const result = instruction.integerResult(integer(slots, operands.lhs), integer(slots, operands.rhs)) orelse return executionError(.division_by_zero, span);
+                    return .{ .returned = .{ .runtime = .{ .int = result } } };
+                },
                 .call => |call| return self.executeCall(call, span),
                 .variant_tag => |operand| return self.variantTag((try self.read(operand)) orelse return .unavailable, operand),
                 .variant_coerce, .variant_extract => |operation| return self.convertVariant((try self.read(operation.operand)) orelse return .unavailable, operation),
@@ -642,13 +642,6 @@ fn ExecutionFrame(comptime Executor: type) type {
             return .{ .returned = .{ .place = cell } };
         }
 
-        fn divide(self: *const Self, operands: structures.BinaryOperands, span: ?structures.SourceSpan) Result {
-            const lhs = integer(self.slots, operands.lhs);
-            const rhs = integer(self.slots, operands.rhs);
-            if (rhs == 0) return executionError(.division_by_zero, span);
-            return .{ .returned = .{ .runtime = .{ .int = if (rhs == -1) -%lhs else @divTrunc(lhs, rhs) } } };
-        }
-
         fn staticConversion(self: *const Self, conversion: @FieldType(structures.FunctionInstruction, "static_conversion"), span: ?structures.SourceSpan) !Result {
             const source = (try self.read(conversion.operand)) orelse return .unavailable;
             if (source == .place and containsReference(source.place)) return executionError(.escaping_storage, span);
@@ -831,18 +824,11 @@ fn predicateValue(
     operation: structures.PredicateOperation,
     operands: structures.BinaryOperands,
 ) bool {
-    return switch (operation) {
-        .lti => predicateInteger(slots, operands.lhs) < predicateInteger(slots, operands.rhs),
-        .gti => predicateInteger(slots, operands.lhs) > predicateInteger(slots, operands.rhs),
-        .lei => predicateInteger(slots, operands.lhs) <= predicateInteger(slots, operands.rhs),
-        .gei => predicateInteger(slots, operands.lhs) >= predicateInteger(slots, operands.rhs),
-        .eqi => predicateInteger(slots, operands.lhs) == predicateInteger(slots, operands.rhs),
-        .nei => predicateInteger(slots, operands.lhs) != predicateInteger(slots, operands.rhs),
-        .eqb => scalar(slots, operands.lhs).bool == scalar(slots, operands.rhs).bool,
-        .neb => scalar(slots, operands.lhs).bool != scalar(slots, operands.rhs).bool,
-        .eqt => slots[@backingInt(operands.lhs)].type == slots[@backingInt(operands.rhs)].type,
-        .net => slots[@backingInt(operands.lhs)].type != slots[@backingInt(operands.rhs)].type,
-    };
+    return operation.holds(switch (operation) {
+        .lti, .gti, .lei, .gei, .eqi, .nei => std.math.order(predicateInteger(slots, operands.lhs), predicateInteger(slots, operands.rhs)),
+        .eqb, .neb => std.math.order(@intFromBool(scalar(slots, operands.lhs).bool), @intFromBool(scalar(slots, operands.rhs).bool)),
+        .eqt, .net => if (slots[@backingInt(operands.lhs)].type == slots[@backingInt(operands.rhs)].type) .eq else .lt,
+    });
 }
 
 fn predicateInteger(slots: []const Value, value: structures.FunctionValueId) i64 {

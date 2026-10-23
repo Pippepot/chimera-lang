@@ -7,6 +7,7 @@ const value_operations = @import("value.zig");
 const ast = @import("frontend/parser.zig");
 const codegen = @import("backend/codegen.zig");
 const comptime_interpreter = @import("frontend/comptime_interpreter.zig");
+const optimizer = @import("optimizer/optimizer.zig");
 const semantic = @import("frontend/semantic.zig");
 const typing = @import("frontend/typing.zig");
 const diagnostic_rendering = @import("diagnostics.zig");
@@ -4221,6 +4222,13 @@ fn selectEntry(ctx: anytype, file_id: structures.FileId) anyerror!?structures.It
     unreachable;
 }
 
+pub const OptimizeFunctionInstance = CompilerQuery("OptimizeFunctionInstance", .optimization, optimizeFunctionInstance, .{});
+
+fn optimizeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?structures.FunctionBodyAnalysis {
+    const body = (try ctx.get(AnalyzeFunctionInstance, instance)).* orelse return null;
+    return try optimizer.optimize(ctx.allocator(), &body);
+}
+
 pub const CompileFunction = CompilerQuery("CompileFunction", .codegen, compileFunction, .{});
 
 fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?structures.CompiledFunction {
@@ -4254,6 +4262,7 @@ fn compileTypedFunction(ctx: anytype, instance: structures.InstanceId) !?structu
     const body = (try ctx.get(AnalyzeFunctionInstance, instance)).* orelse return null;
     const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
     if (!try validateRuntimeBody(ctx, &body, resolved.file_id, instance)) return null;
+    const optimized = (try ctx.get(OptimizeFunctionInstance, instance)).* orelse return null;
     const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
     var name: std.Io.Writer.Allocating = .init(ctx.allocator());
     defer name.deinit();
@@ -4265,7 +4274,7 @@ fn compileTypedFunction(ctx: anytype, instance: structures.InstanceId) !?structu
         .name = name.writer.buffered(),
         .fallback_span = nodeSpan(&parsed, @fromBackingInt(@intCast(resolved.declaration))),
     } };
-    return try codegen.compileFunction(&body, types, ctx.allocator());
+    return try codegen.compileFunction(&optimized, types, ctx.allocator());
 }
 
 fn validateRuntimeBody(ctx: anytype, body: *const structures.FunctionBodyAnalysis, file_id: structures.FileId, instance: structures.InstanceId) anyerror!bool {

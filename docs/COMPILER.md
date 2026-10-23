@@ -46,10 +46,10 @@ owners; compile-time panic is a source diagnostic rather than a compiler exit.
 ## Debugging and Reuse
 
 ```sh
-zig build run -- --debug=ast,ssa,asm,timing program.chi
+zig build run -- --debug=ast,ssa,optimized,asm,timing program.chi
 ```
 
-AST, SSA, and assembly views demand ordinary analysis and bypass bundled std
+AST, SSA, optimized SSA, and assembly views demand ordinary analysis and bypass bundled std
 results. Labels and diagnostics use source-style names with static arguments.
 Native panic traces retain read-only call-site metadata, walk at most 1024 known
 frames, and add no tracing instructions to successful calls.

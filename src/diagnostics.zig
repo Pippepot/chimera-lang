@@ -119,6 +119,7 @@ const work_rows = [_]WorkRow{
     } },
     .{ .label = "type facts", .categories = &.{.type_facts} },
     .{ .label = "comptime", .categories = &.{.comptime_execution} },
+    .{ .label = "optimization", .categories = &.{.optimization}, .unit = .function },
     .{ .label = "codegen", .categories = &.{.codegen}, .unit = .function },
     .{ .label = "other queries", .categories = &.{.query_other} },
 };
