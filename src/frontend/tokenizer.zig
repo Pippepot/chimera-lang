@@ -63,18 +63,12 @@ pub const Tokenizer = struct {
         identifier,
         quoted_literal,
         quoted_literal_backslash,
-        equal,
-        minus,
         line_comment,
         int,
         int_exponent,
         int_period,
         float,
         float_exponent,
-        angle_bracket_left,
-        angle_bracket_right,
-        period,
-        period_2,
         invalid,
     };
 
@@ -92,13 +86,14 @@ pub const Tokenizer = struct {
         return .{ .tag = .eof, .loc = .{ .start = self.index, .end = self.index } };
     }
 
-    fn binaryOperator(self: *Tokenizer, tag: Token.Tag, equal_tag: Token.Tag) Token.Tag {
+    fn scanPunctuation(self: *Tokenizer, comptime prefix: []const u8) Token.Tag {
         self.index += 1;
-        if (self.current() == '=') {
-            self.index += 1;
-            return equal_tag;
+        inline for (comptime Token.punctuation.keys()) |text| {
+            if (comptime text.len == prefix.len + 1 and std.mem.startsWith(u8, text, prefix)) {
+                if (self.current() == text[prefix.len]) return self.scanPunctuation(text);
+            }
         }
-        return tag;
+        return comptime Token.punctuation.get(prefix).?;
     }
 
     fn newlineLength(self: *Tokenizer) ?u32 {
@@ -203,19 +198,7 @@ pub const Tokenizer = struct {
                     result.tag = .identifier;
                     continue :state .identifier;
                 },
-                '=' => continue :state .equal,
-                '-' => continue :state .minus,
-                inline '(', ')', '[', ']', ';', ',', '?', ':', '{', '}', '~' => |byte| {
-                    result.tag = comptime Token.punctuation.get(&.{byte}).?;
-                    self.index += 1;
-                },
-                inline '|', '%', '*', '+', '^', '/', '&' => |byte| result.tag = self.binaryOperator(
-                    comptime Token.punctuation.get(&.{byte}).?,
-                    comptime Token.punctuation.get(&.{ byte, '=' }).?,
-                ),
-                '<' => continue :state .angle_bracket_left,
-                '>' => continue :state .angle_bracket_right,
-                '.' => continue :state .period,
+                inline '=', '-', '(', ')', '[', ']', ';', ',', '?', ':', '{', '}', '~', '|', '%', '*', '+', '^', '/', '&', '<', '>', '.' => |byte| result.tag = self.scanPunctuation(&.{byte}),
                 '0'...'9' => {
                     result.tag = .number_literal;
                     self.index += 1;
@@ -265,62 +248,6 @@ pub const Tokenizer = struct {
                         if (byte != self.buffer[result.loc.start]) continue :state .quoted_literal;
                         self.index += 1;
                     },
-                }
-            },
-
-            inline .equal, .minus => |operator| {
-                self.index += 1;
-                switch (self.current()) {
-                    '=' => {
-                        result.tag = if (operator == .equal) .equal_equal else .minus_equal;
-                        self.index += 1;
-                    },
-                    '>' => {
-                        result.tag = if (operator == .equal) .equal_angle_bracket_right else .arrow;
-                        self.index += 1;
-                    },
-                    else => result.tag = if (operator == .equal) .equal else .minus,
-                }
-            },
-
-            inline .angle_bracket_left, .angle_bracket_right => |operator| {
-                const byte: u8 = comptime if (operator == .angle_bracket_left) '<' else '>';
-                self.index += 1;
-                switch (self.current()) {
-                    byte => result.tag = self.binaryOperator(
-                        comptime Token.punctuation.get(&.{ byte, byte }).?,
-                        comptime Token.punctuation.get(&.{ byte, byte, '=' }).?,
-                    ),
-                    '=' => {
-                        result.tag = comptime Token.punctuation.get(&.{ byte, '=' }).?;
-                        self.index += 1;
-                    },
-                    else => {
-                        result.tag = comptime Token.punctuation.get(&.{byte}).?;
-                        if (operator == .angle_bracket_left and self.current() == '>') {
-                            result.tag = .angle_bracket_left_angle_bracket_right;
-                            self.index += 1;
-                        }
-                    },
-                }
-            },
-
-            .period => {
-                self.index += 1;
-                switch (self.current()) {
-                    '.' => continue :state .period_2,
-                    else => result.tag = .period,
-                }
-            },
-
-            .period_2 => {
-                self.index += 1;
-                switch (self.current()) {
-                    '.' => {
-                        result.tag = .ellipsis3;
-                        self.index += 1;
-                    },
-                    else => result.tag = .ellipsis2,
                 }
             },
 
@@ -379,6 +306,29 @@ test "fixed lexemes roundtrip their spelling and token extent" {
             const token = try scanner.next();
             try std.testing.expectEqual(@as(u32, 0), token.loc.start);
             try std.testing.expectEqual(text.len, token.loc.end);
+        }
+    }
+}
+
+test "adjacent punctuation uses the longest spelling and preserves token extents" {
+    for (Token.punctuation.keys()) |first| {
+        for (Token.punctuation.keys()) |second| {
+            var buffer: [2 * Token.punctuation.max_len]u8 = undefined;
+            @memcpy(buffer[0..first.len], first);
+            @memcpy(buffer[first.len..][0..second.len], second);
+            const source = buffer[0 .. first.len + second.len];
+            var scanner = try Tokenizer.init(std.testing.allocator, source);
+            defer scanner.deinit();
+            var offset: u32 = 0;
+            while (offset < source.len) {
+                const expected = Token.punctuation.getLongestPrefix(source[offset..]).?;
+                const actual = try scanner.next();
+                try std.testing.expectEqual(expected.value, actual.tag);
+                try std.testing.expectEqual(offset, actual.loc.start);
+                offset += @intCast(expected.key.len);
+                try std.testing.expectEqual(offset, actual.loc.end);
+            }
+            try std.testing.expectEqual(Token.Tag.eof, (try scanner.next()).tag);
         }
     }
 }

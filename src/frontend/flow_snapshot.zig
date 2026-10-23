@@ -53,8 +53,7 @@ pub fn Buffer(comptime Element: type, comptime initial: Element) type {
             const slot = &self.root.?.pages[index / page_size];
             if (slot.* == null or !slot.*.?.writable) {
                 const page = try allocator.create(Page);
-                page.* = if (slot.*) |previous| previous.* else .{};
-                page.writable = true;
+                page.* = .{ .values = if (slot.*) |previous| previous.values else @splat(initial) };
                 slot.* = page;
             }
             return &slot.*.?.values[index % page_size];
@@ -127,8 +126,9 @@ test "persistent flow state isolates writes, restores defaults, and shares untou
     try std.testing.expectEqual(@as(?u32, null), live.get(32));
     try live.set(allocator, 0, 5);
     try second.set(allocator, 512, 11);
+    try second.set(allocator, 0, 13);
     try std.testing.expectEqual(@as(?u32, 1), first.get(0));
-    try std.testing.expectEqual(@as(?u32, 1), second.get(0));
+    try std.testing.expectEqual(@as(?u32, 13), second.get(0));
     try std.testing.expectEqual(@as(?u32, 9), first.get(512));
     try std.testing.expectEqual(@as(?u32, 9), live.get(512));
     try std.testing.expectEqual(@as(?u32, 11), second.get(512));

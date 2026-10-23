@@ -450,18 +450,14 @@ fn parseFor(parser: *ParserState) ParseError!Node.Index {
 }
 
 fn parseForBinding(parser: *ParserState) ParseError!Node.Index {
-    const binding = try parseBindingPattern(parser, .null);
+    const binding = try parseBindingPattern(parser, null);
     _ = try parser.expect(.keyword_in);
     return binding;
 }
 
-fn parseBindingPattern(parser: *ParserState, inherited_access: Node.Index) ParseError!Node.Index {
-    const mode_index = parser.index;
+fn parseBindingPattern(parser: *ParserState, inherited_access: ?Token.Tag) ParseError!Node.Index {
     const mode = parser.eatAny(&.{ .keyword_const, .keyword_var, .keyword_ref });
-    const access = if (mode != null)
-        try parser.addNode(.{ .tag = .access, .token_index = mode_index, .data = .{ .none = {} } })
-    else
-        inherited_access;
+    const access = if (mode) |token| token.tag else inherited_access;
     const token_index = parser.index;
     var pattern: Node.Index = undefined;
     if (parser.eatAny(&.{ .l_paren, .l_bracket })) |open| {
@@ -491,7 +487,7 @@ fn parseBindingPattern(parser: *ParserState, inherited_access: Node.Index) Parse
     } else {
         _ = try parser.expect(.identifier);
         const annotation = try parseTypeAnnotation(parser);
-        pattern = try parser.addNode(.{ .tag = .param, .token_index = token_index, .data = .{ .node_node = .{ .a = access, .b = annotation } } });
+        pattern = try parser.addNode(.{ .tag = .param, .token_index = token_index, .data = .{ .parameter = .{ .access = access, .annotation = annotation } } });
     }
     return pattern;
 }
@@ -501,8 +497,7 @@ fn parseBinding(parser: *ParserState) !Node.Index {
         return parseStruct(parser);
     const binding_keyword = parser.eatAny(&.{ .keyword_const, .keyword_var, .keyword_ref, .keyword_static }) orelse return .null;
     if (binding_keyword.tag != .keyword_static and (parser.current().tag == .l_paren or parser.current().tag == .l_bracket)) {
-        const access = try parser.addNode(.{ .tag = .access, .token_index = parser.index - 1, .data = .{ .none = {} } });
-        const pattern = try parseBindingPattern(parser, access);
+        const pattern = try parseBindingPattern(parser, binding_keyword.tag);
         _ = try parser.expect(.equal);
         const value = try parseRequiredExpression(parser);
         return parser.addNode(.{ .tag = .destructure_binding, .token_index = parser.nodes.items[pattern.index()].token_index, .data = .{ .node_node = .{ .a = pattern, .b = value } } });
@@ -674,16 +669,11 @@ fn parseMatchArmBody(parser: *ParserState, header: u32) ParseError!Node.Index {
 }
 
 fn parseMatchCapture(parser: *ParserState) ParseError!Node.Index {
-    const mode_index = parser.index;
     const mode = parser.eatAny(&.{ .keyword_const, .keyword_ref, .keyword_var });
     if (mode != null and mode.?.tag == .keyword_var) return parser.fail(.match_capture_must_be_immutable);
-    const access = if (mode != null)
-        try parser.addNode(.{ .tag = .access, .token_index = mode_index, .data = .{ .none = {} } })
-    else
-        Node.Index.null;
     const name_index = parser.index;
     _ = try parser.expect(.identifier);
-    return parser.addNode(.{ .tag = .param, .token_index = name_index, .data = .{ .node_node = .{ .a = access, .b = .null } } });
+    return parser.addNode(.{ .tag = .param, .token_index = name_index, .data = .{ .parameter = .{ .access = if (mode) |token| token.tag else null } } });
 }
 
 fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
@@ -801,18 +791,12 @@ fn parseParenthesizedList(parser: *ParserState, tag: Node.Tag, comptime parse_it
 }
 
 fn parseParameter(parser: *ParserState, parameters_are_static: bool) ParseError!Node.Index {
-    const access_token_index = parser.index;
     const opt_access = if (parameters_are_static) null else parser.eatAny(&.{ .keyword_imm, .keyword_ref, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_init, .keyword_static });
     _ = try parser.expect(.identifier);
     const identifier_index = parser.index - 1;
     const type_annotation = try parseTypeAnnotation(parser);
-    const access_idx: Node.Index = if (parameters_are_static)
-        try parser.addNode(.{ .tag = .implicit_static, .token_index = access_token_index, .data = .{ .none = {} } })
-    else if (opt_access != null)
-        try parser.addNode(.{ .tag = .access, .token_index = access_token_index, .data = .{ .none = {} } })
-    else
-        .null;
-    return parser.addNode(.{ .tag = .param, .token_index = identifier_index, .data = .{ .node_node = .{ .a = access_idx, .b = type_annotation } } });
+    const access: ?Token.Tag = if (parameters_are_static) .keyword_static else if (opt_access) |token| token.tag else null;
+    return parser.addNode(.{ .tag = .param, .token_index = identifier_index, .data = .{ .parameter = .{ .access = access, .annotation = type_annotation } } });
 }
 
 fn parseTypeAnnotation(parser: *ParserState) !Node.Index {
@@ -906,8 +890,7 @@ fn parseTypeParameter(parser: *ParserState) ParseError!Node.Index {
     const access = parser.eatAny(&.{ .keyword_imm, .keyword_ref, .keyword_mut, .keyword_var, .keyword_deinit, .keyword_init });
     const ty = try parseType(parser);
     if (access == null) return ty;
-    const mode = try parser.addNode(.{ .tag = .access, .token_index = access_token_index, .data = .{ .none = {} } });
-    return parser.addNode(.{ .tag = .param, .token_index = access_token_index, .data = .{ .node_node = .{ .a = mode, .b = ty } } });
+    return parser.addNode(.{ .tag = .param, .token_index = access_token_index, .data = .{ .parameter = .{ .access = access.?.tag, .annotation = ty } } });
 }
 
 const BinaryOpInfo = struct {
@@ -1332,13 +1315,15 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
     const new_indent = if (at_root) "" else try std.mem.concat(gpa, u8, &.{ indent, if (is_last) "  " else "│ " });
     defer if (!at_root) gpa.free(new_indent);
     switch (node.tag) {
-        .access, .bool_literal, .identifier, .none_literal, .type, .number_literal, .string_literal, .field_access, .struct_field, .struct_property, .struct_init_field, .param => {
+        .bool_literal, .identifier, .none_literal, .type, .number_literal, .string_literal, .field_access, .struct_field, .struct_property, .struct_init_field, .param => {
             const loc = ast.tokens[node.token_index].loc;
             try writer.print(" : {s}", .{source[loc.start..loc.end]});
         },
         .unit_literal => try writer.writeAll(" : ()"),
         else => if (node.dataTag() == null) try writer.print("Not implemented {}", .{node.tag}),
     }
+    if (node.tag == .param) if (node.data.parameter.access) |access|
+        try writer.print(" ({s})", .{Token.spelling(access).?});
     try writer.writeByte('\n');
     var children = node.children(ast.node_refs);
     const nodes = children.slice();
@@ -1420,8 +1405,7 @@ test "parse qualified named function declaration" {
         \\  └─func
         \\    ├─signature
         \\    │ ├─param_list
-        \\    │ │ └─param : self
-        \\    │ │   ├─access : imm
+        \\    │ │ └─param : self (imm)
         \\    │ │   └─type : S
         \\    │ └─type : int
         \\    └─return_expr
@@ -1817,7 +1801,7 @@ test "parse direct calls in type positions" {
     const signature = ast.nodes[function.data.node_node.a.index()];
     const parameters = ast.nodes[signature.data.signature.parameters.index()];
     const parameter = ast.nodes[ast.node_refs[parameters.data.ref.start].index()];
-    const call = ast.nodes[parameter.data.node_node.b.index()];
+    const call = ast.nodes[parameter.data.parameter.annotation.index()];
     try std.testing.expectEqual(Node.Tag.call, call.tag);
     try std.testing.expectEqual(Node.Tag.identifier, ast.nodes[call.data.node_node.a.index()].tag);
     try std.testing.expectEqual(Node.Tag.bool_literal, ast.nodes[ast.node_refs[ast.nodes[call.data.node_node.b.index()].data.ref.start].index()].tag);
@@ -1833,7 +1817,7 @@ test "parse qualified types and factory calls" {
     const signature = ast.nodes[function.data.node_node.a.index()];
     const parameters = ast.nodes[signature.data.signature.parameters.index()];
     const parameter = ast.nodes[ast.node_refs[parameters.data.ref.start].index()];
-    const call = ast.nodes[parameter.data.node_node.b.index()];
+    const call = ast.nodes[parameter.data.parameter.annotation.index()];
     try std.testing.expectEqual(Node.Tag.call, call.tag);
     try std.testing.expectEqual(Node.Tag.field_access, ast.nodes[call.data.node_node.a.index()].tag);
     try std.testing.expectEqual(Node.Tag.field_access, ast.nodes[signature.data.signature.return_type.index()].tag);
@@ -2029,8 +2013,7 @@ test "parse qualified namespace declaration" {
         \\  └─func
         \\    ├─signature
         \\    │ ├─param_list
-        \\    │ │ └─param : self
-        \\    │ │   ├─access : imm
+        \\    │ │ └─param : self (imm)
         \\    │ │   └─type : S
         \\    │ └─type : int
         \\    └─return_expr
@@ -2054,8 +2037,7 @@ test "parse struct ownership hook functions" {
         \\  │ └─func
         \\  │   ├─signature
         \\  │   │ ├─param_list
-        \\  │   │ │ └─param : self
-        \\  │   │ │   ├─access : imm
+        \\  │   │ │ └─param : self (imm)
         \\  │   │ │   └─type : Box
         \\  │   │ └─type : Box
         \\  │   └─return_expr
@@ -2070,8 +2052,7 @@ test "parse struct ownership hook functions" {
         \\    └─func
         \\      ├─signature
         \\      │ ├─param_list
-        \\      │ │ └─param : self
-        \\      │ │   ├─access : var
+        \\      │ │ └─param : self (var)
         \\      │ │   └─type : Box
         \\      │ └─type : Box
         \\      └─return_expr
@@ -2110,11 +2091,9 @@ test "parse parameterized struct declaration as a type factory" {
         \\└─func
         \\  ├─signature
         \\  │ ├─param_list
-        \\  │ │ ├─param : T
-        \\  │ │ │ ├─implicit_static
+        \\  │ │ ├─param : T (static)
         \\  │ │ │ └─type : type
-        \\  │ │ └─param : N
-        \\  │ │   ├─implicit_static
+        \\  │ │ └─param : N (static)
         \\  │ │   └─type : int
         \\  │ └─implicit_type
         \\  └─return_expr
@@ -2139,8 +2118,7 @@ test "parse struct ownership hook indented body followed by field" {
         \\  │ └─func
         \\  │   ├─signature
         \\  │   │ ├─param_list
-        \\  │   │ │ └─param : self
-        \\  │   │ │   ├─access : deinit
+        \\  │   │ │ └─param : self (deinit)
         \\  │   │ │   └─type : D
         \\  │   │ └─type : unit
         \\  │   └─block
@@ -2163,8 +2141,7 @@ test "parse anonymous struct expression" {
         \\└─func
         \\  ├─signature
         \\  │ ├─param_list
-        \\  │ │ └─param : T
-        \\  │ │   ├─access : static
+        \\  │ │ └─param : T (static)
         \\  │ │   └─type : type
         \\  │ └─type : type
         \\  └─block
@@ -2403,8 +2380,7 @@ test "parse deinit parameter mode" {
         \\└─func
         \\  ├─signature
         \\  │ ├─param_list
-        \\  │ │ └─param : d
-        \\  │ │   ├─access : deinit
+        \\  │ │ └─param : d (deinit)
         \\  │ │   └─type : D
         \\  │ └─type : unit
         \\  └─block

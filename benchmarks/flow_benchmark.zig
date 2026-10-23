@@ -28,13 +28,12 @@ const Measure = struct {
             .file_id = resolved.file_id,
             .instance = instance,
         };
-        var unresolved = switch (try compiler.semantic.buildUnresolvedBody(
+        var unresolved = switch (try compiler.semantic.analyzer(
             &parsed,
             source,
-            .{ .function = .{ .declaration = resolved.declaration, .parameters = signature.parameters } },
             analysis,
             ctx.allocator(),
-        )) {
+        ).buildUnresolvedBody(.{ .function = .{ .declaration = resolved.declaration, .parameters = signature.parameters } })) {
             .success => |body| body,
             .unsupported => return error.InvalidFixture,
         };

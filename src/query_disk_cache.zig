@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIQRY42";
+const format = "CHIQRY43";
 const max_records = 1_000_000;
 // Snapshot records name their interner, input, or query boundary by type name.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
@@ -137,7 +137,7 @@ fn restoreDependency(comptime Ref: type, comptime candidates: anytype, db: *quer
     const name = try reader.read([]const u8);
     defer reader.allocator.free(name);
     inline for (candidates) |T| {
-        if (std.mem.eql(u8, name, @typeName(T))) {
+        if (std.mem.eql(u8, name, query.identityName(T))) {
             const is_input = Ref == query.PersistedInputRef;
             const key = try reader.read(if (is_input) T.Key else T.Input);
             var digest: [32]u8 = undefined;

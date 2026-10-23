@@ -16,7 +16,12 @@ pub const Writer = struct {
         try self.bytes.appendSlice(self.allocator, &encoded);
     }
 
-    pub fn write(self: *Writer, comptime T: type, value: T) std.mem.Allocator.Error!void {
+    pub inline fn write(self: *Writer, comptime T: type, value: T) std.mem.Allocator.Error!void {
+        return self.writeAdapted(T, value, {});
+    }
+
+    pub fn writeAdapted(self: *Writer, comptime T: type, value: T, adapter: anytype) (if (@TypeOf(adapter) == void) std.mem.Allocator.Error else anyerror)!void {
+        if (@TypeOf(adapter) != void) if (try adapter.encode(self, T, value)) return;
         switch (@typeInfo(T)) {
             .void => {},
             .bool => try self.bytes.append(self.allocator, @intFromBool(value)),
@@ -27,18 +32,18 @@ pub const Writer = struct {
             .@"enum" => try self.write(@typeInfo(T).@"enum".tag_type, @backingInt(value)),
             .optional => |info| {
                 try self.write(bool, value != null);
-                if (value) |present| try self.write(info.child, present);
+                if (value) |present| try self.writeAdapted(info.child, present, adapter);
             },
-            .array => |info| for (value) |element| try self.write(info.child, element),
+            .array => |info| for (value) |element| try self.writeAdapted(info.child, element, adapter),
             .@"struct" => |info| inline for (info.field_names, info.field_types, info.field_attrs) |field_name, FieldType, attrs| {
-                if (!attrs.@"comptime") try self.write(FieldType, @field(value, field_name));
+                if (!attrs.@"comptime") try self.writeAdapted(FieldType, @field(value, field_name), adapter);
             },
             .@"union" => |info| {
                 const Tag = info.tag_type orelse @compileError("untagged unions cannot be persisted");
                 const tag = std.meta.activeTag(value);
                 try self.write(Tag, tag);
                 switch (value) {
-                    inline else => |payload| try self.write(@TypeOf(payload), payload),
+                    inline else => |payload| try self.writeAdapted(@TypeOf(payload), payload, adapter),
                 }
             },
             .pointer => |info| {
@@ -47,7 +52,7 @@ pub const Writer = struct {
                 if (info.child == u8) {
                     try self.bytes.appendSlice(self.allocator, value);
                 } else {
-                    for (value) |element| try self.write(info.child, element);
+                    for (value) |element| try self.writeAdapted(info.child, element, adapter);
                 }
             },
             else => @compileError("unsupported disk cache value: " ++ @typeName(T)),
@@ -175,6 +180,45 @@ fn StorageInt(comptime T: type) type {
 }
 
 pub const freeValue = @import("../value.zig").free;
+
+test "disk codec adapts nested values without adapting framing" {
+    const Input = struct {
+        pair: [2]u32,
+        maybe: ?u32,
+        choice: union(enum) { none, number: u32 },
+        values: []const u32,
+    };
+    const Encoded = struct {
+        pair: [2]u64,
+        maybe: ?u64,
+        choice: union(enum) { none, number: u64 },
+        values: []const u64,
+    };
+    const adapter = struct {
+        pub inline fn encode(_: @This(), writer: *Writer, comptime T: type, value: T) !bool {
+            if (T != u32) return false;
+            try writer.write(u64, value);
+            return true;
+        }
+    }{};
+    for ([_]Input{
+        .{ .pair = .{ 1, 2 }, .maybe = null, .choice = .none, .values = &.{} },
+        .{ .pair = .{ 1, 2 }, .maybe = 3, .choice = .{ .number = 4 }, .values = &.{ 5, 6 } },
+    }) |input| {
+        var adapted: Writer = .{ .allocator = std.testing.allocator };
+        defer adapted.deinit();
+        try adapted.writeAdapted(Input, input, adapter);
+        var expected: Writer = .{ .allocator = std.testing.allocator };
+        defer expected.deinit();
+        try expected.write(Encoded, .{
+            .pair = .{ 1, 2 },
+            .maybe = if (input.maybe) |value| value else null,
+            .choice = if (input.choice == .number) .{ .number = input.choice.number } else .none,
+            .values = if (input.values.len == 0) &.{} else &.{ 5, 6 },
+        });
+        try std.testing.expectEqualSlices(u8, expected.bytes.items, adapted.bytes.items);
+    }
+}
 
 test "disk codec roundtrips nested owned values and rejects invalid tags" {
     const testing = std.testing;

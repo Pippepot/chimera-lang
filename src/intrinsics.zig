@@ -36,43 +36,43 @@ pub fn effect(symbol: standard_library.External) Effect {
     }
 }
 
-pub fn validHostStorage(definition: structures.StructDefinition) bool {
+pub fn validHostStorage(definition: *const structures.StructDefinition) bool {
     if (!ownedResource(definition, &.{ "address_low", "address_high", "byte_size" }, .explicit)) return false;
     for (definition.fields) |field| if (field.type_id != .int) return false;
     return true;
 }
 
-pub fn validAllocation(definition: structures.StructDefinition, storage_type: structures.TypeId) bool {
+pub fn validAllocation(definition: *const structures.StructDefinition, storage_type: structures.TypeId) bool {
     return ownedResource(definition, &.{ "storage", "count" }, .explicit) and
         definition.fields[0].type_id == storage_type and definition.fields[1].type_id == .int;
 }
 
-pub fn validBox(definition: structures.StructDefinition) bool {
+pub fn validBox(definition: *const structures.StructDefinition) bool {
     return ownedResource(definition, &.{"allocation"}, .custom);
 }
 
-pub fn validSpan(facts: anytype, definition: structures.StructDefinition, element_type: structures.TypeId) !bool {
+pub fn validSpan(facts: anytype, definition: *const structures.StructDefinition, element_type: structures.TypeId) !bool {
     return trivialView(definition, &.{ "data", "size" }) and definition.fields[1].type_id == .int and
         (try facts.storageCursorAccess(definition.fields[0].type_id)) == element_type;
 }
 
-pub fn validStaticString(facts: anytype, definition: structures.StructDefinition) !bool {
+pub fn validStaticString(facts: anytype, definition: *const structures.StructDefinition) !bool {
     return trivialView(definition, &.{"bytes"}) and (try facts.spanAccess(definition.fields[0].type_id)) == .byte;
 }
 
-pub fn validStorageCursor(definition: structures.StructDefinition) bool {
+pub fn validStorageCursor(definition: *const structures.StructDefinition) bool {
     return trivialView(definition, &.{ "address_low", "address_high" }) and
         definition.fields[0].type_id == .int and definition.fields[1].type_id == .int;
 }
 
 /// A resource can be neither moved nor copied and is released by its `drop` capability.
-fn ownedResource(definition: structures.StructDefinition, names: []const []const u8, drop: structures.DropCapability) bool {
+fn ownedResource(definition: *const structures.StructDefinition, names: []const []const u8, drop: structures.DropCapability) bool {
     const ownership = definition.ownership;
     return ownedFields(definition, names) and ownership.move == null and ownership.copy == null and
         ownership.drop != null and ownership.drop.?.capability == drop;
 }
 
-fn ownedFields(definition: structures.StructDefinition, names: []const []const u8) bool {
+fn ownedFields(definition: *const structures.StructDefinition, names: []const []const u8) bool {
     if (definition.is_static or definition.fields.len != names.len) return false;
     for (definition.fields, names) |field, name| {
         if (field.kind != .owned or !std.mem.eql(u8, field.name, name)) return false;
@@ -80,7 +80,7 @@ fn ownedFields(definition: structures.StructDefinition, names: []const []const u
     return true;
 }
 
-fn trivialView(definition: structures.StructDefinition, names: []const []const u8) bool {
+fn trivialView(definition: *const structures.StructDefinition, names: []const []const u8) bool {
     if (!ownedFields(definition, names) or definition.ownership.move != null or definition.ownership.drop != null or
         definition.ownership.copy == null or definition.ownership.copy.?.capability != .trivial) return false;
     for (definition.fields) |field| if (field.is_public) return false;

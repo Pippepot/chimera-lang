@@ -64,6 +64,12 @@ pub const Effect = struct {
 pub const Boundary = struct {
     span: structures.SourceSpan,
     effects: std.ArrayList(Effect) = .empty,
+    location: ?Location = null,
+
+    pub const Location = struct {
+        block: structures.FunctionBlockId,
+        item_index: u32,
+    };
 };
 
 pub const BuildInstruction = struct {

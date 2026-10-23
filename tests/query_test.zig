@@ -11127,6 +11127,63 @@ test "discarded spawn handles settle scalar accumulators before parent publicati
     try db.addInput(NumberInput, 0, 1);
 }
 
+test "failed query publication preserves borrowed dependency storage" {
+    const Payload = struct {
+        rows: []const []const u8,
+
+        pub fn eql(first: @This(), second: @This()) bool {
+            if (first.rows.len != second.rows.len) return false;
+            for (first.rows, second.rows) |left, right| if (!std.mem.eql(u8, left, right)) return false;
+            return true;
+        }
+
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            for (self.rows) |*row| {
+                allocator.free(row.*);
+                @constCast(row).* = &.{};
+            }
+            allocator.free(self.rows);
+        }
+    };
+    const Source = struct {
+        pub const Input = void;
+        pub const Output = Payload;
+
+        pub fn run(ctx: *Context, _: Input) !Output {
+            const rows = try ctx.allocator().alloc([]const u8, 2);
+            rows[0] = try ctx.allocator().dupe(u8, "stable");
+            const large = try ctx.allocator().alloc(u8, 2 * 1024 * 1024);
+            @memset(large, 'x');
+            rows[1] = large;
+            return .{ .rows = rows };
+        }
+    };
+    const Borrowed = struct {
+        pub const Input = void;
+        pub const Output = Payload;
+        var failing: *testing.FailingAllocator = undefined;
+
+        pub fn run(ctx: *Context, _: Input) !Output {
+            const source = (try ctx.get(Source, {})).*;
+            failing.fail_index = failing.alloc_index;
+            return source;
+        }
+    };
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const db = try Database.init(failing.allocator(), .{ .worker_count = 0 });
+    defer db.deinit();
+    Borrowed.failing = &failing;
+    const source = try db.get(Source, {});
+    try testing.expectError(error.OutOfMemory, db.get(Borrowed, {}));
+    failing.fail_index = std.math.maxInt(usize);
+    const retained = try db.get(Source, {});
+    try testing.expectEqual(source, retained);
+    try testing.expectEqualStrings("stable", retained.rows[0]);
+    try testing.expectEqual(@as(usize, 2 * 1024 * 1024), retained.rows[1].len);
+    try testing.expectEqual(@as(u8, 'x'), retained.rows[1][0]);
+    try testing.expectEqual(@as(u8, 'x'), retained.rows[1][retained.rows[1].len - 1]);
+}
+
 test "failed dependency registration leaves stale queries idle and retryable" {
     const Parent = struct {
         pub const Input = u32;

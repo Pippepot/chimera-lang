@@ -537,7 +537,7 @@ cached lookup, and incremental recomputation times in CSV form:
 zig build benchmark --seed=0 -Doptimize=fast
 ```
 
-The flow benchmark reports typing time, retained snapshot bytes, and dense
+The flow benchmark reports typing time, retained snapshot bytes, and
 lifetime-table bytes for scalar and owning functions with 8, 32, 128, 256,
 and 512 branches:
 
@@ -551,18 +551,19 @@ published-body teardown and code generation are excluded. Typing includes
 workspace compaction and release. Allocation statistics come from
 a separate sixth database, so footprint-accounting work is excluded from the
 timing samples. Typing includes ownership lowering and lifetime planning.
-Owning fixtures keep all generations live, so their dense tables deliberately
-represent a demanding case rather than a promise that sparse storage would help.
+Owning fixtures keep all generations live to exercise branch and generation scaling.
 
 Snapshot measurements count saved state handles, pointer-table roots and their
 page pointers for values, local and field availability, initializer state, and
 definite consumption completion. Each unique root and 16-slot page is counted
 once, including its writable flag and padding. Default pages allocate nothing;
 all components retain their independent logical lengths. Lifetime measurements
-count dense solver tables, not dirty-block flags or other scratch. Neither
+count the availability/demand bitsets and populated sparse cleanup-operand entries,
+not hash-table capacity, dirty-block flags, or other scratch. Neither
 measurement is process RSS or an allocation-traffic counter. Persistent page
 sharing lets joins skip unchanged pages; all versions are reclaimed with the
-body workspace. Dense block-by-generation lifetime tables remain unchanged.
+body workspace. Cleanup operands are resolved on demand rather than stored in
+dense block-by-generation matrices.
 
 The body-workspace refactor's [ablation data](../benchmarks/flow_ablation.csv)
 was measured on an AMD Ryzen 9 3900X with Zig 0.17's native backend,

@@ -290,62 +290,50 @@ const Demand = struct {
 fn logicalDigest(db: *query.Database, allocator: std.mem.Allocator, comptime T: type, value: T) ![32]u8 {
     var writer: codec.Writer = .{ .allocator = allocator };
     defer writer.deinit();
-    try writeLogical(db, T, value, &writer);
+    try writer.writeAdapted(T, value, LogicalEncoding{ .db = db });
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(writer.bytes.items, &digest, .{});
     return digest;
 }
 
-fn writeLogical(db: *query.Database, comptime T: type, value: T, writer: *codec.Writer) anyerror!void {
-    inline for (disk_cache.interners, 0..) |I, index| {
-        if (T == I.Id) {
-            try writer.write(u8, @intCast(index));
-            return writeLogical(db, I.Value, (try db.lookupInterned(I, value)).*, writer);
-        }
-    }
-    if (T == structures.TypeId) {
-        try writer.write(bool, value.interned() != null);
-        if (value.interned()) |id| return writeLogical(db, structures.InternedTypeId, id, writer);
-        return writer.write(u32, @backingInt(value));
-    }
-    if (T == structures.ItemLoc) {
-        try writer.write(bool, value.origin == .module);
-        if (value.origin == .module) {
-            try writeLogical(db, structures.ModuleId, value.origin.module, writer);
-        } else try writer.write([]const u8, (try db.input(queries.SourcePath, value.origin.entry)).*);
-        inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, Field| {
-            if (comptime !std.mem.eql(u8, name, "origin")) try writeLogical(db, Field, @field(value, name), writer);
-        }
-        return;
-    }
-    if (T == structures.Name and value == .converter) {
-        try writer.write(std.meta.Tag(T), std.meta.activeTag(value));
-        try writer.write([]const u8, (try db.input(queries.SourcePath, value.converter.file_id)).*);
-        return writer.write(u32, value.converter.ordinal);
-    }
-    switch (@typeInfo(T)) {
-        .optional => |info| {
-            try writer.write(bool, value != null);
-            if (value) |present| try writeLogical(db, info.child, present, writer);
-        },
-        .@"struct" => |info| inline for (info.field_names, info.field_types, info.field_attrs) |name, Field, attrs| {
-            if (!attrs.@"comptime") try writeLogical(db, Field, @field(value, name), writer);
-        },
-        .@"union" => {
-            try writer.write(std.meta.Tag(T), std.meta.activeTag(value));
-            switch (value) {
-                inline else => |payload| try writeLogical(db, @TypeOf(payload), payload, writer),
+const LogicalEncoding = struct {
+    db: *query.Database,
+
+    pub inline fn encode(self: @This(), writer: *codec.Writer, comptime T: type, value: T) anyerror!bool {
+        inline for (disk_cache.interners, 0..) |I, index| {
+            if (T == I.Id) {
+                try writer.write(u8, @intCast(index));
+                try writer.writeAdapted(I.Value, (try self.db.lookupInterned(I, value)).*, self);
+                return true;
             }
-        },
-        .array => |info| for (value) |element| try writeLogical(db, info.child, element, writer),
-        .pointer => |info| {
-            if (info.child == u8) return writer.write(T, value);
-            try writer.write(u64, @intCast(value.len));
-            for (value) |element| try writeLogical(db, info.child, element, writer);
-        },
-        else => try writer.write(T, value),
+        }
+        if (T == structures.TypeId) {
+            try writer.write(bool, value.interned() != null);
+            if (value.interned()) |id|
+                try writer.writeAdapted(structures.InternedTypeId, id, self)
+            else
+                try writer.write(u32, @backingInt(value));
+            return true;
+        }
+        if (T == structures.ItemLoc) {
+            try writer.write(bool, value.origin == .module);
+            if (value.origin == .module) {
+                try writer.writeAdapted(structures.ModuleId, value.origin.module, self);
+            } else try writer.write([]const u8, (try self.db.input(queries.SourcePath, value.origin.entry)).*);
+            inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |name, Field| {
+                if (comptime !std.mem.eql(u8, name, "origin")) try writer.writeAdapted(Field, @field(value, name), self);
+            }
+            return true;
+        }
+        if (T == structures.Name and value == .converter) {
+            try writer.write(std.meta.Tag(T), std.meta.activeTag(value));
+            try writer.write([]const u8, (try self.db.input(queries.SourcePath, value.converter.file_id)).*);
+            try writer.write(u32, value.converter.ordinal);
+            return true;
+        }
+        return false;
     }
-}
+};
 
 fn readBytes(reader: *codec.Reader) ![]const u8 {
     const length = std.math.cast(usize, try reader.read(u64)) orelse return error.InvalidCache;

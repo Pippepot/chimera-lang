@@ -24,6 +24,29 @@ pub const Options = struct {
     profile: ?*profiling.Collector = null,
 };
 
+pub const QueryOptions = struct {
+    disk_boundary: bool = false,
+    content_equality: bool = false,
+};
+
+pub fn Query(comptime name: []const u8, comptime category: profiling.Category, comptime implementation: anytype, comptime options: QueryOptions) type {
+    const function = @typeInfo(@TypeOf(implementation)).@"fn";
+    const Result = @typeInfo(function.return_type.?).error_union.payload;
+    if (!options.content_equality) validateObservableType(Result, name ++ ".Output");
+    return struct {
+        pub const cache_name = name;
+        pub const profile_category = category;
+        pub const disk_boundary = options.disk_boundary;
+        pub const Input = function.param_types[1].?;
+        pub const Output = Result;
+        pub const run = implementation;
+
+        pub fn eqlOutput(first: Output, second: Output) bool {
+            return if (options.content_equality) value_operations.equal(Output, first, second) else valueEql(first, second);
+        }
+    };
+}
+
 const EntryState = union(enum) {
     queued,
     running,
@@ -1664,13 +1687,8 @@ fn accumulatorValues(first: ?*AccumBucket, comptime A: type) []const A {
 }
 
 fn accumulatorList(first: ?*AccumBucket, comptime A: type) ?*std.ArrayList(A) {
-    var bucket = first;
-    while (bucket) |current| : (bucket = current.next) {
-        if (std.mem.eql(u8, current.type_name, @typeName(A))) {
-            return @ptrCast(@alignCast(current.values_ptr));
-        }
-    }
-    return null;
+    const bucket = findAccumBucket(first, @typeName(A)) orelse return null;
+    return @ptrCast(@alignCast(bucket.values_ptr));
 }
 
 fn validateQuery(comptime Q: type) void {
@@ -1752,8 +1770,12 @@ inline fn cacheKey(comptime Owner: type, value_ptr: anytype, comptime hash: []co
 
 fn typeIdentity(comptime Owner: type) *const TypeIdentity {
     return &struct {
-        const value: TypeIdentity = .{ .name = @typeName(Owner) };
+        const value: TypeIdentity = .{ .name = identityName(Owner) };
     }.value;
+}
+
+pub fn identityName(comptime Owner: type) []const u8 {
+    return if (@hasDecl(Owner, "cache_name")) Owner.cache_name else @typeName(Owner);
 }
 
 fn erasedEqlFn(comptime T: type, comptime equal: anytype) EqlOpaqueFn {
@@ -1833,7 +1855,7 @@ fn keyHash(comptime Owner: type, comptime hash: []const u8, value: anytype) u64 
 }
 
 inline fn typeHash(comptime T: type) u64 {
-    return comptime std.hash.Wyhash.hash(0, @typeName(T));
+    return comptime std.hash.Wyhash.hash(0, identityName(T));
 }
 
 fn canCompactOutput(comptime T: type, comptime ancestors: anytype) bool {
@@ -1878,7 +1900,8 @@ fn computeFn(comptime Q: type) ComputeFn {
                 computation.begin(db.profile, comptime profiling.queryCategory(Q));
                 output_value = try Q.run(&ctx, input_value.*);
             }
-            errdefer deinitTypedValue(Q.Output, scratch.allocator(), &output_value);
+            errdefer if (comptime !canCompactOutput(Q.Output, .{}))
+                deinitTypedValue(Q.Output, scratch.allocator(), &output_value);
 
             // Spawned dependencies belong to this computation even when their
             // handles are discarded. Q.run decides which errors to propagate;
