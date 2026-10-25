@@ -120,6 +120,8 @@ pub const ModuleCatalog = OwnedInput("ModuleCatalog", void, []const structures.M
 /// Identifies the compiler-owned prelude independently of the user module
 /// catalog, so user module additions cannot invalidate its resolution.
 pub const StandardPreludeModule = OwnedInput("StandardPreludeModule", void, structures.ModuleId);
+pub const InlineLimit = OwnedInput("InlineLimit", void, u32);
+pub const default_inline_limit: u32 = 48;
 pub const StandardFile = OwnedInput("StandardFile", u32, structures.FileId);
 
 /// The embedded bundle is valid only for the closed compiler-owned library.
@@ -861,6 +863,7 @@ pub fn HostTypes(comptime Context: type) type {
     return struct {
         ctx: Context,
         trace_source: ?codegen.TraceSource = null,
+        inline_sources: []const codegen.InlineSource = &.{},
 
         pub fn facts(self: @This()) TypeFacts(Context) {
             return .{ .ctx = self.ctx };
@@ -971,8 +974,8 @@ pub fn AnalysisContext(comptime Context: type) type {
             const definition = (try self.structDefinition(type_id)) orelse return error.Unavailable;
             if (definition.fields.len != 1 or definition.fields[0].kind != .owned or
                 !std.mem.eql(u8, definition.fields[0].name, "value") or
-                (try self.listElement(definition.fields[0].type_id)) != element) return null;
-            return .{ .type_id = definition.fields[0].type_id, .projection = 0, .fallible_allocation = true };
+                (try self.listElement((try intrinsics.optionalPayload(self.facts(), definition.fields[0].type_id)) orelse return null)) != element) return null;
+            return .{ .type_id = definition.fields[0].type_id, .projection = 0, .optional_allocation = true };
         }
 
         pub fn initializerConstruction(self: @This(), type_id: structures.TypeId) !structures.InitializerConstruction {
@@ -1333,7 +1336,7 @@ pub fn AnalysisContext(comptime Context: type) type {
                 .{ "take", .box_value },
                 .{ "append_collection_bounded", .collection_append_bounded },
                 .{ "append_collection_growing", .collection_append_growing },
-                .{ "append_collection_fallible", .collection_append_growing },
+                .{ "append_collection_optional", .collection_append_growing },
             });
             if (location.owner == null) {
                 const behavior = names.get(location.name.text()) orelse return .ordinary;
@@ -1462,18 +1465,6 @@ pub fn AnalysisContext(comptime Context: type) type {
             }
         }
 
-        pub fn inheritsInitializerFailure(self: @This(), instance: structures.InstanceId) !bool {
-            const external = (try self.ctx.get(ExternalSymbol, instance.item)).*;
-            if (external == .array_from or external == .initialize_collection or external == .initialize_collection_element) return true;
-            const behavior = try self.callBehavior(instance.item);
-            if (behavior == .collection_append_bounded or behavior == .collection_append_growing) return true;
-            const item_source = (try itemSource(self.ctx, instance.item)) orelse return error.Unavailable;
-            if (!item_source.parsed.nodes[item_source.parsed.nodes[item_source.resolved.declaration].data.node_node.b.index()].is_converter) return false;
-            const shape = (try self.functionShape(instance.item)) orelse return error.Unavailable;
-            for (shape.parameters) |parameter| if (parameter.mode == .init) return true;
-            return false;
-        }
-
         pub fn needsInheritedInference(self: @This(), instance: structures.InstanceId) !bool {
             const location = try self.ctx.lookupInterned(ItemLocations, instance.item);
             if (location.owner == null) return false;
@@ -1546,8 +1537,7 @@ pub fn AnalysisContext(comptime Context: type) type {
                 .condition = true,
             })).* orelse return null;
             return switch (outcome) {
-                .returned => true,
-                .failure => false,
+                .returned => |value| (try self.lookupCompileTimeValue(value)).runtime.value.bool,
                 .exit => null,
             };
         }
@@ -1603,7 +1593,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             })).* orelse return null;
             return switch (outcome) {
                 .returned => |value| value,
-                .failure, .exit => null,
+                .exit => null,
             };
         }
 
@@ -1641,7 +1631,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             const value = try self.lookupCompileTimeValue(value_id);
             const source_type = switch (value) {
                 .type => |type_id| type_id,
-                .runtime => |runtime| runtime.type_id,
+                .runtime => |runtime| if (runtime.value == .variant) runtime.value.variant.member_type else runtime.type_id,
             };
             const members = (try self.facts().variantMembers(source_type)) orelse &.{source_type};
             const accepted = (try self.facts().variantMembers(target)) orelse &.{target};
@@ -2665,7 +2655,7 @@ fn converterMatch(ctx: anytype, key: struct { item: structures.ItemId, source: C
         if (collection.length != count) return .mismatch;
     } else if (signature.parameters.len != 0 and !try semantic.canWidenTo(analysis, source_type.?, signature.parameters[0].type_id)) return .mismatch;
     const static_source = source_value != null and !try analysis.facts().isRuntimeCapable(source_type.?);
-    if (signature.parameters.len != @as(usize, if (static_source) 0 else 1) or signature.is_fallible or
+    if (signature.parameters.len != @as(usize, if (static_source) 0 else 1) or
         (!static_source and signature.parameters[0].mode != .imm and signature.parameters[0].mode != .ref and signature.parameters[0].mode != .init))
     {
         const declaration = (try itemSource(ctx, key.item)) orelse return error.Unavailable;
@@ -3203,11 +3193,10 @@ fn functionConstraints(ctx: anytype, instance: structures.InstanceId) anyerror!?
     for (semantic.functionWhereConditions(&declaration.parsed, declaration.resolved.declaration)) |condition| {
         var unresolved = (try availableSemanticValue(ctx, file_id, instance, semantic.analyzer(&declaration.parsed, declaration.source, declaration.analysis, ctx.allocator()).buildUnresolvedBody(.{ .where_condition = condition }))) orelse return null;
         defer unresolved.deinit(ctx.allocator());
-        var body = (try typing.resolveAndTypeBody(ctx, instance, file_id, &.{}, .unit, true, .{ .publish_instruction_spans = true, .allow_type_values = true }, declaration.analysis, unresolved)) orelse return null;
+        var body = (try typing.resolveAndTypeBody(ctx, instance, file_id, &.{}, .bool, .{ .publish_instruction_spans = true, .allow_type_values = true }, declaration.analysis, unresolved)) orelse return null;
         defer body.deinit(ctx.allocator());
         switch (try executeThunk(ctx, instance, &body, null)) {
-            .returned => {},
-            .failure => return .{ .failed_condition = condition },
+            .returned => |value| if (!value.runtime.bool) return .{ .failed_condition = condition },
             .exit => |status| {
                 try ctx.emit(structures.CompilerControl, .{ .exit = status });
                 return null;
@@ -3364,7 +3353,7 @@ fn resolveStaticInstance(ctx: anytype, instance: structures.InstanceId) anyerror
     const outcome = (try ctx.get(ExecuteComptimeThunk, site)).* orelse return null;
     const value_id = switch (outcome) {
         .returned => |returned| returned,
-        .failure, .exit => return null,
+        .exit => return null,
     };
     const expected_type = runtime_annotation orelse return value_id;
     var value = (try ctx.lookupInterned(CompileTimeValues, value_id)).*;
@@ -3421,8 +3410,7 @@ fn analyzeComptimeThunk(ctx: anytype, site: structures.CompileTimeSite) anyerror
         site.owner,
         file_id,
         &.{},
-        .unit,
-        true,
+        if (site.condition) .bool else .unit,
         .{ .infer_return_type = true, .publish_instruction_spans = true, .allow_type_values = true, .expected_result_type = site.expected_type },
         declaration.analysis,
         unresolved,
@@ -3439,7 +3427,7 @@ fn executeStaticIteration(ctx: anytype, site: structures.CompileTimeSite) anyerr
     const file_id = declaration.resolved.file_id;
     var unresolved = (try availableSemanticValue(ctx, file_id, site.owner, semantic.analyzer(&declaration.parsed, declaration.source, declaration.analysis, ctx.allocator()).buildUnresolvedBody(.{ .static_iteration = site.node }))) orelse return null;
     defer unresolved.deinit(ctx.allocator());
-    var body = (try typing.resolveAndTypeBody(ctx, site.owner, file_id, &.{}, .unit, true, .{ .allow_type_values = true, .publish_instruction_spans = true }, declaration.analysis, unresolved)) orelse return null;
+    var body = (try typing.resolveAndTypeBody(ctx, site.owner, file_id, &.{}, .unit, .{ .allow_type_values = true, .publish_instruction_spans = true }, declaration.analysis, unresolved)) orelse return null;
     defer body.deinit(ctx.allocator());
     var values: std.ArrayList(structures.CompileTimeValueId) = .empty;
     defer values.deinit(ctx.allocator());
@@ -3482,7 +3470,6 @@ fn executeThunk(ctx: anytype, owner: structures.InstanceId, body: *const structu
 fn reportThunkResult(ctx: anytype, site: structures.CompileTimeSite, result: comptime_interpreter.Result) !ExecuteComptimeThunk.Output {
     switch (result) {
         .returned => unreachable,
-        .failure => return reportComptimeOutcome(ctx, site, .failure),
         .exit => |status| return reportComptimeOutcome(ctx, site, .{ .exit = status }),
         .execution_error => |execution_error| try emitComptimeExecutionIssue(ctx, site.owner, site.node, execution_error),
         .reported_error, .unavailable => {},
@@ -3490,14 +3477,9 @@ fn reportThunkResult(ctx: anytype, site: structures.CompileTimeSite, result: com
     return null;
 }
 
-fn reportComptimeOutcome(ctx: anytype, site: structures.CompileTimeSite, outcome: structures.CompileTimeOutcome) !ExecuteComptimeThunk.Output {
+fn reportComptimeOutcome(ctx: anytype, _: structures.CompileTimeSite, outcome: structures.CompileTimeOutcome) !ExecuteComptimeThunk.Output {
     switch (outcome) {
         .returned => {},
-        .failure => {
-            if (site.condition) return outcome;
-            const declaration = (try itemSource(ctx, site.owner.item)) orelse return null;
-            try ctx.emit(structures.Diagnostic, .{ .file_id = declaration.resolved.file_id, .span = nodeSpan(&declaration.parsed, site.node), .kind = .compile_time_unhandled_failure });
-        },
         .exit => |status| try ctx.emit(structures.CompilerControl, .{ .exit = status }),
     }
     return outcome;
@@ -3545,7 +3527,6 @@ fn executeComptimeCall(ctx: anytype, key: structures.CompileTimeCallKey) anyerro
     const result = try comptime_interpreter.publish(execution, arguments, modes, &executor, ctx.allocator());
     const outcome: structures.CompileTimeOutcome = switch (result) {
         .returned => |value| structures.CompileTimeOutcome{ .returned = try internInterpretedValue(ctx, signature.return_type, value) },
-        .failure => structures.CompileTimeOutcome.failure,
         .exit => |status| structures.CompileTimeOutcome{ .exit = status },
         .execution_error => |execution_error| {
             try emitComptimeExecutionIssue(ctx, key.instance, null, execution_error);
@@ -3636,7 +3617,6 @@ fn ComptimeCallExecutor(comptime Context: type) type {
                     .runtime => |runtime| .{ .returned = .{ .runtime = runtime.value } },
                     .type => |type_id| .{ .returned = .{ .type = type_id } },
                 },
-                .failure => .failure,
                 .exit => |status| .{ .exit = status },
             };
         }
@@ -3763,10 +3743,12 @@ fn ComptimeCallExecutor(comptime Context: type) type {
         }
 
         fn allocateStorage(self: *@This(), symbol: standard_library.External, return_type: structures.TypeId, arguments: []comptime_interpreter.Value, storage: std.mem.Allocator) !comptime_interpreter.Result {
-            const element_type = if (symbol == .allocate) (try self.facts().allocationElement(return_type)) orelse return .unavailable else structures.TypeId.byte;
+            const payload = (try intrinsics.optionalPayload(self.facts(), return_type)) orelse unreachable;
+            const element_type = if (symbol == .allocate) (try self.facts().allocationElement(payload)) orelse unreachable else structures.TypeId.byte;
             const layout = (try self.ctx.get(HostTypeLayout, element_type)).*;
             const count = comptime_interpreter.integerValue(arguments[0]);
-            return .{ .returned = try self.heap.allocateValue(return_type, element_type, layout.byte_size, count, storage) orelse return .failure };
+            const value = try self.heap.allocateValue(payload, element_type, layout.byte_size, count, storage);
+            return .{ .returned = try comptime_interpreter.storedVariantValue(return_type, if (value != null) payload else .none, value orelse .{ .runtime = .none }, self) };
         }
 
         pub fn byteString(self: *@This(), id: structures.ByteStringId) ![]const u8 {
@@ -4148,7 +4130,7 @@ fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: str
     const signature: structures.FunctionSignature = if (loc.kind == .function)
         (try lookupFunctionSignature(ctx, instance)) orelse return null
     else
-        .{ .parameters = &.{}, .return_type = .unit, .is_fallible = loc.kind == .top_level_entry };
+        .{ .parameters = &.{}, .return_type = .unit };
     if (!allow_type_values and signature.return_type == .type) return null;
     const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
     if ((try ctx.get(BuildModuleScope, resolved.file_id)).* == null) return null;
@@ -4192,8 +4174,7 @@ fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: str
         .static, .structure, .primitive, .overload => unreachable,
     }))) orelse return null;
     defer unresolved.deinit(ctx.allocator());
-    const consuming_converter = (if (builtin_body) |body| body == .array_from or body == .initialize_collection or body == .initialize_slot else false) or
-        (loc.kind == .function and try analysis_context.inheritsInitializerFailure(instance));
+
     return typing.resolveBody(
         contract_only,
         ctx,
@@ -4201,8 +4182,7 @@ fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: str
         resolved.file_id,
         signature.parameters,
         signature.return_type,
-        signature.is_fallible,
-        .{ .publish_instruction_spans = true, .allow_type_values = allow_type_values, .builtin_body = builtin_body, .consuming_converter = consuming_converter, .result_mode = signature.result_mode, .infer_reference_contract = reference_inference != null, .widen_reference_indices = if (reference_inference) |inference| inference.recursive else false },
+        .{ .publish_instruction_spans = true, .allow_type_values = allow_type_values, .builtin_body = builtin_body, .result_mode = signature.result_mode, .infer_reference_contract = reference_inference != null, .widen_reference_indices = if (reference_inference) |inference| inference.recursive else false },
         analysis_context,
         unresolved,
     );
@@ -4224,9 +4204,209 @@ fn selectEntry(ctx: anytype, file_id: structures.FileId) anyerror!?structures.It
 
 pub const OptimizeFunctionInstance = CompilerQuery("OptimizeFunctionInstance", .optimization, optimizeFunctionInstance, .{});
 
-fn optimizeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?structures.FunctionBodyAnalysis {
+pub const PrepareFunctionInstance = CompilerQuery("PrepareFunctionInstance", .optimization, prepareFunctionInstance, .{});
+
+fn prepareFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?structures.FunctionBodyAnalysis {
     const body = (try ctx.get(AnalyzeFunctionInstance, instance)).* orelse return null;
-    return try optimizer.optimize(ctx.allocator(), &body);
+    return try optimizer.prepare(ctx.allocator(), &body, TypeLayoutContext(@TypeOf(ctx)){ .ctx = ctx });
+}
+
+fn optimizeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?structures.FunctionBodyAnalysis {
+    const body = (try ctx.get(PrepareFunctionInstance, instance)).* orelse return null;
+    const component = (try ctx.get(CallComponent, instance)).* orelse return null;
+    const context: OptimizationContext(@TypeOf(ctx)) = .{ .ctx = ctx, .instance = instance, .component = component.members };
+    return try optimizer.optimize(ctx.allocator(), &body, context);
+}
+
+fn OptimizationContext(comptime Context: type) type {
+    return struct {
+        ctx: Context,
+        instance: structures.InstanceId,
+        component: []const structures.InstanceId,
+
+        pub fn inlineLimit(self: @This()) !u32 {
+            return (self.ctx.input(InlineLimit, {}) catch |err| switch (err) {
+                error.InputNotFound => &default_inline_limit,
+                else => return err,
+            }).*;
+        }
+
+        pub fn inlineBody(self: @This(), callee: structures.InstanceId) !?*const structures.FunctionBodyAnalysis {
+            if (std.meta.eql(callee, self.instance) or containsInstance(self.component, callee)) return null;
+            if ((try self.ctx.get(ExternalSymbol, callee.item)).*) |symbol| if (!compilesTypedBody(symbol)) return null;
+            if (((try self.ctx.get(CallComponent, callee)).* orelse return null).members.len != 0) return null;
+            if (!(try self.ctx.get(ValidateRuntimeFunction, callee)).*) return null;
+            return if ((try self.ctx.get(OptimizeFunctionInstance, callee)).*) |*body| body else null;
+        }
+
+        pub fn passesIndirectly(self: @This(), type_id: structures.TypeId) !bool {
+            return (TypeLayoutContext(Context){ .ctx = self.ctx }).passesIndirectly(type_id);
+        }
+
+        pub fn structFields(self: @This(), scratch: std.mem.Allocator, type_id: structures.TypeId) !?[]const structures.TypeId {
+            return (TypeLayoutContext(Context){ .ctx = self.ctx }).structFields(scratch, type_id);
+        }
+    };
+}
+
+fn TypeLayoutContext(comptime Context: type) type {
+    return struct {
+        ctx: Context,
+
+        pub fn passesIndirectly(self: @This(), type_id: structures.TypeId) !bool {
+            const passing = (TypeFacts(Context){ .ctx = self.ctx }).argumentPassing(type_id) catch |err| switch (err) {
+                error.Unavailable => return true,
+                else => return err,
+            };
+            return passing == .indirect;
+        }
+
+        pub fn structFields(self: @This(), scratch: std.mem.Allocator, type_id: structures.TypeId) !?[]const structures.TypeId {
+            if (type_id.isPrimitive()) return null;
+            const facts: TypeFacts(Context) = .{ .ctx = self.ctx };
+            const definition = (facts.structDefinition(type_id) catch |err| switch (err) {
+                error.Unavailable => return null,
+                else => return err,
+            }) orelse return null;
+            const fields = try scratch.alloc(structures.TypeId, definition.fields.len);
+            for (definition.fields, fields) |field, *field_type| field_type.* = facts.fieldStorageType(field) catch |err| switch (err) {
+                error.Unavailable => return null,
+                else => return err,
+            };
+            return fields;
+        }
+    };
+}
+
+fn compilesTypedBody(symbol: standard_library.External) bool {
+    return switch (symbol) {
+        .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .borrow, .unsafe_own_box, .unsafe_borrow, .unsafe_take, .unsafe_take_box, .unsafe_destroy, .unsafe_destroy_box, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => true,
+        else => false,
+    };
+}
+
+pub const DirectCallees = struct {
+    pub const profile_category: profiling.Category = .optimization;
+    pub const Input = structures.InstanceId;
+    pub const Output = ?struct {
+        instances: []const structures.InstanceId,
+
+        pub const eql = value_operations.Owned(@This()).eql;
+        pub const deinit = value_operations.Owned(@This()).deinit;
+    };
+
+    pub fn run(ctx: anytype, instance: Input) anyerror!Output {
+        const body = (try ctx.get(PrepareFunctionInstance, instance)).* orelse return null;
+        var instances: std.ArrayList(structures.InstanceId) = .empty;
+        defer instances.deinit(ctx.allocator());
+        try collectDirectCallees(ctx.allocator(), &body, &instances);
+        std.mem.sort(structures.InstanceId, instances.items, {}, instanceLessThan);
+        var unique: usize = 0;
+        for (instances.items) |callee| {
+            if (unique != 0 and std.meta.eql(instances.items[unique - 1], callee)) continue;
+            instances.items[unique] = callee;
+            unique += 1;
+        }
+        return .{ .instances = try ctx.allocator().dupe(structures.InstanceId, instances.items[0..unique]) };
+    }
+};
+
+fn collectDirectCallees(allocator: std.mem.Allocator, body: *const structures.FunctionBodyAnalysis, instances: *std.ArrayList(structures.InstanceId)) !void {
+    for (body.instructions) |instruction| if (instruction == .call and instruction.call.target == .direct) try instances.append(allocator, instruction.call.target.direct);
+    for (body.initializer_regions) |*region| try collectDirectCallees(allocator, region, instances);
+}
+
+fn instanceLessThan(_: void, left: structures.InstanceId, right: structures.InstanceId) bool {
+    if (left.item != right.item) return @backingInt(left.item) < @backingInt(right.item);
+    const left_specialization: u64 = if (left.specialization) |specialization| @as(u64, @backingInt(specialization)) + 1 else 0;
+    const right_specialization: u64 = if (right.specialization) |specialization| @as(u64, @backingInt(specialization)) + 1 else 0;
+    if (left_specialization != right_specialization) return left_specialization < right_specialization;
+    const left_environment: u64 = if (left.environment) |environment| @as(u64, @backingInt(environment)) + 1 else 0;
+    const right_environment: u64 = if (right.environment) |environment| @as(u64, @backingInt(environment)) + 1 else 0;
+    return left_environment < right_environment;
+}
+
+pub const CallComponent = struct {
+    pub const profile_category: profiling.Category = .optimization;
+    pub const Input = structures.InstanceId;
+    pub const Output = ?struct {
+        members: []const structures.InstanceId,
+
+        pub const eql = value_operations.Owned(@This()).eql;
+        pub const deinit = value_operations.Owned(@This()).deinit;
+    };
+
+    pub fn run(ctx: anytype, instance: Input) anyerror!Output {
+        const callees = (try ctx.get(DirectCallees, instance)).* orelse return .{ .members = &.{} };
+        if (ctx.hasParallelWorkers()) {
+            for (callees.instances) |callee| {
+                if (std.meta.eql(callee, instance)) continue;
+                _ = try ctx.spawn(DirectCallees, callee);
+            }
+        }
+        var cyclic = false;
+        for (callees.instances) |callee| {
+            if (std.meta.eql(callee, instance)) {
+                cyclic = true;
+                continue;
+            }
+            const component = ctx.get(CallComponent, callee) catch |err| switch (err) {
+                error.QueryCycle => {
+                    cyclic = true;
+                    continue;
+                },
+                else => return err,
+            };
+            const members = (component.* orelse continue).members;
+            if (containsInstance(members, instance)) return .{ .members = try ctx.allocator().dupe(structures.InstanceId, members) };
+        }
+        if (!cyclic) return .{ .members = &.{} };
+        return .{ .members = try stronglyConnectedCallers(ctx, instance) };
+    }
+};
+
+fn stronglyConnectedCallers(ctx: anytype, instance: structures.InstanceId) ![]const structures.InstanceId {
+    const allocator = ctx.allocator();
+    var graph: std.AutoArrayHashMapUnmanaged(structures.InstanceId, std.ArrayList(usize)) = .empty;
+    defer {
+        for (graph.values()) |*callers| callers.deinit(allocator);
+        graph.deinit(allocator);
+    }
+    try graph.put(allocator, instance, .empty);
+    var next: usize = 0;
+    while (next < graph.count()) : (next += 1) {
+        const callees = (try ctx.get(DirectCallees, graph.keys()[next])).* orelse continue;
+        for (callees.instances) |callee| {
+            const entry = try graph.getOrPut(allocator, callee);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            try entry.value_ptr.append(allocator, next);
+        }
+    }
+    const visited = try allocator.alloc(bool, graph.count());
+    defer allocator.free(visited);
+    @memset(visited, false);
+    var members: std.ArrayList(structures.InstanceId) = .empty;
+    errdefer members.deinit(allocator);
+    var pending: std.ArrayList(usize) = .empty;
+    defer pending.deinit(allocator);
+    try pending.append(allocator, 0);
+    while (pending.pop()) |member| for (graph.values()[member].items) |caller| {
+        if (visited[caller]) continue;
+        visited[caller] = true;
+        try members.append(allocator, graph.keys()[caller]);
+        try pending.append(allocator, caller);
+    };
+    if (!visited[0]) try members.append(allocator, instance);
+    std.mem.sort(structures.InstanceId, members.items, {}, instanceLessThan);
+    return members.toOwnedSlice(allocator);
+}
+
+pub const ValidateRuntimeFunction = CompilerQuery("ValidateRuntimeFunction", .query_other, validateRuntimeFunction, .{});
+
+fn validateRuntimeFunction(ctx: anytype, instance: structures.InstanceId) anyerror!bool {
+    const body = (try ctx.get(AnalyzeFunctionInstance, instance)).* orelse return false;
+    const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return false;
+    return validateRuntimeBody(ctx, &body, resolved.file_id, instance);
 }
 
 pub const CompileFunction = CompilerQuery("CompileFunction", .codegen, compileFunction, .{});
@@ -4236,20 +4416,22 @@ fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?s
     // Only publish code for a declaration with the implementation's signature.
     const signature = (try lookupFunctionSignature(ctx, instance_id)) orelse return null;
     const types: HostTypes(@TypeOf(ctx)) = .{ .ctx = ctx };
+    if (compilesTypedBody(symbol)) return compileTypedFunction(ctx, instance_id);
     return switch (symbol) {
         .static_iteration_item => null,
-        .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .borrow, .unsafe_own_box, .unsafe_borrow, .unsafe_take, .unsafe_take_box, .unsafe_destroy, .unsafe_destroy_box, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => try compileTypedFunction(ctx, instance_id),
+        .primitive_operation, .copy_value, .move_value, .array_filled, .array_from, .array_borrow, .borrow, .unsafe_own_box, .unsafe_borrow, .unsafe_take, .unsafe_take_box, .unsafe_destroy, .unsafe_destroy_box, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => unreachable,
         .io_read, .io_write => try codegen.compileExternalByteIo(symbol == .io_read, signature, types, ctx.allocator()),
         .exit => try codegen.compileExternalExit(ctx.allocator()),
         .panic_message => try codegen.compileExternalPanic(signature, types, ctx.allocator()),
-        .allocate_host_storage => try codegen.compileExternalAllocateHostStorage(ctx.allocator()),
+        .allocate_host_storage => try codegen.compileExternalAllocateHostStorage(signature, types, ctx.allocator()),
         .deallocate_host_storage, .deallocate, .deallocate_box => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
         .allocate => blk: {
-            const element_type = (try types.facts().allocationElement(signature.return_type)).?;
+            const payload = (try intrinsics.optionalPayload(types.facts(), signature.return_type)).?;
+            const element_type = (try types.facts().allocationElement(payload)).?;
             const resolved = (try ctx.get(ResolveItem, instance_id.item)).* orelse return null;
             if (!try validateRuntimeType(ctx, types.facts(), element_type, resolved.file_id, null, instance_id)) return null;
             const layout = (try ctx.get(HostTypeLayout, element_type)).*;
-            break :blk try codegen.compileExternalAllocateHostTypedStorage(ctx.allocator(), layout);
+            break :blk try codegen.compileExternalAllocateHostTypedStorage(signature, types, ctx.allocator(), layout);
         },
         .allocation_count => blk: {
             const layout = (try ctx.get(StructLayout, signature.parameters[0].type_id)).* orelse unreachable;
@@ -4259,22 +4441,50 @@ fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?s
 }
 
 fn compileTypedFunction(ctx: anytype, instance: structures.InstanceId) !?structures.CompiledFunction {
-    const body = (try ctx.get(AnalyzeFunctionInstance, instance)).* orelse return null;
-    const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
-    if (!try validateRuntimeBody(ctx, &body, resolved.file_id, instance)) return null;
+    if (!(try ctx.get(ValidateRuntimeFunction, instance)).*) return null;
     const optimized = (try ctx.get(OptimizeFunctionInstance, instance)).* orelse return null;
+    var sources: std.ArrayList(codegen.InlineSource) = .empty;
+    defer {
+        for (sources.items) |inline_source| ctx.allocator().free(inline_source.source.name);
+        sources.deinit(ctx.allocator());
+    }
+    const root = (try traceSource(ctx, instance)) orelse return null;
+    defer ctx.allocator().free(root.name);
+    if (!try collectInlineSources(ctx, &optimized, &sources)) return null;
+    const types: HostTypes(@TypeOf(ctx)) = .{ .ctx = ctx, .trace_source = root, .inline_sources = sources.items };
+    return try codegen.compileFunction(&optimized, types, ctx.allocator());
+}
+
+fn traceSource(ctx: anytype, instance: structures.InstanceId) !?codegen.TraceSource {
+    const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
     const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
     var name: std.Io.Writer.Allocating = .init(ctx.allocator());
     defer name.deinit();
     try diagnostic_rendering.writeFunctionName(TypeFacts(@TypeOf(ctx)){ .ctx = ctx }, &name.writer, instance);
-    const types: HostTypes(@TypeOf(ctx)) = .{ .ctx = ctx, .trace_source = .{
+    return .{
         .path = (try ctx.input(SourcePath, resolved.file_id)).*,
         .source = (try ctx.input(SourceText, resolved.file_id)).*,
         .line_starts = (try ctx.get(SourceLineStarts, resolved.file_id)).offsets,
-        .name = name.writer.buffered(),
+        .name = try name.toOwnedSlice(),
         .fallback_span = nodeSpan(&parsed, @fromBackingInt(@intCast(resolved.declaration))),
-    } };
-    return try codegen.compileFunction(&optimized, types, ctx.allocator());
+    };
+}
+
+fn collectInlineSources(ctx: anytype, body: *const structures.FunctionBodyAnalysis, sources: *std.ArrayList(codegen.InlineSource)) !bool {
+    if (body.root_instance) |owner| if (!try addInlineSource(ctx, sources, owner)) return false;
+    for (body.inline_frames) |frame| if (!try addInlineSource(ctx, sources, frame.instance)) return false;
+    for (body.initializer_regions) |*region| if (!try collectInlineSources(ctx, region, sources)) return false;
+    return true;
+}
+
+fn addInlineSource(ctx: anytype, sources: *std.ArrayList(codegen.InlineSource), instance: structures.InstanceId) !bool {
+    for (sources.items) |existing| if (std.meta.eql(existing.instance, instance)) return true;
+    const source = (try traceSource(ctx, instance)) orelse return false;
+    sources.append(ctx.allocator(), .{ .instance = instance, .source = source }) catch |err| {
+        ctx.allocator().free(source.name);
+        return err;
+    };
+    return true;
 }
 
 fn validateRuntimeBody(ctx: anytype, body: *const structures.FunctionBodyAnalysis, file_id: structures.FileId, instance: structures.InstanceId) anyerror!bool {
@@ -4384,7 +4594,7 @@ pub const ValidateModuleGraph = struct {
     }
 };
 
-pub const BuildExecutable = CompilerQuery("BuildExecutable", .query_other, buildExecutable, .{});
+pub const BuildExecutable = CompilerQuery("BuildExecutable", .query_other, buildExecutable, .{ .result_arena = true });
 
 fn buildExecutable(ctx: anytype, file_id: structures.FileId) anyerror!?structures.Executable {
     const module = (try ctx.input(FileModule, file_id)).*;
@@ -4401,7 +4611,7 @@ fn buildExecutable(ctx: anytype, file_id: structures.FileId) anyerror!?structure
     }
 
     const entry = reachable.instances[0];
-    return try codegen.buildExecutable(entry, functions.items, ctx.allocator());
+    return try codegen.buildExecutableWithResultAllocator(entry, functions.items, ctx.allocator(), ctx.resultAllocator());
 }
 
 test "embedded source syntax preserves ordinary parser results" {
@@ -4450,7 +4660,7 @@ test "struct public field annotations preserve declaration visibility" {
         .{ .source = "static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(if hidden_count > 0 -> 1 else 2)", .accepted = false },
         .{ .source = "static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(if 0 < 1 -> 1 else hidden_count)", .accepted = false },
         .{ .source = "pub static count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(if count > 0 -> count else 2)", .accepted = true },
-        .{ .source = "import std.exit as counts\npub struct Count\n  copy = trivial\n  pub value: int\npub static optional: Count | none = Count{value = 1}\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(if const counts = optional as Count -> counts.value else 0)", .accepted = true },
+        .{ .source = "import std.exit as counts\npub struct Count\n  copy = trivial\n  pub value: int\npub static optional: Count | none = Count{value = 1}\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(if const counts: Count = optional -> counts.value else 0)", .accepted = true },
         .{ .source = "static hidden_count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(comptime -> hidden_count + 1)", .accepted = false },
         .{ .source = "pub static count = 1\npub struct Sized(n: int)\n  value: int\npub struct Visible\n  pub value: Sized(comptime -> count + 1)", .accepted = true },
         .{ .source = "static hidden_count = 1\npub struct Count\n  pub value: int\npub struct Sized(n: Count)\n  value: int\npub struct Visible\n  pub value: Sized(Count{value = hidden_count})", .accepted = false },
@@ -4829,22 +5039,21 @@ test "inline array namespace signatures and externs use typed builtin bodies" {
             const namespace = (try analysis.typeNamespace(type_id)).?;
             const len = (try analysis.typeNamespaceMember(type_id, "len", .{ .start = 0, .end = 0 })).?;
             const len_signature = (try ctx.get(FunctionInstanceSignature, len)).*.?;
-            try std.testing.expect(!len_signature.is_fallible);
             try std.testing.expectEqual(structures.TypeId.int, len_signature.return_type);
             const getter = (try analysis.typeNamespaceCallMember(type_id, "get", 2, .{ .start = 0, .end = 0 })).?;
             const getters = try analysis.functionOverloads(getter.overloaded_function);
             for (getters.candidates) |member| {
                 const signature = (try ctx.get(FunctionInstanceSignature, member)).*.?;
                 if (signature.parameters[1].type_id != .int) continue;
-                try std.testing.expect(signature.is_fallible);
                 try std.testing.expectEqual(structures.CallBehavior.ordinary, try analysis.callBehavior(member.item));
                 try std.testing.expectEqual(@as(usize, 2), signature.parameters.len);
                 try std.testing.expectEqual(structures.ParameterMode.ref, signature.parameters[0].mode);
                 try std.testing.expectEqual(type_id, signature.parameters[0].type_id);
                 try std.testing.expectEqual(structures.ParameterMode.imm, signature.parameters[1].mode);
                 try std.testing.expectEqual(structures.TypeId.int, signature.parameters[1].type_id);
-                try std.testing.expectEqual(structures.TypeId.int, signature.return_type);
-                try std.testing.expectEqual(structures.ResultMode.reference, signature.result_mode);
+                const members = (try analysis.facts().variantMembers(signature.return_type)).?;
+                try std.testing.expectEqual(@as(usize, 2), members.len);
+                try std.testing.expectEqual(structures.ResultMode.owned, signature.result_mode);
                 break;
             } else return error.ExpectedIntegerGetter;
             for ([_]standard_library.External{ .array_filled, .array_borrow }) |symbol| {

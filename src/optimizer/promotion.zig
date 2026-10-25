@@ -3,308 +3,370 @@ const structures = @import("../structures.zig");
 const function_ir = @import("function.zig");
 const compaction = @import("compaction.zig");
 const canonicalize = @import("canonicalize.zig");
+const Graph = @import("graph.zig").Graph;
 
 const ValueId = structures.FunctionValueId;
 const Instruction = structures.FunctionInstruction;
 const Function = function_ir.Function;
 
-pub fn promote(function: *Function) !void {
+pub fn promote(function: *Function) !bool {
     const scratch = function.scratch;
-    const graph = try Graph.init(scratch, function);
+    var has_candidates = false;
+    for (function.instructions.items, function.removed.items) |instruction, removed| {
+        if (!removed and instruction == .local_storage and function.direct(instruction.local_storage)) {
+            has_candidates = true;
+            break;
+        }
+    }
+    if (!has_candidates) return false;
+    function.resolveReferences();
+    const graph = (try function.controlFlowEdges()).*;
+    const slots = try collectSlots(function, graph);
+    if (slots.len == 0) return false;
     const address_taken = try canonicalize.addressTaken(function);
-    const slots = try promotableSlots(function, graph, address_taken);
     var undefined_values: [3]?ValueId = .{ null, null, null };
-    for (slots) |slot| try promoteSlot(function, graph, slot, &undefined_values);
+    var shared_slots: std.ArrayList(Slot) = .empty;
+    var shared_uses: std.ArrayList(std.ArrayList(Site)) = .empty;
+    var changed = false;
+    for (slots) |slot| {
+        const sites = slot.uses;
+        if (localSites(sites.items)) {
+            if (try promoteLocal(function, address_taken, slot, sites.items, &undefined_values)) changed = true;
+        } else {
+            try shared_slots.append(scratch, slot);
+            try shared_uses.append(scratch, sites);
+        }
+    }
+    if (shared_slots.items.len != 0 and try promoteShared(function, address_taken, shared_slots.items, shared_uses.items, &undefined_values)) changed = true;
+    if (changed) function.invalidateOperands();
+    return changed;
 }
 
-const Graph = struct {
-    reachable: []const bool,
-    order: []const u32,
-    rank: []const u32,
-    dominator: []const u32,
-    frontier: []const std.ArrayList(u32),
-    incoming: []const std.ArrayList(Incoming),
+const Slot = struct {
+    storage: ValueId,
+    instruction: u32,
+    type_id: structures.TypeId,
+    references: u32 = 0,
+    accepted: u32 = 0,
+    uses: std.ArrayList(Site) = .empty,
+};
 
-    const Incoming = struct { block: u32, branch: ?*structures.FunctionBranch };
+const Site = struct { block: u32, instruction: ?u32 };
 
-    fn init(scratch: std.mem.Allocator, function: *Function) !Graph {
-        const count = function.blocks.items.len;
-        const reachable = try compaction.reachableBlocks(scratch, function);
-        const incoming = try scratch.alloc(std.ArrayList(Incoming), count);
-        @memset(incoming, .empty);
-        for (function.blocks.items, 0..) |*block, index| {
-            for (Function.edges(&block.terminator)) |maybe_edge| if (maybe_edge) |edge| {
-                try incoming[@backingInt(Function.edgeTarget(edge))].append(scratch, .{
-                    .block = @intCast(index),
-                    .branch = if (edge == .branch) edge.branch else null,
-                });
-            };
-        }
-        const order = try postorder(scratch, function, reachable);
-        std.mem.reverse(u32, order);
-        const rank = try scratch.alloc(u32, count);
-        for (order, 0..) |block, position| rank[block] = @intCast(position);
-        const dominator = try dominators(scratch, order, rank, reachable, incoming);
-        const frontier = try scratch.alloc(std.ArrayList(u32), count);
-        @memset(frontier, .empty);
-        for (order) |block| {
-            var predecessors: usize = 0;
-            for (incoming[block].items) |edge| {
-                if (reachable[edge.block]) predecessors += 1;
-            }
-            if (predecessors < 2) continue;
-            for (incoming[block].items) |edge| {
-                if (!reachable[edge.block]) continue;
-                var runner = edge.block;
-                while (runner != dominator[block]) : (runner = dominator[runner]) {
-                    if (std.mem.indexOfScalar(u32, frontier[runner].items, block) == null) try frontier[runner].append(scratch, block);
-                }
-            }
-        }
-        return .{ .reachable = reachable, .order = order, .rank = rank, .dominator = dominator, .frontier = frontier, .incoming = incoming };
+const Scan = struct {
+    allocator: std.mem.Allocator,
+    mapping: []const ?u32,
+    slots: []Slot,
+    site: Site,
+    failed: bool = false,
+
+    fn accept(self: *Scan, operand: *ValueId) void {
+        const index = self.mapping[@backingInt(operand.*)] orelse return;
+        const slot = &self.slots[index];
+        slot.accepted += 1;
+        const sites = &slot.uses;
+        if (sites.items.len != 0 and std.meta.eql(sites.items[sites.items.len - 1], self.site)) return;
+        sites.append(self.allocator, self.site) catch {
+            self.failed = true;
+        };
     }
 
-    fn successors(function: *Function, block: u32) [2]?u32 {
-        var result: [2]?u32 = .{ null, null };
-        for (Function.edges(&function.blocks.items[block].terminator), &result) |maybe_edge, *successor| {
-            if (maybe_edge) |edge| successor.* = @backingInt(Function.edgeTarget(edge));
-        }
-        return result;
+    fn reference(self: *Scan, value: ValueId) void {
+        const index = self.mapping[@backingInt(value)] orelse return;
+        self.slots[index].references += 1;
     }
 };
 
-fn postorder(scratch: std.mem.Allocator, function: *Function, reachable: []const bool) ![]u32 {
-    var order: std.ArrayList(u32) = .empty;
-    const visited = try scratch.alloc(bool, function.blocks.items.len);
-    @memset(visited, false);
-    const Frame = struct { block: u32, next: u2 };
-    var stack: std.ArrayList(Frame) = .empty;
-    const entry = @backingInt(function.body.entry);
-    visited[entry] = true;
-    try stack.append(scratch, .{ .block = entry, .next = 0 });
-    while (stack.items.len != 0) {
-        const frame = &stack.items[stack.items.len - 1];
-        const successors = Graph.successors(function, frame.block);
-        if (frame.next < 2) {
-            const successor = successors[frame.next];
-            frame.next += 1;
-            if (successor) |target| if (!visited[target]) {
-                std.debug.assert(reachable[target]);
-                visited[target] = true;
-                try stack.append(scratch, .{ .block = target, .next = 0 });
-            };
-            continue;
-        }
-        try order.append(scratch, frame.block);
-        _ = stack.pop();
-    }
-    return order.items;
-}
-
-fn dominators(scratch: std.mem.Allocator, order: []const u32, rank: []const u32, reachable: []const bool, incoming: []const std.ArrayList(Graph.Incoming)) ![]u32 {
-    const unset = std.math.maxInt(u32);
-    const dominator = try scratch.alloc(u32, rank.len);
-    @memset(dominator, unset);
-    dominator[order[0]] = order[0];
-    var changed = true;
-    while (changed) {
-        changed = false;
-        for (order[1..]) |block| {
-            var candidate: u32 = unset;
-            for (incoming[block].items) |edge| {
-                if (!reachable[edge.block] or dominator[edge.block] == unset) continue;
-                candidate = if (candidate == unset) edge.block else intersect(dominator, rank, edge.block, candidate);
-            }
-            if (candidate != dominator[block]) {
-                dominator[block] = candidate;
-                changed = true;
-            }
-        }
-    }
-    return dominator;
-}
-
-fn intersect(dominator: []const u32, rank: []const u32, first: u32, second: u32) u32 {
-    var left = first;
-    var right = second;
-    while (left != right) {
-        while (rank[left] > rank[right]) left = dominator[left];
-        while (rank[right] > rank[left]) right = dominator[right];
-    }
-    return left;
-}
-
-const Slot = struct { storage: ValueId, instruction: u32, type_id: structures.TypeId };
-
-const Access = union(enum) { load: ValueId, store: ValueId, none };
-
-fn access(instruction: Instruction, slot: ValueId) Access {
-    if (instruction != .value_copy) return .none;
-    const copy = instruction.value_copy;
-    if (copy.destination == null and copy.source == slot) return .{ .load = slot };
-    if (copy.destination == slot and copy.source != slot) return .{ .store = copy.source };
-    return .none;
-}
-
-const SlotScan = struct {
-    candidate: []bool,
-    allowed: []u32,
-
-    fn disqualify(self: *SlotScan, value: ValueId) void {
-        const index = @backingInt(value);
-        if (self.allowed[index] != 0) {
-            self.allowed[index] -= 1;
-            return;
-        }
-        self.candidate[index] = false;
-    }
-};
-
-fn terminatorReads(terminator: *structures.FunctionTerminator) [2]?*ValueId {
-    return switch (terminator.*) {
-        .predicate_branch => |*predicate| .{ &predicate.operands.lhs, &predicate.operands.rhs },
-        .return_value => |*use| .{ if (use.coerce_to == null) &use.value else null, null },
-        .branch, .fallible_call, .return_unit, .return_failure, .diverge => .{ null, null },
-    };
-}
-
-fn promotableSlots(function: *Function, graph: Graph, address_taken: []const bool) ![]const Slot {
+fn collectSlots(function: *Function, graph: Graph) ![]const Slot {
     const scratch = function.scratch;
-    var scan: SlotScan = .{ .candidate = try scratch.alloc(bool, function.valueCount()), .allowed = try scratch.alloc(u32, function.valueCount()) };
-    @memset(scan.candidate, false);
-    @memset(scan.allowed, 0);
-    for (function.blocks.items, graph.reachable) |block, kept| {
-        if (!kept) continue;
-        for (block.instructions.items) |index| {
-            const instruction = function.instructions.items[index];
-            if (!function.removed.items[index] and instruction == .local_storage and compaction.isScalar(instruction.local_storage))
-                scan.candidate[@backingInt(function.results.items[index])] = true;
-        }
-    }
+    const mapping = try scratch.alloc(?u32, function.valueCount());
+    @memset(mapping, null);
+    var slots: std.ArrayList(Slot) = .empty;
+    for (graph.order) |block| for (function.blocks.items[block].instructions.items) |index| {
+        if (function.removed.items[index]) continue;
+        const instruction = function.instructions.items[index];
+        if (instruction != .local_storage or !function.direct(instruction.local_storage)) continue;
+        const storage = function.results.items[index];
+        mapping[@backingInt(storage)] = @intCast(slots.items.len);
+        try slots.append(scratch, .{ .storage = storage, .instruction = index, .type_id = instruction.local_storage });
+    };
+    var scan: Scan = .{ .allocator = scratch, .mapping = mapping, .slots = slots.items, .site = undefined };
     const tables = function_ir.tableView(function);
-    for (function.blocks.items, graph.reachable) |*block, kept| {
-        if (!kept) continue;
+    for (graph.order) |block_index| {
+        const block = &function.blocks.items[block_index];
         for (block.instructions.items) |index| {
             if (function.removed.items[index]) continue;
+            scan.site = .{ .block = block_index, .instruction = index };
             const instruction = &function.instructions.items[index];
-            if (instruction.* == .value_copy) {
-                const copy = instruction.value_copy;
-                const loaded = copy.destination == null and scan.candidate[@backingInt(copy.source)] and copy.type_id == function.valueType(copy.source) and !address_taken[@backingInt(function.results.items[index])];
-                const stored = if (copy.destination) |destination| scan.candidate[@backingInt(destination)] and copy.type_id == function.valueType(destination) and function.plainValue(copy.source) and !address_taken[@backingInt(copy.source)] else false;
-                if (loaded or stored) continue;
-            }
-            function_ir.visitInstructionReferences(tables, instruction, &scan, SlotScan.disqualify);
+            function_ir.visitInstructionReferences(tables, instruction, &scan, Scan.reference);
+            if (instruction.* == .value_copy) if (instruction.value_copy.destination) |destination| {
+                if (destination != instruction.value_copy.source and instruction.value_copy.type_id == function.valueType(destination)) {
+                    var storage = destination;
+                    scan.accept(&storage);
+                }
+            };
+            function_ir.readOperands(function, instruction, &scan, Scan.accept);
         }
-        for (terminatorReads(&block.terminator)) |maybe_read| if (maybe_read) |read| {
-            scan.allowed[@backingInt(read.*)] += 1;
-        };
-        function_ir.visitTerminatorReferences(tables, &block.terminator, &scan, SlotScan.disqualify);
+        scan.site = .{ .block = block_index, .instruction = null };
+        function_ir.visitTerminatorReferences(tables, &block.terminator, &scan, Scan.reference);
+        function_ir.terminatorReadOperands(function, &block.terminator, &scan, Scan.accept);
     }
-    var slots: std.ArrayList(Slot) = .empty;
-    for (function.blocks.items, graph.reachable) |block, kept| {
-        if (!kept) continue;
-        for (block.instructions.items) |index| {
-            const result = function.results.items[index];
-            if (scan.candidate[@backingInt(result)])
-                try slots.append(scratch, .{ .storage = result, .instruction = index, .type_id = function.instructions.items[index].local_storage });
-        }
-    }
+    if (scan.failed) return error.OutOfMemory;
+    var kept: usize = 0;
+    for (slots.items) |slot| if (slot.accepted == slot.references) {
+        slots.items[kept] = slot;
+        kept += 1;
+    };
+    slots.shrinkRetainingCapacity(kept);
     return slots.items;
 }
 
-fn promoteSlot(function: *Function, graph: Graph, slot: Slot, undefined_values: *[3]?ValueId) !void {
+fn storedValue(instruction: Instruction, slot: ValueId) ?ValueId {
+    if (instruction != .value_copy) return null;
+    const copy = instruction.value_copy;
+    if (copy.destination != slot or copy.source == slot) return null;
+    return copy.source;
+}
+
+const Rewrite = struct {
+    slot: ValueId,
+    current: ValueId,
+    reads: bool = false,
+
+    fn substitute(self: *Rewrite, operand: *ValueId) void {
+        if (operand.* != self.slot) return;
+        operand.* = self.current;
+    }
+
+    fn observe(self: *Rewrite, operand: *ValueId) void {
+        if (operand.* == self.slot) self.reads = true;
+    }
+};
+
+fn localSites(sites: []const Site) bool {
+    if (sites.len == 0) return true;
+    for (sites) |site| if (site.block != sites[0].block) return false;
+    return true;
+}
+
+fn promoteLocal(function: *Function, address_taken: []const bool, slot: Slot, sites: []const Site, undefined_values: *[3]?ValueId) !bool {
+    var rewrite: Rewrite = .{ .slot = slot.storage, .current = slot.storage };
+    if (sites.len != 0) {
+        const stored_first = if (sites[0].instruction) |index| storedValue(function.instructions.items[index], slot.storage) != null else false;
+        if (!stored_first) {
+            if (!compaction.isScalar(slot.type_id)) return false;
+            rewrite.current = try undefinedValue(function, slot, undefined_values);
+        }
+    }
+    for (sites) |site| rewriteSite(function, address_taken, slot, site, &rewrite);
+    function.removed.items[slot.instruction] = true;
+    return true;
+}
+
+const SlotBits = struct {
+    words: usize,
+    bits: []u64,
+
+    fn init(scratch: std.mem.Allocator, blocks: usize, slots: usize) !SlotBits {
+        const words = std.math.divCeil(usize, slots, 64) catch unreachable;
+        const bits = try scratch.alloc(u64, blocks * words);
+        @memset(bits, 0);
+        return .{ .words = words, .bits = bits };
+    }
+
+    fn row(self: SlotBits, block: u32) []u64 {
+        return self.bits[@as(usize, block) * self.words ..][0..self.words];
+    }
+
+    fn contains(self: SlotBits, block: u32, slot: usize) bool {
+        return self.row(block)[slot / 64] & (@as(u64, 1) << @as(u6, @intCast(slot % 64))) != 0;
+    }
+
+    fn insert(self: SlotBits, block: u32, slot: usize) bool {
+        const word = &self.row(block)[slot / 64];
+        const mask = @as(u64, 1) << @as(u6, @intCast(slot % 64));
+        const fresh = word.* & mask == 0;
+        word.* |= mask;
+        return fresh;
+    }
+};
+
+const Phi = struct { slot: u32, value: ValueId };
+
+const Renaming = struct {
+    function: *Function,
+    mapping: []const ?u32,
+    enabled: []const bool,
+    current: []ValueId,
+    undo: std.ArrayList(struct { slot: u32, value: ValueId }) = .empty,
+
+    fn substitute(self: *Renaming, operand: *ValueId) void {
+        if (@backingInt(operand.*) >= self.mapping.len) return;
+        const slot = self.mapping[@backingInt(operand.*)] orelse return;
+        if (self.enabled[slot]) operand.* = self.current[slot];
+    }
+
+    fn set(self: *Renaming, slot: u32, value: ValueId) !void {
+        try self.undo.append(self.function.scratch, .{ .slot = slot, .value = self.current[slot] });
+        self.current[slot] = value;
+    }
+
+    fn restore(self: *Renaming, position: usize) void {
+        while (self.undo.items.len > position) {
+            const previous = self.undo.pop().?;
+            self.current[previous.slot] = previous.value;
+        }
+    }
+};
+
+fn promoteShared(function: *Function, address_taken: []const bool, slots: []const Slot, uses: []const std.ArrayList(Site), undefined_values: *[3]?ValueId) !bool {
     const scratch = function.scratch;
+    const graph = (try function.controlFlow()).*;
     const count = function.blocks.items.len;
-    const defines = try scratch.alloc(bool, count);
-    const exposed = try scratch.alloc(bool, count);
-    @memset(defines, false);
-    @memset(exposed, false);
-    for (graph.order) |block| {
-        for (function.blocks.items[block].instructions.items) |index| {
-            if (function.removed.items[index]) continue;
-            switch (access(function.instructions.items[index], slot.storage)) {
-                .load => if (!defines[block]) {
-                    exposed[block] = true;
-                },
-                .store => defines[block] = true,
-                .none => {},
+    const defines = try SlotBits.init(scratch, count, slots.len);
+    const live_in = try SlotBits.init(scratch, count, slots.len);
+    const merges = try SlotBits.init(scratch, count, slots.len);
+    const definitions = try scratch.alloc(std.ArrayList(u32), slots.len);
+    @memset(definitions, .empty);
+    for (slots, uses, 0..) |slot, sites, slot_index| {
+        for (sites.items) |site| {
+            var observer: Rewrite = .{ .slot = slot.storage, .current = slot.storage };
+            if (site.instruction) |index| {
+                if (function.removed.items[index]) continue;
+                function_ir.readOperands(function, &function.instructions.items[index], &observer, Rewrite.observe);
+                if (observer.reads and !defines.contains(site.block, slot_index)) _ = live_in.insert(site.block, slot_index);
+                if (storedValue(function.instructions.items[index], slot.storage) != null and defines.insert(site.block, slot_index))
+                    try definitions[slot_index].append(scratch, site.block);
+            } else {
+                function_ir.terminatorReadOperands(function, &function.blocks.items[site.block].terminator, &observer, Rewrite.observe);
+                if (observer.reads and !defines.contains(site.block, slot_index)) _ = live_in.insert(site.block, slot_index);
             }
         }
-        for (terminatorReads(&function.blocks.items[block].terminator)) |maybe_read| if (maybe_read) |read| {
-            if (read.* == slot.storage and !defines[block]) exposed[block] = true;
+    }
+    var pending: std.ArrayList(u32) = .empty;
+    const queued = try scratch.alloc(bool, count);
+    @memset(queued, false);
+    for (graph.order) |block| for (live_in.row(block)) |word| {
+        if (word == 0) continue;
+        try pending.append(scratch, block);
+        queued[block] = true;
+        break;
+    };
+    while (pending.pop()) |block| {
+        queued[block] = false;
+        for (graph.incoming[block].items) |edge| {
+            var changed = false;
+            for (live_in.row(edge.block), live_in.row(block), defines.row(edge.block)) |*before, after, defined| {
+                const combined = before.* | (after & ~defined);
+                changed = changed or combined != before.*;
+                before.* = combined;
+            }
+            if (changed and !queued[edge.block]) {
+                try pending.append(scratch, edge.block);
+                queued[edge.block] = true;
+            }
+        }
+    }
+    const enabled = try scratch.alloc(bool, slots.len);
+    const frontiers = try (try function.controlFlow()).dominanceFrontiers(scratch);
+    for (slots, definitions, 0..) |slot, blocks, slot_index| {
+        enabled[slot_index] = !live_in.contains(function.entry, slot_index) or compaction.isScalar(slot.type_id);
+        if (!enabled[slot_index]) continue;
+        pending.clearRetainingCapacity();
+        try pending.appendSlice(scratch, blocks.items);
+        while (pending.pop()) |block| for (frontiers[block].items) |frontier| {
+            if (merges.contains(frontier, slot_index) or !live_in.contains(frontier, slot_index)) continue;
+            _ = merges.insert(frontier, slot_index);
+            if (!defines.contains(frontier, slot_index)) try pending.append(scratch, frontier);
         };
     }
-    const live_in = try scratch.dupe(bool, exposed);
-    var changed = true;
-    while (changed) {
-        changed = false;
-        var position = graph.order.len;
-        while (position > 0) {
-            position -= 1;
-            const block = graph.order[position];
-            if (live_in[block] or defines[block]) continue;
-            for (Graph.successors(function, block)) |successor| if (successor) |target| if (live_in[target]) {
-                live_in[block] = true;
-                changed = true;
+    const phis = try scratch.alloc(std.ArrayList(Phi), count);
+    @memset(phis, .empty);
+    for (graph.order) |block| {
+        for (merges.row(block), 0..) |word, word_index| {
+            var remaining = word;
+            while (remaining != 0) {
+                const slot_index = word_index * 64 + @ctz(remaining);
+                remaining &= remaining - 1;
+                if (!enabled[slot_index]) continue;
+                try phis[block].append(scratch, .{ .slot = @intCast(slot_index), .value = try function.addParameter(block, .{ .type_id = slots[slot_index].type_id }) });
+            }
+        }
+    }
+    const mapping = try scratch.alloc(?u32, function.valueCount());
+    @memset(mapping, null);
+    var rename: Renaming = .{ .function = function, .mapping = mapping, .enabled = enabled, .current = try scratch.alloc(ValueId, slots.len) };
+    var changed = false;
+    for (slots, enabled, 0..) |slot, active, slot_index| {
+        rename.current[slot_index] = slot.storage;
+        if (!active) continue;
+        mapping[@backingInt(slot.storage)] = @intCast(slot_index);
+        if (live_in.contains(function.entry, slot_index)) rename.current[slot_index] = try undefinedValue(function, slot, undefined_values);
+        function.removed.items[slot.instruction] = true;
+        changed = true;
+    }
+    const Frame = struct { block: u32, restore: ?usize = null };
+    var stack: std.ArrayList(Frame) = .empty;
+    try stack.append(scratch, .{ .block = function.entry });
+    while (stack.pop()) |frame| {
+        if (frame.restore) |position| {
+            rename.restore(position);
+            continue;
+        }
+        const block = frame.block;
+        const position = rename.undo.items.len;
+        for (phis[block].items) |phi| try rename.set(phi.slot, phi.value);
+        for (function.blocks.items[block].instructions.items) |index| {
+            if (function.removed.items[index]) continue;
+            const instruction = &function.instructions.items[index];
+            function_ir.readOperands(function, instruction, &rename, Renaming.substitute);
+            if (instruction.* == .value_copy) if (instruction.value_copy.destination) |destination| {
+                if (@backingInt(destination) >= mapping.len) continue;
+                const slot_index = mapping[@backingInt(destination)] orelse continue;
+                const source = function.find(instruction.value_copy.source);
+                if (function.plainValue(source) and !taken(address_taken, source)) {
+                    try rename.set(slot_index, source);
+                    function.removed.items[index] = true;
+                } else {
+                    instruction.value_copy.destination = null;
+                    try rename.set(slot_index, function.results.items[index]);
+                }
             };
         }
-    }
-
-    const merges = try scratch.alloc(bool, count);
-    @memset(merges, false);
-    var pending: std.ArrayList(u32) = .empty;
-    for (graph.order) |block| if (defines[block]) try pending.append(scratch, block);
-    while (pending.pop()) |block| for (graph.frontier[block].items) |frontier| {
-        if (merges[frontier] or !live_in[frontier]) continue;
-        for (graph.incoming[frontier].items) |edge| {
-            if (graph.reachable[edge.block] and edge.branch == null) return;
-        }
-        merges[frontier] = true;
-        if (!defines[frontier]) try pending.append(scratch, frontier);
-    };
-
-    const parameters = try scratch.alloc(?ValueId, count);
-    @memset(parameters, null);
-    for (graph.order) |block| if (merges[block]) {
-        parameters[block] = try function.addParameter(block, .{ .type_id = slot.type_id });
-    };
-    const outgoing = try scratch.alloc(?ValueId, count);
-    @memset(outgoing, null);
-    const entry = @backingInt(function.body.entry);
-    for (graph.order) |block| {
-        var current: ValueId = if (parameters[block]) |parameter|
-            parameter
-        else if (block == entry)
-            try undefinedValue(function, slot, undefined_values)
-        else
-            outgoing[graph.dominator[block]].?;
-        for (function.blocks.items[block].instructions.items) |index| {
-            if (function.removed.items[index]) continue;
-            switch (access(function.instructions.items[index], slot.storage)) {
-                .load => {
-                    function.replace(function.results.items[index], current);
-                    function.removed.items[index] = true;
-                },
-                .store => |stored| {
-                    current = function.find(stored);
-                    function.removed.items[index] = true;
-                },
-                .none => {},
-            }
-        }
-        for (terminatorReads(&function.blocks.items[block].terminator)) |maybe_read| if (maybe_read) |read| {
-            if (read.* == slot.storage) read.* = current;
+        function_ir.terminatorReadOperands(function, &function.blocks.items[block].terminator, &rename, Renaming.substitute);
+        for (Function.edges(&function.blocks.items[block].terminator)) |maybe_edge| if (maybe_edge) |edge| {
+            for (phis[@backingInt(edge.target)].items) |phi| try function.appendBranchArgument(edge, rename.current[phi.slot]);
         };
-        outgoing[block] = current;
+        try stack.append(scratch, .{ .block = block, .restore = position });
+        var child = graph.first_child[block];
+        while (child != std.math.maxInt(u32)) : (child = graph.next_sibling[child]) try stack.append(scratch, .{ .block = child });
     }
-    for (0..count) |block| if (merges[block]) {
-        for (graph.incoming[block].items) |edge| {
-            const branch = edge.branch orelse continue;
-            const value = if (graph.reachable[edge.block]) outgoing[edge.block].? else try undefinedValue(function, slot, undefined_values);
-            try function.appendBranchArgument(branch, value);
-        }
+    return changed;
+}
+
+fn taken(address_taken: []const bool, value: ValueId) bool {
+    return @backingInt(value) < address_taken.len and address_taken[@backingInt(value)];
+}
+
+fn rewriteSite(function: *Function, address_taken: []const bool, slot: Slot, site: Site, rewrite: *Rewrite) void {
+    const index = site.instruction orelse {
+        function_ir.terminatorReadOperands(function, &function.blocks.items[site.block].terminator, rewrite, Rewrite.substitute);
+        return;
     };
-    function.removed.items[slot.instruction] = true;
+    if (function.removed.items[index]) return;
+    const instruction = &function.instructions.items[index];
+    if (storedValue(instruction.*, slot.storage)) |stored| {
+        const source = function.find(stored);
+        if (function.plainValue(source) and !taken(address_taken, source)) {
+            rewrite.current = source;
+            function.removed.items[index] = true;
+        } else {
+            instruction.value_copy.destination = null;
+            rewrite.current = function.results.items[index];
+        }
+        return;
+    }
+    function_ir.readOperands(function, instruction, rewrite, Rewrite.substitute);
 }
 
 fn undefinedValue(function: *Function, slot: Slot, cache: *[3]?ValueId) !ValueId {
@@ -321,8 +383,7 @@ fn undefinedValue(function: *Function, slot: Slot, cache: *[3]?ValueId) !ValueId
         .byte => .{ .const_byte = 0 },
         else => unreachable,
     };
-    const span = if (function.publishesSpans()) function.spans.items[slot.instruction] else structures.SourceSpan{ .start = 0, .end = 0 };
-    const value = try function.insertInstruction(@backingInt(function.body.entry), 0, instruction, span);
+    const value = try function.insertInstruction(function.entry, 0, instruction, function.instructionSpan(slot.instruction), function.instructionFrame(slot.instruction));
     cache[index] = value;
     return value;
 }

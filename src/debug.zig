@@ -28,7 +28,15 @@ pub fn renderReachableSsa(
     const reachable = (try db.get(queries.CollectReachableInstances, file_id)).* orelse unreachable;
 
     try writer.writeAll(if (Query == queries.OptimizeFunctionInstance) "OPTIMIZED SSA\n" else "SSA\n");
-    for (reachable.instances) |instance| {
+    var called: std.AutoArrayHashMapUnmanaged(structures.InstanceId, void) = .empty;
+    defer called.deinit(db.allocator);
+    try called.put(db.allocator, reachable.instances[0], {});
+    var next: usize = 0;
+    while (Query != queries.OptimizeFunctionInstance and next < called.count()) : (next += 1) {
+        const callees = (try db.get(queries.DirectCallees, called.keys()[next])).* orelse continue;
+        for (callees.instances) |callee| try called.put(db.allocator, callee, {});
+    }
+    for (if (Query == queries.OptimizeFunctionInstance) reachable.instances else called.keys()) |instance| {
         const body = (try db.get(Query, instance)).*;
         if (body == null) continue;
         try renderFunctionSource(db, instance, sources, writer);
@@ -98,21 +106,12 @@ fn renderSsaFunction(
                 try renderBranchTarget(db, ssa, predicate.else_branch, writer);
                 try writer.writeByte('\n');
             },
-            .fallible_call => |fallible| {
-                try writer.writeAll("    fcall ");
-                try renderCallTarget(db, fallible.call.target, writer);
-                if (fallible.call.destination) |storage| try writer.print(" into %{d}", .{@backingInt(storage)});
-                try writer.print(" -> b{d}", .{@backingInt(fallible.success)});
-                if (fallible.failure) |failure| try writer.print(", failure b{d}", .{@backingInt(failure)});
-                try writer.writeByte('\n');
-            },
             .return_unit => try writer.writeAll("    ret\n"),
             .return_value => |value| {
                 try writer.writeAll("    ret ");
                 try renderValueUse(db, value, writer);
                 try writer.writeByte('\n');
             },
-            .return_failure => try writer.writeAll("    fail\n"),
             .diverge => try writer.writeAll("    diverge\n"),
         }
     }
@@ -164,7 +163,6 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
             try writer.print(" %{d}{s}", .{ @backingInt(operation.operand), if (instruction == .variant_coerce) " to " else " as " });
             try renderType(db, operation.target_type, writer);
         },
-        .callable_coerce => |coercion| try writer.print(" %{d}", .{@backingInt(coercion.operand)}),
         .storage_projection => |operation| try renderStorageProjection(operation, writer),
         .allocation_element => |operation| try writer.print(" %{d}[%{d}]", .{ @backingInt(operation.allocation), @backingInt(operation.index) }),
         .array_element => |operation| try writer.print(" %{d}[%{d}]", .{ @backingInt(operation.array), @backingInt(operation.index) }),
@@ -175,9 +173,23 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
         .initializer_capture_write => |operation| try writer.print(" {d}, %{d}", .{ operation.parameter_index, @backingInt(operation.value) }),
         .call => |call| try renderCall(db, ssa, call, writer),
         .addi, .subi, .muli, .divsi => |operands| try writer.print(" %{d}, %{d}", .{ @backingInt(operands.lhs), @backingInt(operands.rhs) }),
+        .compare => |operation| try writer.print(" {s} %{d}, %{d}", .{ @tagName(operation.operation), @backingInt(operation.operands.lhs), @backingInt(operation.operands.rhs) }),
+        .select => |operation| try writer.print(" %{d}, %{d}, %{d}", .{ @backingInt(operation.condition), @backingInt(operation.then_value), @backingInt(operation.else_value) }),
+        .fill => |operation| try writer.print(" %{d}, %{d}, %{d}", .{ @backingInt(operation.first), @backingInt(operation.count), @backingInt(operation.value) }),
+        .move => |operation| try writer.print(" %{d}, %{d}, %{d}{s}", .{ @backingInt(operation.destination), @backingInt(operation.source), @backingInt(operation.count), if (operation.backward) " backward" else "" }),
+        .aggregate => |operation| {
+            try writer.writeByte(' ');
+            try renderType(db, operation.type_id, writer);
+            try writer.writeByte('(');
+            for (ssa.aggregate_fields[operation.fields.start..operation.fields.end], 0..) |field, index| {
+                if (index != 0) try writer.writeAll(", ");
+                try writer.print("%{d}", .{@backingInt(field)});
+            }
+            try writer.writeByte(')');
+        },
     }
     const destination = switch (instruction) {
-        inline .variant_coerce, .callable_coerce, .value_copy, .call => |operation| operation.destination,
+        inline .variant_coerce, .value_copy, .call => |operation| operation.destination,
         else => null,
     };
     if (destination) |storage| try writer.print(" into %{d}", .{@backingInt(storage)});

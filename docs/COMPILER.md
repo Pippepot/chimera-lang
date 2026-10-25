@@ -35,9 +35,10 @@ status. Options precede the source path; later arguments go to the program.
 `--workers=N` accepts 0 through 64; 0 is synchronous. The default is two workers
 on machines with at least two CPUs.
 
-Top-level success and unhandled ordinary failure clean up and exit the generated
-program with status 0 and 1 respectively. The CLI itself exits 0 after a normal
-program exit, reporting its status separately; invalid arguments, source or
+A normal top-level return cleans up and exits the generated program with status 0.
+Optional and error results are ordinary values; their callers handle them explicitly.
+The CLI itself exits 0 after a normal program exit, reporting its status separately;
+invalid arguments, source or
 compiler failures, and abnormal program termination make the CLI exit 1.
 A compile-time `exit(code)` instead produces no executable and becomes the CLI
 status. Panic prints a message and source trace, exits 134, and does not unwind
@@ -54,9 +55,11 @@ results. Labels and diagnostics use source-style names with static arguments.
 Native panic traces retain read-only call-site metadata, walk at most 1024 known
 frames, and add no tracing instructions to successful calls.
 
-The build embeds parsed std syntax and precompiled concrete std functions.
-Ordinary runs load bodies and native functions lazily; absent specializations
-compile normally. No adjacent std files or disk-cache flag are required.
+The build embeds parsed std syntax and precompiled concrete std functions,
+including typed, prepared, and optimized bodies and call components. Ordinary
+runs load these results and native functions lazily, so inlining a bundled std
+function reuses its optimized body. Absent specializations compile normally.
+No adjacent std files or disk-cache flag are required.
 
 `--disk-cache` enables `.chi-cache/` beside the entry. A whole-program hit skips
 analysis and linking; a changed program may reuse validated body and code

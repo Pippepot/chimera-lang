@@ -6,11 +6,11 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIQRY43";
+const format = "CHIQRY45";
 const max_records = 1_000_000;
 // Snapshot records name their interner, input, or query boundary by type name.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
-pub const persisted_inputs = .{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile };
+pub const persisted_inputs = .{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile, queries.InlineLimit };
 pub const persisted_query_dependencies = .{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.ConversionCandidates, queries.InferReferenceContract, queries.AnalyzeFunctionInstance, queries.StandardLibraryUnchanged };
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
@@ -389,7 +389,6 @@ fn validReferenceContractTypes(db: *query.Database, types: anytype, body: struct
         }
     }
     for (contract.origins) |origin| {
-        if (origin.failure and origin.output_parameter == null) return false;
         if (origin.readonly_owned) |type_id| {
             if (origin.readonly or type_id.isPrimitive()) return false;
             if (try types.borrowElement(type_id) != null or try types.storageAccess(type_id) != null) return false;
@@ -508,7 +507,7 @@ fn validUse(use: structures.FunctionValueUse, body: structures.FunctionBodyAnaly
 }
 
 /// Only calls may pass initializer handles as operands.
-fn validOperands(operands: [2]?*const structures.FunctionValueId, initializers_allowed: bool, body: structures.FunctionBodyAnalysis) bool {
+fn validOperands(operands: anytype, initializers_allowed: bool, body: structures.FunctionBodyAnalysis) bool {
     for (operands) |operand| if (operand) |value| {
         if (!validValue(value.*, body)) return false;
         if (!initializers_allowed and valueRepresentation(body, value.*) == .initializer) return false;
@@ -587,10 +586,10 @@ fn validReferenceContract(contract: structures.ReferenceContract, parameter_coun
 
 fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     if (body.blocks.len == 0 or @backingInt(body.entry) >= body.blocks.len) return false;
-    if (body.is_initializer_region and !body.is_fallible) return false;
     if (body.valueCount() > std.math.maxInt(u32)) return false;
     if (body.instruction_spans.len != 0 and body.instruction_spans.len != body.instructions.len) return false;
     if (body.terminator_spans.len != 0 and body.terminator_spans.len != body.blocks.len) return false;
+    if (body.root_instance != null or body.inline_frames.len != 0 or body.instruction_frames.len != 0 or body.terminator_frames.len != 0 or body.aggregate_fields.len != 0) return false;
     for (body.blocks) |block| {
         if (block.argument_start > block.argument_end or block.argument_end > body.block_arguments.len or
             block.instruction_start > block.instruction_end or block.instruction_end > body.instructions.len) return false;
@@ -625,18 +624,19 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
         const valid = switch (instruction) {
             .initializer_ref => |reference| validInitializerReference(reference, body),
             .variant_coerce => |operation| operation.tag_mapping != null and validTagMapping(operation.tag_mapping, body),
-            .variant_extract, .callable_coerce => |operation| validTagMapping(operation.tag_mapping, body),
+            .variant_extract => |operation| validTagMapping(operation.tag_mapping, body),
             .result_storage => |type_id| type_id == body.return_type,
             .borrow_address => |operation| validRange(operation.fields, body.borrow_fields.len),
             .initializer_capture_write => |operation| body.is_initializer_region and
                 operation.parameter_index < body.parameter_modes.len and body.parameter_modes[operation.parameter_index] == .mut,
-            .call => |call| validCall(call, body) and call.target != .initializer,
+            .call => |call| validCall(call, body),
+            .compare, .select, .aggregate, .fill, .move => false,
             else => true,
         };
         if (!valid) return false;
     }
     for (body.blocks) |block| {
-        if (!validOperands(block.terminator.operands(), block.terminator == .fallible_call, body)) return false;
+        if (!validOperands(block.terminator.operands(), false, body)) return false;
         var terminator = block.terminator;
         for (terminator.successors()) |successor| if (successor) |target| {
             if (@backingInt(target.*) >= body.blocks.len) return false;
@@ -645,10 +645,7 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
             if (!validBranch(branch.*, body)) return false;
         };
         const valid = switch (block.terminator) {
-            .fallible_call => |branch| validCall(branch.call, body) and
-                validFallibleTargets(branch.call, branch.success, branch.failure, body),
             .return_value => |use| validUse(use, body) and (use.coerce_to orelse body.valueType(use.value)) == body.return_type,
-            .return_failure => body.is_fallible,
             .return_unit => body.return_type == .unit,
             .branch, .predicate_branch, .diverge => true,
         };
@@ -666,21 +663,6 @@ fn validInitializerReference(reference: @FieldType(structures.FunctionInstructio
     for (body.initializer_captures[reference.captures.start..reference.captures.end], region.block_arguments[entry.argument_start..entry.argument_end]) |capture, argument| {
         if (body.valueType(capture) != argument.type_id) return false;
         if ((argument.representation == .initializer) != (valueRepresentation(body, capture) == .initializer)) return false;
-    }
-    return true;
-}
-
-/// A failure target is already a validated successor; a success target is
-/// one only when the call can return.
-fn validFallibleTargets(call: structures.FunctionCall, success: structures.FunctionBlockId, failure: ?structures.FunctionBlockId, body: structures.FunctionBodyAnalysis) bool {
-    if (@backingInt(success) >= body.blocks.len) return false;
-    const success_block = body.blocks[@backingInt(success)];
-    if (success_block.argument_end - success_block.argument_start != 1) return false;
-    const result = body.block_arguments[success_block.argument_start];
-    if (result.representation != .value or result.type_id != (if (call.destination == null) call.return_type else .unit)) return false;
-    if (failure) |target| {
-        const block = body.blocks[@backingInt(target)];
-        if (block.argument_end != block.argument_start) return false;
     }
     return true;
 }
@@ -786,7 +768,7 @@ test "canonical values reject mismatched aggregate and callable shapes" {
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
     const target = scope.resolveFunction("target").?;
     const record_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .structure = .{ .declared = scope.resolveStatic("Record").? } }));
-    const callable_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .callable = .{ .parameters = &.{}, .return_type = .int, .is_fallible = false } }));
+    const callable_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .callable = .{ .parameters = &.{}, .return_type = .int } }));
     const variant_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .variant = .{ .members = &.{ .int, .bool } } }));
     const payload = try db.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } });
     const fields = try db.intern(queries.CompileTimeValueTuples, .{ .values = &.{payload} });
@@ -823,13 +805,13 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
         \\func copied(imm input: Pair) Pair -> input
         \\func selected(ref input: Pair) ref Ref(int) -> input.first
         \\func install(var target: Ref(Ref(int)), ref source: int) -> target.value = Ref.from(source)
-        \\fallible element(ref values: Array(Ref(int), 2), index: int) ref Ref(int) -> values.get?(index)
+        \\func element(ref values: Array(Ref(int), 2), index: int) ref Ref(int) | none -> values.get(index)
         \\struct Buffers
         \\    first: Ref(String)
         \\    second: Ref(String)
-        \\fallible retained(input: Buffers) int
+        \\func retained(input: Buffers) int | none
         \\    const view = input.first.value.view()
-        \\    input.second.value.append?("x")
+        \\    input.second.value.append("x")
         \\    return view.byte_length()
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
@@ -852,10 +834,6 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
             paths[selected].element_at.parameter = 0;
             try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
             paths[selected] = original;
-            var origins = [_]structures.ReferenceOriginContract{body.reference_contract.origins[0]};
-            invalid.reference_contract.origins = &origins;
-            origins[0].failure = true;
-            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
         }
         if (std.mem.eql(u8, name, "copied")) {
             var invalid = body;
@@ -969,9 +947,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
 
     blocks[0].instruction_end = 0;
     body.instructions = instructions[0..0];
-    blocks[0].terminator = .return_failure;
-    try std.testing.expect(!validFunctionBody(body));
-    body.is_fallible = true;
+    blocks[0].terminator = .return_unit;
     try std.testing.expect(validFunctionBody(body));
 
     instructions[0] = .{ .storage_projection = .{
@@ -1095,6 +1071,7 @@ test "typed bodies and code survive an edit to another file" {
 
     const first = try query.Database.init(allocator, .{ .worker_count = 2 });
     defer first.deinit();
+    try first.addInput(queries.InlineLimit, {}, 0);
     try modules.registerSources(first, allocator, "exit(a() + b())", &source_files, &.{""});
     const original = (try first.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
     try save(io, allocator, directory, digest, first);
@@ -1103,6 +1080,7 @@ test "typed bodies and code survive an edit to another file" {
 
     const second = try query.Database.init(allocator, .{ .worker_count = 2 });
     defer second.deinit();
+    try second.addInput(queries.InlineLimit, {}, 0);
     const offset = try restoreInterns(second, allocator, payload);
     var second_registry: modules.SourceRegistry = .{};
     defer second_registry.deinit(allocator);
@@ -1128,6 +1106,7 @@ test "typed bodies and code survive an edit to another file" {
     };
     const third = try query.Database.init(allocator, .{ .worker_count = 2 });
     defer third.deinit();
+    try third.addInput(queries.InlineLimit, {}, 0);
     const third_offset = try restoreInterns(third, allocator, payload);
     try modules.registerSources(third, allocator, "exit(a() + b())", &changed_files, &.{""});
     const reused = try restoreQueries(third, payload, third_offset);
@@ -1138,6 +1117,7 @@ test "typed bodies and code survive an edit to another file" {
 
     const fourth = try query.Database.init(allocator, .{ .worker_count = 2 });
     defer fourth.deinit();
+    try fourth.addInput(queries.InlineLimit, {}, 0);
     const fourth_offset = try restoreInterns(fourth, allocator, payload[0 .. payload.len - 1]);
     try modules.registerSources(fourth, allocator, "exit(a() + b())", &source_files, &.{""});
     try std.testing.expectError(error.InvalidCache, restoreQueries(fourth, payload[0 .. payload.len - 1], fourth_offset));
@@ -1149,20 +1129,20 @@ test "Box and Ref alias bodies restore and invalidate after a binding edit" {
     const io = std.testing.io;
     const initial_source =
         \\import std.memory
-        \\fallible run() int
-        \\  var owner = Box.new?(17)
+        \\func run() int | none
+        \\  var owner: Box(int) = Box.new(17) else return none
         \\  var item = Ref.from(owner.borrow())
         \\  return item.value
-        \\if const result = run() -> exit(result) else exit(1)
+        \\if const result: int = run() -> exit(result) else exit(1)
     ;
     const edited_source =
         \\import std.memory
-        \\fallible run() int
-        \\  var owner = Box.new?(17)
+        \\func run() int | none
+        \\  var owner: Box(int) = Box.new(17) else return none
         \\  var item = Ref.from(owner.borrow())
         \\  item.value = 42
         \\  return item.value
-        \\if const result = run() -> exit(result) else exit(1)
+        \\if const result: int = run() -> exit(result) else exit(1)
     ;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1304,7 +1284,7 @@ test "deinit bodies restore and invalidate when parameter modes change" {
     const io = std.testing.io;
     const source =
         \\func take(deinit value: int | none) int
-        \\  if const number = value as int -> return number
+        \\  if const number: int = value -> return number
         \\  return 1
         \\func pick(flag: int) int
         \\  const first: int | none = 20
@@ -1504,7 +1484,6 @@ test "cached initializer handles stay out of ordinary operands and mutable write
     };
     var body: structures.FunctionBodyAnalysis = .{
         .return_type = .unit,
-        .is_fallible = true,
         .parameter_modes = &parameter_modes,
         .block_arguments = &block_arguments,
         .instructions = &instructions,
@@ -1512,9 +1491,7 @@ test "cached initializer handles stay out of ordinary operands and mutable write
         .entry = @fromBackingInt(@intCast(0)),
     };
     try std.testing.expect(validFunctionBody(body));
-    body.is_fallible = false;
     try std.testing.expect(validFunctionBody(body));
-    body.is_fallible = true;
 
     const branch: structures.FunctionBranch = .{ .target = @fromBackingInt(@intCast(1)), .arguments = .{ .start = 0, .end = 0 } };
     blocks[0].terminator = .{ .predicate_branch = .{
@@ -1548,76 +1525,15 @@ test "cached initializer handles stay out of ordinary operands and mutable write
     try std.testing.expect(!validFunctionBody(body));
 }
 
-test "cached initializer failures reject invalid ordinary targets and result representations" {
-    const allocator = std.testing.allocator;
-    var modes = [_]structures.ParameterMode{.init};
-    var arguments = [_]structures.FunctionBlockArgument{
-        .{ .type_id = .int, .representation = .initializer },
-        .{ .type_id = .int },
-    };
-    var blocks = [_]structures.FunctionBlock{
-        .{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .fallible_call = .{
-            .call = .{ .target = .{ .initializer = @fromBackingInt(@intCast(0)) }, .arguments = .{ .start = 0, .end = 0 }, .return_type = .int },
-            .success = @fromBackingInt(@intCast(1)),
-            .failure = @fromBackingInt(@intCast(2)),
-        } } },
-        .{ .argument_start = 1, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(1)) } } },
-        .{ .argument_start = 2, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .return_failure },
-    };
-    const original: structures.FunctionBodyAnalysis = .{
-        .return_type = .int,
-        .is_fallible = true,
-        .parameter_modes = &modes,
-        .block_arguments = &arguments,
-        .blocks = &blocks,
-        .entry = @fromBackingInt(@intCast(0)),
-    };
-    var writer: codec.Writer = .{ .allocator = allocator };
-    defer writer.deinit();
-    try writer.write(structures.FunctionBodyAnalysis, original);
-    var reader: codec.Reader = .{ .allocator = allocator, .bytes = writer.bytes.items };
-    var restored = try reader.read(structures.FunctionBodyAnalysis);
-    defer restored.deinit(allocator);
-    try std.testing.expect(validFunctionBody(restored));
-    var body = restored;
-    body.blocks = &blocks;
-    body.block_arguments = &arguments;
-    const call = &blocks[0].terminator.fallible_call;
-    const success = call.success;
-    const failure = call.failure;
-    call.success = failure.?;
-    try std.testing.expect(!validFunctionBody(body));
-    call.success = success;
-    const success_argument = &arguments[blocks[@backingInt(success)].argument_start];
-    const success_type = success_argument.type_id;
-    success_argument.type_id = .bool;
-    try std.testing.expect(!validFunctionBody(body));
-    success_argument.type_id = success_type;
-    success_argument.representation = .storage;
-    try std.testing.expect(!validFunctionBody(body));
-    success_argument.representation = .value;
-    call.failure = success;
-    try std.testing.expect(!validFunctionBody(body));
-    call.failure = @fromBackingInt(@intCast(body.blocks.len));
-    try std.testing.expect(!validFunctionBody(body));
-    call.failure = null;
-    try std.testing.expect(validFunctionBody(body));
-    call.failure = failure;
-    body.is_fallible = false;
-    try std.testing.expect(!validFunctionBody(body));
-    body.is_fallible = true;
-    try std.testing.expect(validFunctionBody(body));
-}
-
 test "cached nested handles reject changed capture representations" {
     const modules = @import("modules.zig");
     const allocator = std.testing.allocator;
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
     defer db.deinit();
     try modules.registerSources(db, allocator,
-        \\fallible materialize(init item: int) int -> return item
-        \\fallible forward(init item: int) int -> return materialize?(materialize?(item))
-        \\if const result = forward(42) -> exit(result) else exit(99)
+        \\func materialize(init item: int) int -> return item
+        \\func forward(init item: int) int -> return materialize(materialize(item))
+        \\if const result: int = forward(42) -> exit(result) else exit(99)
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
     const original = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("forward").? })).*.?;
@@ -1653,9 +1569,8 @@ test "cached query outputs cannot adopt a private initializer calling convention
     var modes = [_]structures.ParameterMode{.imm};
     var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int, .representation = .storage }};
     var blocks = [_]structures.FunctionBlock{.{ .argument_start = 0, .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .diverge }};
-    var body: structures.FunctionBodyAnalysis = .{
+    const body: structures.FunctionBodyAnalysis = .{
         .is_initializer_region = true,
-        .is_fallible = true,
         .return_type = .unit,
         .parameter_modes = &modes,
         .block_arguments = &arguments,
@@ -1664,8 +1579,6 @@ test "cached query outputs cannot adopt a private initializer calling convention
     };
     try std.testing.expect(validFunctionBody(body));
     try std.testing.expect(!(try validOutput(queries.AnalyzeFunctionInstance, db, body)));
-    body.is_fallible = false;
-    try std.testing.expect(!validFunctionBody(body));
 }
 
 test "cached initializers reject changed regions captures and value representation" {
@@ -1674,9 +1587,9 @@ test "cached initializers reject changed regions captures and value representati
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
     defer db.deinit();
     try modules.registerSources(db, allocator,
-        \\fallible materialize(init item: int) int -> return item
-        \\fallible run(imm value: int) int -> return materialize?(value + 2)
-        \\if const result = run(40) -> exit(result) else exit(99)
+        \\func materialize(init item: int) int -> return item
+        \\func run(imm value: int) int | none -> return materialize(value + 2)
+        \\if const result: int = run(40) -> exit(result) else exit(99)
     , &.{}, &.{});
     const executable = (try db.get(queries.BuildExecutable, 0)).*;
     try std.testing.expect(executable != null);
@@ -1753,11 +1666,6 @@ test "cached variant operations require mappings only for tagged results" {
         try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, body));
     }
     instructions[0] = .{ .variant_extract = .{ .operand = @fromBackingInt(@as(u32, 0)), .target_type = .int } };
-    try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
-    const plain: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .callable = .{ .parameters = &.{}, .return_type = .unit, .is_fallible = false } }));
-    const fallible: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .callable = .{ .parameters = &.{}, .return_type = .unit, .is_fallible = true } }));
-    arguments[0].type_id = plain;
-    instructions[0] = .{ .callable_coerce = .{ .operand = @fromBackingInt(@as(u32, 0)), .target_type = fallible } };
     try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
 }
 

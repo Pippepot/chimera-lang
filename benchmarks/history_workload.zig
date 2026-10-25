@@ -31,12 +31,12 @@ const support =
     \\pub func identity(static T: type, value: T) T -> value
     \\pub func integer(value: int) int -> value
     \\pub func boolean(value: bool) int
-    \\    if value? -> return 1
+    \\    if value -> return 1
     \\    return 0
     \\pub overload choose(integer, boolean)
     \\pub func bump(mut value: int) -> value += 1
-    \\pub fallible checked(value: int) int
-    \\    value >= 0
+    \\pub func checked(value: int) int | none
+    \\    if not (value >= 0) -> return none
     \\    return value
 ;
 
@@ -69,13 +69,13 @@ const unit_body =
     \\        return 0
     \\    const variant: int | none = total
     \\    total = match variant
-    \\        is int as value -> value
+    \\        value: int -> value
     \\        none -> 0
-    \\    if const accepted = checked(total)
+    \\    if const accepted: int = checked(total)
     \\        total = accepted
     \\    else
     \\        return 0
-    \\    if checked(-1) -> return 0
+    \\    if checked(-1) is int -> return 0
     \\    total += choose(seed)
     \\    total += choose(true)
     \\    bump(total)
@@ -115,12 +115,12 @@ pub fn generate(allocator: std.mem.Allocator, target_lines: usize) !Workload {
         var source: std.Io.Writer.Allocating = .init(owned);
         try source.writer.writeAll("import support.{Pair, Cell, Token, identity, integer, choose, bump, checked, consume}\n");
         for (0..units_per_module) |unit_index| {
-            try source.writer.print("fallible exercise_{d}(seed: int) int\n", .{unit_index});
+            try source.writer.print("func exercise_{d}(seed: int) int\n", .{unit_index});
             try source.writer.writeAll(body);
         }
-        try source.writer.writeAll("pub fallible run(seed: int) int\n    var total = 0\n");
+        try source.writer.writeAll("pub func run(seed: int) int\n    var total = 0\n");
         for (0..units_per_module) |unit_index|
-            try source.writer.print("    total += exercise_{d}?(seed)\n", .{unit_index});
+            try source.writer.print("    total += exercise_{d}(seed)\n", .{unit_index});
         try source.writer.writeAll("    return total\n");
         files[module_index + 1] = .{
             .path = try std.fmt.allocPrint(owned, "{s}.chi", .{module_path}),
@@ -130,7 +130,7 @@ pub fn generate(allocator: std.mem.Allocator, target_lines: usize) !Workload {
     }
     try entry.writer.writeAll("var padding = 0\n");
     for (0..module_count) |module_index| {
-        try entry.writer.print("if const actual = part{d}.run(1)\n", .{module_index});
+        try entry.writer.print("if const actual: int = part{d}.run(1)\n", .{module_index});
         try entry.writer.print("    if actual <> {d} -> exit(1)\n", .{units_per_module});
         try entry.writer.writeAll("else\n    exit(1)\n");
     }

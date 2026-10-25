@@ -56,9 +56,9 @@ test "primitive predicates preserve argument snapshots converters and indirect c
         \\    if value < change(value) and value == 40
         \\        if 40 >= Number{value = 41} -> return 90
         \\        if not bool.==(true, true) -> return 91
-        \\        const less: fallible(int, int) unit = int.<
+        \\        const less: func(int, int) bool = int.<
         \\        if not less(2, 3) -> return 92
-        \\        const different: fallible(bool, bool) unit = bool.<>
+        \\        const different: func(bool, bool) bool = bool.<>
         \\        if not different(true, false) -> return 93
         \\        if int.==(1, 2) -> return 94
         \\        return 42
@@ -70,7 +70,7 @@ test "overload named functions select logical argument types in both engines" {
     try Fixture.expectParity(
         \\func integer(value: int) int -> value
         \\func boolean(value: bool) int
-        \\    if value? -> return 42
+        \\    if value -> return 42
         \\    return 0
         \\pub overload choose(integer, boolean)
         \\func run() int -> choose(true) + choose(0)
@@ -116,7 +116,7 @@ test "overload methods and custom index types share ordinary selection" {
 
 test "overload array brackets preserve borrowed integers and owned range handles" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var values = [10, 20, 30, 40]
         \\    ref first = values[0]
         \\    first = 12
@@ -127,7 +127,7 @@ test "overload array brackets preserve borrowed integers and owned range handles
         \\    const empty = values[4..4]
         \\    return values[0] + values[1] + tail.len() + selected.len() + empty.len() + values[..].len()
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -232,7 +232,7 @@ test "overload generic namespaces infer inherited static arguments" {
         \\    pub overload get(read)
         \\func run() int
         \\    const container = Container(int){value = 42}
-        \\    return Container.get(container)
+        \\    return (if const _selected_result_0: int = Container.get(container) -> _selected_result_0 else panic "unexpected none")
     , 42);
 }
 
@@ -256,7 +256,7 @@ test "overload implicit converters do not make alternatives eligible" {
     , .no_matching_overload);
 }
 
-test "overload return types and fallible call syntax do not select implementations" {
+test "overload return types and func call syntax do not select implementations" {
     try Fixture.expectSourceDiagnostic(
         \\func integer(value: int) int -> value
         \\func boolean(value: int) bool -> true
@@ -266,10 +266,10 @@ test "overload return types and fallible call syntax do not select implementatio
     , .ambiguous_overload);
     try Fixture.expectSourceDiagnostic(
         \\func plain(value: int) int -> value
-        \\fallible checked(value: int) int -> value
+        \\func checked(value: int) int | none -> value
         \\overload choose(plain, checked)
-        \\fallible run() int -> choose?(42)
-        \\if const result = run() -> exit(result)
+        \\func run() int | none -> choose(42)
+        \\if const result: int = run() -> exit(result)
     , .ambiguous_overload);
     try Fixture.expectSourceDiagnostic(
         \\func identity(value: int) int -> value
@@ -294,8 +294,8 @@ test "overload zero argument calls and callable effect widening retain selection
         \\func answer() int -> 21
         \\overload choose(answer)
         \\func run() int
-        \\    const selected: fallible() int = choose
-        \\    if const result = selected() -> return result + choose()
+        \\    const selected: func() int = choose
+        \\    if const result: int = selected() -> return result + choose()
         \\    return 90
     , 42);
 }
@@ -303,13 +303,13 @@ test "overload zero argument calls and callable effect widening retain selection
 test "overload selected alternatives retain exact fallibility" {
     try Fixture.expectParity(
         \\func integer(value: int) int -> value
-        \\fallible checked(value: bool) int
-        \\    value?
+        \\func checked(value: bool) int | none
+        \\    if not (value) -> return none
         \\    return 22
         \\overload choose(integer, checked)
         \\func run() int
-        \\    if const unexpected = choose(false) -> return 90
-        \\    if const result = choose(true) -> return choose(20) + result
+        \\    if const unexpected: int = choose(false) -> return 90
+        \\    if const result: int = choose(true) -> return choose(20) + result
         \\    return 91
     , 42);
 }
@@ -354,9 +354,9 @@ test "overload custom setter and compound indexing evaluate the key once" {
 
 test "overload range indexing covers initialized lists spans and text views" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var values: List(int) = [10, 20, 30]
-        \\    values.reserve?(20)
+        \\    const _: unit = values.reserve(20) else return none
         \\    var selected = values[1..]
         \\    selected[0] = 22
         \\    const tail = selected[1..]
@@ -365,38 +365,38 @@ test "overload range indexing covers initialized lists spans and text views" {
         \\    const byte_slice = bytes[1..3]
         \\    const text_slice = text[1..]
         \\    const empty = values[3..3]
-        \\    if const invalid = values[..4] -> return 90
+        \\    if const invalid: Span(int) = values.slice(..4) -> return 90
         \\    return values[0] + values[1] + tail.len() + byte_slice.byte_length() + text_slice.byte_length() + bytes[..].byte_length() + empty.len()
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 91
     , 42);
 }
 
 test "overload range indexing rejects reversed extreme and invalid UTF8 bounds" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const values = [10, 20, 30]
-        \\    if const invalid = values[2..1] -> return 90
-        \\    if const invalid = values[-1..2] -> return 91
-        \\    if const invalid = values[0..2147483647] -> return 92
-        \\    if const invalid = values[3..=3] -> return 93
+        \\    if const invalid: Span(int) = values.slice(2..1) -> return 90
+        \\    if const invalid: Span(int) = values.slice(-1..2) -> return 91
+        \\    if const invalid: Span(int) = values.slice(0..2147483647) -> return 92
+        \\    if const invalid: Span(int) = values.slice(3..=3) -> return 93
         \\    const text = StringView("a\u{e9}z")
-        \\    if const invalid = text[1..2] -> return 94
+        \\    if const invalid: StringView = text.slice(1..2) -> return 94
         \\    const selected = text[1..3]
         \\    return 40 + selected.byte_length()
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 95
     , 42);
 }
 
 test "overload range results cannot escape their backing owner" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible escaped() Span(int)
+        \\func escaped() Span(int) | none
         \\    var values = [10, 20]
         \\    return values[..]
-        \\if const selected = escaped() -> exit(selected.len())
+        \\if const selected: Span(int) = escaped() -> exit(selected.len())
     , .borrow_outlives_source);
 }
 
@@ -465,17 +465,19 @@ test "overload noncopyable index arguments preserve borrowing and reject overlap
 
 test "overload range indexing preserves readonly backing and excludes bulk assignment" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible run()
+        \\func run() unit | none
         \\    const values = [1, 2, 3]
         \\    var selected = values[..]
         \\    selected[0] = 42
-        \\if run() -> exit(0)
+        \\    return ()
+        \\if (run() is unit) -> exit(0)
     , .reference_not_writable);
     try Fixture.expectAnySourceDiagnostic(
-        \\fallible run()
+        \\func run() unit | none
         \\    var values = [1, 2, 3]
         \\    values[0..2] = [4, 5]
-        \\if run() -> exit(0)
+        \\    return ()
+        \\if (run() is unit) -> exit(0)
     , .where_condition_failed);
 }
 
@@ -515,11 +517,11 @@ test "overload operator sets include unary and binary forms explicitly" {
 test "overload integer indexing retains checked defaults for typed literal values" {
     try Fixture.expectParity(
         \\static position: int_literal = 1
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const values = [0, 42]
         \\    return values[position]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -556,7 +558,7 @@ test "overload qualified operator declarations resolve namespace implementations
     , 42);
 }
 
-test "overload callable contexts refresh return types and effects" {
+test "overload callable contexts refresh ordinary variant return types" {
     const source =
         \\func integer(value: int) int -> value
         \\func boolean(value: bool) int -> 0
@@ -569,9 +571,9 @@ test "overload callable contexts refresh return types and effects" {
     const fixture = try Fixture.init(source);
     defer fixture.deinit();
     try fixture.expectExit(0, 42);
-    const changed_effect = try std.mem.replaceOwned(u8, std.testing.allocator, source, "func integer", "fallible integer");
-    defer std.testing.allocator.free(changed_effect);
-    try fixture.db.setInput(queries.SourceText, 0, changed_effect);
+    const changed_variant = try std.mem.replaceOwned(u8, std.testing.allocator, source, "int) int -> value", "int) int | none -> value");
+    defer std.testing.allocator.free(changed_variant);
+    try fixture.db.setInput(queries.SourceText, 0, changed_variant);
     try fixture.expectDiagnostic(null, .no_matching_overload);
     const changed_result = try std.mem.replaceOwned(u8, std.testing.allocator, source, "int) int -> value", "int) bool -> true");
     defer std.testing.allocator.free(changed_result);

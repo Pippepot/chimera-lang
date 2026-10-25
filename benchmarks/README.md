@@ -50,27 +50,36 @@ replaces it, even with a different parent, and a committed run clears it. Raw
 records retain all runs and snapshot status; replacement affects the graphs,
 not the saved measurements. The temporary point follows its parent without a
 status label. Incompatible environments remain separate. The dashboard plots
-only the latest compilation workload and compatible runtime workload. Debug and
-obsolete suites remain in raw records without adding duplicate graphs. Compilation
-and runtime have separate identities: replacing compilation workloads does not
-discard unchanged runtime history or its cached C references.
-Suite hashes, protocol, Zig, machine, kernel, and affinity prevent incompatible
-measurements from being silently joined.
+separate zero-worker and eight-worker compilation curves per phase and matched
+environment, using the latest result per commit regardless of suite hash.
+Driver or generator edits do not hide
+history or add duplicate workload curves. Keep the benchmark input fixed for
+comparable timings; raw records retain the original suite hashes for auditing.
+Debug and obsolete protocols remain in raw records without adding duplicate
+graphs. Runtime still uses its latest compatible workload.
+Compilation and runtime have separate identities: replacing compilation
+workloads does not discard unchanged runtime history or its cached C references.
+Protocol, Zig, machine, and kernel keep incompatible timing environments
+separate. Affinity is retained in raw records but does not split the graphs;
+worker-count curves share the existing history axes.
 
 The report also writes `.history/benchmarks.html`, `benchmarks.png`, and standalone
 SVG/PNG graphs under `.history/graphs/`. Matplotlib uses its `xkcd` style and the
 bundled openly licensed Comic Neue font; SVGs embed the font for offline use.
+Graphs are monochrome: serial compilation is solid, while eight workers uses a
+thicker dotted line and hollow point markers.
 Benchmark tooltips retain dates, medians, minima, and maxima. Graphs omit runner,
-suite, and status labels; raw records preserve that metadata. `--render-only`
+suite hashes, and status labels; raw records preserve that metadata. `--render-only`
 rebuilds reports without measuring. One snapshot gives points, not a trend.
 
 ### Measurement Protocol
 
 The history driver uses ReleaseFast with LLVM and each revision's ordinary std
 configuration: its own precompiled bundle where supported, otherwise its own
-embedded std sources. Compilation samples use fresh zero-worker databases,
-without disk caching or profiling. Compilation has one warm-up followed by three
-measured cold/edit pairs; runtime has one warm-up and nine samples. The cold timer
+embedded std sources. Compilation is measured separately with zero and eight
+workers, using fresh databases without disk caching or profiling. Each worker
+count has one warm-up followed by three measured cold/edit pairs; runtime has
+one warm-up and nine samples and keeps its zero-worker compilation setup. The cold timer
 includes database creation, module/source registration, analysis, native
 code generation, and linking. It excludes source generation, compiler builds,
 database teardown, file writes, and generated-program execution. Cold means
@@ -88,7 +97,7 @@ Each repeated feature unit combines arithmetic, predicates, branches, loops,
 ranges, arrays, List construction/indexing, slices and reference mutation, text
 conversion/comparison, structs and methods, generic types/functions, tuples and
 destructuring, variants/match, overload selection, custom converters, indirect
-calls, fallible success/failure handling, explicit ownership transfer, and
+calls, explicit optional result handling, explicit ownership transfer, and
 compile-time evaluation. The full executable must exit 42; changing the leaf's
 returned value must produce 43 while preserving all feature checks.
 
@@ -116,6 +125,44 @@ zig build history-benchmark --seed=0 -j1 -Doptimize=fast -- --case=core-1000000 
 Nondefault line counts are labelled `probe-core-N` and rejected by the recorder.
 Workload semantics, sample counts, and timer boundaries are versioned; changing
 them starts a new compilation identity.
+
+For worker-scaling measurements, the compilation driver accepts
+`--workers=N` from 0 through 64 (default 0):
+
+```sh
+zig build history-benchmark --seed=0 -j1 -Doptimize=fast -- --case=core-1000000 --workers=4
+```
+
+Nonzero-worker samples use a `workers-N` lane. The history recorder runs the
+zero-worker and eight-worker lanes independently and plots both; other counts
+remain standalone probes. The serial protocol and its historical measurements
+are unchanged. Compare worker counts on the same CPU affinity set, using physical
+cores where possible; do not pin a multiworker run to one CPU. `--cpu` restricts
+every lane to that one CPU. To record both lanes on an eight-core CPU set:
+
+```sh
+taskset -c 4-11 .venv/bin/python benchmarks/history.py --worktree
+```
+
+Affinity remains part of the recorded environment for auditing and C-reference
+reuse, but these results overlay the existing graphs for the same machine and
+toolchain. Consult the raw records when comparing runs with different affinities.
+Keep the normal warm-up and cold/edit validation. The worker option does not
+change runtime sampling.
+
+Only cold-compilation legends show rounded C++20 comparison estimates, without
+reference lines or changes to the graph scale. The 2026-10-25 comparison uses
+Clang 22.1.8, serial CPU 6 builds, no debug info, PCH, LTO, or compiler cache:
+1,000,000 generated lines, 128 feature modules, and 19,584 mixed-feature units.
+Cold estimates (160 s at `-O0`, 268 s at `-O2`) use mean projections from three
+four-module resamples, checked against one full build per setting. The combined
+observed/projected ranges were 158-162 s and 266-270 s, not confidence intervals.
+C++ leaf-edit comparisons are omitted: reusing object files and invoking a
+disk-based linker differs from Chimera's query-level reuse and in-memory linking.
+C++ timing includes object/executable writes. Both exit statuses, 42 and 43,
+were checked. C++ library and ownership
+semantics differ from Chimera's; these labels are context, not matched history
+samples or a claim about every C++ project.
 
 Historical measurements use the current fixed driver and standalone
 [build harness](history_build.zig) in temporary snapshots, not the historical
@@ -165,10 +212,13 @@ remain in raw records and are not joined to the new runtime curve.
 The equivalent [C sieve](history_runtime.c) uses the same algorithm, signed 32-bit
 integer array, input, output, correctness probes, warm-up, and process timer.
 This matches Chi's `int`; the old C reference used a wider 64-bit array.
-The system `cc` builds it at `-O0`, `-O1`, `-O2`, and `-O3`, outside the timer;
+The system `cc` builds it at `-O0` and `-O3`, outside the timer;
 these snapshots require a C11 compiler on `PATH`. Each level gets nine samples.
-The latest matching run's C medians appear as four labelled horizontal runtime
-reference lines in the report and SVG/PNG exports. Render-only never reruns C.
+The latest matching run's C medians appear as two labelled horizontal runtime
+reference lines in the report and SVG/PNG exports. They share the runtime
+curve's color, with dotted `-O0` and dashed `-O3` lines. Render-only never reruns C.
+Older `-O1` and `-O2` samples remain in raw records but are neither plotted nor
+remeasured; existing complete `-O0`/`-O3` samples remain reusable.
 Normal recording reuses complete C samples from existing `.history/records/`
 when the suite (C source and timing driver), protocol, Zig/C toolchains, and
 runner (including CPU affinity) match. On a hit, C is neither compiled nor run;
@@ -186,7 +236,7 @@ Optimization levels are not guaranteed to improve monotonically.
 Assembly inspection confirms that optimized C still executes the factor and
 multiple-marking loops. GCC replaces elementwise zeroing with `memset` and
 vectorizes the final count; it does not substitute a precomputed prime count.
-The generated Chi marking loop retains List assignment/get calls, fallibility
+The generated Chi marking loop retains List assignment/get calls, bounds
 checks, and stack loads/stores; filling still calls an element initializer per
 slot. These are concrete code-generation/library differences, not evidence
 of C skipping the requested computation. ReleaseFast optimizes the Zig compiler

@@ -41,7 +41,7 @@
 # never: bottom type for expressions that never return.
 # Evaluated subexpressions execute once, left to right in source order.
 # An init argument defers its entire expression until destination construction;
-# forwarding does not evaluate it, and earlier failure may skip it.
+# forwarding does not evaluate it, and an ordinary return may skip it.
 # Struct initializers evaluate in initializer order, not field declaration order.
 # Reordering is allowed only when unobservable.
 
@@ -49,7 +49,8 @@
 # Operation functions
 # An operation function is a type-namespace member with a compiler-specified
 # signature. Namespace visibility and ordinary call/specialization rules apply;
-# lookup uses the left operand's defining namespace, independently of imports.
+# arithmetic, comparison, and indexing lookup uses the left operand's defining
+# namespace, independently of imports. Membership uses the collection on the right.
 # No fallback to the right operand or implicit merging of same-named declarations
 # participates in selection. Explicit overload sets use the rules below.
 # Operands evaluate once, left to right.
@@ -59,11 +60,9 @@
 pub extern func int.+(imm left: int, imm right: int) int
 # Only the registered prelude may extend primitive namespaces. Other modules
 # cannot extend them, just as they cannot extend an imported struct namespace.
-# Comparisons succeed with unit or fail in every expression position. Logical
-# and/or/not compose success and failure; they never produce bool. Querying a
-# stored bool with postfix ? succeeds with unit for true and fails for false.
-# and/or skip the right operand when the left outcome determines their result.
-# The complete current inventory is +, -, *, /, %, ==, <>, <, >, <=, >=, unary
+# Comparisons and logical operators return bool in every expression position.
+# and/or skip the right operand when the left bool determines their result.
+# The operation-function inventory is +, -, *, /, %, ==, <>, <, >, <=, >=, unary
 # negation and read/write indexing. Logical not is dedicated control flow.
 # Unary and binary arithmetic minus
 # share the spelling -, distinguished only by runtime operand count. neg is an
@@ -71,10 +70,10 @@ pub extern func int.+(imm left: int, imm right: int) int
 # change operator precedence.
 # For receiver type Self, the exact signatures are:
 # +, -, *, /, %: func (imm Self, imm Self) Self
-# ==, <>, <, >, <=, >=: fallible (imm Self, imm Right) unit
+# ==, <>, <, >, <=, >=: func (imm Self, imm Right) bool
 # unary -: func (imm Self) Self
-# []: func or fallible (imm Self, index: Index) Result; ref Self is also allowed
-# []=: func or fallible (mut Self, index: Index, var value: Element) unit
+# []: func (imm Self, index: Index) Result; ref Self is also allowed
+# []=: func (mut Self, index: Index, var value: Element) unit
 # Inherited namespace static arguments and inferable static parameters use
 # ordinary specialization; they do not count as runtime operands or permit
 # extra runtime operands. Signature validation rejects mismatches even for
@@ -98,28 +97,20 @@ pub extern func int.-(imm left: int, imm right: int) int
 const negate: func(imm int) int = int.-
 const subtract: func(imm int, imm int) int = int.-
 # Explicitly declared sets instead select by argument types as specified below.
-# Arithmetic and arithmetic unary operations cannot fail. Comparison functions
-# succeed with unit or fail. Indexers may fail; indexed expressions propagate
-# ordinary failure in a fallible function
-# and can be handled by ordinary binding conditions. Writable indexing calls
-# []= rather than treating a by-value [] result as a writable place. Receiver
-# and index are evaluated once, then the replacement is eagerly prepared as an
-# owned argument before the setter checks bounds. Its effects and transfers are
-# not rolled back on bounds failure; the prepared value is cleaned up normally.
-# Compound indexing reads the old element before evaluating its RHS; failed
-# getter bounds therefore still skip that RHS. Capturing `ref item = values[i]`
-# before assignment provides bounds-first evaluation. User-defined indexers own
-# their bounds policy. Standard Array, List, and Span reads return borrowed places;
-# an owned destination requires the element's copy capability. Array, List, and writable Span writes
-# use checked reference replacement: elements must move directly, contain no
-# borrowed references, and permit automatic drop. Immovable elements still
-# construct in containers, but cannot use these copied-read/replacement APIs;
-# get remains available for checked borrowed access. Readonly Span has no
-# writable element access.
+# Arithmetic and indexing are ordinary operations. Comparisons return bool.
+# Writable indexing calls []=; compound indexing reads before preparing its RHS.
+# Receivers, indices, and eager replacements evaluate once in source order.
+# Standard [] bounds checks and panics on invalid access. get returns an explicit
+# optional reference instead; slice returns an optional view. To handle absence,
+# bind the optional result with a typed pattern before reading or replacing it.
+# Standard checked reference replacement requires directly movable elements,
+# automatic drop, and no contained borrowed references. Immovable elements may
+# still construct in containers and be accessed through get. Readonly Span
+# provides no writable element access. User indexers choose their own bounds policy.
 # Assignment remains ownership-aware replacement; compound assignments combine
 # the corresponding binary operation and assignment. and/or remain short-
-# circuit control flow; is/as remain type membership/extraction. Transfer ^,
-# fallible call ?, field access, and initialization retain their dedicated
+# circuit control flow; is tests type membership. Transfer ^, field access,
+# typed binding patterns, and initialization retain their dedicated
 # semantics and are not eager operation functions. Predicates over explicitly
 # typed compile-time-only int_literal values remain intrinsic and preserve their
 # wide literal range. Equality of compile-time type metadata remains compiler
@@ -128,11 +119,26 @@ const subtract: func(imm int, imm int) int = int.-
 # by this contract. Later numeric types use the same operation signatures.
 
 
+# Collection membership
+# value in collection returns bool through the visible contains member, using
+# ordinary lookup, specialization, overloads, and argument conversion. Its
+# signature is func(imm Collection, imm Element) bool. Both operands are borrowed.
+# The value evaluates before the collection; the callee receives collection
+# first. There is no iteration fallback. Logical operators compose the bool
+# result normally; completed effects persist and temporary owners clean normally.
+# in has comparison precedence; ranges bind more tightly. for item in collection
+# has its own binding/header grammar and continues to use the iteration protocol.
+# Membership in a match guard uses the same dispatch protections as other calls
+# and contributes no exhaustive coverage.
+if value in collection -> found()
+if not (value in collection) -> missing()
+
+
 # Numeric conversions (open)
 # Ordinary value converters are infallible. Conversions between numeric runtime
 # types that wrap, truncate, round, saturate, or widen are named functions instead.
 # Their names, overflow and failure behavior, other numeric widths, and float
-# literal typing remain open. Existing variant widening and 'as' extraction do
+# literal typing remain open. Existing variant widening and typed patterns do
 # not define numeric conversion behavior.
 
 
@@ -160,10 +166,11 @@ const subtract: func(imm int, imm int) int = int.-
 # literal-backed String results refer to symbolic immutable storage, never host
 # addresses. Runtime descriptors and the referenced bytes have independent
 # storage. String has move and automatic drop, but no implicit copy; clone is
-# explicit and fallible. Allocation-backed text also executes at compile time,
+# explicit and returns an optional variant. Allocation-backed text also executes at compile time,
 # subject to the evaluation-local storage publication boundary.
 # BytesView is a copyable wrapper of Span(byte) with readonly backing access.
-# get and [] return readonly ref byte; ref bindings alias the byte, while owned
+# get returns readonly ref byte | none; [] returns readonly ref byte and panics
+# on invalid access. ref bindings alias the byte, while owned
 # bindings copy it. A borrowed byte can outlive a temporary view descriptor but
 # not its backing owner. Views of arrays,
 # allocations, Lists, and Strings retain their backing owners and storage
@@ -195,9 +202,9 @@ const subtract: func(imm int, imm int) int = int.-
 # compile time within the ordinary storage-publication boundary.
 # A collection literal can initialize String directly, as in String([1, 2]);
 # its consuming converter constructs an Array before formatting it. Element
-# failure preserves ordinary initializer propagation and partial cleanup.
-# std.io supplies stdin/stdout/stderr handles, fallible read_bytes, write_once,
-# write_all, and write_text. Infallible print accepts an immutable value of T
+# expressions use ordinary values and lifetime cleanup, not a failure channel.
+# std.io supplies stdin/stdout/stderr handles, optional read_bytes, write_once,
+# write_all, and write_text. Ordinary print accepts an immutable value of T
 # that converts to String, converts it once, and writes
 # the text followed by a newline. Existing String inputs are borrowed without copying.
 # print is a generic overload export; callable references require a function-type
@@ -210,7 +217,7 @@ const subtract: func(imm int, imm int) int = int.-
 # without reading. Interrupted syscalls retry. write_all advances by completed
 # counts and fails on zero progress. Output programs ignore SIGPIPE so closed
 # pipes report ordinary write failure; print handles that failure by panicking.
-# Other OS failures propagate ordinary failure; earlier external effects are
+# Other OS failures return none; earlier external effects are
 # not rolled back. Reading or allocating
 # failure preserves initialized List contents; reservation may change capacity.
 # Writes borrow initialized readonly byte spans. Reads initialize spare allocation
@@ -220,7 +227,7 @@ const subtract: func(imm int, imm int) int = int.-
 # become text, so partial UTF-8 sequences can be accumulated before conversion.
 # print is an ordinary declaration and may be shadowed or used as a callable.
 # Reached compile-time I/O is an unavailable execution operation, even inside a
-# fallible condition; an unexecuted branch performs no I/O and causes no error.
+# optional result handler; an unexecuted branch performs no I/O and causes no error.
 # StaticString represents immutable literal storage. Only literal
 # materialization creates one; its bytes are permanent and readonly, so views of
 # them may outlive every binding. Ref and Span use one private StorageCursor(T)
@@ -251,8 +258,8 @@ const singleton: (int,) = (42,)
 # and an empty sequence respectively. A sequence pattern requires exactly its
 # number of elements; there is no implicit prefix or rest match. Tuple and Array
 # length mismatches are source errors. List and Span check their lengths at
-# runtime before extracting elements; mismatch follows ordinary failure flow.
-# An if binding catches both source failure and length mismatch, and exposes
+# runtime before extracting elements; mismatch follows the explicit handler.
+# A conditional binding tests length and type patterns and exposes
 # names only to its successful branch. Conditional patterns permit const/ref
 # bindings; mutable conditional bindings remain unsupported.
 #
@@ -357,17 +364,11 @@ pub import math.{Vec3}
 # Any file may contain executable top-level statements, but only the file
 # passed to the compiler executes them. Imported files never run on import;
 # imports have no runtime side effects.
-# The designated file's top-level body is implicitly fallible. Successful
-# fallthrough cleans up live owners and finishes the generated program with
-# status 0. Unhandled ordinary failure cleans up through the same rules as a
-# fallible function and finishes with status 1. This includes fallible calls,
-# checked access, comparisons, casts, initializer failures, iterator failures,
-# and bare fail. Local failure handlers take precedence. Ordinary functions
-# retain their declared fallibility; compile-time consumers still require
-# successful evaluation. Explicit exit and panic retain their own semantics.
-# Renaming a file within its folder has no effect. Moving a declaration across
-# folders changes its module and identity, including nominal type identity; a
-# re-export preserves the old path but never the old identity.
+# The designated file's top-level body is an ordinary unit entry. Reaching its
+# end cleans live owners and exits with status 0. A discarded false or none is
+# data and does not exit the program. Explicit exit and panic retain their own
+# semantics. Compile-time required evaluation can return none as an ordinary value.
+
 
 
 # Bindings and compile-time execution
@@ -450,38 +451,11 @@ const computed_block = comptime
 # host functions are never implicitly callable. An unavailable operation is an
 # error only when execution reaches it.
 #
-# A compile-time value consumer requires successful evaluation. An unhandled
-# fallible failure is a source error; fallible calls handled within the executed
-# code retain their ordinary control-flow behavior. Query/declaration cycles are
-# source errors. A recursive call that repeats the same function instance and
-# arguments is also an exact cycle and therefore a source error. For cycle
-# checking, arguments include deferred initializer captures and the state of
-# reachable storage at call entry. Storage handles retain their logical identity;
-# ordinary data compares by value. Changed reachable contents or a different
-# allocation identity are different arguments. Later mutation does not change
-# an earlier call's recorded entry state. Other compile-time computations run
-# until they finish or the compiler process is interrupted.
-# The language defines no call-depth, execution-fuel, storage, or time limit;
-# interruption and machine resource exhaustion do not make the source invalid.
-# Compiler resource exhaustion is an infrastructure failure, distinct from
-# ordinary language failure and a source diagnostic. It remains retryable and
-# must not be cached as source rejection or converted into fallible failure.
-#
-# A direct call may appear in a type position when its declared return type is
-# 'type'. It is evaluated at compile time and the consumer receives its canonical
-# type value. This is not return-type inference. 'type' values and functions
-# returning 'type' are compile-time-only and have no runtime storage layout.
-# During compile-time execution, equality and inequality compare type values by
-# canonical type identity. They are unavailable as runtime operations.
-# An anonymous struct expression evaluated at compile time produces a nominal
-# type. Its identity is its source site plus the enclosing function's static
-# specialization, so repeated evaluation of one site with equal static arguments
-# returns the same type, while distinct sites or static arguments produce
-# distinct types. Ordinary interpreted arguments do not affect this identity.
-# Generated struct field types may reference module statics and enclosing static
-# parameters. They cannot capture function-local bindings. Generated definitions
-# accept the same ownership declarations as declared structs, with custom hooks
-# specialized by the enclosing type factory.
+# A compile-time value consumer evaluates an ordinary typed result. none and
+# error variants publish like other values when their payloads are publishable.
+# Reached panic, unsupported execution capabilities, and invalid operations are
+# source diagnostics; ordinary control exit retains its structured compiler result.
+
 
 
 # Compile-time storage
@@ -505,14 +479,14 @@ const computed_block = comptime
 # Allocation uses the selected host target's request rules for element
 # eligibility, layout, size, and alignment. A negative count, checked layout
 # overflow, unsupported resolved request, or provider refusal produces ordinary
-# allocation failure through the declared fallible API. Compiler memory used
+# allocation refusal as none through the declared optional API. Compiler memory used
 # to interpret values is an implementation resource: exhausting it is the
 # infrastructure failure described above, not an allocation-provider refusal.
 # Optimization may remove an allocation and its matching deallocation when the
 # storage is otherwise unobserved; the removed request cannot then be refused.
-# Allocation failure skips deferred initialization. Construction failure cleans
-# completed subobjects and releases storage as required by the owning library
-# declaration; captured writes and completed transfers are not rolled back.
+# Allocation refusal skips deferred initialization and returns none. Ordinary
+# returns clean completed subobjects and release storage as required by the owning
+# library declaration; captured writes and completed transfers are not rolled back.
 # Deallocation itself never destroys elements. Ordinary scope cleanup and hooks
 # retain their runtime ordering and effects.
 #
@@ -536,16 +510,16 @@ const computed_block = comptime
 # allocations into persistent storage remains unspecified. Cached execution
 # must preserve these rules: a cached result cannot share a fresh allocation
 # between calls or extend storage beyond its evaluation.
-fallible make_twenty() Box(int) -> Box.new?(20)
-fallible inspect_allocations() int
-    var first = make_twenty?()
-    const second = make_twenty?()
+func make_twenty() Box(int) | none -> Box.new(20)
+func inspect_allocations() int | none
+    var first: Box(int) = make_twenty() else return none
+    const second: Box(int) = make_twenty() else return none
     ref borrowed = first.borrow()
     borrowed = 22
     return first.borrow() + second.borrow()
-static allocated_answer = if const value = inspect_allocations() -> value else 0
+static allocated_answer = if const value: int = inspect_allocations() -> value else 0
 # allocated_answer is ordinary data: 42. Both Boxes are destroyed normally.
-# static escaped = make_twenty?() # source error: retains evaluation-local storage
+# static escaped = make_twenty() # source error: retains evaluation-local storage
 
 
 # Functions
@@ -570,7 +544,7 @@ func double(a: int) int -> a * 2
 
 # Function references are values and may be bound, passed, returned, and called.
 # Callable types contain each parameter's access mode and type, the return type,
-# and fallibility. Parameter names are not part of type identity. Plain function
+# and result access mode. Parameter names are not part of type identity. Plain function
 # references do not capture local bindings; capturing closures are planned below.
 func choose() func(int) int -> double
 func apply(operation: func(int) int, value: int) int -> operation(value)
@@ -601,11 +575,11 @@ func stack_example() int
     const add = func(value: int) int -> value + offset
     return add(32)
 
-fallible heap_example() int
+func heap_example() int | none
     const offset = 10
-    const boxed = Box.new?(
+    const boxed: Box(func(int) int) = Box.new(
         func(value: int) int -> value + offset
-    )
+    ) else return none
     ref add = boxed.borrow()
     return add(32)
 
@@ -626,7 +600,7 @@ pub overload identity(identity_int, identity_bool)
 # their ordinary defaults. Builtin widening participates, but implicit converters
 # do not. There is no declaration-order, conversion, or generic-specificity ranking.
 # Direct selection ignores expected result type, access authority, result
-# ownership, and fallible call spelling. Selected where clauses validate that
+# ownership, and result types. Selected where clauses validate that
 # implementation; failure does not try another alternative.
 # After selection, ordinary ownership, overlap, conversion, destination, and
 # effect checks apply. Arguments execute once, left to right; explicit static
@@ -636,7 +610,7 @@ pub overload identity(identity_int, identity_bool)
 #
 # A reference to a set requires a callable type context. It selects one function
 # by the full signature, including parameter modes, result ownership, and ordinary
-# infallible-to-fallible widening.
+# exact callable identity.
 const selected: func(int) int = identity
 # Operator syntax, qualified calls, methods, and callable references share
 # explicit sets. Each alternative must satisfy the operation's signature contract.
@@ -657,26 +631,25 @@ const selected: func(int) int = identity
 # At runtime exit terminates the program. During compile-time execution it produces an
 # uncatchable compiler-control exit carrying the i32 code. The effect propagates
 # through compile-time calls and queries, stops the active compilation request,
-# and produces no executable. It is not a source diagnostic or a fallible
-# failure. An embedding compiler receives the structured exit result; the CLI
+# and produces no executable. It is distinct from source diagnostics and ordinary values. An embedding compiler receives the structured exit result; the CLI
 # maps it to its own process exit status using the host status convention.
 exit(0)
 
-# Panic is an expression keyword with successful type never, independent of
+# Panic is an expression keyword with type never, independent of
 # imports and lexical names. An optional message on the same source line is an
 # ordinary expression with expected type StringView; normal conversions borrow
 # owned strings or construct literal views. Evaluate that expression once before
-# panicking. Its ordinary failure or other control effects occur before panic.
+# panicking. Its ordinary control effects occur before panic.
 # Bare panic reports just "panic", with no colon or message. An empty message
 # reports the same. Delimiters and else end a bare
 # panic; a following source line does not supply its message.
 # At runtime panic reports its message and active call sites to stderr, then
 # terminates with status 134. Reporting is allocation-free and best effort;
 # output failure still terminates. Panic does not unwind or destroy live owners
-# and cannot be caught by ordinary failure handling or failure-to-none capture.
+# and cannot be caught by optional or error matching.
 # Existing lifetime endings during message evaluation retain their usual rules.
 # At compile time a reached panic is a source diagnostic carrying the message
-# and compile-time call trace, not compiler-control exit or ordinary failure.
+# and compile-time call trace, distinct from compiler-control exit and ordinary values.
 # No executable is produced. Unexecuted panic expressions have no panic effect;
 # demanded bodies retain ordinary source validation.
 # Native traces use read-only metadata and existing return addresses, adding no
@@ -702,12 +675,11 @@ func invalid_state() never -> panic "invalid state"
 # Static parameters belong to the declaration and specialization key,
 # not to the specialized function's runtime callable type or calling convention.
 # Runtime callable parameter types retain these modes, for example
-# func(imm T) T, func(deinit T) T, and fallible(init T) Box(T). Taking a function
+# func(imm T) T, func(deinit T) T, and func(init T) Box(T) | none. Taking a function
 # value, aliasing it, or calling it indirectly does not erase its modes or
 # deferred effects. Implementation support is tracked in ROADMAP.md.
-# Callable compatibility requires identical parameter modes. Ordinary-to-
-# fallible callable widening still applies when every parameter mode and type
-# and the return type match.
+# Callable compatibility requires identical parameter modes, parameter types,
+# return types, and result access modes.
 #
 # A direct call may supply all parameters in declared order, including every
 # static argument, or supply only runtime arguments in their declared order and
@@ -748,14 +720,14 @@ const middle = between(1, 42)         # T is int
 
 # A function signature may end with one or more `where` clauses after its
 # return type. Each clause contains
-# one fallible condition, on the signature line or on a following line at the
+# one bool condition, on the signature line or on a following line at the
 # same indentation as the declaration. Clauses are checked in source order
 # when the function instance is specialized, before its body is used; they do
-# not make the function fallible at runtime or change its callable type.
+# not change the function's runtime result type or callable identity.
 # Evaluated predicates may read only static parameters, module statics, and
 # declarations reachable from them. Runtime parameters cannot be captured by
 # a compile-time condition. A failed condition rejects the
-# specialization with a diagnostic at that clause; unhandled failure during
+# specialization with a diagnostic at that clause; an error during
 # compile-time evaluation also rejects it. Undemanded specializations are not
 # checked. The ordinary function body (or `extern` declaration) is still
 # required, and compile-time execution has no ambient I/O.
@@ -787,6 +759,10 @@ func add1(mut a: int)
 # reference arguments retain their backing owners through that preparation too.
 # This retains ownership without granting additional reference access; explicit
 # transfers and writes still have their ordinary effects and alias restrictions.
+# Caller-visible stored-reference dependencies conservatively merge all ordinary
+# return paths. Selecting a returned alternative does not narrow mutation effects;
+# an early return can retain the previous capture even after selecting another
+# alternative. Unconditional replacement can remove a previous capture.
 var mutable_value = 41
 add1(mutable_value)
 
@@ -821,7 +797,7 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # references retain their independent origins.
 # After a selection, a source is available only if every incoming path retains
 # it. Later arguments cannot overwrite source storage retained by the selection.
-# Later argument failure does not restore ownership; prepared arguments must
+# A later argument's nonlocal exit does not restore ownership; prepared arguments must
 # have valid cleanup, including explicit-drop obligations.
 #
 # A deinit callee must complete or delegate the source's lifetime. It can move
@@ -898,7 +874,7 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # which that use is reachable. Each loop exit ends it independently at the
 # earliest boundary on that path.
 #
-# Return, failure propagation, break, and continue are control-flow exits and
+# Return, break, and continue are control-flow exits and
 # destroy every still-owned automatic generation that does not escape along that
 # edge. No destruction is sequenced after a no-return expression because that
 # continuation does not exist; values whose last uses precede it still end at
@@ -948,7 +924,7 @@ _ = resource
 # Calls receive the caller's result destination; conditional results, loop break
 # results, and variant widenings propagate destinations to the selected result
 # and its storage projections. These guarantees apply to direct
-# and indirect calls, including fallible calls, regardless of optimization.
+# and indirect calls, including ordinary calls, regardless of optimization.
 # Delivering a fresh result does not itself invoke a copy or move hook.
 # An immovable object retains its address throughout its lifetime, including
 # destruction. Address stability does not extend or retarget existing borrows.
@@ -1011,7 +987,7 @@ func make_named() Immovable
 # usable. Read or transfer the old value in an earlier statement instead:
 const current = item.value
 item = make(current + 1)
-# A path that leaves the right-hand side early, by return, failure, break, or
+# A path that leaves the right-hand side early, by return, break, or
 # continue, leaves the place uninitialized as after a transfer. A replaced field
 # therefore needs parents that permit a missing field, and a mut parameter
 # cannot return from within its own replacement.
@@ -1024,74 +1000,55 @@ item = make(current + 1)
 # expression, including producer arguments, copy hooks, and explicit transfers.
 # Ordinary parameters retain eager argument evaluation in source order.
 #
-# Every path that completes the receiving function successfully must consume
-# each init parameter exactly once, either by constructing it into an owning
-# destination or by forwarding it to another init parameter. Forwarding does
-# not evaluate the expression; the receiving callee takes over the obligation.
-# Construction supplies a destination and consumes the initializer even if its
-# evaluation fails. A path that fails or diverges before consumption may leave
-# it unevaluated. Returning successfully with a pending initializer, or using
-# one after it was consumed, is an error. An init parameter cannot be copied,
-# stored, returned as a pending initializer, or escape the receiving call.
-# Captured values remain subject to their ordinary lifetime obligations when
-# failure or divergence skips evaluation.
+# Each init parameter is affine: construct or forward it at most once on any
+# path. Any return may skip construction. A pending initializer cannot be copied,
+# stored, returned as a handle, or escape the receiving call. Forwarding defers
+# evaluation further. Captured values keep their ordinary lifetime obligations;
+# skipped evaluation leaves their sources untouched.
 #
 # An init parameter cannot be read, borrowed as T, or inspected for fields
 # before construction. Constructing it into a local consumes the initializer
 # and establishes that local as the value's destination. An immovable local
 # cannot subsequently be relocated into another destination.
-fallible materialize(static T: type, init item: T) T
+func materialize(static T: type, init item: T) T
     return item # constructs directly in this call's result destination
 
-fallible forward_initializer(static T: type, init item: T) T
-    return materialize?(T, item) # forwards once, without early construction
+func forward_initializer(static T: type, init item: T) T
+    return materialize(T, item) # forwards once, without early construction
 #
 # Deferred expressions retain the lexical bindings and access needed for later
-# evaluation. Their possible reads, writes, transfers, reference origins, and
-# failures are checked across argument preparation, the call, and forwarding.
+# evaluation. Their possible reads, writes, transfers, and reference origins are checked across argument preparation, the call, and forwarding.
 # Required owners and storage must remain valid until those accesses end;
 # conflicting consumption or mutation is rejected. Merely deferring a transfer
 # does not perform it, nor does nonescaping capture require a public closure.
 # Pending capture restrictions end when the receiving construction call ends,
-# on success or failure, including collection converters and handled initializer
-# expressions. Borrowed results retain their ordinary reference origins.
+# for every ordinary result, including collection converters and handled
+# initializer expressions. Borrowed results retain their ordinary reference origins.
 # Callable boundaries must preserve these effects rather than infer safety
 # from a particular callee body, inlining, or a direct-call spelling.
 # A caller may use a source afterward only if it remains available on every
 # path reaching that use. Skipped evaluation does not consume its source;
-# failure after a transfer does not undo it. A shared failure continuation may
-# therefore see the source as possibly consumed.
+# returning none or an error after a transfer does not undo it. A shared
+# continuation may therefore see the source as possibly consumed.
 #
-# init describes deferred construction and ownership, not a promise of success
-# or a policy for allocation failure. An abstract init parameter is conservatively
-# allowed to fail. A concrete initializer's ordinary failure effect is determined
-# without evaluating it, from the operations it may execute, including nested
-# initializers and selected element conversions. Declared fallible operations
-# remain fallible; inspecting a particular callee body does not waive its contract.
-# A provably infallible initializer needs no ordinary failure handling merely
-# because it is deferred or consumed through init. Deferral and forwarding
-# preserve the supplied initializer's effect rather than introducing failure.
-# Possible ordinary failure must be handled at the construction site or propagated
-# from a fallible function, including the implicit top-level entry. An ordinary
-# func cannot acquire a hidden failure outcome. A forwarding call still obeys the receiving callable's declared
-# fallibility; an infallible argument does not make a declared fallible call ordinary.
-# Keep one init mode, without separate infallible/fallible parameter modifiers.
-# Explicit type-level assertions of initializer infallibility remain unspecified.
-# Partial construction cleans up completed subobjects, with dependents before
-# owners and otherwise reverse initialization order. A completed nested object
-# receives its normal drop;
-# an incomplete object's whole-object drop hook is never called. Explicit-drop
-# obligations must be discharged on failure too. A successfully completed
-# aggregate uses its ordinary destruction order, not partial-construction order.
+# init describes deferred construction and ownership. Its result type describes
+# all returned values, including absence or error alternatives. Deferral adds no
+# return channel or implicit propagation. A region may return its own declared
+# result or diverge; return to the caller and break/continue to an outside loop
+# are rejected. A mismatch handler inside a deferred expression respects this
+# region boundary. Partial construction on an ordinary nonlocal exit destroys
+# completed subobjects in reverse initialization order, with dependents before
+# owners. An incomplete object's whole-object drop hook never runs. Explicit
+# drop obligations still apply. Completed aggregates use ordinary drop order.
 # Runtime and compile-time execution obey the same rules.
 #
 # A deferred initializer is a control-flow boundary: it produces its value,
-# fails, or diverges. Return targeting the caller and break or continue targeting
+# or diverges. Return targeting the caller and break or continue targeting
 # a loop outside the initializer are errors, not retargeted exits. Loops inside
 # the initializer retain their own break and continue; called functions return
 # normally. Forwarding, aliases, and indirect calls preserve this boundary.
 # Ordinary eager argument expressions retain caller-directed exits.
-# Deferred writes and completed transfers are not rolled back on failure.
+# Deferred writes and completed transfers are not rolled back by an absent or error result.
 # Reference escape, mutations of caller storage, and explicit-drop obligations still apply.
 
 
@@ -1157,15 +1114,16 @@ fallible forward_initializer(static T: type, init item: T) T
 # readonly-backing rules; this reference-field rule does not upgrade those views.
 #
 # Box.borrow(ref self) returns ref T. Array, List, and Span get(ref self, index)
-# and [](ref self, index) return ref T after checking bounds. `ref item = values[i]`
+# return (ref T) | none after checking bounds. Their [] operators return ref T
+# and panic on invalid bounds. `ref item = values[i]`
 # aliases an element; `var item = values[i]` copies it. Containers of Ref(T) return
 # ref Ref(T), which borrows the handle slot rather than silently unwrapping it.
 # An owned getter remains an owned getter and cannot satisfy a ref binding.
-# Explicit handles are requested with Ref.from(values.get?(i)) or
+# Explicit handles are requested with Ref.from(values[i]) or
 # Ref.from(owner.borrow()). No separate get_mut or borrow_mut accessor is needed.
 #
-# `if ref item = value as Member` selects an existing variant payload without
-# copying or consuming it. `if ref item = values.get(index)` binds on success.
+# `if ref item: Member = value` selects an existing variant payload without
+# copying or consuming it. `if ref item: T = values.get(index)` binds a present item.
 # Matching uses logical type and can select owned or reference alternatives.
 # An owned payload borrow retains its carrier and active-tag dependency; selecting
 # a reference alternative follows its captured referent without also borrowing
@@ -1193,15 +1151,19 @@ fallible forward_initializer(static T: type, init item: T) T
 #
 # Host storage and low-level operations:
 # `std.memory.Box(T)` uniquely owns one initialized T in separately managed
-# host storage. Its allocation is fallible, moving it preserves the storage
+# host storage. Its allocation returns Box(T) | none; moving preserves the storage
 # address, and destruction destroys T before releasing that storage. Box has
-# no copy capability; allocating a separate owner is an explicit fallible call.
+# no copy capability; allocating a separate owner returns an explicit optional.
 # Value construction and local binding do not themselves select allocation.
-# Box(T).new has the signature fallible(init item: T) Box(T). Box.new may infer
+# Box(T).new has the signature func(init item: T) Box(T) | none. Box.new may infer
 # T from the unevaluated initializer's type. The constructor obtains storage
 # before evaluating any part of item, for every T and every initializer shape.
-# Box.new?(make(argument())) orders allocation before argument() and make().
-# Box.new?(if condition -> first else second) allocates before the condition.
+# Box.new(make(argument())) orders allocation before argument() and make().
+# Box.new(if condition -> first else second) allocates before the condition.
+# An initializer returning T | none constructs that entire variant. For an
+# immovable T, Box(T | none).new(produce()) constructs its result in place;
+# extracting T into a separate Box(T) would require moving the selected payload.
+# Return alternatives do not bypass construction or deallocate a completed Box.
 # Nested Box construction follows the same rule, with the outer allocation first.
 #
 # Struct initializers and function results construct directly in that storage.
@@ -1211,18 +1173,10 @@ fallible forward_initializer(static T: type, init item: T) T
 # constructor is required for different capabilities. A transferred immovable
 # value remains invalid. T must be automatically droppable.
 #
-# Allocation failure skips the entire initializer. If evaluation later fails,
-# completed subobjects are cleaned up under the partial-construction rules,
-# then the allocation is released. No destructor runs on an uninitialized T.
-# Only successful construction publishes a Box owning the live T and storage.
-# The ordinary fallible constructor directly allocates one slot, handles
-# unsafe_initialize failure by deallocating it, then propagates with bare fail.
-# Earlier transfers and other initializer effects are not rolled back. Explicit
-# drop obligations created during evaluation must have a valid failure path.
-# These guarantees use general init and storage initialization semantics, not
-# Box-specific expression recognition or optional optimization.
-#
-# Box.new?(owner.borrow()) copies a copyable pointee into a distinct allocation.
+# Allocation refusal returns none and skips the entire initializer. Otherwise
+# construction produces T in its final slot and the constructor returns the Box.
+# Panic and divergence have their ordinary behavior. An optional/error value
+# returned by the initializer must be part of T; it never signals constructor failure.
 # Box has no separate duplication API. Consuming take(T, owner) or
 # take(T, owner^) uses deinit access to the Box; extraction of T still
 # requires direct movement in the host API.
@@ -1233,27 +1187,21 @@ fallible forward_initializer(static T: type, init item: T) T
 # succeed with a distinct, stable storage address; the provider may reserve
 # a minimal region to supply it.
 # Zero-sized values still run their destruction hooks. Negative counts and
-# layout overflow fail through fallible control flow.
+# layout overflow return none.
 #
 # `std.memory.Allocation(T)` uniquely owns uninitialized storage. Its layout
 # comes from the layout domain selected by the execution target and location,
 # the element count, and alignment; the checked byte size is count times that
 # domain's element stride, which is aligned even for zero-count requests.
 # Alignment is at least the natural alignment for T in that domain. Overflow
-# fails before allocation. The logical count remains separate from the byte layout.
+# returns none before allocation. The logical count remains separate from the byte layout.
 # It must be consumed by deallocation, which releases storage but does not
-# destroy elements. fallible unsafe_initialize(T, mut allocation, index, init value)
-# consumes an initializer into an uninitialized element slot using the general
-# destination rules. Allocation and index arguments evaluate eagerly; the value
-# expression is deferred until slot initialization. Allocation(T).unsafe_initialize
-# is also explicitly fallible. Calls obey these declared fallible signatures,
-# even when the supplied initializer is infallible; this does not make the
-# initializer itself fallible. Failed construction
-# cleans completed subobjects and leaves no initialized element; captured writes
-# and completed transfers are not rolled back.
-# Planned fallible unsafe_initialize_all(T, N, mut allocation, init value: collection_literal(T, N))
-# constructs the literal's elements in order into slots 0 through N - 1; the
-# caller proves capacity and that those slots are uninitialized.
+# destroy elements. unsafe_initialize(T, mut allocation, index, init value)
+# constructs into a caller-proven uninitialized element slot and returns unit.
+# Allocation and index evaluate eagerly; value stays deferred until construction.
+# The method form uses the same ordinary signature and destination rules.
+# Planned unsafe_initialize_all(T, N, mut allocation, init value: collection_literal(T, N))
+# constructs slots 0 through N - 1 with caller-proven capacity and initialization.
 # unsafe_take(T, mut allocation, index) still requires directly movable T in
 # the host API.
 # unsafe_destroy(T, mut allocation, index) destroys an initialized element at
@@ -1280,9 +1228,9 @@ fallible forward_initializer(static T: type, init item: T) T
 # Allocation(T).capacity() returns its allocated element count, including for
 # zero-sized T. List capacity is derived from that count rather than stored twice.
 # std.memory.List(T) owns Allocation(T) and a contiguous initialized prefix
-# of length elements within capacity allocated slots. Creation is fallible;
+# of length elements within capacity allocated slots. Creation returns List(T) | none;
 # negative capacity fails. Zero capacity still owns a distinct allocation.
-# List(T).filled(imm value: T, count: int) is fallible and requires copyable T.
+# List(T).filled(imm value: T, count: int) returns List(T) | none and requires copyable T.
 # It allocates exactly count slots once, then constructs each element by one
 # ordinary copy of value, which is not consumed. Negative count fails.
 # Destroying a List destroys only the initialized prefix, in reverse order,
@@ -1296,15 +1244,15 @@ fallible forward_initializer(static T: type, init item: T) T
 # relocates in reverse index order. unsafe_take extracts the owned value with
 # its contained referent origins, independently of the old slot. Internal slot
 # construction inherits only its initializer's failure; supported moves are
-# infallible, so relocation has no ordinary failure after allocation succeeds.
+# ordinary, so relocation needs no optional result after allocation succeeds.
 # The initialized count remains unchanged, and the old allocation is released
 # after all elements have been relocated. `get(index)`
-# checks 0 <= index < length and returns ref T with permission inherited from
-# the receiver. An empty
+# checks 0 <= index < length and returns (ref T) | none, with a present reference
+# inheriting permission from the receiver. An empty
 # List has no initialized element, even for an immovable T; append still
 # rejects elements that cannot move directly. slice(bounds)
 # resolves a Range against the initialized prefix and returns
-# Span(T). span() borrows the complete initialized prefix with backing permission
+# Span(T) | none. span() borrows the complete initialized prefix with backing permission
 # inherited from the receiver. Lookup preserves existing element aliases. Writes preserve
 # the identity of an initialized slot and invalidate content-dependent views;
 # reallocation or destruction invalidates loans into ended element storage.
@@ -1323,7 +1271,7 @@ fallible forward_initializer(static T: type, init item: T) T
 # allocation or a container owner. Array also supplies span(). Span
 # owns no destruction; Ref designates one initialized element and owns none either.
 # Span.len() is initialized length, never reserved capacity. get checks bounds
-# and returns ref T; slice(bounds) checks nonnegative, overflow-safe bounds
+# and returns ref T | none; slice(bounds) checks nonnegative, overflow-safe bounds
 # and preserves permission. Array and List expose the same range-based slice
 # operation. There is no separate public start/size slicing API. Empty endpoint
 # slices are valid, including for
@@ -1415,7 +1363,7 @@ fallible forward_initializer(static T: type, init item: T) T
 # internally; success satisfies the requested size and alignment. It cannot
 # change the element stride or reinterpret another target's representation.
 #
-# Allocation is fallible and grants exclusive ownership of uninitialized storage.
+# Allocation returns an optional owner of uninitialized storage.
 # The handle retains location, count, original layout, and deallocation authority.
 # That authority is self-contained or depends on provider and location resources
 # that must remain alive; dependent references retain those resources too.
@@ -1565,8 +1513,8 @@ func S.read_a(imm value: S) int -> value.a
 # do not contribute fields or execute when a struct value is initialized.
 # A generic struct factory's namespace can be used before specializing the
 # factory. A direct member call infers its missing factory parameters from the
-# member's argument types, including unevaluated init arguments in Box.new?(value).
-# The caller may specialize the factory first, as with Box(T).new?(value).
+# member's argument types, including unevaluated init arguments in Box.new(value).
+# The caller may specialize the factory first, as with Box(T).new(value).
 # Missing members are namespace errors even when the factory is not specialized.
 # In a nested namespace, enclosing factories must be specialized before inferring the
 # immediate factory's arguments.
@@ -1610,8 +1558,8 @@ pub struct Interval
     start: int
     end: int
 
-    pub fallible new(start: int, end: int) Interval
-        start <= end
+    pub func new(start: int, end: int) Interval | none
+        if start > end -> return none
         return Interval{start = start, end = end}
 
 # Ownership properties and defaults:
@@ -1652,7 +1600,7 @@ pub struct Interval
 # explicitly requested inside the hook follow the same rules as other code.
 # The logical effects of selected hooks are observable and cannot be omitted
 # merely because storage could be reused.
-# Potentially failing duplication is an explicitly called fallible function,
+# Potentially failing duplication is an ordinary function returning an optional,
 # not an implicit copy operation.
 # Without copy support, an existing value passed to a var parameter requires
 # transfer with '^'. A deinit parameter consumes the original value in place.
@@ -1710,7 +1658,7 @@ reassigned = int_or_float_value
 # and requires no payload storage; the variant may still need a discriminant.
 # Named cases have distinct identities even when their payload types coincide.
 # A payload-free case is neither bare unit nor bare none, so it does not itself
-# introduce failure-to-none conversion. Existing type alternatives remain ordinary
+# change the meaning of none. Existing type alternatives remain ordinary
 # members rather than becoming wrapped cases.
 # Informative errors use ordinary variants and payloads, not a new payload-carrying
 # failure effect. Declaration syntax below is a sketch; case construction,
@@ -1732,33 +1680,14 @@ static Error =
 # parameter's mode follows its type: static for a compile-time-only type,
 # including static structs and int_literal, init for collection_literal, and
 # imm otherwise, so inserting a converter never consumes an existing value.
-# Ordinary value converters are infallible. A value parameter whose expected
-# variant includes none accepts failure as that member. Selection uses the
-# successful source and target types and permits builtin input widening; it does
-# not depend on whether the particular argument can fail. A consuming init converter may
-# propagate ordinary failure from its supplied initializer, with the required
-# partial-construction cleanup. This construction effect is separate from the
-# converter's own operations: the converter cannot introduce unrelated ordinary
-# failure, and must handle such failures locally. The implicit initialization
-# inherits the supplied initializer's actual effect; an abstract initializer
-# remains conservatively allowed to fail. A provably infallible initializer does
-# not make the conversion fallible merely because its parameter mode is init.
-# Failure is handled by the enclosing binding condition or propagated within a
-# declared fallible function; it never silently makes an ordinary func fallible.
-# Implicit conversion needs no explicit construction function or call marker.
-# Explicitly written fallible calls retain their ordinary marker requirements.
-# No general fallible converter declaration or additional init mode is introduced.
-# Allocation panic policy belongs to the consuming constructor, not to init.
-# Bodies, `where` clauses, and reference origins follow ordinary function rules.
-# A static source argument is evaluated at compile time; it does not require
-# the converter body to execute at compile time. A converter may construct a
-# runtime-capable result at runtime, but cannot retain compile-time-only values
-# in that result's runtime storage.
-struct Degrees
-    value: float
-struct Radians
-    value: float
-pub converter(value: Degrees) Radians -> Radians{value = to_radians(value.value)}
+# Converters are ordinary functions with their declared result type. Their
+# source and target types determine selection before evaluation; builtin source
+# widening is allowed, but no converter chains are inferred. A none alternative
+# is data and never establishes a control boundary. A consuming init converter
+# uses the same deferred construction, region boundaries, and cleanup rules as
+# any init consumer. Its supplied expression must construct the declared type.
+# Pattern matching selects types directly and never calls a converter.
+
 
 # A converter is a top-level declaration in a module that owns its source or
 # target type. A struct is owned by its defining module, a parameterized struct
@@ -1790,8 +1719,8 @@ where T is String or T.String is func(imm T) String -> 1
 # Conversion applies only where the expected type is already known: bindings,
 # assignments, arguments, returns, struct initializer fields, and the results
 # propagated to them, such as conditional branches. A value whose type equals
-# the expected type is not converted. Built-in variant and callable widening
-# also take precedence over converters, preserving an already compatible value.
+# the expected type is not converted. Built-in variant widening also takes
+# precedence over converters, preserving an already compatible value.
 # Otherwise the candidates are the built-in literal defaults, a
 # converter from the source to the expected type, and, for an expected variant,
 # a converter from the source to one member followed by widening. Exactly one
@@ -1853,8 +1782,8 @@ const read_only = handle
 # Arrays containing immovable elements cannot move directly. No operation in
 # this initial API consumes individual elements or exposes uninitialized slots.
 #
-# len(imm self) returns N. get(ref self, index: int) is fallible and succeeds
-# only for 0 <= index < N. It returns ref T with the receiver's permission
+# len(imm self) returns N. get(ref self, index: int) returns ref T | none.
+# Only 0 <= index < N selects a reference with the receiver's permission
 # and storage origin. Element
 # references cannot outlive, move with, or survive destruction of their array.
 # Replacing an element uses ordinary Ref replacement and cleanup rules.
@@ -1863,7 +1792,7 @@ const read_only = handle
 # execution share this API and its checked-reference semantics.
 # Collection construction and iteration are specified separately below.
 var repeated = Array(int, 4).filled(7)
-const first = repeated.get?(0)
+const first: int = repeated.get(0) else panic "missing element"
 
 
 # Collection literals
@@ -1891,42 +1820,18 @@ const first = repeated.get?(0)
 # Elements construct directly into their final destinations, without first
 # building and relocating an intermediate Array or requiring copyable elements.
 #
-# Collection construction has the ordinary failure effect of its elements,
-# including their initializers and conversions. For infallible element operations,
-# [1, 2, 3] is infallible construction and needs no binding condition or other
-# ordinary failure handling. An Array literal performs no separate allocation,
-# but may still fail when an element initializer fails. On ordinary failure,
-# first clean any partially constructed current element, then destroy the
-# completed element prefix in reverse initialization order. Do not evaluate
-# remaining elements. Captured writes and completed transfers are not rolled back.
-#
-# std: pub converter(static T: type, static N: int, init value: collection_literal(T, N)) List(T)
-# List's consuming converter obtains the required storage before evaluating any
-# elements, then constructs them in place. Allocation failure in this convenient
-# implicit construction causes a runtime panic, not ordinary failure. Panic
-# terminates runtime execution and cannot be recovered through fallible control
-# flow; it is not a compiler invariant violation. This policy does not change
-# explicitly fallible allocation APIs, and recoverable allocation remains an
-# opt-in operation rather than a requirement at every literal use.
-# At compile time, the standard converter's reached panic reports a source
-# diagnostic and call trace; it does not become ordinary failure, compiler-
-# control exit, or compiler resource exhaustion.
-# Ordinary element failure is not a panic: clean partial construction and the
-# completed prefix, release the List allocation, and propagate that failure.
-# The allocation panic policy therefore adds no ordinary failure effect to a
-# literal with infallible elements. No explicit function call is needed to
-# construct a List from a literal with a known expected type.
-# The explicit alternative List(T).from([elements]) is a fallible factory whose
-# static length is inferred from the literal. Allocation failure returns ordinary
-# failure before evaluating elements. Element failure remains ordinary failure
-# with the same reverse cleanup and allocation release. This explicitly fallible
-# API retains its declared call requirements even for infallible elements.
-const values: List(int) = [1, 2, 3] # ordinary initialization; allocation may panic
-const bytes: List(byte) = [1, 2] # T = byte; each element converts
-const numbers: List(int | float) = [1, 2.5]
-const mixed = [1, 2.5] # defaults to Array(int | float, 2)
-if const parsed: List(int) = [parse_number?(text), 42] -> use(parsed)
-else -> handle_failure() # ordinary element failure, not allocation panic
+# Elements construct directly in final storage. An ordinary exit from an
+# element expression cleans its partially built value, completed prefix, and
+# owned allocation in reverse initialization order; later elements do not run.
+# none and explicit error alternatives remain elements when the element type
+# accepts them; they do not interrupt construction.
+# List's consuming literal converter allocates before evaluating its elements
+# and panics if allocation is refused. Explicit List(T).from returns List(T) | none
+# instead, leaving deferred elements unevaluated when allocation is refused.
+# Both paths share the same element construction and ownership rules.
+const values: List(int) = [1, 2, 3]
+const bytes: List(byte) = [1, 2]
+const recovered: List(int) = List(int).from([1, 2, 3]) else panic "allocation refused"
 
 
 # Collection expansion
@@ -1946,9 +1851,9 @@ else -> handle_failure() # ordinary element failure, not allocation panic
 # a separate feature.
 # Array spreading uses the Array's structural sequence and length, independently
 # of user iteration methods. Other sequence spreading and runtime for/if clauses
-# use the ordinary iteration and condition contracts. A filter's ordinary failure
-# skips the item; source preparation, polling, and element failures fail the
-# construction. Panic and diagnostics are never filter rejection. Sources are
+# use the ordinary iteration and bool condition contracts. A false filter
+# skips the item. Source preparation, polling, and element evaluation follow
+# their explicit return types; panic and diagnostics are never filter rejection. Sources are
 # evaluated once, in source order; producers are never replayed to count items.
 # Purely static expansion and Array spreading retain fixed-count literal
 # conversion and Array defaults. Potentially runtime-sized constructions default
@@ -1962,7 +1867,7 @@ else -> handle_failure() # ordinary element failure, not allocation panic
 # and ownership rules; it does not consume individual source slots. Comprehension
 # bindings use ordinary for modes. Output references retain their source lifetimes
 # and cannot survive invalidating polls. Elements construct in final storage;
-# ordinary failure destroys the completed prefix in reverse order and releases
+# an ordinary exit destroys the completed prefix in reverse order and releases
 # owned sources, cursors, and List storage. Completed side effects are not undone.
 # Growable contiguous results require movable elements. A statically bounded
 # result can reserve its complete static bound before constructing immovable
@@ -1971,162 +1876,79 @@ else -> handle_failure() # ordinary element failure, not allocation panic
 # Implicit List allocation failure, including growth, panics. List(T).collect
 # receives init collection_sequence(T), a construction-only carrier for a List(T)
 # expression with recoverable bracket allocation. Its logical value field holds
-# the eventual List's reference shape; the carrier has no ordinary runtime value.
+# the eventual optional List's reference shape; the carrier has no ordinary runtime value.
 # Consuming it constructs List(T), and it cannot be bound or stored. The parameter
 # type selects recoverable construction for direct calls, callable values, and
 # other init consumers uniformly. Both fixed and runtime shapes are supported;
-# collect's normal fallible call marker is required in expression contexts.
+# collect returns List(T) | none using the ordinary variant result protocol.
 # Existing List(T).from remains the fixed-count pending-literal factory.
 
 
-# Fallibility
-# A fallible expression succeeds with a value of its successful type or fails
-# without a value. Failure is a control effect, independent of the payload type.
-# Comparisons succeed with unit when true and fail otherwise.
-# Equality and inequality accept matching int or bool operands. Ordered
-# comparisons accept int operands. Bool payloads carry data, not an outcome;
-# postfix query is the explicit bridge from bool data to ordinary failure.
-# 'fallible' replaces 'func' in declarations and callable types.
-static accept_small = fallible(a: int) int
-    a < 2 # failure propagates out of this fallible function
-    return a
+# Variants and typed binding patterns
+# There is one ordinary return channel. Absence and errors are ordinary variant
+# alternatives: T | none, T | E, bool | E, or T | none | E. none has no truthiness.
+# An expected type never catches control flow or manufactures none. Functions
+# return none or an error explicitly. Calls use the same syntax in every context.
+# Function types describe parameters and results, with no fallibility effect or
+# implicit callable widening. There is no fail statement, query postfix, or
+# expression-level checked cast. `as` is reserved for import aliases.
+func accept_small(value: int) int | none
+    if value >= 2 -> return none
+    return value
 
-# Failure-to-none conversion
-# An expected variant containing none catches ordinary failure from its complete
-# expression and stores none. On success the value must satisfy the usual
-# conversion and ownership rules. An explicit none directly selects the none
-# member of such a variant, without competing with converters to other members.
-# This applies at arguments, typed bindings, assignments, field initialization,
-# and returns. A variant without none does
-# not introduce a failure boundary. none alone is an ordinary single-valued type.
+# Comparisons, membership, is, and logical operators produce bool. and/or short
+# circuit left to right; not negates a bool. Precedence, tightest first:
+# comparisons, not, and, or. No variant-to-bool conversion is implicit.
+const small: bool = value < limit
+if small -> use_small()
+
+# A type annotation in a conditional binding is a pattern: select the active
+# alternative whose logical type is included in the annotation. It does not
+# invoke converters. Union annotations select their structural intersection.
+# A nonvariant value matches its own type. A disjoint type always mismatches.
+# The source executes once. A match binds even when the payload is false or none.
+# An unannotated binding binds the complete value and is irrefutable.
+if const value: int = accept_small(input) -> use(value)
+else -> handle_absence()
+if const flag: bool = optional_flag -> use(flag)
+if const stored = optional_flag -> use_optional(stored)
+
+# Standalone bindings use the same pattern with an explicit mismatch handler.
+# The handler must leave the enclosing flow (return, break, continue, or never).
+# Bound names are visible after the declaration; the handler cannot see them.
+# Without else, ordinary initialization must be statically valid and cannot
+# narrow a variant. Its normal conversions and ownership rules still apply.
 func value_or(value: int | none, fallback: int) int
-    if const found = value as int -> return found
-    return fallback
-const size = value_or(read_size?(), 0)
-const saved: int | none = read_size?()
+    const found: int = value else return fallback
+    return found
+const size: int = read_size() else panic "missing size"
+const saved: int | none = read_size()
 
-# Arguments are prepared exactly once, left to right. Captured failure includes
-# nested operands, calls, indexing, conversion, and partial construction. Clean
-# up the completed construction prefix, construct the none member, and proceed
-# to the next argument. An argument without such an expected variant still
-# requires success: its failure skips the call and later arguments. Earlier
-# writes and completed transfers are not rolled back. Panic, exit, and compiler
-# errors never become none. A nearer failure handler owns the failure first.
+# Conditional bindings use immutable const or ref; standalone bindings may also
+# use var. const copies an existing borrowed payload and requires copy support.
+# ref aliases the selected payload without consuming the source. It preserves
+# the source's permission and lifetime, and never grants ownership.
+# An explicit transfer consumes the whole variant before testing. A fresh
+# result is also owned. Matching transfers its selected payload; mismatch cleans
+# the unmatched owned alternative. Explicit-drop obligations apply only to
+# alternatives possible on each path. Completed side effects are not undone.
+# The original transferred source is unavailable on either outcome. No pattern
+# narrows the type of the original binding.
+if const item: Item = source^ -> consume(item^)
+if ref item: Item = source -> inspect(item)
 
-# The callee receives an ordinary variant. Reading or forwarding it does not
-# fail; is tests its active member and as extracts it. Success with none and
-# captured failure are indistinguishable. Ownership modes keep their ordinary
-# meanings. A mut parameter needs a mutable place of the exact variant type;
-# optional references can represent an optional borrow of different storage.
-static handler: func(int | none, int) int = value_or
-
-# Ordinary infallible converters may receive a source through builtin widening
-# into their declared input type. Selection uses the successful source and
-# target types before evaluating the expression; no converter chains are inferred.
-# If the selected converter's input variant contains none, that ordinary expected
-# input type captures failure during expression preparation.
-# A never-typed expression has no successful payload. For converter selection,
-# only input variants accepting none can handle its ordinary failure; several
-# eligible converters remain ambiguous. Divergence and compiler control still
-# bypass the conversion.
-pub converter(condition: unit | none) bool
-    if condition is unit -> return true
-    return false
-const small = bool(value < limit)
-if small? -> use_small()
-const missing = bool(false?) # false
-const inverse = bool(not small?)
-# An already boolean value uses identity conversion, so bool(false) is false.
-# none remains ordinary data: reading it succeeds. Extract or inspect the active
-# member to turn absence back into control failure, e.g. saved as int.
-
-# A fallible function need not fail. Fallibility is part of its type.
-static checked_identity: fallible(int) int = fallible(a: int) int -> a
-
-# Ordinary functions implicitly widen to compatible fallible functions,
-# but fallible functions never narrow implicitly to ordinary functions.
-# When a variant contains both the exact callable type and its fallible
-# widening, injection preserves the exact member.
-static identity: func(int) int = func(a: int) int -> a
-static widened_identity: fallible(int) int = identity
-
-# Named declarations follow the same sugar as ordinary functions.
-fallible accept(arg: int) int
-    return arg
-
-# A call to a fallible callable must use fallible-call syntax `callee?(args)`
-# unless the call expression itself appears in a context that requires a
-# fallible expression. The exemption applies only when the context requires
-# that specific call to be fallible, not merely because an enclosing or
-# containing expression is fallible. Direct calls, namespace and instance
-# calls, aliases, and callable values obey the same rule.
-foo?()          # required: ordinary expression context
-foo?() < 0      # required: the comparison is fallible independently of foo
-foo?() as int   # required: `as` is fallible independently of foo
-
-if foo()        # no `?`: the condition itself must be fallible
-    run()
-if const x = foo() -> use(x) # no `?`: the binding condition requires a fallible expression
-# `?` marks a fallible invocation only where the call's fallibility would
-# otherwise be indistinguishable from an ordinary call. It is not a general
-# failure-propagation operator. Handling and propagation follow the ordinary
-# fallible control-flow rules; a fallible enclosing function alone does not
-# exempt a call from the marker.
-# The marker requires a fallible callable; it does not implicitly widen an
-# ordinary callable to a fallible one. Explicit callable widening still applies
-# before invocation according to the callable compatibility rules above.
-
-# Bare fail is a statement that propagates ordinary failure with no value.
-# It is permitted only in a fallible enclosing function (including the implicit
-# top-level entry) or initializer region, including after explicit cleanup.
-# It is not an expression or a separate
-# nonlocal outcome. Initializer regions permit failure, but being a region does
-# not itself add an ordinary failure effect. A possible fail contributes that
-# effect to the initializer. Functions retain their declared fallibility; implicit
-# init conversion additionally preserves its supplied initializer's effect.
-fallible reject()
-    fail
-
-# 'is' succeeds when the active variant member belongs to the given type.
-# 'as' also carries the narrowed value on success.
-# The inspected value must have a variant type. The inspected type may overlap
-# partially or not at all; 'as' produces the structural intersection on success,
-# and an empty intersection always fails.
-# A condition binding is immutable and visible only in the success body. Its
-# optional annotation follows ordinary widening rules. A fallible call can
-# bind its successful return value as an owned local (`if const item = call() -> ...`).
-# Failure enters `else` without a binding. Extracting from an existing place
-# copies the selected payload and requires copy support; it does not refine
-# or alias the original value. `if const item = source^ as T` transfers the
-# whole variant before testing. Success gives item ownership of the selected
-# payload without copying it; failure ends the unmatched temporary normally.
-# The original source is unavailable on both paths, including when the types
-# do not overlap. A fresh variant result is owned and uses the same consuming
-# extraction without needing ^. Explicit-drop obligations still apply to every
-# ownership path. Failure cleanup checks only unmatched alternatives; matched
-# explicit-drop members create no obligation on the failure path. Casting an
-# an `if ref part = value as Member` condition borrows the payload without consuming it.
-func inspect(fi: float | int)
-    if fi is float -> found_float()
-    if const f = fi as float -> use_float(f)
-    if fi is float | bool -> found_float_or_bool()
-
-# 'and', 'or', 'not' compose expression outcomes and succeed with unit, short-circuiting
-# left to right. Precedence, tightest first: comparisons, not, and, or.
-if 2 < 3 and 5 > 4 or 1 < 5 and not 9 < 2 -> run()
-# 'not 9 < 2' means 'not (9 < 2)'.
+# Type membership inspects the active alternative and returns bool. It binds
+# nothing and does not convert or consume its operand.
+if saved is int -> found_number()
+if saved is int | bool -> found_number_or_flag()
 
 
 # Conditionals
-# 'if' selects its body on success and 'else' on failure.
-# The complete condition expression is a failure boundary: nested calls and
-# indexing failures select else, including failures before the final comparison.
-# Any successful value selects the body; its payload does not decide the branch.
-# bool is ordinary data: query it explicitly to branch on true versus false.
+# A plain if condition must be bool: true selects the body, false selects else.
+# A binding condition instead tests its pattern. Nested calls have no implicit
+# control effect. A stored optional must be inspected or matched explicitly.
 const enabled: bool = true
-if enabled? -> run()
-# `if false` succeeds with false data and therefore selects its body.
-# `if false?` fails and therefore selects else.
+if enabled -> run()
 
 # Bodies can be indented, inline, or mixed.
 if 1 < 2
@@ -2150,7 +1972,7 @@ else if 3 < 5
 else true
 const c: int = if 1 < 2 -> 1 else exit(0)
 
-# Without 'else', the failure path produces unit and joins with the body value
+# Without 'else', the unmatched or false path produces unit and joins with the body value
 # like an explicit 'else ()'.
 const maybe: int | unit = if 1 < 2 -> 1
 
@@ -2163,37 +1985,38 @@ const maybe: int | unit = if 1 < 2 -> 1
 
 # Match
 # Literal: match an equal value. '_': match anything without binding.
-# Bare identifier: match anything and bind it immutably in the arm.
+# A bare name resolving to a type tests the active alternative against that type.
+# Type names include aliases, qualified names, and specialized types; unions
+# select their structural intersection with the subject. Type patterns bind
+# nothing and do not narrow the original subject binding.
+# A fresh bare identifier matches anything and binds it immutably in the arm.
+# name: Type combines type selection and capture, with the same orientation and
+# copy/borrow/transfer rules as conditional bindings. ref name: Type borrows the
+# selected alternative. Typed tuple elements nest these patterns recursively.
 # Tuple: match the stated arity and apply each element pattern recursively.
 # (x, y) captures two elements; (0, y) tests one and captures the other;
 # (x, _) ignores the second without copying it. (x) groups a pattern and
 # (x,) matches a singleton tuple. () still matches unit, not an empty tuple.
 # Tuple patterns do not positionally destructure nominal structs.
-# A bare pattern name always introduces a new arm-local capture; it never
-# tests equality against an outer name. Duplicate names and shadowing are
-# source errors. Sibling arms can independently reuse the same names.
+# A name that does not resolve to a type introduces a new arm-local capture;
+# it never tests equality against an outer value. Duplicate names and shadowing
+# are source errors. Sibling arms can independently reuse the same names.
 # Tuple captures have their elements' logical types; corresponding captures
 # across compatible tuple alternatives must agree. No variant-of-tuples to
 # tuple-of-variants distribution is inferred. Reference storage and authority
 # remain independent of those logical element types.
-# Existing scalar/type 'pattern as name' also binds the matched value.
-# Tuple captures use element names; whole-tuple 'as name' is not supported.
-# 'is Type': type pattern, distinct from an identifier binding.
+# Match headers have no leading 'is' or 'pattern as name' capture syntax.
+# Payload extraction uses ordinary bindings in the arm body, e.g.
+# 'if const name: Type = subject' or 'if ref name: Type = subject'.
 # Captures own immutable values like const bindings: an existing place supplies
 # a copy, while a fresh or explicitly transferred owner supplies ownership.
-# `ref name` and `pattern as ref name` instead alias the matched place under
-# ordinary permission and lifetime rules. There is one capture per matched
-# value: `x as y` and chained `as` captures are errors. Further copies or aliases
-# are explicit ordinary bindings in the arm body. `as _` binds nothing.
+# `ref name` aliases the matched place under ordinary permission and lifetime
+# rules. Further copies or aliases are explicit ordinary bindings in the arm body.
 # Capturing a whole variant preserves its stored alternatives; owning logical
 # type extraction copies a selected reference referent, never consumes it.
-# A type capture has the pattern's structural intersection with the original
-# subject type, not a residual type after preceding arms. Reference capture
-# cannot alias a subset variant with a different layout.
 # The subject evaluates once without an arm-result expected type. Tests inspect
-# without consuming on mismatch. The first matching arm runs; body failure
-# propagates rather than trying another arm. Subject failure runs no arm, and
-# a none pattern matches successful none data, not an earlier failure.
+# without consuming on mismatch. The first matching arm runs. Returning none
+# or an error from its body returns ordinary data and never tries another arm.
 # Literal patterns use built-in value equality, not user equality or arbitrary
 # converters. Supported domains are int, byte, bool, unit, none, compile-time
 # integer literals, and registered String/StaticString/StringView text. A literal
@@ -2212,9 +2035,8 @@ const maybe: int | unit = if 1 < 2 -> 1
 # An arm can follow its pattern with and and an ordinary condition expression.
 # All captures become visible only after the complete pattern matches, then
 # remain visible in its condition and selected body. Conditions short-circuit
-# with ordinary success/failure semantics; bool values require explicit ?.
-# Nested ordinary failure rejects the arm after attempt-local cleanup. Body
-# failure never retries. Side effects outside protected storage persist.
+# as bool expressions. A false guard cleans attempt-local captures and tries
+# the next arm. A selected body never retries. Completed side effects persist.
 # A guarded arm does not establish exhaustive coverage. An unconstrained,
 # unguarded tuple pattern covers its compatible tuple alternatives; partial
 # element patterns require an unconditional remainder unless existing scalar
@@ -2231,9 +2053,7 @@ const maybe: int | unit = if 1 < 2 -> 1
 # During dispatch, conditions cannot consume, mutate, or invalidate the retained
 # subject, its projected referents, or their prepared captures through any alias.
 # Unrelated writes and I/O are permitted. Normal reference permissions resume
-# in the selected body. A capture requiring a consuming representation change
-# is unavailable for condition reads until selection; no temporary substitute
-# or implicit clone is used. Ordinary const declarations and if are unchanged.
+# in the selected body. Ordinary const declarations and if are unchanged.
 match point
     (0, 0) -> origin()
     (x, y) and x > y -> above(x, y)
@@ -2241,14 +2061,14 @@ match point
 
 match n
     2 -> 3
-    10 as x ->
-        const y = x + 2
+    10 ->
+        const y = n + 2
         y
     _ -> 6
 
 match fi
-    is int as i -> use_int(i)
-    is float as f -> use_float(f)
+    int -> found_int()
+    bool -> found_bool()
 
 
 # Loops
@@ -2293,6 +2113,11 @@ loop
 # These finite integer ranges initially iterate upward. A start greater than
 # the end produces an empty iteration; x..x is empty and x..=x contains exactly x.
 # This does not make reversed bounds valid for slicing.
+# Range.contains supports membership only when both stored endpoints are absolute
+# integers. x in a..b checks a <= x and x < b; x in a..=b checks a <= x and x <= b.
+# Empty or reversed ranges fail membership. Omitted and FromEnd bounds fail
+# membership, including when those bounds are selected at runtime. Inclusive
+# comparisons do not increment the upper bound and support the full int domain.
 #
 # Prefix ^n constructs an ordinary std.range.FromEnd value, equivalent to
 # std.range.from_end(n), independently of caller imports or shadowing. It evaluates
@@ -2306,7 +2131,7 @@ loop
 # element. ^0 denotes the past-end boundary: valid as an exclusive slice bound,
 # invalid as an element index or inclusive upper bound. Relative positions and
 # stored ranges resolve anew against each receiver's current initialized length,
-# never its capacity. Range.resolve?(length) explicitly resolves a stored range
+# never its capacity. Range.resolve(length) explicitly resolves a stored range
 # to absolute, exclusive (start, limit) bounds.
 # The old inclusive spelling ..^ is not an alias for ..=: it now means an
 # exclusive range with a relative upper bound.
@@ -2328,7 +2153,7 @@ loop
 # No standard range setter or bulk slice assignment is defined.
 #
 # reversed() reverses the actual sequence, including a stepped sequence.
-# step_by?(positive_factor) selects the first item and then every factor-th item
+# step_by(positive_factor) selects the first item and then every factor-th item
 # of the receiver's sequence. It fails for a zero or negative factor, even on
 # an empty range. Both return std.range.RangeSequence values, distinct from raw
 # Range bounds; a RangeSequence is not a contiguous slice argument. Repeated
@@ -2337,10 +2162,10 @@ loop
 # Iteration checks the final item before advancing past it, so inclusive ranges
 # ending at 2147483647 terminate without wrapping. Reversal and stepping do not
 # add items outside the original sequence. Reversing an empty range is empty.
-fallible range_examples()
-    const selected = (0..10).step_by?(4) # 0, 4, 8
+func range_examples()
+    const selected: RangeSequence = (0..10).step_by(4) else panic "invalid stride" # 0, 4, 8
     const backward = selected.reversed() # 8, 4, 0
-    const other = (0..10).reversed().step_by?(4) # 9, 5, 1
+    const other: RangeSequence = (0..10).reversed().step_by(4) else panic "invalid stride" # 9, 5, 1
 
 # Iteration protocol
 # Iterators are ordinary structs specialized through static parameters, with no
@@ -2355,11 +2180,11 @@ fallible range_examples()
 # and std.iteration.End, also exported by the prelude. next is the sole cursor
 # protocol; there is no build flag, advance/current compatibility, or automatic
 # fallback. General computed-member composition and automatic callable
-# result/effect discovery remain separate, deferred interface decisions.
+# result-type discovery remains a separate, deferred interface decision.
 # Ref has one type parameter; writable authority follows ordinary provenance,
 # not a boolean type argument or a factory name that upgrades readonly access.
 #
-# End denotes normal exhaustion, independently of ordinary fallible failure.
+# End denotes normal exhaustion. Any error protocol must use explicit data.
 # Loop lowering requires an owned std.iteration.End alternative in
 # the poll result, independent of caller imports or shadowing. A reference-to-End
 # alternative is not the exhaustion representation.
@@ -2377,7 +2202,7 @@ fallible range_examples()
 #
 # Borrowed aggregate results and fresh immovable destination construction through
 # the result union are implemented. Type factories can select exact static
-# fallibility and owned/reference delivery from explicit static arguments.
+# result types and owned/reference delivery from explicit static arguments.
 # Broader generic adapter interfaces require approval before implementation;
 # they are not prerequisites for this protocol. Buffering does not permit later
 # relocation. ROADMAP.md owns remaining library priorities and validation gates.
@@ -2386,7 +2211,7 @@ fallible range_examples()
 #   iter(...) Cursor          optional source-to-cursor factory
 #   next(...) T | End         owned-item cursor operation
 #   next(...) ref T | End     borrowed-item cursor operation
-# Methods retain their ordinary receiver modes, ownership, and fallibility.
+# Methods retain their ordinary receiver modes, ownership, and result types.
 # Generic methods and callable fields follow ordinary member-call rules.
 # No trait, associated item type, iter declaration, or yield syntax is required.
 #
@@ -2406,17 +2231,15 @@ fallible range_examples()
 # droppable, with no owned End alternative that could be confused with exhaustion.
 # Captured references retain their referents and permissions; aliases into an
 # owned item depend on its poll carrier, independently of the former List slot.
-# Break, return, and ordinary failure destroy remaining elements in reverse order
+# Break and return destroy remaining elements in reverse order
 # and release storage. Even empty traversal consumes the List. Cursor and item
 # follow independent last-use cleanup. Panic and process exit do not unwind.
 #
 # Each iteration calls next once and retains its result carrier. End means
 # successful exhaustion; otherwise the item is extracted and the body runs.
-# A failure from source preparation, iter, next, or the body is
-# ordinary failure of the complete for expression, never implicit exhaustion.
-# Surrounding conditions and expected variants may capture it normally.
-# Producer failure propagates before item matching. No subsequent poll is made
-# after exhaustion, and a buffered item is never reacquired from the producer.
+# Source preparation, iter, next, and the body use ordinary function result
+# types. A returned error alternative is an item unless the cursor explicitly
+# interprets it. No return alternative silently becomes exhaustion.
 # Even an underscore binding acquires the item once and performs its cleanup.
 #
 # The bare binding preserves the result's ownership but grants read-only use:

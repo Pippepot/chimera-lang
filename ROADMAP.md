@@ -1,120 +1,112 @@
 # Roadmap
 
 [syntax&semantics.txt](syntax&semantics.txt) owns language rules;
-[ARCHITECTURE.md](ARCHITECTURE.md) owns compiler boundaries. This file tracks
-future work in priority order, not completed features or implementation history.
+[ARCHITECTURE.md](ARCHITECTURE.md) describes the compiler. This file tracks future
+work and its priority, not completed features or implementation history.
 
-Settle missing semantics before implementation. Each phase includes
+Settle missing semantics before implementation. Each milestone covers
 diagnostics, execution, ownership, and incremental/cache behavior. Legacy parity
 is not a goal.
 
-## Ordered phases
+## Immediate design priorities
 
-### 1. Algorithms and iterator adapters
+Investigate these before the remaining implementation milestones, in this order.
 
-- Start with `swap`, `reverse`, and `sort`, independently of Map/Set. Settle
-  element capabilities, comparator access/fallibility, stability, failure
-  guarantees, ordering laws (including partial versus total ordering), and
-  mutating versus value-returning APIs. Distinguish a negative comparison from
-  operational failure.
-- Before general adapters, settle the required compile-time member descriptors,
-  callable result/effect discovery, and tuple/variant builders. Keep logical
-  types, whole-result ownership, and member storage kinds separate; descriptors
-  stay compile-time-only and public APIs remain undecided.
-- Build `zip`, `enumerate`, `pairwise`, `windows`, `chunks`, `map`, `filter`,
-  `find`, `any`, `all`, and `sorted`.
-- Cover owned/borrowed carriers, mixed alternatives, and nested tuples while
-  preserving declared effects, polling order, authority, lending, and immovable
-  construction. Define End-only support, sticky exhaustion, and explicit-drop
-  cleanup; keep predicate rejection distinct from producer/callback failure.
+1. **Static comprehensions.** Fixed-size Array construction with compile-time
+  iteration shape and runtime element evaluation. Prefer `static if` and
+  `static for` ordering; determine when filtering preserves a static count.
+2. **Collection spreading and comprehensions.** `[1, ..values, 5]` and
+  `[x * 2 for x in values if x > 0]`. Preserve fixed-size Array literal
+  semantics and favor List for potentially runtime-sized results; settle mixed
+  static/runtime sizes, evaluation order, ownership, and partial failure cleanup.
 
-### 2. Collections
+## Ordered milestones
 
-- Map/Set: key equivalence, equal-key hash consistency, key mutation, ownership,
-  and ordering laws for ordered variants, building on tuples and iteration.
-  Queue/Stack may reuse List.
-- Enum-indexed arrays: domain coverage, storage order, and initialization;
-  reuse those decisions for an efficient standard-library `EnumSet[T]`.
+### 4. List mutation
 
-### 3. Optimization
+- Removal, append, and relocation of reference-containing elements, with
+  per-element provenance and failure cleanup. Borrowed get/index results and
+  replacement through tracked reference slots use the existing place semantics.
+- Structural mutation during iteration and explicit consuming traversal, with
+  stable backing references distinguished from content-dependent views.
 
-[docs/OPTIMIZATION.md](docs/OPTIMIZATION.md) owns the target IR shape and pass
-design. Remaining slices, in order:
+### 5. Structural tuples
 
-- Inline small callees bottom-up with call summaries, cost limits, recursive
-  component exclusion, and inline-chain trace metadata, then promote again.
-- Remove empty blocks and jump chains.
-- Scalar replacement of struct and variant slots, then forwarding, dead-store,
-  and invariant-hoisting passes over ownership-derived alias facts.
-- Loop normalization, induction variables, bounds-check elimination, and fill
-  and bulk-move idioms lowered to externs.
-- Comparison values with `select`, then backend register allocation.
+- Tuple identity, type spelling, access, destructuring, layout, and elementwise
+  ownership, including `const (x, y) = point`. Resolve grouping/singletons;
+  support multiple results and Map items.
 
-Each slice requires measured runtime or code-size gains, tracks compiler time
-separately, and compares optimized against unoptimized behavior for evaluation
-order, failure, ownership/cleanup, diagnostics, and incremental/cache
-correctness.
+### 6. Match
 
-## Independent foundations and ergonomics
+- Single subject evaluation; literal, wildcard, binding, and typed `name: Type`
+  patterns. Diagnose redundancy and non-exhaustiveness.
+- Define when subject and pattern bindings copy, borrow, or consume, including
+  noncopyable payloads and cleanup of unmatched alternatives and arm exits.
+- Check whether existing expression semantics cover value-producing `if` and
+  `match`; align any missing rules with value-producing blocks.
 
-Schedule these when needed; floating point does not gate collections or algorithms.
+### 7. Basic collection algorithms
 
-- Inline named variant cases alongside ordinary type alternatives: payload-free
-  cases use implicit unit without payload storage; named cases remain distinct
-  from bare unit/none and from other cases with the same payload type. Settle
-  construction, matching, visibility, and identity across aliases/composition.
-  Represent informative errors with ordinary variants, not payload-carrying failure.
-- Concrete capturing closures: settle capture syntax/defaults, invocation access
-  and consumption, and generic callable inspection alongside adapter needs.
-  Environments live inline or construct directly in a return destination; Box
-  explicitly selects heap storage. Preserve ordinary ownership and borrow rules;
-  defer owning type erasure and do not introduce implicit environment allocation.
-- Foreign interoperability: define a C ABI boundary, representation/layout,
-  calling conventions, opaque handles, buffer access, callbacks, and ownership
-  obligations separately from compiler-registered externs. Unrestricted raw
-  pointers are not a prerequisite.
-- Numeric foundations: nondecimal/wider literals, byte operations, and named
-  wrap/truncate/round/saturate/widen conversions with explicit overflow and
-  failure rules. No converters between numeric runtime types.
-- Floating point: representation, literals, operations, conversions, exceptional
-  values, mixed operations, and widths before extending library math.
-- Chained comparisons: single evaluation and failure flow; `defer`: cleanup on
-  failure and nonlocal exits; interpolation: formatting, allocation, and failure.
-- General `static if`: analyze only the selected branch, including declaration
-  visibility and dependency tracking.
-- Compiler usability: check/build-only workflows and explicit output paths;
-  prioritize formatter/editor integration against concrete user needs.
+- `swap`, `reverse`, and `sort` need not wait for Map/Set. Define support for
+  noncopyable and reference-containing elements, comparator access and
+  fallibility, stability, failure guarantees, and mutating versus value-returning
+  APIs.
+- Build pull-iterator utilities in the standard library: `zip`, `enumerate`,
+  `pairwise`, `windows`, and `chunks`; algorithms `map`, `filter`, `find`, `any`,
+  `all`, and `sorted`; numerical helpers `min`, `max`, and `clamp`.
 
-## Deferred candidates
+### 8. Collections
 
-- Mixed owned/reference variant narrowing and explicit storage-kind selection;
-  settle binding syntax/permissions without changing const/var copying or ref aliasing.
-- Strided views: representation, bounds, access, and lifetimes, separate from
-  contiguous slicing and range traversal. Decide bulk range assignment separately.
-- Failure fallback and guard bindings, only where existing condition bindings
-  are insufficient; enum shorthand and smart casts with mutation invalidation.
-- Match extensions beyond tuple patterns and ordinary and conditions: settle
-  nominal record patterns/captures, relative comparisons, and container/range
-  membership separately, preserving ordinary binding and extraction spelling.
-  Settle narrowed header captures and migration of legacy scalar/type `as name`
-  captures separately; tuple capture syntax does not extend that spelling.
-- Generators/yield only if cursor composition proves insufficient; preserve
-  ownership, lending, and failure effects.
-- Compile-time allocation publication: serialization, relocation, mutability,
-  and ownership before escape into static/runtime storage.
-- Local `static`; remove `comptime` only after equivalent scope, type-valued
-  results, specialization, effects, and caching are verified.
-- Initializer infallibility proofs through `where`, retaining one `init` mode;
-  temporary-projection borrowing and lifetime extension.
-- Shared ownership: atomic counts, synchronization guarantees, and cycle policy;
-  no upgradeable weak-reference API.
-- Concurrency: thread transfer/sharing, synchronization, atomics, and data-race
-  semantics before concurrent APIs; async remains deferred too.
-- User project tooling: language-level tests and reproducible dependency/package
-  declarations, separately from compiler tests and module discovery.
-- Overloading beyond explicit sets, `sizeof`, and return inference.
-- Additional targets only for concrete use cases: layouts, allocation, access,
-  and zero-byte behavior. Start with scalar device buffers; defer raw addresses
-  and foreign memory.
-- Finer invalidation only after measurement; decide unused-declaration validation
-  separately from demand-driven compilation.
+- Map/Set hashing, equality, key-mutation rules, ownership, and ordered variants.
+  Build on storage, tuples, and iteration contracts; Queue/Stack may reuse List.
+- Efficient enum sets, preferably a standard-library `EnumSet[T]`; share enum
+  domain decisions with enum-indexed arrays.
+
+## Language ergonomics candidates
+
+- Chained comparisons: `0 <= x < 10`; define single evaluation and Boolean short circuit flow.
+- `defer` for scope-exit cleanup, including failure and nonlocal exits.
+- String interpolation: `f"Value: {x}"`, potentially `{x=}`; settle formatting
+  and allocation/failure behavior.
+- Selected-branch-only analysis for `static if`, including declarations and
+  dependencies in the unselected branch.
+
+## Independent numeric foundations
+
+Schedule integer/byte work when earlier milestones need it; floating point does
+not gate collections or basic algorithms.
+
+- Nondecimal integer literals and magnitudes beyond the current signed-64-bit
+  literal representation; define spelling, typing, and range diagnostics.
+- Byte arithmetic and comparisons, and named wrap/truncate/round/saturate/widen
+  conversions (including int/byte), with explicit overflow and failure rules;
+  no converters between numeric runtime types.
+- Float representation, literals, operations, conversions, and exceptional
+  values before library math. Mixed operations and extra widths need decisions.
+
+## Deferred or independent
+
+- Result-correlated mutation provenance: preserve per-alternative output effects
+  through forwarding, saved results, later writes, loop joins, and cached contracts.
+  Until then, caller-visible output dependencies merge all ordinary return paths.
+- Contextual enum shorthand (`.Red`) and smart casts after variant checks;
+  define name resolution, narrowing, and invalidation by mutation.
+- Generator suspension/yield syntax only if ordinary cursor composition proves
+  insufficient; preserve item ownership, lending lifetimes, and failure effects.
+- Publication of compile-time allocations into static/runtime storage: define
+  serialization, relocation, mutability, and ownership before allowing escape.
+- Local `static` bindings. Remove `comptime` only after verified equivalence
+  across lexical scope, type-valued results, specialization, effects, and caching.
+- Temporary-projection borrowing and lifetime extension.
+- Shared ownership: atomic reference counts, access synchronization guarantees,
+  and cycle policy. No upgradeable weak-reference API is proposed.
+- General overloading, function literals/closures, `sizeof`, and return inference.
+- Additional targets only for concrete use cases: target/location-specific
+  layouts, allocation, access, and zero-byte behavior. Start with scalar device
+  buffers; defer raw addresses and foreign memory.
+- Finer-grained invalidation only after measurements; decide unused-declaration
+  validation separately from demand-driven compilation.
+**Enum-indexed arrays.** Dense, type-safe arrays indexed directly by enum
+  values; define domain coverage, storage order, and initialization.
+**Value-producing blocks.** Blocks and labeled `break` carrying values;
+  define result typing, ownership, cleanup, and interaction with failure.

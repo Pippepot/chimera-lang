@@ -4,5 +4,5 @@ struct HostStorage
     byte_size: int
     drop = explicit
 
-extern fallible allocate_host_storage(byte_size: int) HostStorage
+extern func allocate_host_storage(byte_size: int) HostStorage | none
 extern func deallocate_host_storage(deinit storage: HostStorage)

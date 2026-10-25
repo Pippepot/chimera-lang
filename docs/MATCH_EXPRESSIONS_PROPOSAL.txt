@@ -1,4 +1,4 @@
-# Match design decision: bare tuple patterns and ordinary conditions
+# Match design decision: bare types, tuple patterns, and ordinary conditions
 # syntax&semantics.txt owns the implemented language rules.
 # ARCHITECTURE.md owns compiler boundaries; ROADMAP.md owns deferred work.
 # This decision supersedes the earlier proposals in this file.
@@ -9,8 +9,8 @@ match point
     (x, y) -> remaining(x, y)
 
 # Approved implementation
-# A name in a pattern introduces an immutable capture, recursively through tuples.
-# This extends existing bare-name match captures without abbreviating const.
+# A fresh name introduces an immutable capture, recursively through tuples.
+# A name resolving to a type tests the active alternative without binding.
 # Ordinary const declarations still require their normal explicit initializer.
 # Patterns support literals, ignores, grouping, singleton commas, and nesting.
 # ref x explicitly aliases a place; bare x owns its capture under existing match
@@ -20,13 +20,15 @@ match point
 #
 # The first and separates the leading pattern from an ordinary condition
 # expression. The condition retains normal and/or/not precedence and ordinary
-# success/failure semantics; an or in it cannot bypass the leading pattern.
+# Boolean semantics; an or in it cannot bypass the leading pattern.
 # No comma headers or extra guard if/where keyword are introduced.
 # Functions receive explicitly written arguments. No predicate discovery,
 # signature-based implicit application, bool adaptation, or smart casts.
+# General value in collection predicates work in ordinary arm conditions.
+# They use the collection's contains method and establish no exhaustive coverage.
 #
-# Evaluate the subject once; try arms in source order. Whole-condition ordinary
-# failure retries after attempt cleanup. Body failure never retries another arm.
+# Evaluate the subject once; try arms in source order. A false condition retries
+# after attempt cleanup. A selected body never retries another arm.
 # Existing expected-result construction and branch joins remain authoritative.
 # Guarded arms do not establish exhaustiveness. An unconstrained unguarded tuple
 # pattern covers compatible tuple alternatives; partial product coverage is not
@@ -41,21 +43,24 @@ match point
 # Conditions cannot consume or invalidate protected subject/capture storage through
 # aliases. Unrelated effects persist. Copy/drop/callee effects are included, and
 # conditions' references can reach the body only with stable places and origins.
-# A consuming representation-changing capture is unavailable to condition reads.
 # Explicit-drop, ignored-owner, reference-authority, and ASAP obligations remain.
 #
 # Tuple alternatives retain their actual layouts and storage modes. Captured
 # element types must agree across compatible alternatives; no inferred
 # variant-of-tuples to tuple-of-variants distribution or positional struct access.
-# Existing scalar/type capture spellings remain until a separate migration decision.
+# Bare type names test variant alternatives without binding or smart casts.
+# Ordinary name resolution distinguishes types from fresh arm-local captures.
+# Type aliases, qualified names, specialized types, and type unions are supported.
+# Leading is and match-specific as-name captures are removed. Payload access
+# uses typed name: Type captures or ordinary typed bindings in the selected body.
 
 # Deferred separately
 # - nominal struct tests and struct-field capture spelling;
-# - relative comparison patterns and container/range membership;
-# - narrowed header binding syntax and expression initializers in headers;
+# - relative comparison patterns and direct membership arm syntax;
+# - expression initializers in headers;
 # - sequence/rest patterns, extractor protocols, and pattern boolean algebra.
-# No @, prefix as Type, as-name replacement, const-prefixed match captures,
-# ordinary named-struct destructuring, or new if-binding grammar is introduced.
+# No @, prefix as Type, match-specific as-name captures, const-prefixed match
+# captures, or ordinary named-struct destructuring is introduced.
 
 # Verification lives with the implementation
 # tests/match_test.zig covers native/comptime behavior, rejected attempts,

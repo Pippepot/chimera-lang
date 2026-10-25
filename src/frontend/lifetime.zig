@@ -481,10 +481,10 @@ pub const Solver = struct {
         for (self.blocks, 0..) |block, block_index| {
             if (!self.reachable[block_index]) continue;
             switch (block.terminator orelse unreachable) {
-                .return_unit, .return_value, .return_failure => {
+                .return_unit, .return_value => {
                     std.debug.assert(std.mem.allEqual(u64, self.blockSet(self.available_out, @fromBackingInt(@intCast(block_index))), 0));
                 },
-                .branch, .predicate_branch, .fallible_call, .diverge => {},
+                .branch, .predicate_branch, .diverge => {},
             }
         }
         self.validateEndingApplications(endings);
@@ -878,7 +878,7 @@ test "lifetime solver propagates through reordered blocks and ignores unreachabl
     }} });
 }
 
-test "lifetime solver handles terminal consumes divergence and fallible production" {
+test "lifetime solver handles terminal consumes divergence and branch production" {
     const consumed_generation = [_]Generation{testSolverGeneration(0, false)};
     const consumed_boundaries = [_][]const LifetimeEffect{&.{.{ .define = .{
         .generation = @fromBackingInt(@intCast(0)),
@@ -887,7 +887,7 @@ test "lifetime solver handles terminal consumes divergence and fallible producti
     const consumed_blocks = [_]TestSolverBlock{.{
         .boundaries = &.{0},
         .terminator_effects = &.{.{ .consume = @fromBackingInt(@intCast(0)) }},
-        .terminator = .return_failure,
+        .terminator = .return_unit,
     }};
     try testExpectLifetimePlan(std.testing.allocator, &consumed_generation, &consumed_boundaries, &consumed_blocks, &.{}, &.{}, &.{}, .{});
 
@@ -902,13 +902,14 @@ test "lifetime solver handles terminal consumes divergence and fallible producti
     try testExpectLifetimePlan(std.testing.allocator, &consumed_generation, &.{}, &diverging_blocks, &.{}, &.{}, &.{}, .{});
 
     const produced_blocks = [_]TestSolverBlock{
-        .{ .terminator = .{ .fallible_call = .{
-            .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(@intCast(0)) } }, .arguments = .{ .start = 0, .end = 0 }, .return_type = .unit },
-            .success = @fromBackingInt(@intCast(1)),
-            .failure = @fromBackingInt(@intCast(2)),
+        .{ .terminator = .{ .predicate_branch = .{
+            .operation = .eqi,
+            .operands = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(0) },
+            .then_branch = .{ .target = @fromBackingInt(1), .arguments = .{ .start = 0, .end = 0 } },
+            .else_branch = .{ .target = @fromBackingInt(2), .arguments = .{ .start = 0, .end = 0 } },
         } } },
         .{ .terminator = .return_unit, .argument_start = 0, .argument_end = 1 },
-        .{ .terminator = .return_failure, .argument_start = 1, .argument_end = 1 },
+        .{ .terminator = .return_unit, .argument_start = 1, .argument_end = 1 },
     };
     const produced_forwards = [_]OwnershipForward{.{ .produce = @fromBackingInt(@intCast(0)) }};
     const produced_edges = [_]OwnershipEdge{

@@ -2,18 +2,149 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const Fixture = test_sources.SourceFixture;
 
+test "bare type patterns select variants aliases and nested tuple alternatives" {
+    try Fixture.expectParity(
+        \\static Number = int
+        \\static Scalar = int | bool
+        \\struct Wrapped(T: type)
+        \\    value: T
+        \\func select(value: int | bool | none) int
+        \\    return match value
+        \\        Number and 1 > 2 -> 90
+        \\        Number -> 19
+        \\        Scalar -> 23
+        \\        none -> 91
+        \\func nested(value: (int | bool, int) | none) int
+        \\    return match value
+        \\        (Number, extra) -> extra
+        \\        (bool, _) -> 91
+        \\        _ -> 92
+        \\func specialized(value: Wrapped(int) | none) int
+        \\    return match value
+        \\        Wrapped(int) -> nested((19, select(true)))
+        \\        none -> 93
+        \\func run() int -> select(1) + specialized(Wrapped(int){value = 0})
+    , 42);
+    try Fixture.expectParity(
+        \\func select(static T: type, value: T | none) int
+        \\    return match value
+        \\        T -> 19
+        \\        none -> 23
+        \\func run() int -> select(int, 1) + select(bool, none)
+    , 42);
+}
+
+test "bare type patterns resolve qualified names" {
+    const fixture = try Fixture.initFiles(
+        \\import kinds
+        \\func choose(value: int | bool) int
+        \\    return match value
+        \\        kinds.Number -> 19
+        \\        bool -> 23
+        \\static first = choose(1)
+        \\exit(first + choose(true))
+    , &.{.{ .path = "kinds/types.chi", .module_path = "kinds", .source = "pub static Number = int" }});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+}
+
+test "bare type patterns accept callable and tuple union types" {
+    try Fixture.expectParity(
+        \\func number() int -> 42
+        \\func callable(value: (func() int) | none) int
+        \\    return match value
+        \\        func() int -> 19
+        \\        none -> 90
+        \\func tuple(value: (int, bool) | none) int
+        \\    return match value
+        \\        (int, bool) | none -> 23
+        \\func run() int -> callable(number) + tuple((1, true))
+    , 42);
+    try Fixture.expectParity(
+        \\func choose(value: ((ref int, int), bool) | none) int
+        \\    return match value
+        \\        ((ref int, int), bool) | none -> 42
+        \\func run() int
+        \\    var value = 19
+        \\    const pair: (ref int, int) = (value, 23)
+        \\    return choose((pair, true))
+    , 42);
+}
+
+test "match rejects leading is and match specific as captures" {
+    try Fixture.expectSourceDiagnostic(
+        \\const value: int | bool = 1
+        \\match value
+        \\    is int -> 19
+        \\    bool -> 23
+    , .invalid_expression);
+    for ([_][]const u8{
+        "int as name",
+        "0 as name",
+        "_ as name",
+        "name as other",
+        "ref name as other",
+        "(left, right) as pair",
+    }) |pattern| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "match 0\n    {s} -> 42", .{pattern});
+        defer std.testing.allocator.free(source);
+        try Fixture.expectSourceDiagnostic(source, .expected_token);
+    }
+}
+
+test "type patterns do not narrow the original subject" {
+    try Fixture.expectSourceDiagnostic(
+        \\func consume(value: int) int -> value
+        \\func choose(value: int | none) int
+        \\    return match value
+        \\        int -> consume(value)
+        \\        none -> 0
+        \\exit(choose(42))
+    , .call_argument_type_mismatch);
+}
+
+test "incremental type aliases change match dispatch and capture resolution" {
+    const fixture = try Fixture.init(
+        \\static Kind = int
+        \\func select(value: int | bool) int
+        \\    return match value
+        \\        Kind -> 19
+        \\        _ -> 23
+        \\exit(select(1))
+    );
+    defer fixture.deinit();
+    try fixture.expectExit(0, 19);
+    try fixture.expectExit(0, 19);
+    const changed =
+        \\static Kind = bool
+        \\func select(value: int | bool) int
+        \\    return match value
+        \\        Kind -> 19
+        \\        _ -> 23
+        \\exit(select(1))
+    ;
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, changed);
+    try fixture.expectExit(0, 23);
+    const value_name = try std.mem.replaceOwned(u8, std.testing.allocator, changed, "Kind = bool", "Kind = 1");
+    defer std.testing.allocator.free(value_name);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, value_name);
+    try fixture.expectDiagnostic(0, .duplicate_local_binding);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, changed);
+    try fixture.expectExit(0, 23);
+}
+
 test "initializer inference captures nested tuple patterns and outer guard inputs" {
     try Fixture.expectParity(
-        \\fallible materialize(init value: int) int -> value
-        \\fallible probe() int
+        \\func materialize(init value: int) int -> value
+        \\func probe() int | none
         \\    var threshold = 20
         \\    var increment = 1
-        \\    return materialize?(match ((19,), 22)
+        \\    return materialize(match ((19,), 22)
         \\        ((0,), _) -> 90
         \\        ((left,), right) and left < threshold -> left + right + increment
         \\        _ -> 91)
         \\func run() int
-        \\    if const result = probe() -> return result
+        \\    if const result: int = probe() -> return result
         \\    return 92
     , 42);
 }
@@ -40,18 +171,19 @@ test "tuple match grouping singleton ignores and nested patterns" {
     , 42);
 }
 
-test "tuple match fallible conditions preserve effects and evaluate the subject once" {
+test "tuple match func conditions preserve effects and evaluate the subject once" {
     try Fixture.expectParity(
         \\func produce(mut calls: int) (int, int)
         \\    calls += 1
         \\    return (19, 23)
-        \\fallible allowed(imm x: int, imm y: int, mut calls: int) unit
+        \\func allowed(imm x: int, imm y: int, mut calls: int) unit | none
         \\    calls += 10
-        \\    x > y
+        \\    if not (x > y) -> return none
+        \\    return ()
         \\func run() int
         \\    var calls = 0
         \\    const result = match produce(calls)
-        \\        (x, y) and allowed(x, y, calls) -> 90
+        \\        (x, y) and (allowed(x, y, calls) is unit) -> 90
         \\        (x, y) -> x + y
         \\    if calls <> 11 -> return 91
         \\    return result
@@ -68,7 +200,7 @@ test "tuple match conditions inspect the actual custom copy" {
         \\        return Item{copies = self.copies, value = self.value + 1}
         \\func run() int
         \\    var copies = 0
-        \\    const pair = (Item{copies = Ref.from(copies), value = 40}, 1)
+        \\    const pair = (Item{copies = (if const _selected_result_0: Ref(int) = Ref.from(copies) -> _selected_result_0 else panic "unexpected none"), value = 40}, 1)
         \\    const result = match pair
         \\        (item, extra) and item.value == 0 -> 90
         \\        (item, extra) and item.value == 41 -> item.value + extra
@@ -117,20 +249,20 @@ test "tuple match conditions cannot mutate or consume protected places" {
         \\func change(ref value: int) unit -> value += 1
         \\var pair = (19, 23)
         \\match pair
-        \\    (ref x, _) and change(x) -> ()
+        \\    (ref x, _) and (change(x) is unit) -> ()
         \\    _ -> ()
     , .match_guard_invalidates_subject);
     try Fixture.expectSourceDiagnostic(
         \\func change(ref value: (int, int)) unit -> value.0 += 1
         \\var pair = (19, 23)
         \\match pair
-        \\    (x, y) and change(pair) -> x + y
+        \\    (x, y) and (change(pair) is unit) -> x + y
         \\    _ -> 0
     , .match_guard_invalidates_subject);
     try Fixture.expectSourceDiagnostic(
         \\func consume(deinit value: int) unit -> ()
         \\match (19, 23)
-        \\    (x, y) and consume(x) -> y
+        \\    (x, y) and (consume(x) is unit) -> y
         \\    _ -> 0
     , .match_guard_invalidates_subject);
 }
@@ -155,16 +287,16 @@ test "tuple match requires a structural remainder and distinct local names" {
     , .duplicate_local_binding);
 }
 
-test "tuple match guard failure and selected body failure have separate boundaries" {
+test "false guards retry while selected bodies return their explicit results" {
     try Fixture.expectParity(
-        \\fallible selected() int
+        \\func selected() int | none
         \\    return match (19, 23)
-        \\        (x, y) and false -> fail
+        \\        (x, y) and true -> return none
         \\        _ -> 90
         \\func run() int
-        \\    if const result = selected() -> return result
+        \\    if const result: int = selected() -> return result
         \\    return match (19, 23)
-        \\        (x, y) and false? -> 91
+        \\        (x, y) and false -> 91
         \\        (x, y) -> x + y
     , 42);
 }
@@ -175,13 +307,13 @@ test "tuple match guards protect referents tested by earlier arms during cleanup
         \\    copy = trivial
         \\    target: Ref(int)
         \\    drop = func(deinit self: Item) -> self.target.value = 0
-        \\fallible reject() unit -> fail
+        \\func reject() unit | none -> return none
         \\func run() int
         \\    var number = 19
         \\    const pair: (ref int, Item) = (number, Item{target = Ref.from(number)})
         \\    return match pair
         \\        (0, _) -> 90
-        \\        (_, item) and reject() -> 91
+        \\        (_, item) and (reject() is unit) -> 91
         \\        (_, _) -> 42
         \\exit(run())
     , .match_guard_invalidates_subject);
@@ -243,13 +375,13 @@ test "tuple match guard derived references survive stable ownership commit" {
         \\    drops: Ref(int)
         \\    drop = func(deinit self: Fixed) -> self.drops.value += 1
         \\func remember(imm item: Fixed, mut saved: Ref(Fixed) | none) unit
-        \\    saved = Ref.from(item)
+        \\    saved = (if const _selected_result_0: Ref(Fixed) = Ref.from(item) -> _selected_result_0 else panic "unexpected none")
         \\func run() int
         \\    var drops = 0
         \\    var saved: Ref(Fixed) | none = none
-        \\    const result = match (Fixed{value = 42, drops = Ref.from(drops)}, 0)
-        \\        (item, _) and remember(item, saved) ->
-        \\            if ref view = saved as Ref(Fixed) -> view.value.value
+        \\    const result = match (Fixed{value = 42, drops = (if const _selected_result_1: Ref(int) = Ref.from(drops) -> _selected_result_1 else panic "unexpected none")}, 0)
+        \\        (item, _) and (remember(item, saved) is unit) ->
+        \\            if ref view: Ref(Fixed) = saved -> view.value.value
         \\            else 90
         \\        _ -> 91
         \\    if drops <> 1 -> return 92
@@ -260,7 +392,7 @@ test "tuple match guard derived references survive stable ownership commit" {
 test "tuple match variant alternatives preserve element types and separate SSA paths" {
     try Fixture.expectParity(
         \\func produce(flag: bool) (int, int) | (bool, int)
-        \\    if flag?
+        \\    if flag
         \\        const pair: (int, int) = (19, 23)
         \\        return pair
         \\    const pair: (bool, int) = (false, 19)
@@ -305,32 +437,17 @@ test "guarded match catch all copies retain feasible cleanup without changing th
         \\func dispose(deinit token: Token) unit -> ()
         \\func run() int
         \\    var drops = 0
-        \\    const owner: Token | Item = Item{drops = Ref.from(drops)}
+        \\    const owner: Token | Item = Item{drops = (if const _selected_result_0: Ref(int) = Ref.from(drops) -> _selected_result_0 else panic "unexpected none")}
         \\    const answer = match owner
-        \\        is Token as token ->
-        \\            dispose(token)
+        \\        Token ->
+        \\            if const token: Token = owner -> dispose(token)
         \\            90
         \\        selected and selected is Item -> 42
         \\        selected -> 91
-        \\    match owner^
-        \\        is Token as token -> dispose(token)
-        \\        is Item -> ()
+        \\    if const token: Token = owner^ -> dispose(token)
         \\    if drops <> 2 -> return 92
         \\    return answer
     , 42);
-}
-
-test "match conditions cannot borrow a capture before its representation is committed" {
-    try Fixture.expectSourceDiagnostic(
-        \\struct Wide
-        \\    ref value: int
-        \\func produce() Wide | int | bool -> 42
-        \\fallible inspect(ref selected: int | bool) unit -> selected is int
-        \\match produce()
-        \\    is Wide -> 90
-        \\    is int | bool as selected and inspect(selected) -> 42
-        \\    _ -> 91
-    , .match_capture_unavailable_in_condition);
 }
 
 test "match scalar literals captures and nested expressions" {
@@ -338,7 +455,7 @@ test "match scalar literals captures and nested expressions" {
         \\func choose(number: int) int
         \\    return match number
         \\        -1 -> 90
-        \\        0 as zero -> zero + 19
+        \\        0 -> number + 19
         \\        other -> other + 22
         \\func run() int -> choose(0) + choose(1)
     , 42);
@@ -366,7 +483,7 @@ test "match evaluates its subject once and chooses only one arm" {
         \\    const selected = match produce(calls)
         \\        none -> 90
         \\        0 -> 91
-        \\        is int as value -> value
+        \\        int -> 42
         \\    return selected + calls - 1
     , 42);
 }
@@ -388,22 +505,24 @@ test "match immutable captures copy while explicit references alias" {
         \\func run() int
         \\    var source: int | none = 19
         \\    match source
-        \\        is int as ref item -> item += 23
+        \\        int ->
+        \\            if ref item: int = source -> item += 23
         \\        none -> ()
-        \\    if const result = source as int -> return result
+        \\    if const result: int = source -> return result
         \\    return 90
     , 42);
 }
 
-test "match type arms permit partial overlap without residual capture typing" {
+test "match type arms permit partial overlap with ordinary payload extraction" {
     try Fixture.expectParity(
         \\func choose(value: bool) int | bool | none -> value
         \\func run() int
-        \\    return match choose(true)
-        \\        is int -> 90
-        \\        is int | bool as selected ->
-        \\            if const flag = selected as bool
-        \\                if flag? -> return 42
+        \\    const subject: int | bool | none = choose(true)
+        \\    return match subject
+        \\        int -> 90
+        \\        int | bool ->
+        \\            if const flag: bool = subject
+        \\                if flag -> return 42
         \\            return 91
         \\        none -> 92
     , 42);
@@ -433,8 +552,8 @@ test "match byte literals and integer default remain distinct" {
         \\    const number: int | byte = byte_value
         \\    const second = match number
         \\        1 -> 91
-        \\        is byte -> 23
-        \\        is int -> 92
+        \\        byte -> 23
+        \\        int -> 92
         \\    return first + second
     , 42);
 }
@@ -457,16 +576,16 @@ test "match text literals compare decoded bytes without copying Strings" {
     , 42);
 }
 
-test "match preserves expected result conversion and optional failure boundaries" {
+test "match preserves expected conversion and optional results" {
     try Fixture.expectParity(
-        \\fallible reject() int -> fail
+        \\func reject() int | none -> return none
         \\func run() int
         \\    const result: int | none = match true
-        \\        true -> reject?()
+        \\        true -> reject()
         \\        false -> 90
         \\    return match result
         \\        none -> 42
-        \\        is int -> 91
+        \\        int -> 91
     , 42);
     try Fixture.expectParity(
         \\func run() int
@@ -478,34 +597,34 @@ test "match preserves expected result conversion and optional failure boundaries
     , 42);
 }
 
-test "match subject failure and selected arm failure do not retry" {
+test "match handles none subjects and selected none results without retry" {
     try Fixture.expectParity(
-        \\fallible produce(mut calls: int) int | none
+        \\func produce(mut calls: int) int | none
         \\    calls += 1
-        \\    fail
-        \\fallible select(mut calls: int) int
-        \\    return match produce?(calls)
+        \\    return none
+        \\func select(mut calls: int) int | none
+        \\    return match produce(calls)
         \\        none ->
         \\            calls += 100
-        \\            90
-        \\        is int -> 91
+        \\            none
+        \\        int -> 91
         \\func run() int
         \\    var calls = 0
-        \\    if const result = select(calls) -> return result
-        \\    return calls + 41
+        \\    if const result: int = select(calls) -> return result
+        \\    return calls - 59
     , 42);
     try Fixture.expectParity(
-        \\fallible select(mut calls: int) int
+        \\func select(mut calls: int) int | none
         \\    return match 1
         \\        1 ->
         \\            calls += 1
-        \\            fail
+        \\            return none
         \\        _ ->
         \\            calls += 100
         \\            90
         \\func run() int
         \\    var calls = 0
-        \\    if const result = select(calls) -> return result
+        \\    if const result: int = select(calls) -> return result
         \\    return calls + 41
     , 42);
 }
@@ -521,8 +640,10 @@ test "match keeps fresh noncopyable payloads through rejected tests" {
         \\    return match produce()
         \\        none -> 90
         \\        0 -> 91
-        \\        is int -> 92
-        \\        is Item as selected -> consume(selected^)
+        \\        int -> 92
+        \\        selected ->
+        \\            if const item: Item = selected^ -> return consume(item^)
+        \\            return 93
     , 42);
 }
 
@@ -534,17 +655,17 @@ test "match selected and rejected owners are dropped once with ASAP timing" {
         \\    digit: int
         \\    drop = func(deinit self: Tracked)
         \\        self.trace.value = self.trace.value * 10 + self.digit
-        \\func produce(ref trace: int) Tracked | int | none -> Tracked{trace = Ref.from(trace), digit = 1}
+        \\func produce(ref trace: int) Tracked | int | none -> Tracked{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), digit = 1}
         \\func observe(imm first: Tracked, imm second: Tracked) -> ()
         \\func run() int
         \\    var trace = 0
-        \\    const outer = Tracked{trace = Ref.from(trace), digit = 2}
+        \\    const outer = Tracked{trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else panic "unexpected none"), digit = 2}
         \\    match produce(trace)
         \\        none -> ()
         \\        0 -> ()
-        \\        is int -> ()
-        \\        is Tracked ->
-        \\            const inner = Tracked{trace = Ref.from(trace), digit = 3}
+        \\        int -> ()
+        \\        Tracked ->
+        \\            const inner = Tracked{trace = (if const _selected_result_2: Ref(int) = Ref.from(trace) -> _selected_result_2 else panic "unexpected none"), digit = 3}
         \\            observe(outer, inner)
         \\    if trace == 132 -> return 42
         \\    return trace
@@ -563,16 +684,18 @@ test "match narrows explicit drop obligations across continuations" {
         \\    drop = func(deinit self: Tracked) -> self.trace.value += 1
         \\func dispose(deinit token: Token) -> ()
         \\func produce(ref trace: int, token: bool) Token | Tracked | none
-        \\    if token? -> return Token{number = 19}
-        \\    return Tracked{trace = Ref.from(trace)}
+        \\    if token -> return Token{number = 19}
+        \\    return Tracked{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")}
         \\func inspect(ref trace: int, token: bool) int
         \\    return match produce(trace, token)
         \\        none -> 90
-        \\        is Token as selected ->
-        \\            const result = selected.number
-        \\            dispose(selected)
-        \\            result
-        \\        is Tracked -> 22
+        \\        Tracked -> 22
+        \\        selected ->
+        \\            if const item: Token = selected^
+        \\                const result = item.number
+        \\                dispose(item)
+        \\                return result
+        \\            return 91
         \\func run() int
         \\    var trace = 0
         \\    const first = inspect(trace, true)
@@ -588,18 +711,20 @@ test "match narrows explicit drop obligations across continuations" {
     , .value_requires_explicit_drop);
 }
 
-test "match fresh immovable payloads hand off without relocation" {
+test "match fresh immovable whole captures hand off without relocation" {
     try Fixture.expectParity(
         \\struct Fixed
         \\    copy = none
         \\    move = none
         \\    value: int
         \\func produce() Fixed | none -> Fixed{value = 42}
-        \\func consume(deinit item: Fixed) int -> item.value
+        \\func consume(deinit item: Fixed | none) int
+        \\    if ref value: Fixed = item -> return value.value
+        \\    return 91
         \\func run() int
         \\    return match produce()
         \\        none -> 90
-        \\        is Fixed as selected -> consume(selected)
+        \\        selected -> consume(selected)
     , 42);
     try Fixture.expectParity(
         \\struct Fixed
@@ -613,16 +738,17 @@ test "match fresh immovable payloads hand off without relocation" {
     , 42);
 }
 
-test "match subset capture reconstructs the selected variant layout" {
+test "match whole capture permits ordinary subset extraction" {
     try Fixture.expectParity(
         \\struct Wide
         \\    ref value: int
         \\func produce() Wide | int | bool -> 42
         \\func run() int
         \\    return match produce()
-        \\        is Wide -> 90
-        \\        is int | bool as selected ->
-        \\            if const number = selected as int -> return number
+        \\        Wide -> 90
+        \\        selected ->
+        \\            if const subset: int | bool = selected^
+        \\                if const number: int = subset -> return number
         \\            return 91
     , 42);
 }
@@ -637,20 +763,23 @@ test "match borrowed noncopyable sources need explicit ref captures" {
         \\func run() int
         \\    const owner: Item | none = Item{value = 42}
         \\    return match owner
-        \\        is Item as ref selected -> selected.value
         \\        none -> 90
+        \\        ref selected ->
+        \\            if ref item: Item = selected -> return item.value
+        \\            return 91
     , 42);
     try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
         \\const owner: Item | none = Item{value = 42}
         \\const result = match owner
-        \\    is Item as selected -> selected.value
         \\    none -> 90
+        \\    selected -> 91
     , .type_not_copyable);
     try Fixture.expectSourceDiagnostic(
         \\const owner: int | none = 41
         \\match owner
-        \\    is int as ref selected -> selected += 1
         \\    none -> ()
+        \\    ref selected ->
+        \\        if ref number: int = selected -> number += 1
     , .reference_not_writable);
 }
 
@@ -659,8 +788,10 @@ test "match reference alternatives preserve authority and may outlive their carr
         \\func capture(ref owner: int) ref int | none -> owner
         \\func select(ref owner: int) ref int
         \\    return match capture(owner)
-        \\        is int as ref selected -> selected
         \\        none -> owner
+        \\        ref selected ->
+        \\            if ref number: int = selected -> return number
+        \\            return owner
         \\func run() int
         \\    var owner = 19
         \\    ref selected = select(owner)
@@ -672,10 +803,12 @@ test "match reference alternatives preserve authority and may outlive their carr
         \\func run() int
         \\    var owner = 19
         \\    const result = match capture(owner)
-        \\        is int as selected ->
-        \\            owner = 23
-        \\            selected
         \\        none -> 90
+        \\        selected ->
+        \\            if const number: int = selected
+        \\                owner = 23
+        \\                number
+        \\            else 91
         \\    return result + owner
     , 42);
     try Fixture.expectSourceDiagnostic(
@@ -695,14 +828,16 @@ test "match supports mixed owned and reference alternatives without storage sele
         \\    copy = trivial
         \\func capture(ref owner: int) ref int | End -> owner
         \\func choose(ref owner: int, borrowed: bool) int | ref int | End
-        \\    if borrowed? -> return capture(owner)
+        \\    if borrowed -> return capture(owner)
         \\    return 19
         \\func update(ref owner: int, borrowed: bool) int
         \\    return match choose(owner, borrowed)
-        \\        is int as ref selected ->
-        \\            selected += 23
-        \\            selected
-        \\        is End -> 90
+        \\        End -> 90
+        \\        ref selected ->
+        \\            if ref number: int = selected
+        \\                number += 23
+        \\                return number
+        \\            return 91
         \\func run() int
         \\    var owner = 19
         \\    if update(owner, false) <> 42 -> return 91
@@ -770,20 +905,22 @@ test "match nonlocal exits clean retained owned subjects" {
         \\func choose(ref trace: int) int
         \\    return match produce(trace)
         \\        none -> 90
-        \\        is Tracked as selected -> return selected.value
+        \\        selected ->
+        \\            if const item: Tracked = selected^ -> return item.value
+        \\            return 91
         \\func run() int
         \\    var trace = 0
         \\    const result = choose(trace)
         \\    return result + trace
     , 42);
     try Fixture.expectParity(declarations ++ "\n" ++
-        \\fallible reject(ref trace: int) int
+        \\func reject(ref trace: int) int | none
         \\    return match produce(trace)
         \\        none -> 90
-        \\        is Tracked as selected -> fail
+        \\        Tracked -> return none
         \\func run() int
         \\    var trace = 0
-        \\    if const result = reject(trace) -> return result
+        \\    if const result: int = reject(trace) -> return result
         \\    return trace + 41
     , 42);
     try Fixture.expectParity(declarations ++ "\n" ++
@@ -792,7 +929,7 @@ test "match nonlocal exits clean retained owned subjects" {
         \\    for index in 0..3
         \\        match produce(trace)
         \\            none -> ()
-        \\            is Tracked ->
+        \\            Tracked ->
         \\                if index == 0 -> continue
         \\                break
         \\    return trace + 40
@@ -823,9 +960,9 @@ test "match normalizes decoded literal coverage and respects type coverage" {
     try Fixture.expectSourceDiagnostic(
         \\func choose(value: int | bool | none) int
         \\    return match value
-        \\        is int -> 1
-        \\        is bool -> 2
-        \\        is int | bool -> 3
+        \\        int -> 1
+        \\        bool -> 2
+        \\        int | bool -> 3
         \\        none -> 4
         \\exit(choose(1))
     , .match_redundant_arm);
@@ -852,13 +989,13 @@ test "match rejects nonexhaustive redundant incompatible and duplicate captures"
     , .match_redundant_arm);
     try Fixture.expectSourceDiagnostic(
         \\const value = match 1
-        \\    is bool -> 2
+        \\    bool -> 2
         \\    _ -> 3
     , .match_pattern_incompatible);
     try Fixture.expectSourceDiagnostic(
         \\const value = match 1
         \\    x as y -> x + y
-    , .match_multiple_captures);
+    , .expected_token);
     try Fixture.expectSourceDiagnostic(
         \\const value = match 1
         \\    var x -> x
@@ -875,10 +1012,10 @@ test "match captures use ordinary copy hooks and explicit transfer" {
         \\        return Item{copies = self.copies, value = self.value}
         \\func run() int
         \\    var copies = 0
-        \\    const owner = Item{copies = Ref.from(copies), value = 14}
+        \\    const owner = Item{copies = (if const _selected_result_0: Ref(int) = Ref.from(copies) -> _selected_result_0 else panic "unexpected none"), value = 14}
         \\    const first = match owner
         \\        selected -> selected.value
-        \\    const second = match Item{copies = Ref.from(copies), value = 14}
+        \\    const second = match Item{copies = (if const _selected_result_1: Ref(int) = Ref.from(copies) -> _selected_result_1 else panic "unexpected none"), value = 14}
         \\        selected -> selected.value
         \\    const third = match owner^
         \\        selected -> selected.value
@@ -889,12 +1026,12 @@ test "match captures use ordinary copy hooks and explicit transfer" {
         \\var owner: int | none = 42
         \\match owner^
         \\    none -> ()
-        \\    is int -> ()
+        \\    int -> ()
         \\const invalid = owner
     , .use_after_transfer);
 }
 
-test "match overlapping owning captures retain only feasible drop obligations" {
+test "match whole owning captures retain only feasible drop obligations" {
     try Fixture.expectParity(
         \\struct Token
         \\    copy = none
@@ -904,26 +1041,17 @@ test "match overlapping owning captures retain only feasible drop obligations" {
         \\    trace: Ref(int)
         \\    drop = func(deinit self: Tracked) -> self.trace.value += 1
         \\func dispose(deinit token: Token) -> ()
-        \\func produce(ref trace: int) Token | Tracked | none -> Tracked{trace = Ref.from(trace)}
+        \\func produce(ref trace: int) Token | Tracked | none -> Tracked{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")}
         \\func run() int
         \\    var trace = 0
         \\    const result = match produce(trace)
-        \\        is Token as selected ->
-        \\            dispose(selected)
-        \\            90
-        \\        is Token | Tracked as selected ->
-        \\            var retained = selected^
-        \\            const finished = loop
-        \\                break if trace == 0
-        \\                    retained^
-        \\                else
-        \\                    retained^
-        \\            match finished^
-        \\                is Token as token ->
-        \\                    dispose(token)
-        \\                    92
-        \\                is Tracked -> 41
-        \\        none -> 91
+        \\        none -> 90
+        \\        selected ->
+        \\            const retained = selected^
+        \\            if const token: Token = retained^
+        \\                dispose(token)
+        \\                return 91
+        \\            41
         \\    return result + trace
     , 42);
     try Fixture.expectParity(
@@ -934,17 +1062,12 @@ test "match overlapping owning captures retain only feasible drop obligations" {
         \\func produce() Token | int | none -> 42
         \\func run() int
         \\    return match produce()
-        \\        is Token as token ->
-        \\            dispose(token)
-        \\            90
         \\        selected ->
         \\            const retained = selected^
-        \\            match retained^
-        \\                is Token as token ->
-        \\                    dispose(token)
-        \\                    91
-        \\                is int as number -> number
-        \\                none -> 92
+        \\            if const token: Token = retained^
+        \\                dispose(token)
+        \\                return 90
+        \\            42
     , 42);
 }
 
@@ -954,8 +1077,9 @@ test "match rejects borrowed subset layouts and ambiguous text domains" {
         \\    ref value: int
         \\var owner: Wide | int | bool = 42
         \\match owner
-        \\    is Wide -> ()
-        \\    is int | bool as ref selected -> ()
+        \\    Wide -> ()
+        \\    ref selected ->
+        \\        if ref subset: int | bool = selected -> ()
     , .reference_projection_requires_member);
     try Fixture.expectSourceDiagnostic(
         \\func choose(view: StringView) String | StringView -> view
@@ -969,7 +1093,7 @@ test "match literals do not invoke user converters or equality" {
     try Fixture.expectSourceDiagnostic(
         \\struct Wrapped
         \\    value: int
-        \\    pub fallible ==(imm left: Wrapped, imm right: Wrapped) unit -> ()
+        \\    pub func ==(imm left: Wrapped, imm right: Wrapped) bool -> ()
         \\converter(static value: int_literal) Wrapped -> Wrapped{value = int(value)}
         \\const result = match Wrapped{value = 42}
         \\    42 -> 1
@@ -993,7 +1117,7 @@ test "match static specialization and sibling capture scopes stay independent" {
     try Fixture.expectParity(
         \\func choose(static number: int_literal) int
         \\    return match number
-        \\        1 as selected -> int(selected) + 18
+        \\        1 -> int(number) + 18
         \\        selected -> int(selected) + 21
         \\func run() int -> choose(1) + choose(2)
     , 42);

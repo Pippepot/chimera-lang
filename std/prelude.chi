@@ -14,16 +14,11 @@ pub extern func int.*(imm left: int, imm right: int) int
 pub extern func int./(imm left: int, imm right: int) int
 pub extern func int.%(imm left: int, imm right: int) int
 pub extern func int.-(imm self: int) int
-pub extern fallible int.==(imm left: int, imm right: int) unit
-pub extern fallible int.<>(imm left: int, imm right: int) unit
-pub extern fallible int.<(imm left: int, imm right: int) unit
-pub extern fallible int.>(imm left: int, imm right: int) unit
-pub extern fallible int.<=(imm left: int, imm right: int) unit
-pub extern fallible int.>=(imm left: int, imm right: int) unit
-
-pub extern fallible bool.==(imm left: bool, imm right: bool) unit
-pub extern fallible bool.<>(imm left: bool, imm right: bool) unit
-
-pub converter(condition: unit | none) bool
-    if condition is unit -> return true
-    return false
+pub extern func int.==(imm left: int, imm right: int) bool
+pub extern func int.<>(imm left: int, imm right: int) bool
+pub extern func int.<(imm left: int, imm right: int) bool
+pub extern func int.>(imm left: int, imm right: int) bool
+pub extern func int.<=(imm left: int, imm right: int) bool
+pub extern func int.>=(imm left: int, imm right: int) bool
+pub extern func bool.==(imm left: bool, imm right: bool) bool
+pub extern func bool.<>(imm left: bool, imm right: bool) bool

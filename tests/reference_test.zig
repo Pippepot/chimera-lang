@@ -64,8 +64,8 @@ test "forwarded borrow-carrying receivers keep their owned storage alive" {
         \\    storage: Span(int) | List(int)
         \\
         \\    func view(imm self: Holder) Span(int)
-        \\        if const span = self.storage as Span(int) -> return span
-        \\        if ref list = self.storage as List(int) -> return list.span()
+        \\        if const span: Span(int) = self.storage -> return span
+        \\        if ref list: List(int) = self.storage -> return list.span()
         \\        panic "invalid holder"
         \\
         \\    func forward(imm self: Holder) Span(int) -> self.view()
@@ -78,9 +78,9 @@ test "forwarded borrow-carrying receivers keep their owned storage alive" {
         \\    const holder = make()
         \\    const span = holder.forward()
         \\    const text = String(7).view()
-        \\    if const first = span.get(1)
-        \\        if const second = span.get(2)
-        \\            if const digit = text.as_bytes().get(0) -> return first + second + byte_int(digit) - 29
+        \\    if const first: int = span.get(1)
+        \\        if const second: int = span.get(2)
+        \\            if const digit: byte = text.as_bytes().get(0) -> return first + second + byte_int(digit) - 29
         \\    return 90
     , 42);
 }
@@ -105,7 +105,7 @@ test "variant member conversions retain borrowed backing and reject its mutation
         \\var text = "hello"
         \\const source: ref String | Marker = text
         \\const result = view(source)
-        \\text.append?(" world")
+        \\const _: unit = text.append(" world") else panic "unexpected none"
         \\print(result)
     , .borrow_outlives_source);
     try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
@@ -120,9 +120,9 @@ test "variant member conversions retain borrowed backing and reject its mutation
 test "references copied optional call arguments remain independent in growing work queues" {
     try Fixture.expectParity(
         \\func must(static T: type, var outcome: T | none) T
-        \\    if const value = outcome^ as T -> return value^
+        \\    if const value: T = outcome^ -> return value^
         \\    panic "required operation failed"
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var pending: List(int) = [1]
         \\    var head = 0
         \\    var total = 0
@@ -132,11 +132,11 @@ test "references copied optional call arguments remain independent in growing wo
         \\        head += 1
         \\        total += current
         \\        if current < 4
-        \\            pending.append?(current * 2)
-        \\            pending.append?(current * 2 + 1)
+        \\            const _: unit = pending.append(current * 2) else return none
+        \\            const _: unit = pending.append(current * 2 + 1) else return none
         \\    return total + 14
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -150,13 +150,13 @@ test "references owned optional argument preparation copies only successful payl
         \\        self.copies.value += 1
         \\        return Item{copies = self.copies, value = self.value}
         \\func receive(var outcome: Item | none) int
-        \\    if const item = outcome^ as Item -> return item.value
+        \\    if const item: Item = outcome^ -> return item.value
         \\    return 0
         \\func run() int
         \\    var copies = 0
-        \\    const values = [Item{copies = Ref.from(copies), value = 20}]
+        \\    const values = [Item{copies = (if const _selected_result_0: Ref(int) = Ref.from(copies) -> _selected_result_0 else panic "unexpected none"), value = 20}]
         \\    var total = 0
-        \\    for index in 0..3 -> total += receive(values[index % 2])
+        \\    for index in 0..3 -> total += receive(values.get(index % 2))
         \\    return total + copies
     , 42);
 }
@@ -164,12 +164,12 @@ test "references owned optional argument preparation copies only successful payl
 test "references optional borrowed results still reject use across loop growth" {
     try Fixture.expectSourceDiagnostic(
         \\func must_ref(static T: type, var outcome: ref T | none) ref T
-        \\    if ref value = outcome as T -> return value
+        \\    if ref value: T = outcome -> return value
         \\    panic "required element missing"
         \\var values: List(int) = [42]
         \\loop
         \\    ref current = must_ref(values[0])
-        \\    values.append?(17)
+        \\    const _: unit = values.append(17) else panic "unexpected none"
         \\    print(current)
         \\    break
     , .borrow_outlives_source);
@@ -178,13 +178,13 @@ test "references optional borrowed results still reject use across loop growth" 
 test "references copied optional view results retain their backing dependencies" {
     try Fixture.expectSourceDiagnostic(
         \\func must(static T: type, var outcome: T | none) T
-        \\    if const value = outcome^ as T -> return value^
+        \\    if const value: T = outcome^ -> return value^
         \\    panic "required operation failed"
         \\var text = "hello"
         \\var values: List(StringView) = [text.view()]
         \\loop
-        \\    const current = must(values[0])
-        \\    text.append?(" world")
+        \\    const current = must(StringView, values.get(0))
+        \\    const _: unit = text.append(" world") else panic "unexpected none"
         \\    print(current)
         \\    break
     , .borrow_outlives_source);
@@ -198,15 +198,15 @@ test "references custom drops preserve temporal conflicts between captures" {
         \\    trace: Ref(int)
         \\    drop = func(deinit self: Captures)
         \\        const view = self.left.value.view()
-        \\        if self.right.value.append("x") -> ()
+        \\        if (self.right.value.append("x") is unit) -> ()
         \\        self.trace.value = view.byte_length() + 39
         \\func discard(var item: Captures) -> ()
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     ;
     try Fixture.expectParity(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var left: String = "abc"
         \\    var right: String = ""
         \\    var trace = 0
@@ -214,7 +214,7 @@ test "references custom drops preserve temporal conflicts between captures" {
         \\    return trace
     , 42);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var buffer: String = "abc"
         \\    var trace = 0
         \\    discard(Captures{left = Ref.from(buffer), right = Ref.from(buffer), trace = Ref.from(trace)})
@@ -222,7 +222,7 @@ test "references custom drops preserve temporal conflicts between captures" {
         \\_ = run()
     , .borrow_outlives_source);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var left: String = "abc"
         \\    var right: String = ""
         \\    const view = right.view()
@@ -241,14 +241,14 @@ test "references custom drops enforce projected write authority and effects" {
         \\    drop = func(deinit self: Observer)
         \\        self.trace.value += self.owner.value.byte_length()
         \\func discard(var observer: Observer) -> ()
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var owner: String = "abc"
         \\    const view = owner.view()
         \\    var trace = 0
-        \\    discard(Observer{owner = Ref.from(owner), trace = Ref.from(trace)})
+        \\    discard(Observer{owner = (if const _selected_result_0: Ref(String) = Ref.from(owner) -> _selected_result_0 else return none), trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else return none)})
         \\    return view.byte_length() + trace + 36
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
     try Fixture.expectAnySourceDiagnostic(
@@ -262,29 +262,29 @@ test "references custom drops enforce projected write authority and effects" {
     inline for (.{
         .{ .clear = "hook.target = none", .clear_value = "true", .safe = true },
         .{ .clear = "_ = 0", .clear_value = "true", .safe = false },
-        .{ .clear = "if clear?\n        hook.target = none\n    else\n        hook.target = none", .clear_value = "true", .safe = true },
-        .{ .clear = "if clear?\n        hook.target = none\n    else\n        hook.target = none", .clear_value = "false", .safe = true },
-        .{ .clear = "if clear? -> hook.target = none", .clear_value = "false", .safe = false },
-        .{ .clear = "if clear?\n        _ = hook\n        return view.byte_length() + 39\n    hook.target = none", .clear_value = "true", .safe = false },
-        .{ .clear = "loop\n        if not clear? -> break\n        hook.target = none\n        clear = false", .clear_value = "false", .safe = false },
+        .{ .clear = "if clear\n        hook.target = none\n    else\n        hook.target = none", .clear_value = "true", .safe = true },
+        .{ .clear = "if clear\n        hook.target = none\n    else\n        hook.target = none", .clear_value = "false", .safe = true },
+        .{ .clear = "if clear -> hook.target = none", .clear_value = "false", .safe = false },
+        .{ .clear = "if clear\n        _ = hook\n        return view.byte_length() + 39\n    hook.target = none", .clear_value = "true", .safe = false },
+        .{ .clear = "loop\n        if not clear -> break\n        hook.target = none\n        clear = false", .clear_value = "false", .safe = false },
     }) |capture| {
         const source = try test_sources.renderTemplate(std.testing.allocator,
             \\struct Hook
             \\    move = none
             \\    target: Ref(String) | none
             \\    drop = func(deinit self: Hook)
-            \\        if const target = self.target as Ref(String)
-            \\            if target.value.append("x") -> ()
-            \\fallible inspect(ref owner: String, ref clear: bool) int
+            \\        if const target: Ref(String) = self.target
+            \\            const _: unit = target.value.append("x") else panic "append failed"
+            \\func inspect(ref owner: String, ref clear: bool) int
             \\    const view = owner.view()
             \\    var hook = Hook{target = Ref.from(owner)}
             \\    $clear
             \\    _ = hook
             \\    return view.byte_length() + 39
-            \\fallible calculate() int
+            \\func calculate() int
             \\    var owner: String = "abc"
             \\    var clear = $clear_value
-            \\    return inspect?(owner, clear)
+            \\    return inspect(owner, clear)
             \\func run() int
             \\    if const result = calculate() -> return result
             \\    return 90
@@ -317,36 +317,36 @@ test "references ownership hooks export temporal writes at their call sites" {
             \\struct Hook
             \\    target: Ref(String)
             \\    $member = func($mode self: Hook) Hook
-            \\        if self.target.value.append("x") -> ()
+            \\        const _: unit = self.target.value.append("x") else panic "append failed"
             \\        return Hook{target = self.target}
             \\struct Wrapper
             \\    $member = fieldwise
             \\    value: Hook
             \\func consume(var hook: $container) -> ()
-            \\fallible inspect(ref left: String, ref right: String) int
+            \\func inspect(ref left: String, ref right: String) int
             \\    const view = left.view()
             \\    const hook: $container = $construct
             \\    consume(hook$transfer)
             \\    return view.byte_length() + 39
             \\func run() int
-            \\    if const result = calculate() -> return result
+            \\    if const result: int = calculate() -> return result
             \\    return 90
         , hook);
         defer std.testing.allocator.free(declarations);
         const unrelated = try std.mem.concat(std.testing.allocator, u8, &.{
             declarations, "\n",
-            \\fallible calculate() int
+            \\func calculate() int | none
             \\    var left: String = "abc"
             \\    var right: String = ""
-            \\    return inspect?(left, right)
+            \\    return inspect(left, right)
         });
         defer std.testing.allocator.free(unrelated);
         try Fixture.expectParity(unrelated, 42);
         const aliased = try std.mem.concat(std.testing.allocator, u8, &.{
             declarations, "\n",
-            \\fallible calculate() int
+            \\func calculate() int | none
             \\    var buffer: String = "abc"
-            \\    return inspect?(buffer, buffer)
+            \\    return inspect(buffer, buffer)
             \\_ = run()
         });
         defer std.testing.allocator.free(aliased);
@@ -360,8 +360,8 @@ test "reference result mode borrows the complete variant" {
         \\func run() int
         \\    var owner: int | none = 12
         \\    ref selected = select(owner)
-        \\    if ref item = selected as int -> item += 30
-        \\    if const result = owner as int -> return result
+        \\    if ref item: int = selected -> item += 30
+        \\    if const result: int = owner -> return result
         \\    return 90
     , 42);
 }
@@ -369,21 +369,22 @@ test "reference result mode borrows the complete variant" {
 test "callable widening preserves reference result contracts" {
     for ([_][]const u8{
         \\func source(ref value: int) int -> value
-        \\func accept(callback: fallible(ref int) ref int) -> ()
+        \\func accept(callback: func(ref int) ref int) -> ()
         \\accept(source)
         ,
         \\func source(ref value: int) ref int -> value
-        \\func accept(callback: fallible(ref int) int) -> ()
+        \\func accept(callback: func(ref int) int) -> ()
         \\accept(source)
         ,
     }) |source| try Fixture.expectSourceDiagnostic(source, .call_argument_type_mismatch);
     try Fixture.expectParity(
         \\func identity(ref value: int) ref int -> value
         \\func run() int
-        \\    var source = 42
-        \\    const callback: fallible(ref int) ref int = identity
-        \\    if ref result = callback(source) -> return result
-        \\    return 1
+        \\    var source = 19
+        \\    const callback: func(ref int) ref int = identity
+        \\    ref result = callback(source)
+        \\    result += 23
+        \\    return source
     , 42);
 }
 
@@ -394,13 +395,13 @@ test "references readonly borrows preserve owner cleanup authority" {
         \\    trace: Ref(int)
         \\    value: int
         \\    drop = func(deinit self: Item) -> self.trace.value += self.value
-        \\fallible calculate(var trace: Ref(int)) int
-        \\    const owner = Box.new?(Item{trace = trace, value = 2})
+        \\func calculate(var trace: Ref(int)) int | none
+        \\    const owner: Box(Item) = Box.new(Item{trace = trace, value = 2}) else return none
         \\    return owner.borrow().value + 38
         \\func run() int
-        \\    var trace = Array(int, 1).filled(0)
-        \\    if ref target = trace.get(0)
-        \\        if const value = calculate(Ref.from(target)) -> return value + target
+        \\    var trace: Array(int, 1) = Array(int, 1).filled(0) else panic "unexpected none"
+        \\    if ref target: int = trace.get(0)
+        \\        if const value: int = calculate((if const _selected_result_0: Ref(int) = Ref.from(target) -> _selected_result_0 else panic "unexpected none")) -> return value + target
         \\    return 90
     , 42);
 }
@@ -473,20 +474,20 @@ test "references generic handles own only their reference field" {
 
 test "references array and list lookups preserve earlier element borrows" {
     try Fixture.expectParity(
-        \\fallible compute() int
+        \\func compute() int | none
         \\    var array = [1, 2]
         \\    ref first = array[0]
         \\    ref second = array[1]
         \\    first += 9
         \\    second += 8
         \\    var list: List(int) = [1, 2]
-        \\    ref third = list.get?(0)
-        \\    ref fourth = list.get?(1)
+        \\    ref third: int = list.get(0) else return none
+        \\    ref fourth: int = list.get(1) else return none
         \\    third += 10
         \\    fourth += 9
         \\    return first + second + third + fourth
         \\func run() int
-        \\    if const result = compute() -> return result
+        \\    if const result: int = compute() -> return result
         \\    return 90
     , 42);
 }
@@ -498,25 +499,25 @@ test "references conditional payload borrows and mutable calls preserve ownershi
         \\func update(mut value: int) -> value += 30
         \\func run() int
         \\    var owner: Payload | none = Payload{value = 12}
-        \\    if ref payload = owner as Payload
+        \\    if ref payload: Payload = owner
         \\        update(payload.value)
-        \\    if ref result = owner as Payload -> return result.value
+        \\    if ref result: Payload = owner -> return result.value
         \\    return 90
     , 42);
 }
 
-test "references borrowed fallible results bind conditionally without copying" {
+test "references borrowed func results bind conditionally without copying" {
     try Fixture.expectParity(
         \\struct Payload
         \\    pub value: int
-        \\fallible select(ref owner: Payload, index: int) ref Payload
-        \\    index == 0
+        \\func select(ref owner: Payload, index: int) ref Payload | none
+        \\    if not (index == 0) -> return none
         \\    return owner
         \\func run() int
         \\    var owner = Payload{value = 12}
-        \\    if ref item = select(owner, 0)
+        \\    if ref item: Payload = select(owner, 0)
         \\        item.value += 30
-        \\    if ref absent = select(owner, 1) -> return 90
+        \\    if ref absent: Payload = select(owner, 1) -> return 90
         \\    return owner.value
     , 42);
 }
@@ -529,7 +530,7 @@ test "references variant alternatives capture existing places" {
         \\func run() int
         \\    var owner = 17
         \\    const result = capture(owner)
-        \\    if ref selected = result as int -> selected += 25
+        \\    if ref selected: int = result -> selected += 25
         \\    else return 90
         \\    return owner
     , 42);
@@ -542,7 +543,7 @@ test "references variant captures retain independent referent lifetime" {
         \\func capture(ref value: int) ref int | End -> value
         \\func selected(ref value: int) ref int
         \\    const carrier = capture(value)
-        \\    if ref result = carrier as int -> return result
+        \\    if ref result: int = carrier -> return result
         \\    return value
         \\func run() int
         \\    var owner = 17
@@ -564,7 +565,7 @@ test "references variant captures retain independent referent lifetime" {
         \\func capture(ref value: int) ref int | End -> value
         \\const owner = 17
         \\const carrier = capture(owner)
-        \\if ref result = carrier as int -> result += 25
+        \\if ref result: int = carrier -> result += 25
     , .reference_not_writable);
 }
 
@@ -578,7 +579,7 @@ test "references variant construction rejects ambiguous storage selection" {
         \\func owned() int | ref int -> 42
         \\func run() int
         \\    const carrier = owned()
-        \\    if ref result = carrier as int -> return result
+        \\    if ref result: int = carrier -> return result
         \\    return 90
     , 42);
 }
@@ -589,11 +590,11 @@ test "references variant logical matching aliases either storage kind" {
         \\    copy = trivial
         \\func capture(ref value: int) ref int | End -> value
         \\func choose(ref value: int, borrowed: bool) int | ref int | End
-        \\    if borrowed? -> return capture(value)
+        \\    if borrowed -> return capture(value)
         \\    return 17
         \\func update(ref value: int, borrowed: bool) int
         \\    var carrier = choose(value, borrowed)
-        \\    if ref selected = carrier as int
+        \\    if ref selected: int = carrier
         \\        selected += 25
         \\        return selected
         \\    return 90
@@ -612,7 +613,7 @@ test "references variant owning matches copy reference referents" {
         \\func capture(ref value: int) ref int | End -> value
         \\func run() int
         \\    var owner = 17
-        \\    if const selected = capture(owner) as int
+        \\    if const selected: int = capture(owner)
         \\        var copied = selected
         \\        copied += 25
         \\        if owner <> 17 -> return 90
@@ -624,12 +625,12 @@ test "references variant owning matches copy reference referents" {
 test "references variant union matches copy logical reference payloads" {
     try Fixture.expectParity(
         \\func capture(ref value: int, present: bool) ref int | none
-        \\    if present? -> return value
+        \\    if present -> return value
         \\    return none
         \\func inspect(ref owner: int, present: bool) int
-        \\    const carrier = capture(owner, present)
-        \\    if const selected = carrier as (int | none)
-        \\        if const value = selected as int -> return value + 25
+        \\    const carrier: ref int | none = capture(owner, present)
+        \\    if const selected: int | none = carrier
+        \\        if const value: int = selected -> return value + 25
         \\        return 42
         \\    return 90
         \\func run() int
@@ -639,13 +640,13 @@ test "references variant union matches copy logical reference payloads" {
     , 42);
     try Fixture.expectParity(
         \\func produce(first: bool) none | Array(int, 3) | int
-        \\    if first? -> return [10, 11, 21]
+        \\    if first -> return [10, 11, 21]
         \\    return 42
         \\func inspect(first: bool) int
-        \\    if const selected = produce(first) as (Array(int, 3) | int)
-        \\        if const number = selected as int -> return number
-        \\        if ref values = selected as Array(int, 3)
-        \\            if const last = values.get(2) -> return last + 21
+        \\    if const selected: Array(int, 3) | int = produce(first)
+        \\        if const number: int = selected -> return number
+        \\        if ref values: Array(int, 3) = selected
+        \\            if const last: int = values.get(2) -> return last + 21
         \\    return 90
         \\func run() int
         \\    if inspect(true) <> 42 -> return 91
@@ -668,7 +669,7 @@ test "references contextual tuple construction permits unrelated reference alter
     try Fixture.expectParity(
         \\func run() int
         \\    const pair: (int, int) | ref bool = (19, 23)
-        \\    if const selected = pair as (int, int) -> return selected.0 + selected.1
+        \\    if const selected: (int, int) = pair -> return selected.0 + selected.1
         \\    return 90
     , 42);
 }
@@ -682,7 +683,7 @@ test "references readonly recursive owners preserve captured authority when forw
         \\func forward(imm node: Node) -> update(node)
         \\func run() int
         \\    var target = 41
-        \\    const node = Node{next = none, target = Ref.from(target)}
+        \\    const node = Node{next = none, target = (if const _selected_result_0: Ref(int) = Ref.from(target) -> _selected_result_0 else panic "unexpected none")}
         \\    forward(node)
         \\    return target
     , 42);
@@ -694,17 +695,18 @@ test "references readonly recursive owners cannot upgrade owned views" {
         \\    next: Box(Node) | none
         \\    view: Span(int) | none
         \\func selected(ref node: Node) Span(int)
-        \\    if ref next = node.next as Box(Node) -> return selected(next.borrow())
-        \\    if const view = node.view as Span(int) -> return view
+        \\    if ref next: Box(Node) = node.next -> return selected(next.borrow())
+        \\    if const view: Span(int) = node.view -> return view
         \\    panic
         \\func forward(imm node: Node) Span(int) -> selected(node)
-        \\fallible calculate()
+        \\func calculate() unit | none
         \\    var values = [41]
-        \\    var leaf = Box.new?(Node{next = none, view = values.span()})
+        \\    var leaf: Box(Node) = Box.new(Node{next = none, view = values.span()}) else return none
         \\    const root = Node{next = leaf^, view = none}
         \\    var view = forward(root)
         \\    view[0] = 42
-        \\if calculate() -> ()
+        \\    return ()
+        \\if (calculate() is unit) -> ()
     , .reference_not_writable);
 }
 
@@ -714,18 +716,18 @@ test "references readonly recursive owners return writable captured handles" {
         \\    next: Box(Node) | none
         \\    target: Ref(int)
         \\func selected(ref node: Node) Ref(int)
-        \\    if ref next = node.next as Box(Node) -> return selected(next.borrow())
+        \\    if ref next: Box(Node) = node.next -> return selected(next.borrow())
         \\    return node.target
         \\func forward(imm node: Node) Ref(int) -> selected(node)
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var target = 41
-        \\    var leaf = Box.new?(Node{next = none, target = Ref.from(target)})
-        \\    const root = Node{next = leaf^, target = Ref.from(target)}
+        \\    var leaf: Box(Node) = Box.new(Node{next = none, target = (if const _selected_result_0: Ref(int) = Ref.from(target) -> _selected_result_0 else panic "unexpected none")}) else return none
+        \\    const root = Node{next = leaf^, target = (if const _selected_result_1: Ref(int) = Ref.from(target) -> _selected_result_1 else return none)}
         \\    const handle = forward(root)
         \\    handle.value += 1
         \\    return target
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -736,23 +738,23 @@ test "references recursive parameter outputs retain replacement authority and li
         \\    next: Box(Node) | none
         \\    target: Ref(int)
         \\func replace(ref node: Node, ref source: int)
-        \\    if ref next = node.next as Box(Node) -> replace(next.borrow(), source)
+        \\    if ref next: Box(Node) = node.next -> replace(next.borrow(), source)
         \\    else
-        \\        node.target = Ref.from(source)
+        \\        node.target = (if const _selected_result_0: Ref(int) = Ref.from(source) -> _selected_result_0 else panic "unexpected none")
         \\func selected(ref node: Node) Ref(int)
-        \\    if ref next = node.next as Box(Node) -> return selected(next.borrow())
+        \\    if ref next: Box(Node) = node.next -> return selected(next.borrow())
         \\    return node.target
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var original = 0
         \\    var replacement = 41
-        \\    var leaf = Box.new?(Node{next = none, target = Ref.from(original)})
-        \\    var root = Node{next = leaf^, target = Ref.from(original)}
+        \\    var leaf: Box(Node) = Box.new(Node{next = none, target = (if const _selected_result_1: Ref(int) = Ref.from(original) -> _selected_result_1 else panic "unexpected none")}) else return none
+        \\    var root = Node{next = leaf^, target = (if const _selected_result_2: Ref(int) = Ref.from(original) -> _selected_result_2 else return none)}
         \\    replace(root, replacement)
         \\    const handle = selected(root)
         \\    handle.value += 1
         \\    return replacement
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     ;
     try Fixture.expectParity(source, 42);
@@ -782,7 +784,7 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\    source: Ref(T)
         \\    ready: bool
         \\    func next(mut self: Cursor(T)) ref T | End
-        \\        if not self.ready? -> return End{}
+        \\        if not self.ready -> return End{}
         \\        self.ready = false
         \\        return self.source.value
         \\struct Zip(L: type, R: type, A: type, B: type)
@@ -790,9 +792,9 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\    right: R
         \\    func next(mut self: Zip(L, R, A, B)) (ref A, ref B) | End
         \\        const left_result = self.left.next()
-        \\        if ref left_item = left_result as A
+        \\        if ref left_item: A = left_result
         \\            const right_result = self.right.next()
-        \\            if ref right_item = right_result as B
+        \\            if ref right_item: B = right_result
         \\                var pair: (ref A, ref B) = (left_item, right_item)
         \\                return pair^
         \\        return End{}
@@ -803,7 +805,7 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\    const right = Right{value = 7}
         \\    var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
         \\    const result = zipped.next()
-        \\    if ref pair = result as (ref Left, ref Right)
+        \\    if ref pair: (ref Left, ref Right) = result
         \\        pair.0.value += 30
         \\        if pair.1.value <> 7 -> return 90
         \\        if zipped.next() is End -> return left.value
@@ -814,14 +816,14 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\const right = Right{value = 7}
         \\var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
         \\const result = zipped.next()
-        \\if ref pair = result as (ref Left, ref Right) -> pair.1.value += 1
+        \\if ref pair: (ref Left, ref Right) = result -> pair.1.value += 1
     , .reference_not_writable);
     try Fixture.expectParity(declarations ++ "\n" ++
         \\func first(ref left: Left) ref Left
         \\    const right = Right{value = 7}
         \\    var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
         \\    const result = zipped.next()
-        \\    if const pair = result as (ref Left, ref Right) -> return pair.0
+        \\    if const pair: (ref Left, ref Right) = result -> return pair.0
         \\    exit(90)
         \\func run() int
         \\    var left = Left{value = 12}
@@ -835,7 +837,7 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\    var right = Right{value = 12}
         \\    var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
         \\    const result = zipped.next()
-        \\    if const pair = result as (ref Left, ref Right)
+        \\    if const pair: (ref Left, ref Right) = result
         \\        if pair.0.value <> 7 -> return 90
         \\        pair.1.value += 30
         \\        return right.value
@@ -846,7 +848,7 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\var right = Right{value = 12}
         \\var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
         \\const result = zipped.next()
-        \\if const pair = result as (ref Left, ref Right) -> pair.0.value += 1
+        \\if const pair: (ref Left, ref Right) = result -> pair.0.value += 1
     , .reference_not_writable);
 }
 
@@ -866,7 +868,7 @@ test "references tuples own cleanup only for owned members" {
         \\    _ = copied.1.value
         \\func run() int
         \\    var effects = 0
-        \\    var owner = Tracked{value = 17, effects = Ref.from(effects)}
+        \\    var owner = Tracked{value = 17, effects = (if const _selected_result_0: Ref(int) = Ref.from(effects) -> _selected_result_0 else panic "unexpected none")}
         \\    exercise(owner)
         \\    const result = effects + 20
         \\    _ = owner.value
@@ -880,7 +882,7 @@ test "references tuples own cleanup only for owned members" {
         \\    copy = trivial
         \\func capture(ref value: Item) ref Item | End -> value
         \\var owner = Item{value = 42}
-        \\if const copied = capture(owner) as Item -> exit(copied.value)
+        \\if const copied: Item = capture(owner) -> exit(copied.value)
     , .type_not_copyable);
 }
 
@@ -894,7 +896,7 @@ test "references separate union alternatives do not become a whole union borrow"
         \\func run() int
         \\    var number = 42
         \\    var flag = false
-        \\    if ref item = choose(number, flag, true) as int | bool -> return 1
+        \\    if ref item: int | bool = choose(number, flag, true) -> return 1
         \\    return 0
         \\_ = run()
     , .reference_projection_requires_member);
@@ -905,8 +907,8 @@ test "references separate union alternatives do not become a whole union borrow"
         \\func run() int
         \\    var owner: int | bool = true
         \\    const carrier = capture(owner)
-        \\    if ref item = carrier as int | bool -> item = 42
-        \\    if const item = owner as int -> return item
+        \\    if ref item: int | bool = carrier -> item = 42
+        \\    if const item: int = owner -> return item
         \\    return 90
     , 42);
 }
@@ -917,7 +919,7 @@ test "references logical payload borrows do not retain temporary carriers" {
     ;
     try Fixture.expectParity(declarations ++ "\n" ++
         \\func selected(ref owner: int) ref int
-        \\    if ref item = capture(owner) as int -> return item
+        \\    if ref item: int = capture(owner) -> return item
         \\    exit(90)
         \\func run() int
         \\    var owner = 12
@@ -928,7 +930,7 @@ test "references logical payload borrows do not retain temporary carriers" {
     try Fixture.expectParity(declarations ++ "\n" ++
         \\func selected(ref owner: int) ref int
         \\    var carrier: ref int | End = owner
-        \\    if ref item = carrier as int
+        \\    if ref item: int = carrier
         \\        carrier = End{}
         \\        return item
         \\    exit(90)
@@ -940,18 +942,18 @@ test "references logical payload borrows do not retain temporary carriers" {
     , 42);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
         \\const owner = 12
-        \\if ref item = capture(owner) as int -> item += 30
+        \\if ref item: int = capture(owner) -> item += 30
     , .reference_not_writable);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
         \\func invalid() ref int
         \\    var owner = 12
-        \\    if ref item = capture(owner) as int -> return item
+        \\    if ref item: int = capture(owner) -> return item
         \\    exit(90)
         \\_ = invalid()
     , .borrow_outlives_source);
     try Fixture.expectAnySourceDiagnostic(
         \\var carrier: int | End = 12
-        \\if ref item = carrier as int
+        \\if ref item: int = carrier
         \\    carrier = End{}
         \\    exit(item)
     , .borrow_outlives_source);
@@ -983,7 +985,7 @@ test "references const carriers preserve captured referent authority" {
         \\func forward(ref handle: Ref(int)) Ref(int) -> handle
         \\func run() int
         \\    var owner = 12
-        \\    const first = Ref.from(owner)
+        \\    const first: Ref(int) = Ref.from(owner) else panic "unexpected none"
         \\    first.value += 10
         \\    const second = first
         \\    update(second)
@@ -1002,7 +1004,7 @@ test "references const aggregate copies preserve independent reference and stora
         \\func run() int
         \\    var owner = 12
         \\    var values = [1]
-        \\    const original = Mixed{target = Ref.from(owner), view = values.span()}
+        \\    const original = Mixed{target = (if const _selected_result_0: Ref(int) = Ref.from(owner) -> _selected_result_0 else panic "unexpected none"), view = values.span()}
         \\    var copied = original
         \\    copied.target.value += 30
         \\    return owner
@@ -1012,14 +1014,15 @@ test "references const aggregate copies preserve independent reference and stora
         \\    copy = trivial
         \\    pub target: Ref(int)
         \\    pub view: Span(int)
-        \\fallible invalid()
+        \\func invalid() unit | none
         \\    var owner = 12
         \\    var values = [1]
         \\    const original = Mixed{target = Ref.from(owner), view = values.span()}
         \\    var copied = original
-        \\    ref item = copied.view.get?(0)
+        \\    ref item: int = copied.view.get(0) else return none
         \\    item = 42
-        \\if invalid() -> unit
+        \\    return ()
+        \\if (invalid() is unit) -> unit
     , .reference_not_writable);
 }
 
@@ -1027,9 +1030,9 @@ test "references const aggregate copies preserve array and variant captures" {
     try Fixture.expectParity(
         \\func run() int
         \\    var owner = 12
-        \\    const original = [Ref.from(owner)]
+        \\    const original = [(if const _selected_result_0: Ref(int) = Ref.from(owner) -> _selected_result_0 else panic "unexpected none")]
         \\    var copied = original
-        \\    if ref handle = copied.get(0) -> handle.value += 30
+        \\    if ref handle: Ref(int) = copied.get(0) -> handle.value += 30
         \\    return owner
     , 42);
     try Fixture.expectParity(
@@ -1037,7 +1040,7 @@ test "references const aggregate copies preserve array and variant captures" {
         \\    var owner = 12
         \\    const original: Ref(int) | none = Ref.from(owner)
         \\    var copied = original
-        \\    if ref handle = copied as Ref(int) -> handle.value += 30
+        \\    if ref handle: Ref(int) = copied -> handle.value += 30
         \\    return owner
     , 42);
 }
@@ -1065,20 +1068,20 @@ test "references readonly handle fields preserve permission in conditional borro
     try Fixture.expectSourceDiagnostic(
         \\const source: int | none = 42
         \\const handle = Ref.from(source)
-        \\if ref item = handle.value as int -> item += 1
+        \\if ref item: int = handle.value -> item += 1
     , .reference_not_writable);
     try Fixture.expectSourceDiagnostic(
         \\const source: int | none = 42
         \\const readonly = Ref.from(source)
         \\var handle = readonly
-        \\if ref item = handle.value as int -> item += 1
+        \\if ref item: int = handle.value -> item += 1
     , .reference_not_writable);
     try Fixture.expectParity(
         \\func run() int
         \\    var source: int | none = 41
-        \\    const handle = Ref.from(source)
-        \\    if ref item = handle.value as int -> item += 1
-        \\    if ref item = source as int -> return item
+        \\    const handle: Ref(int | none) = Ref.from(source) else panic "unexpected none"
+        \\    if ref item: int = handle.value -> item += 1
+        \\    if ref item: int = source -> return item
         \\    return 90
     , 42);
 }
@@ -1160,12 +1163,13 @@ test "references readonly attenuation through a helper is preserved at its call 
 
 test "references readonly spans cannot grant writable element access" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible invalid()
+        \\func invalid() unit | none
         \\    var owner = [12]
         \\    var view = owner.span().as_imm()
         \\    ref item = view[0]
         \\    item = 42
-        \\if invalid() -> unit
+        \\    return ()
+        \\if (invalid() is unit) -> unit
     , .reference_not_writable);
 }
 
@@ -1174,8 +1178,8 @@ test "references returning a referent does not capture an intermediate handle ow
         \\import std.memory.{Ref}
         \\func referent(ref handle: Ref(int)) ref int -> handle.value
         \\func capture(ref owner: int) Ref(int)
-        \\    var temporary = Ref.from(owner)
-        \\    return Ref.from(referent(temporary))
+        \\    var temporary: Ref(int) = Ref.from(owner) else panic "unexpected none"
+        \\    return (if const _selected_result_0: Ref(int) = Ref.from(referent(temporary)) -> _selected_result_0 else panic "unexpected none")
         \\func run() int
         \\    var owner = 12
         \\    var result = capture(owner)
@@ -1190,7 +1194,7 @@ test "references returned origin excludes unrelated reference arguments" {
         \\func first(ref left: int, ref right: int) ref int -> left
         \\func capture(ref source: int) Ref(int)
         \\    var unrelated = 90
-        \\    return Ref.from(first(source, unrelated))
+        \\    return (if const _selected_result_0: Ref(int) = Ref.from(first(source, unrelated)) -> _selected_result_0 else panic "unexpected none")
         \\func run() int
         \\    var source = 12
         \\    var result = capture(source)
@@ -1212,7 +1216,7 @@ test "references helper writes respect the captured referent permission" {
         \\func update(mut handle: Ref(int)) -> handle.value += 30
         \\func run() int
         \\    var source = 12
-        \\    var handle = Ref.from(source)
+        \\    var handle: Ref(int) = Ref.from(source) else panic "unexpected none"
         \\    update(handle)
         \\    return source
     , 42);
@@ -1221,18 +1225,18 @@ test "references helper writes respect the captured referent permission" {
 test "references containers of handles expose the handle slot and copy only its contents" {
     try Fixture.expectParity(
         \\import std.memory.{Ref}
-        \\fallible capture(ref source: int) Ref(int)
-        \\    var handles = [Ref.from(source)]
+        \\func capture(ref source: int) Ref(int) | none
+        \\    var handles = [(if const _selected_result_0: Ref(int) = Ref.from(source) -> _selected_result_0 else return none)]
         \\    ref slot = handles[0]
         \\    slot.value += 10
         \\    return handles[0]
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var source = 12
-        \\    var copied = capture?(source)
+        \\    var copied: Ref(int) = capture(source) else return none
         \\    copied.value += 20
         \\    return source
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -1242,7 +1246,7 @@ test "references variant payload aliases cannot survive a changed active tag" {
         \\struct Payload
         \\    pub value: int
         \\var owner: Payload | none = Payload{value = 42}
-        \\if ref payload = owner as Payload
+        \\if ref payload: Payload = owner
         \\    owner = none
         \\    exit(payload.value)
     , .borrow_outlives_source);
@@ -1250,12 +1254,13 @@ test "references variant payload aliases cannot survive a changed active tag" {
 
 test "references list element aliases cannot survive reallocation" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible invalid()
+        \\func invalid() unit | none
         \\    var owner: List(int) = [42]
         \\    ref item = owner[0]
-        \\    owner.reserve?(128)
+        \\    const _: unit = owner.reserve(128) else return none
         \\    exit(item)
-        \\if invalid() -> unit
+        \\    return ()
+        \\if (invalid() is unit) -> unit
     , .borrow_outlives_source);
 }
 
@@ -1316,8 +1321,8 @@ test "references recursive forwarding infers writes through every participating 
         \\func run() int
         \\    var left = 20
         \\    var right = 21
-        \\    var a = Ref.from(left)
-        \\    var b = Ref.from(right)
+        \\    var a: Ref(int) = Ref.from(left) else panic "unexpected none"
+        \\    var b: Ref(int) = Ref.from(right) else panic "unexpected none"
         \\    first(a, b, 1)
         \\    return left + right
     , 42);
@@ -1356,7 +1361,7 @@ test "references owned handles keep captured permission during argument preparat
         \\func discard(var item: Item) -> unit
         \\func run() int
         \\    var source = 0
-        \\    discard(Item{trace = Ref.from(source)})
+        \\    discard(Item{trace = (if const _selected_result_0: Ref(int) = Ref.from(source) -> _selected_result_0 else panic "unexpected none")})
         \\    return source
     , 42);
 }
@@ -1367,20 +1372,20 @@ test "references owned handles survive borrowed variant conversion through an im
         \\func choose(imm handle: Ref(int)) Ref(int) | none -> handle
         \\func run() int
         \\    const source = [42]
-        \\    if ref element = source.get(0)
-        \\        if const handle = choose(Ref.from(element)) as Ref(int) -> return handle.value
+        \\    if ref element: int = source.get(0)
+        \\        if const handle: Ref(int) = choose((if const _selected_result_0: Ref(int) = Ref.from(element) -> _selected_result_0 else panic "unexpected none")) -> return handle.value
         \\    return 90
     , 42);
 }
 
 test "references list views keep allocation storage through copied descriptor frames" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var values: List(int) = [19, 23]
-        \\    const view = values.slice?(0..2)
+        \\    const view: Span(int) = values.slice(0..2) else return none
         \\    return view[0] + view[1]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -1404,14 +1409,14 @@ test "references read-only helpers do not invalidate another live element refere
     try Fixture.expectParity(
         \\import std.memory.{Ref}
         \\func inspect(var handle: Ref(int)) int -> handle.value
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var owner: List(int) = [12]
-        \\    ref element = owner.get?(0)
-        \\    const observed = inspect(Ref.from(element))
+        \\    ref element: int = owner.get(0) else return none
+        \\    const observed = inspect((if const _selected_result_0: Ref(int) = Ref.from(element) -> _selected_result_0 else return none))
         \\    element += 18
         \\    return observed + element
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -1419,13 +1424,14 @@ test "references read-only helpers do not invalidate another live element refere
 test "references helper replacement invalidates allocated descendants but preserves the owner slot" {
     try Fixture.expectSourceDiagnostic(
         \\func replace(ref owner: Box(int), var replacement: Box(int)) -> owner = replacement^
-        \\fallible invalid()
-        \\    var owner = Box.new?(12)
+        \\func invalid() unit | none
+        \\    var owner: Box(int) = Box.new(12) else return none
         \\    ref old = owner.borrow()
-        \\    replace(owner, Box.new?(42))
+        \\    replace(owner, (if const _selected_result_0: Box(int) = Box.new(42) -> _selected_result_0^ else return none))
         \\    print("replaced")
         \\    old += 1
-        \\if invalid() -> unit
+        \\    return ()
+        \\if (invalid() is unit) -> unit
     , .borrow_outlives_source);
 }
 
@@ -1445,20 +1451,20 @@ test "references unknown function values cannot upgrade a returned readonly capt
 test "references replacing a handle slot retains the newly borrowed referent" {
     try Fixture.expectParity(
         \\import std.memory.{Ref}
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var first = 12
         \\    var second = 42
-        \\    var handles = [Ref.from(first)]
+        \\    var handles = [(if const _selected_result_0: Ref(int) = Ref.from(first) -> _selected_result_0 else return none)]
         \\    ref slot = handles[0]
-        \\    slot = Ref.from(second)
+        \\    slot = (if const _selected_result_1: Ref(int) = Ref.from(second) -> _selected_result_1 else return none)
         \\    return slot.value
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
     try Fixture.expectSourceDiagnostic(
         \\import std.memory.{Ref}
-        \\fallible invalid() int
+        \\func invalid() int | none
         \\    const original = 42
         \\    var handles = [Ref.from(original)]
         \\    if 1 == 1
@@ -1466,7 +1472,7 @@ test "references replacing a handle slot retains the newly borrowed referent" {
         \\        ref slot = handles[0]
         \\        slot = Ref.from(temporary)
         \\    return handles[0].value
-        \\if invalid() -> unit
+        \\if (invalid() is int) -> unit
     , .borrow_outlives_source);
 }
 
@@ -1478,11 +1484,11 @@ test "references recursive reference fields infer a finite return contract" {
         \\    pub value: int
         \\func select(ref node: Node, depth: int) ref Node
         \\    if depth == 0 -> return node
-        \\    if ref next = node.next as Ref(Node) -> return select(next.value, depth - 1)
+        \\    if ref next: Ref(Node) = node.next -> return select(next.value, depth - 1)
         \\    return node
         \\func run() int
         \\    var first = Node{next = none, value = 12}
-        \\    var second = Node{next = Ref.from(first), value = 30}
+        \\    var second = Node{next = (if const _selected_result_0: Ref(Node) = Ref.from(first) -> _selected_result_0 else panic "unexpected none"), value = 30}
         \\    ref found = select(second, 1)
         \\    return found.value + 30
     , 42);
@@ -1511,15 +1517,15 @@ test "references immutable scalar arguments snapshot a borrowed value before lat
         \\    owner^.deallocate()
         \\    return 0
         \\func observe(first: int, second: int) int -> first + second
-        \\fallible calculate() int
-        \\    var owner = Allocation(int).allocate?(1)
-        \\    if owner.unsafe_initialize(0, 42) -> unit
+        \\func calculate() int | none
+        \\    var owner: Allocation(int) = Allocation(int).allocate(1) else return none
+        \\    if (owner.unsafe_initialize(0, 42) is unit) -> unit
         \\    else
         \\        owner^.deallocate()
-        \\        fail
+        \\        return none
         \\    return observe(owner.unsafe_borrow(0), discard(owner^))
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -1527,7 +1533,7 @@ test "references immutable scalar arguments snapshot a borrowed value before lat
 test "references span capabilities survive copies calls fields and joins" {
     try Fixture.expectParity(
         \\func retain(ref view: Span(int)) Span(int) -> view
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var owner = [12]
         \\    var view = owner.span()
         \\    const callback: func(ref Span(int)) Span(int) = retain
@@ -1536,7 +1542,7 @@ test "references span capabilities survive copies calls fields and joins" {
         \\    item += 30
         \\    return owner[0]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
     for ([_][]const u8{
@@ -1550,39 +1556,40 @@ test "references span capabilities survive copies calls fields and joins" {
             \\struct Wrapped
             \\    pub view: Span(int)
             \\func retain(ref view: Span(int)) Span(int) -> view
-            \\fallible invalid(choice: int)
+            \\func invalid(choice: int)
             \\    var owner = [12]
             \\    $setup
             \\    ref item = selected[0]
             \\    item = 42
-            \\if invalid(1) -> unit
+            \\invalid(1)
         , .{ .setup = setup });
         defer std.testing.allocator.free(source);
         try Fixture.expectSourceDiagnostic(source, .reference_not_writable);
     }
     try Fixture.expectSourceDiagnostic(
         \\func retain(ref view: Span(int)) Span(int) -> view
-        \\fallible invalid(callback: func(ref Span(int)) Span(int))
+        \\func invalid(callback: func(ref Span(int)) Span(int)) unit | none
         \\    var owner = [12]
         \\    var view = owner.span()
         \\    var selected = callback(view)
         \\    ref item = selected[0]
         \\    item = 42
-        \\if invalid(retain) -> unit
+        \\    return ()
+        \\if (invalid(retain) is unit) -> unit
     , .reference_not_writable);
 }
 
 test "references slicing a writable span preserves captured permission" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var source = [12, 0]
         \\    var complete = source.span()
-        \\    var slice = complete.slice?(0..1)
+        \\    var slice: Span(int) = complete.slice(0..1) else return none
         \\    ref item = slice[0]
         \\    item += 30
         \\    return source[0]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -1594,7 +1601,7 @@ test "references assignments to returned places evaluate their receiver once" {
         \\    return item
         \\func handle(ref item: int, mut calls: int) Ref(int)
         \\    calls += 1
-        \\    return Ref.from(item)
+        \\    return (if const _selected_result_0: Ref(int) = Ref.from(item) -> _selected_result_0 else panic "unexpected none")
         \\func run() int
         \\    var source = 10
         \\    var calls = 0
@@ -1610,16 +1617,16 @@ test "references recursive allocated owners infer a finite borrowed-result contr
         \\    pub next: Box(Node) | none
         \\    pub value: int
         \\func last(ref node: Node) ref int
-        \\    if ref next = node.next as Box(Node) -> return last(next.borrow())
+        \\    if ref next: Box(Node) = node.next -> return last(next.borrow())
         \\    return node.value
-        \\fallible calculate() int
-        \\    var leaf = Box.new?(Node{next = none, value = 12})
+        \\func calculate() int | none
+        \\    var leaf: Box(Node) = Box.new(Node{next = none, value = 12}) else return none
         \\    var root = Node{next = leaf^, value = 0}
         \\    ref result = last(root)
         \\    result += 30
         \\    return result
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -1627,7 +1634,7 @@ test "references recursive allocated owners infer a finite borrowed-result contr
 test "references a parameter payload cannot survive replacing its variant tag" {
     try Fixture.expectSourceDiagnostic(
         \\func invalid(ref source: int | none) int
-        \\    if ref item = source as int
+        \\    if ref item: int = source
         \\        source = none
         \\        return item
         \\    return 90
@@ -1639,11 +1646,11 @@ test "references a parameter payload cannot survive replacing its variant tag" {
 test "references parameter replacement retains the new referent" {
     try Fixture.expectParity(
         \\import std.memory.{Ref}
-        \\func replace(ref slot: Ref(int), ref source: int) -> slot = Ref.from(source)
+        \\func replace(ref slot: Ref(int), ref source: int) -> slot = (if const _selected_result_0: Ref(int) = Ref.from(source) -> _selected_result_0 else panic "unexpected none")
         \\func run() int
         \\    var first = 10
         \\    var second = 40
-        \\    var slot = Ref.from(first)
+        \\    var slot: Ref(int) = Ref.from(first) else panic "unexpected none"
         \\    replace(slot, second)
         \\    slot.value += 2
         \\    return second
@@ -1703,12 +1710,12 @@ test "references ownership hook writes retain newly installed loans" {
 
 test "references handle parameter writes retain new loans and reject expired referents" {
     try Fixture.expectParity(
-        \\func install(var target: Ref(Ref(int)), ref source: int) -> target.value = Ref.from(source)
+        \\func install(var target: Ref(Ref(int)), ref source: int) -> target.value = (if const _selected_result_0: Ref(int) = Ref.from(source) -> _selected_result_0 else panic "unexpected none")
         \\func run() int
         \\    var original = 1
         \\    var replacement = 42
-        \\    var slot = Ref.from(original)
-        \\    install(Ref.from(slot), replacement)
+        \\    var slot: Ref(int) = Ref.from(original) else panic "unexpected none"
+        \\    install((if const _selected_result_1: Ref(Ref(int)) = Ref.from(slot) -> _selected_result_1 else panic "unexpected none"), replacement)
         \\    return slot.value
     , 42);
     try Fixture.expectSourceDiagnostic(
@@ -1732,7 +1739,7 @@ test "references handle parameter writes retain new loans and reject expired ref
     , .borrow_outlives_source);
     try Fixture.expectSourceDiagnostic(
         \\func choose(var target: Ref(Ref(int)), ref first: int, ref second: int, selected: bool)
-        \\    if selected?
+        \\    if selected
         \\        target.value = Ref.from(first)
         \\    else
         \\        target.value = Ref.from(second)
@@ -1790,17 +1797,21 @@ test "references fieldwise destruction leaves the referent owned by its source" 
 
 test "references stored by a replacing call expire after the next replacement" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible install(mut slot: Ref(int), mut owner: Box(int))
-        \\    owner = Box.new?(42)
+        \\func install(mut slot: Ref(int), mut owner: Box(int)) unit | none
+        \\    owner = (if const _selected_result_0: Box(int) = Box.new(42) -> _selected_result_0^ else return none)
         \\    slot = Ref.from(owner.borrow())
-        \\fallible replace(mut owner: Box(int)) -> owner = Box.new?(17)
-        \\fallible invalid() int
+        \\    return ()
+        \\func replace(mut owner: Box(int)) unit | none
+        \\    var replacement: Box(int) = Box.new(17) else return none
+        \\    owner = replacement^
+        \\    return unit
+        \\func invalid() int | none
         \\    var source = 1
         \\    var slot = Ref.from(source)
-        \\    var owner = Box.new?(10)
-        \\    install?(slot, owner)
-        \\    replace?(owner)
+        \\    var owner: Box(int) = Box.new(10) else return none
+        \\    const _: unit = install(slot, owner) else return none
+        \\    const _: unit = replace(owner) else return none
         \\    return slot.value
-        \\if const result = invalid() -> exit(result)
+        \\if const result: int = invalid() -> exit(result)
     , .borrow_outlives_source);
 }

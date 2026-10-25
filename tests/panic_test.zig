@@ -67,11 +67,11 @@ test "panic bypasses ordinary failure handlers and user cleanup" {
         \\struct Guard
         \\    value: String
         \\    drop = func(deinit self: Guard) -> print("dropped")
-        \\fallible stop() int
+        \\func stop() int | none
         \\    const guard = Guard{value = "fatal"}
         \\    panic guard.value
         \\func run()
-        \\    const value: int | none = stop?()
+        \\    const value: int | none = stop()
         \\    print("caught")
         \\run()
     , "fatal", &.{ "at stop ", "at run ", "at <entry> " });
@@ -83,21 +83,21 @@ test "panic bypasses ordinary failure handlers and user cleanup" {
 
 test "panic snapshots borrowed sliced and heap-backed text" {
     const source =
-        \\fallible stop() never
+        \\func stop() never | none
         \\    var message = "prefix: hé"
-        \\    message.append?("\0suffix")
-        \\    const view = message.view().slice?(8..message.byte_length())
+        \\    const _: unit = message.append("\0suffix") else return none
+        \\    const view: StringView = message.view().slice(8..message.byte_length()) else return none
         \\    panic view
-        \\if stop() -> exit(90) else exit(91)
+        \\stop()
     ;
     try expectPanic(source, "hé\x00suffix", &.{ "at stop ", "at <entry> " });
     const fixture = try SourceFixture.init(
-        \\fallible stop() never
+        \\func stop() never | none
         \\    var message = "prefix: hé"
-        \\    message.append?("\0suffix")
-        \\    const view = message.view().slice?(8..message.byte_length())
+        \\    const _: unit = message.append("\0suffix") else return none
+        \\    const view: StringView = message.view().slice(8..message.byte_length()) else return none
         \\    panic view
-        \\static result = if stop() -> 90 else 91
+        \\static result = stop()
         \\exit(result)
     );
     defer fixture.deinit();
@@ -149,8 +149,8 @@ test "panic ignores prelude exclusions and lexical names and remains execution l
 
 test "panic traces outlined initializers and imported functions" {
     try expectPanic(
-        \\fallible accept(init value: int) int -> value
-        \\if const value = accept(panic "initializer") -> exit(value) else exit(91)
+        \\func accept(init value: int) int | none -> value
+        \\if const value: int = accept(panic "initializer") -> exit(value) else exit(91)
     , "initializer", &.{ "at <entry> ", "at accept ", "at <entry> " });
     const fixture = try SourceFixture.initFiles("import lib\nlib.stop()", &.{.{
         .path = "lib/stop.chi",
@@ -194,15 +194,15 @@ test "bare compile-time panic and constraint panic are diagnostics" {
 
 test "panic snapshots inline byte-array backing" {
     const declarations =
-        \\fallible stop() never
+        \\func stop() never | none
         \\    const bytes: Array(byte, 3) = [65, 0, 66]
-        \\    const message = BytesView.from_array(3, bytes).validate_utf8?()
+        \\    const message: StringView = BytesView.from_array(3, bytes).validate_utf8() else return none
         \\    panic message
     ;
-    const native_source = try std.testing.allocator.print("{s}\nif stop() -> exit(90) else exit(91)", .{declarations});
+    const native_source = try std.testing.allocator.print("{s}\nstop()", .{declarations});
     defer std.testing.allocator.free(native_source);
     try expectPanic(native_source, "A\x00B", &.{ "at stop ", "at <entry> " });
-    const comptime_source = try std.testing.allocator.print("{s}\nstatic result = if stop() -> 90 else 91\nexit(result)", .{declarations});
+    const comptime_source = try std.testing.allocator.print("{s}\ncomptime -> stop()", .{declarations});
     defer std.testing.allocator.free(comptime_source);
     const fixture = try SourceFixture.init(comptime_source);
     defer fixture.deinit();
@@ -211,10 +211,10 @@ test "panic snapshots inline byte-array backing" {
 
 test "ordinary failure while evaluating a panic message precedes panic" {
     try SourceFixture.expectParity(
-        \\fallible message() StringView -> fail
-        \\fallible stop() int -> panic message?()
+        \\func message() StringView | none -> return none
+        \\func stop() int | none -> panic (if const _selected_result_0: StringView = message() -> _selected_result_0 else return none)
         \\func run() int
-        \\    if stop() -> return 90
+        \\    if (stop() is int) -> return 90
         \\    return 42
     , 42);
 }

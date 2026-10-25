@@ -22,7 +22,8 @@ def samples(include_runtime=False, include_c=False):
             result.append({"case": history.RUNTIME_CASE, "lane": "normal", "phase": "runtime", "sample": index,
                            "nanoseconds": (96 + index) * 1_000_000, "executable_bytes": 200})
     if include_c:
-        for level, lane in enumerate(history.C_LANES):
+        for lane in history.C_LANES:
+            level = int(lane.removeprefix("c-O"))
             for index in range(9):
                 result.append({"case": history.RUNTIME_CASE, "lane": lane, "phase": "runtime", "sample": index,
                                "nanoseconds": (1600 + index - level) * 1_000_000, "executable_bytes": 300})
@@ -51,6 +52,17 @@ def record():
 class HistoryTests(unittest.TestCase):
     def test_csv_round_trip(self):
         self.assertEqual(history.parse_samples(encode(samples())), samples())
+
+    def test_eight_worker_compilation_samples(self):
+        parallel = [dict(sample, lane="workers-8") for sample in samples()]
+        for rows in (parallel, samples() + parallel):
+            with self.subTest(lanes={row["lane"] for row in rows}):
+                self.assertEqual(history.parse_samples(encode(rows), history.COMPILATION_CASE), rows)
+                self.assertEqual(history.parse_samples(encode(rows)), rows)
+                with self.assertRaises(ValueError):
+                    history.parse_samples(encode(rows[:-1]), history.COMPILATION_CASE)
+        with self.assertRaises(ValueError):
+            history.parse_samples(encode([dict(sample, lane="workers-4") for sample in samples()]))
 
     def test_individual_cases_require_exactly_their_own_samples(self):
         for case in history.CORE_CASES:
@@ -100,9 +112,11 @@ class HistoryTests(unittest.TestCase):
                 measured = history.measure(snapshot, "abc", previous["commit_date"], "tree", False, False, data)
             self.assertEqual({row["case"] for row in measured["benchmarks"][0]["samples"]},
                              {history.RUNTIME_CASE})
-            failure, = measured["failures"]
-            self.assertEqual(failure["case"], history.COMPILATION_CASE)
-            self.assertIn("unsupported String conversion", (data / failure["log"]).read_text())
+            self.assertEqual([failure["workers"] for failure in measured["failures"]], [0, 8])
+            self.assertEqual(len({failure["log"] for failure in measured["failures"]}), 2)
+            for failure in measured["failures"]:
+                self.assertEqual(failure["case"], history.COMPILATION_CASE)
+                self.assertIn("unsupported String conversion", (data / failure["log"]).read_text())
 
     def test_runtime_csv_round_trip_and_incomplete_sample_rejection(self):
         rows = samples(include_runtime=True)
@@ -121,6 +135,9 @@ class HistoryTests(unittest.TestCase):
     def test_c_reference_cache_matches_environment_and_preserves_origin(self):
         previous = record()
         previous["benchmarks"][0]["samples"] = samples(include_c=True)
+        previous["benchmarks"][0]["samples"].extend(
+            dict(sample, lane=lane) for lane in ("c-O1", "c-O2")
+            for sample in samples(include_c=True) if sample["lane"] == "c-O3")
         previous["c_compiler"] = {"path": "/usr/bin/cc", "version": "cc 1.0"}
         expected = [sample for sample in previous["benchmarks"][0]["samples"] if sample["lane"] in history.C_LANES]
         cached, origin = history.cached_c_reference([previous], previous)
@@ -179,7 +196,11 @@ class HistoryTests(unittest.TestCase):
                     self.assertEqual("--skip-c" in arguments, hit)
                     self.assertEqual(cwd, snapshot)
                     case = next(argument.removeprefix("--case=") for argument in arguments if argument.startswith("--case="))
-                    return encode([row for row in samples(include_runtime=True, include_c=not hit) if row["case"] == case])
+                    rows = [row for row in samples(include_runtime=True, include_c=not hit) if row["case"] == case]
+                    if "--workers=8" in arguments:
+                        self.assertEqual(case, history.COMPILATION_CASE)
+                        rows = [dict(row, lane="workers-8") for row in rows]
+                    return encode(rows)
 
                 with patch.object(history, "command", side_effect=command), \
                     patch.object(history, "prepare", return_value=True), \
@@ -187,7 +208,9 @@ class HistoryTests(unittest.TestCase):
                         patch.object(history, "runner", return_value=previous["runner"]), \
                         patch.object(history.shutil, "which", return_value="/usr/bin/cc"):
                     measured = history.measure(snapshot, "abc", previous["commit_date"], "new-tree", True, False, data, refresh)
-                self.assertEqual(measured["benchmarks"][0]["samples"], samples(include_c=True))
+                expected = samples() + [dict(sample, lane="workers-8") for sample in samples()]
+                expected.extend(sample for sample in samples(include_c=True) if sample["case"] == history.RUNTIME_CASE)
+                self.assertEqual(measured["benchmarks"][0]["samples"], expected)
                 self.assertEqual(measured["c_reference"]["snapshot"], "tree" if hit else "new-tree")
                 if saved:
                     self.assertEqual(history.read_records(data), [previous])
@@ -237,20 +260,65 @@ class HistoryTests(unittest.TestCase):
         self.assertIn("data:font/ttf;base64,", svg)
         self.assertIn("SIL OPEN FONT LICENSE", svg)
 
+    def test_compilation_series_use_monochrome_line_styles(self):
+        svg = history.chart({"Compile": [(0, 3, "first"), (1, 4, "second")],
+                             "Compile (8 workers)": [(0, 1, "first"), (1, 2, "second")]},
+                            [("a", "2026-10-22"), ("b", "2026-10-23")], "s")
+        tree = ElementTree.fromstring(svg)
+        namespace = {"svg": "http://www.w3.org/2000/svg"}
+        styles = []
+        for index in range(2):
+            series = tree.find(f".//*[@id='series-{index}']")
+            self.assertIsNotNone(series)
+            paths = [path for path in series.findall("svg:path", namespace)
+                     if "stroke: #444444" in path.get("style", "")]
+            self.assertTrue(paths)
+            styles.append(dict(declaration.strip().split(": ", 1)
+                               for declaration in paths[-1].get("style").split(";") if declaration.strip()))
+        self.assertNotIn("stroke-dasharray", styles[0])
+        self.assertIn("stroke-dasharray", styles[1])
+        self.assertGreater(float(styles[1]["stroke-width"]), float(styles[0]["stroke-width"]))
+        for color in ("#147d64", "#b43c44", "#3567ad"):
+            self.assertNotIn(color, svg)
+
     def test_runtime_reference_lines_span_the_plot_without_commit_markers(self):
         references = {f"C -O{level}": (level + 1, "median of 9") for level in range(4)}
         svg = history.chart({"Runtime": [(0, 2, "first"), (1, 3, "second")]},
                             [("a", "2026-10-22"), ("b", "2026-10-23")], "ms", references=references)
         tree = ElementTree.fromstring(svg)
         namespace = {"svg": "http://www.w3.org/2000/svg"}
+        dash_patterns = []
         for level in range(4):
             reference = tree.find(f".//*[@id='reference-{level}']")
             self.assertIsNotNone(reference)
             self.assertTrue(reference.find("svg:title", namespace).text.startswith(f"C -O{level}:"))
-            coordinates = reference.find("svg:path", namespace).get("d").split()
+            reference_path = reference.find("svg:path", namespace)
+            style = dict(declaration.strip().split(": ", 1)
+                         for declaration in reference_path.get("style").split(";") if declaration.strip())
+            self.assertEqual(style["stroke"], "#444444")
+            dash_patterns.append(style["stroke-dasharray"])
+            coordinates = reference_path.get("d").split()
             self.assertEqual(coordinates[2], coordinates[5])
             self.assertLess(float(coordinates[1]), float(coordinates[4]))
+        self.assertNotEqual(dash_patterns[0], dash_patterns[1])
         self.assertEqual(len(tree.findall(".//svg:title", namespace)), 6)
+
+    def test_compilation_estimates_are_legend_only_and_preserve_the_axis(self):
+        series = {"Compile": [(0, 2, "first"), (1, 3, "second")]}
+        commits = [("a", "2026-10-22"), ("b", "2026-10-23")]
+        estimates = ("C++ -O0 estimate: ~158 s", "C++ -O2 estimate: ~269 s")
+        baseline = ElementTree.fromstring(history.chart(series, commits, "s"))
+        tree = ElementTree.fromstring(history.chart(series, commits, "s", estimates=estimates))
+        namespace = {"svg": "http://www.w3.org/2000/svg"}
+        baseline_ticks = baseline.find(".//*[@id='matplotlib.axis_2']")
+        ticks = tree.find(".//*[@id='matplotlib.axis_2']")
+        self.assertEqual([label.text for label in ticks.findall(".//svg:text", namespace)],
+                         [label.text for label in baseline_ticks.findall(".//svg:text", namespace)])
+        legend = tree.find(".//*[@id='legend_1']")
+        labels = [label.text for label in legend.findall(".//svg:text", namespace)]
+        self.assertEqual(labels, ["Compile: 3.000 s", *estimates])
+        self.assertIsNone(tree.find(".//*[@id='reference-0']"))
+        self.assertEqual(len(tree.findall(".//svg:title", namespace)), 2)
 
     def test_single_worktree_point_has_visible_date(self):
         svg = history.chart({"Compile": [(0.35, 2, "2026-10-23")]},
@@ -271,7 +339,6 @@ class HistoryTests(unittest.TestCase):
         self.assertIsNone(tree.find(".//*[@id='point-0-0']"))
         self.assertIsNone(tree.find(".//*[@id='point-0-1']"))
         self.assertIn("stroke: #444444", svg)
-        self.assertNotIn(history.COLORS[0], svg)
 
     def test_loc_grid_is_dotted_at_ten_thousand_line_intervals(self):
         svg = history.chart({"Code": [(0, 100, "first"), (1, 25_000, "second")]},
@@ -343,6 +410,8 @@ class HistoryTests(unittest.TestCase):
             data = Path(directory)
             current = record()
             current["benchmarks"][0]["samples"] = samples(include_runtime=True)
+            current["benchmarks"][0]["samples"].extend(
+                dict(sample, lane="workers-8", nanoseconds=sample["nanoseconds"] // 2) for sample in samples())
             history.save(data, current)
             content = history.render(data, [("abc", current["commit_date"])]).read_text()
             compilation = content.split("<h2>ReleaseFast Compilation</h2>")[1].split("</section>")[0]
@@ -353,11 +422,53 @@ class HistoryTests(unittest.TestCase):
             graph, = (data / "graphs").glob(f"*-{history.RUNTIME_CASE}-runtime.svg")
             self.assertIn(graph.name, runtime)
             namespace = {"svg": "http://www.w3.org/2000/svg"}
+            for phase in history.CORE_CASES[history.COMPILATION_CASE]:
+                compilation_graph, = (data / "graphs").glob(f"*-{history.COMPILATION_CASE}-{phase}.svg")
+                tree = ElementTree.parse(compilation_graph)
+                legend = tree.find(".//*[@id='legend_1']")
+                labels = [label.text for label in legend.findall(".//svg:text", namespace)]
+                estimates = history.COMPILATION_ESTIMATES.get(phase, ())
+                self.assertEqual(labels, ["Compile: 0.002 s", "Compile (8 workers): 0.001 s", *estimates])
+                tooltips = tree.findall(".//svg:title", namespace)
+                self.assertEqual(len(tooltips), 2)
+                self.assertTrue(tooltips[1].text.startswith("Compile (8 workers): 0.001 s"))
+                self.assertIsNone(tree.find(".//*[@id='reference-0']"))
+                self.assertNotIn("est.:", compilation_graph.read_text())
+                if phase == "leaf-edit":
+                    self.assertNotIn("C++", compilation_graph.read_text())
+            self.assertNotIn("C++", graph.read_text())
             tooltip, = ElementTree.parse(graph).findall(".//svg:title", namespace)
             self.assertTrue(tooltip.text.startswith("Runtime: 0.100 s"))
             self.assertTrue(graph.with_suffix(".png").exists())
             self.assertIn("<h2>Generated Program Runtime</h2>", (data / "benchmarks.html").read_text())
             self.assertEqual(history.read_records(data), [current])
+
+    def test_worker_series_join_existing_graphs_across_affinities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            previous = record()
+            previous["runner"]["affinity"] = [4]
+            previous["benchmarks"][0]["samples"] = samples(include_runtime=True)
+            current = copy.deepcopy(previous)
+            current["worktree"] = True
+            current["recorded_at"] = "2026-10-23T12:00:00Z"
+            current["runner"]["affinity"] = list(range(4, 12))
+            current["benchmarks"][0]["samples"].extend(
+                dict(sample, lane="workers-8") for sample in samples())
+            for entry in (previous, current):
+                history.save(data, entry)
+            with patch.object(history, "graph_artifact", return_value="") as graph, \
+                    patch.object(history, "benchmark_overview"):
+                history.render(data, [("abc", previous["commit_date"])])
+            self.assertEqual(graph.call_count, 4)
+            for call in graph.call_args_list:
+                series = call.args[2]
+                if "Compile" in series:
+                    self.assertEqual([point[0] for point in series["Compile"]], [0, 0.35])
+                    self.assertEqual([point[0] for point in series["Compile (8 workers)"]], [0.35])
+                elif "Runtime" in series:
+                    self.assertEqual([point[0] for point in series["Runtime"]], [0, 0.35])
+            self.assertEqual(history.read_records(data), [previous, current])
 
     def test_runtime_report_uses_latest_medians_in_legend(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -365,6 +476,9 @@ class HistoryTests(unittest.TestCase):
             current = record()
             current["c_compiler"] = {"version": "hidden compiler version", "path": "/hidden/cc"}
             current["benchmarks"][0]["samples"] = samples(include_c=True)
+            current["benchmarks"][0]["samples"].extend(
+                dict(sample, lane=lane) for lane in ("c-O1", "c-O2")
+                for sample in samples(include_c=True) if sample["lane"] == "c-O3")
             older = copy.deepcopy(current)
             older["commit"] = "older"
             older["recorded_at"] = "2026-10-23T09:00:00Z"
@@ -380,10 +494,13 @@ class HistoryTests(unittest.TestCase):
             legend = tree.find(".//*[@id='legend_1']")
             labels = [text.text for text in legend.findall(".//svg:text", namespace)]
             self.assertEqual(labels, ["Runtime: 0.100 s"] +
-                             [f"C -O{level}: {(1604 - level) / 1000:.3f} s" for level in range(4)])
-            for level in range(4):
-                reference = tree.find(f".//*[@id='reference-{level}']")
+                             [f"C -O{level}: {(1604 - level) / 1000:.3f} s" for level in (0, 3)])
+            for index, level in enumerate((0, 3)):
+                reference = tree.find(f".//*[@id='reference-{index}']")
                 self.assertTrue(reference.find("svg:title", namespace).text.startswith(f"C -O{level}: {(1604 - level) / 1000:.3f} s"))
+            self.assertIsNone(tree.find(".//*[@id='reference-2']"))
+            self.assertNotIn("C -O1:", graph.read_text())
+            self.assertNotIn("C -O2:", graph.read_text())
             self.assertNotIn("hidden compiler version", content + graph.read_text())
             self.assertNotIn("/hidden/cc", content + graph.read_text())
             self.assertEqual(content.count("<object"), 4)
@@ -438,18 +555,41 @@ class HistoryTests(unittest.TestCase):
             self.assertNotIn("ReleaseFast Compilation", content)
             self.assertEqual(history.read_records(data), [older])
 
-    def test_report_hides_previous_suite_of_current_protocol(self):
+    def test_report_keeps_one_compilation_series_across_suite_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             older = record()
             older["suite"] = "previous suite"
+            for sample in older["benchmarks"][0]["samples"]:
+                sample["nanoseconds"] *= 2
             current = record()
+            current["suite"] = "aaa-current"
             current["recorded_at"] = "2026-10-23T12:00:00Z"
-            history.save(data, older)
-            history.save(data, current)
-            content = history.render(data, [("abc", current["commit_date"])]).read_text()
+            returned = copy.deepcopy(older)
+            returned["commit"] = "new"
+            returned["recorded_at"] = "2026-10-23T13:00:00Z"
+            records = [older, current, returned]
+            for entry in records:
+                history.save(data, entry)
+            content = history.render(data, [("abc", current["commit_date"]), ("new", returned["commit_date"])]).read_text()
             self.assertEqual(content.count("<object"), 3)
-            self.assertEqual(len(history.read_records(data)), 2)
+            namespace = {"svg": "http://www.w3.org/2000/svg"}
+            for phase in ("cold", "leaf-edit"):
+                graph, = (data / "graphs").glob(f"*-{history.COMPILATION_CASE}-{phase}.svg")
+                tree = ElementTree.parse(graph)
+                tooltips = tree.findall(".//svg:title", namespace)
+                self.assertEqual(len(tooltips), 2)
+                self.assertTrue(tooltips[0].text.startswith("Compile: 0.002 s"))
+                self.assertTrue(tooltips[1].text.startswith("Compile: 0.004 s"))
+                for point in ("point-0-0", "point-0-1"):
+                    self.assertIsNotNone(tree.find(f".//*[@id='{point}']"))
+                self.assertIsNone(tree.find(".//*[@id='point-1-0']"))
+                legend = tree.find(".//*[@id='legend_1']")
+                labels = [label.text for label in legend.findall(".//svg:text", namespace)]
+                self.assertEqual(labels, ["Compile: 0.004 s", *history.COMPILATION_ESTIMATES.get(phase, ())])
+                self.assertNotIn("Workload", graph.read_text())
+                self.assertNotIn("previous suite", graph.read_text())
+            self.assertEqual(history.read_records(data), records)
 
     def test_new_compilation_workload_preserves_only_unchanged_runtime_history(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -475,7 +615,7 @@ class HistoryTests(unittest.TestCase):
             for graph in compilation:
                 self.assertEqual(len(ElementTree.parse(graph).findall(".//svg:title", namespace)), 1)
             graph, = (data / "graphs").glob(f"*-{history.RUNTIME_CASE}-runtime.svg")
-            self.assertEqual(len(ElementTree.parse(graph).findall(".//svg:title", namespace)), 6)
+            self.assertEqual(len(ElementTree.parse(graph).findall(".//svg:title", namespace)), 4)
             self.assertEqual(len(history.read_records(data)), 2)
 
     def test_backfill_resumes_matching_attempts_including_failures(self):

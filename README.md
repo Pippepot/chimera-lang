@@ -3,8 +3,8 @@
 **An ergonomic systems language.**
 
 Chimera brings native code and checked ownership to a small, expressive syntax.
-Describe alternatives with variants, handle success and failure with `fallible`,
-and run ordinary functions at compile time.
+Describe optional values and errors with variants, bind their alternatives
+explicitly, and run ordinary functions at compile time.
 
 ## A first look
 
@@ -32,7 +32,7 @@ hold an integer or be absent:
 ```chi
 const limit: int | none = 42
 
-if const value = limit as int
+if const value: int = limit
   exit(value)
 else
   exit(64)
@@ -41,75 +41,56 @@ else
 `int | none` is a **variant**: here, either an integer or the value `none`.
 Assign either directly; there is no wrapper to construct.
 
-`limit as int` checks whether `limit` holds an integer. If it does, `if const`
-names that integer `value` inside the first branch. Otherwise, `else` runs.
+`if const value: int = limit` tests the active alternative and names the integer
+inside the first branch. Otherwise, `else` runs. The annotation is a pattern;
+it does not convert the value.
 Change `42` to `none` and the program uses the default exit code of `64`.
 
 Variants are not limited to optional values. Combine types with `|` to describe
 the alternatives your program needs, including your own structs.
 
-## Success and failure, built in
+## Explicit results
 
-A missing setting is a possible value. A failed operation is different:
+Functions return ordinary values. An operation that may have no result can
+return an optional variant:
 
 ```chi
-fallible divide(numerator: int, denominator: int) int
-  denominator <> 0
+func divide(numerator: int, denominator: int) int | none
+  if denominator == 0 -> return none
   return numerator / denominator
 
-if const quotient = divide(84, 2)
+if const quotient: int = divide(84, 2)
   exit(quotient)
 else
   exit(1)
 ```
 
-`fallible` replaces `func` for a function that can fail. On success, this function
-returns an integer. On failure, it returns no value.
-
-`<>` means "not equal." The standalone line `denominator <> 0` is a check:
-if it succeeds, execution continues to `return`. If it fails, `divide` fails
-immediately and skips the remaining body. Comparisons always succeed with `unit`
-or fail. Store their outcome as data with `bool(value < limit)` and test a stored
-boolean with `enabled?`. Logical `and`, `or`, and `not` compose success and failure.
-
-A parameter such as `value: int | none` accepts ordinary failure from its entire
-argument expression as `none`. Evaluation is eager and happens once, from left
-to right. The function receives an ordinary variant and extracts its payload
-with `if const found = value as int`. Expected variants containing `none` apply
-the same conversion at typed bindings, assignments, field initialization, and
-returns. Ownership modes and the function's declared fallibility keep their
-ordinary meanings.
-
-The caller uses `if const` to name the successful result `quotient`. If the call
-fails, `else` runs instead. Try `divide(84, 0)` to take the failure branch.
-
-A fallible call uses `divide?(84, 2)` in an ordinary expression context. The
-marker can be omitted when the call itself must be fallible, as in the `if const`
-above or `if divide(84, 2)`. A containing comparison or extraction does not grant
-that exemption: `divide?(84, 2) < 50` still needs the marker.
-
-For a standalone marked call inside a fallible function, success continues to
-the next statement and failure makes the enclosing function fail too. The `?`
-marks the invocation, not failure propagation; use `if` to handle failure locally.
-
-Top-level code is implicitly fallible, so scripts can use the same operations
-directly:
+Try `divide(84, 0)` to take the second branch. To keep the binding in the current
+scope, give it a mismatch handler that exits:
 
 ```chi
-var numbers = List(int).new?(4)
-numbers.append?(10)
-numbers.append?(20)
+const quotient: int = divide(84, 2) else panic "division by zero"
+```
+
+A plain `const result = divide(84, 2)` stores the complete `int | none` value.
+Use `T | Error` or `T | none | Error` when you need informative error alternatives.
+The same typed patterns work in match arms, for example `error: Error -> ...`.
+
+Comparisons and logical `and`, `or`, and `not` produce `bool`. A plain `if` tests
+that Boolean; optionals have no truthiness. A typed binding of `bool | none`
+selects a present `false` just as it selects a present `true`.
+
+Allocation APIs also return explicit optionals:
+
+```chi
+var numbers: List(int) = List(int).new(4) else panic "allocation refused"
+const _: unit = numbers.append(10) else panic "allocation refused"
+const _: unit = numbers.append(20) else panic "allocation refused"
 print(numbers[0])
 ```
 
-Successful fallthrough cleans up and exits with status `0`. Unhandled ordinary
-failure cleans up and exits with status `1`. Local handlers still take precedence.
-
-Use the bare statement `fail` to propagate failure explicitly, including after
-local cleanup. Top-level code, a `fallible` function, or a deferred initializer
-can propagate it. An ordinary `func` handles fallible expressions with `if` or an expected variant containing
-`none`. Consuming a deferred initializer is always potentially
-fallible, so its construction site must handle or propagate that failure.
+Normal top-level completion cleans up and exits with status `0`. Scalar indexing
+checks bounds and panics; `get` returns an optional reference for explicit handling.
 
 ## Compile-time code is still code
 
@@ -138,8 +119,8 @@ const positives = [x for x in evens if x > 0]
 ```
 
 `evens` and `combined` are fixed-size Arrays. The runtime filter makes `positives`
-a List. Use `List(int).collect?([x for x in evens if x > 0])` when allocation
-failure should propagate as ordinary failure.
+a List. `List(int).collect([x for x in evens if x > 0])` instead returns
+`List(int) | none`, allowing allocation refusal to be handled explicitly.
 
 Ranges use `..` for an exclusive end and `..=` for an inclusive end. Prefix `^n`
 counts back from the collection's initialized length:
@@ -153,8 +134,8 @@ const prefix = values[..^1]
 ```
 
 `^0` is the past-end boundary, valid for exclusive slices but not element access.
-Invalid distances fail instead of wrapping or clamping. Postfix `value^` still
-transfers ownership.
+Invalid distances return `none` from checked APIs and panic when indexing;
+they never wrap or clamp. Postfix `value^` still transfers ownership.
 
 ## Make change visible
 
@@ -179,7 +160,7 @@ A `ref` binding aliases existing storage and inherits its permission:
 
 ```chi
 var scores = [20, 21]
-if ref item = scores.get(1)
+if ref item: int = scores.get(1)
   item += 1
 ```
 

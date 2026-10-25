@@ -296,7 +296,6 @@ pub const ValueSnapshot = struct {
 
 pub const Result = union(enum) {
     returned: Value,
-    failure,
     exit: i32,
     execution_error: ExecutionError,
     reported_error,
@@ -318,7 +317,7 @@ pub fn execute(
 }
 
 pub fn publish(result: Result, arguments: []Value, modes: []const structures.ParameterMode, executor: anytype, gpa: std.mem.Allocator) !Result {
-    if (result != .returned and result != .failure) return result;
+    if (result != .returned) return result;
     for (arguments, modes) |*argument, mode| {
         if ((mode != .mut and mode != .ref) or argument.* != .place) continue;
         const published = try publishCell(argument.place, executor, gpa, null);
@@ -403,14 +402,10 @@ fn ExecutionFrame(comptime Executor: type) type {
                     switch (try self.instructionValue(instruction, span)) {
                         .returned => |value| {
                             const destination = switch (instruction) {
-                                inline .call, .value_copy, .variant_coerce, .callable_coerce, .static_conversion => |operation| operation.destination,
+                                inline .call, .value_copy, .variant_coerce, .static_conversion => |operation| operation.destination,
                                 else => null,
                             };
                             try self.store(@backingInt(self.body.instructionValue(index)), destination, value);
-                        },
-                        .failure => {
-                            std.debug.assert(instruction != .call);
-                            return .failure;
                         },
                         else => |result| return if (instruction == .static_conversion) result else atSpan(result, span),
                     }
@@ -419,10 +414,8 @@ fn ExecutionFrame(comptime Executor: type) type {
                 switch (block.terminator) {
                     .branch => |branch| step = try self.enterBranch(branch),
                     .predicate_branch => |predicate| step = try self.enterBranch(if (predicateValue(self.slots, predicate.operation, predicate.operands)) predicate.then_branch else predicate.else_branch),
-                    .fallible_call => |fallible| step = try self.fallibleCall(fallible.call, fallible.success, fallible.failure, terminatorSpan(self.body, block_id)),
                     .return_unit => return .{ .returned = .{ .runtime = .unit } },
                     .return_value => |use| return self.evaluateUse(use),
-                    .return_failure => return .failure,
                     .diverge => unreachable,
                 }
                 switch (step) {
@@ -452,7 +445,6 @@ fn ExecutionFrame(comptime Executor: type) type {
                 .cursor_element => |operation| return .{ .returned = try storageCursorElement(slots[@backingInt(operation.cursor)], operation.type_id, @intCast(integer(slots, operation.index)), self.storage) },
                 .byte_to_int => |source| return .{ .returned = .{ .runtime = .{ .int = scalar(slots, source).byte } } },
                 .static_conversion => |conversion| return self.staticConversion(conversion, span),
-                .callable_coerce => |operation| return self.coerceCallable(operation),
                 .negi => |operand| return .{ .returned = .{ .runtime = .{ .int = -%integer(slots, operand) } } },
                 .addi, .subi, .muli, .divsi => |operands| {
                     const result = instruction.integerResult(integer(slots, operands.lhs), integer(slots, operands.rhs)) orelse return executionError(.division_by_zero, span);
@@ -472,6 +464,7 @@ fn ExecutionFrame(comptime Executor: type) type {
                 .value_copy => |operation| return self.copyValue(operation),
                 .field_access => |operation| return self.accessField(slots[@backingInt(operation.operand)], operation),
                 .initializer_capture_write => |operation| return self.writeCapture(operation),
+                .compare, .select, .aggregate, .fill, .move => unreachable,
             }
         }
 
@@ -653,12 +646,6 @@ fn ExecutionFrame(comptime Executor: type) type {
             return self.executor.convertStaticValue(self.body.valueType(conversion.operand), runtime, conversion.type_id, span, self.storage);
         }
 
-        fn coerceCallable(self: *const Self, operation: structures.VariantOperation) Result {
-            var reference = scalar(self.slots, operation.operand).function_ref;
-            reference.type_id = operation.target_type;
-            return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
-        }
-
         fn borrowRead(self: *const Self, operation: structures.BorrowOperation, span: ?structures.SourceSpan) !Result {
             if (try readStaticReference(self.slots[@backingInt(operation.source)], self.executor)) |value| return .{ .returned = value };
             const target = referenceTarget(self.slots[@backingInt(operation.source)]) orelse return executionError(.unsupported_operation, span);
@@ -724,19 +711,6 @@ fn ExecutionFrame(comptime Executor: type) type {
                 }
             }
             return self.executor.callInStorage(instance, interpreted, call_span, self.storage);
-        }
-
-        fn fallibleCall(self: *const Self, call: structures.FunctionCall, success_id: structures.FunctionBlockId, failure_id: ?structures.FunctionBlockId, call_span: ?structures.SourceSpan) !Step {
-            switch (try self.executeCall(call, call_span)) {
-                .returned => |value| {
-                    const success = self.body.blocks[@backingInt(success_id)];
-                    std.debug.assert(success.argument_end - success.argument_start == 1);
-                    try self.store(success.argument_start, call.destination, value);
-                    return .{ .next = success_id };
-                },
-                .failure => return .{ .next = failure_id orelse unreachable },
-                else => |result| return .{ .result = result },
-            }
         }
 
         fn store(self: *const Self, own: usize, destination: ?structures.FunctionValueId, value: Value) !void {

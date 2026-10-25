@@ -343,7 +343,7 @@ test "keywords" {
         .keyword_mut,
         .keyword_deinit,
         .keyword_return,
-        .keyword_fail,
+        .identifier,
         .keyword_true,
         .keyword_false,
         .keyword_comptime,
@@ -367,12 +367,12 @@ test "keywords" {
     try testTokenize("read", &.{.identifier});
 }
 
-test "fail keyword preserves identifier boundaries" {
+test "former failure words are ordinary identifiers" {
     try testTokenize("fail failure fail_value fallible", &.{
-        .keyword_fail,
         .identifier,
         .identifier,
-        .keyword_fallible,
+        .identifier,
+        .identifier,
     });
 }
 

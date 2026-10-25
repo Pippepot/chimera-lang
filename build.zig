@@ -91,6 +91,8 @@ pub fn build(b: *std.Build) void {
         "tests/operation_test.zig",
         "tests/optimizer_test.zig",
         "tests/match_test.zig",
+        "tests/membership_test.zig",
+        "tests/binding_test.zig",
         "tests/overload_test.zig",
         "tests/query_disk_cache_test.zig",
         "tests/query_artifact_test.zig",

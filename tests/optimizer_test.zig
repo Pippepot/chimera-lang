@@ -39,6 +39,65 @@ fn hasConstant(body: structures.FunctionBodyAnalysis, value: i32) bool {
 
 const arithmetic = [_]Tag{ .addi, .subi, .muli, .divsi, .negi };
 
+test "value numbering eliminates repeated expressions" {
+    const program =
+        \\func repeated(a: int, b: int) int -> (a + b) * (a + b)
+        \\exit(repeated(3, 4))
+    ;
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 49);
+    const body = (try optimizedBody(fixture, "repeated")).*.?;
+    try testing.expectEqual(@as(usize, 1), count(body, &.{.addi}));
+}
+
+test "value numbering respects branch dominance and shares aggregates" {
+    const program =
+        \\struct Pair
+        \\    copy = trivial
+        \\    pub first: int
+        \\    pub second: int
+        \\func separate(flag: bool, a: int, b: int) int
+        \\    if flag? -> return (a + b) * (a + b)
+        \\    return (a + b) * (a + b) * 2
+        \\func dominated(flag: bool, a: int, b: int) int
+        \\    const sum = a + b
+        \\    if flag? -> return sum * (a + b)
+        \\    return sum * (a + b) * 2
+        \\func alternatives(branch: int, a: int, b: int) int
+        \\    if branch == 0 -> return (a + b) * (a + b)
+        \\    if branch == 1 -> return (a + b) * (a + b) * 2
+        \\    if branch == 2 -> return (a + b) * (a + b) * 3
+        \\    return (a + b) * (a + b) * 4
+        \\func aggregate(flag: bool, a: int, b: int) Pair
+        \\    const first = Pair{first = a, second = b}
+        \\    const second = Pair{first = a, second = b}
+        \\    if flag? -> return first
+        \\    return second
+        \\func run() int
+        \\    if separate(true, 2, 3) <> 25 -> return 90
+        \\    if separate(false, 2, 3) <> 50 -> return 91
+        \\    if dominated(true, 2, 3) <> 25 -> return 92
+        \\    if dominated(false, 2, 3) <> 50 -> return 93
+        \\    if alternatives(0, 2, 3) <> 25 -> return 94
+        \\    if alternatives(1, 2, 3) <> 50 -> return 95
+        \\    if alternatives(2, 2, 3) <> 75 -> return 96
+        \\    if alternatives(3, 2, 3) <> 100 -> return 97
+        \\    return aggregate(false, 30, 12).first + aggregate(true, 30, 12).second
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const separate = (try optimizedBody(fixture, "separate")).*.?;
+    try testing.expectEqual(@as(usize, 2), count(separate, &.{.addi}));
+    const dominated = (try optimizedBody(fixture, "dominated")).*.?;
+    try testing.expectEqual(@as(usize, 1), count(dominated, &.{.addi}));
+    const alternatives = (try optimizedBody(fixture, "alternatives")).*.?;
+    try testing.expectEqual(@as(usize, 4), count(alternatives, &.{.addi}));
+    const aggregate = (try optimizedBody(fixture, "aggregate")).*.?;
+    try testing.expectEqual(@as(usize, 1), count(aggregate, &.{.aggregate}));
+}
+
 test "optimizer folds integer constants identities and constant branches" {
     const program = try testing.allocator.print("{s}\nexit(run())", .{source});
     defer testing.allocator.free(program);
@@ -110,9 +169,10 @@ fn countLocalStorage(body: structures.FunctionBodyAnalysis, type_id: structures.
 }
 
 const promotion_source =
-    \\func change(ref value: int) unit -> value += 1
-    \\fallible positive(value: int) int
-    \\    if value < 0 -> fail
+    \\func change(ref value: int, times: int) unit
+    \\    if times == 0 -> value += 1 else change(value, times - 1)
+    \\func positive(value: int) int | none
+    \\    if value < 0 -> return none
     \\    return value
     \\func sum(limit: int) int
     \\    var total = 0
@@ -121,13 +181,13 @@ const promotion_source =
     \\    loop
     \\        if index == limit -> break
     \\        index += 1
-    \\        if odd? -> odd = false else odd = true
-    \\        if odd? -> continue
+    \\        if odd -> odd = false else odd = true
+    \\        if odd -> continue
     \\        total += index
     \\    return total
     \\func merge(flag: bool, var start: int) int
     \\    var value = start
-    \\    if flag?
+    \\    if flag
     \\        value = value * 2
     \\        start = 1
     \\    else
@@ -135,21 +195,26 @@ const promotion_source =
     \\    return value + start
     \\func borrowed(start: int) int
     \\    var value = start
-    \\    change(value)
+    \\    change(value, 1)
     \\    return value
-    \\fallible checked(start: int) int
+    \\func reopened(start: int) int
+    \\    var value = start
+    \\    if 1 + 1 == 3 -> change(value, 0)
+    \\    return value * 2
+    \\func checked(start: int) int | none
     \\    var value = start
     \\    var attempts = 0
     \\    loop
     \\        attempts += 1
-    \\        if const accepted = positive(value) -> return accepted + attempts
+    \\        if const accepted: int = positive(value) -> return accepted + attempts
     \\        value += 5
     \\func run() int
     \\    if sum(10) <> 30 -> return 90
     \\    if merge(true, 4) <> 9 -> return 91
     \\    if merge(false, 4) <> 11 -> return 92
     \\    if borrowed(6) <> 7 -> return 93
-    \\    if const value = checked(-12) -> if value == 7 -> return 42
+    \\    if reopened(21) <> 42 -> return 95
+    \\    if const value: int = checked(-12) -> if value == 7 -> return 42
     \\    return 94
 ;
 
@@ -160,11 +225,195 @@ test "promotion turns non-escaping scalar locals into SSA values" {
     const fixture = try Fixture.init(program);
     defer fixture.deinit();
     try fixture.expectExit(0, 42);
-    for ([_][]const u8{ "sum", "merge", "checked" }) |name| {
+    for ([_][]const u8{ "sum", "merge", "checked", "reopened" }) |name| {
         const body = (try optimizedBody(fixture, name)).*.?;
         try testing.expectEqual(@as(usize, 0), countLocalStorage(body, .int) + countLocalStorage(body, .bool));
         try testing.expectEqual(@as(usize, 0), count(body, &.{.value_copy}));
     }
     const borrowed = (try optimizedBody(fixture, "borrowed")).*.?;
     try testing.expectEqual(@as(usize, 1), countLocalStorage(borrowed, .int));
+}
+
+test "promotion batches loop carried slots across bitset words" {
+    var program: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer program.deinit();
+    try program.writer.writeAll("func many(limit: int) int\n");
+    for (0..65) |index| try program.writer.print("    var value{d} = {d}\n", .{ index, index });
+    try program.writer.writeAll("    var index = 0\n    loop\n        if index == limit -> break\n");
+    for (0..65) |index| try program.writer.print("        value{d} += 1\n", .{index});
+    try program.writer.writeAll("        index += 1\n    return ");
+    for (0..65) |index| try program.writer.print("{s}value{d}", .{ if (index == 0) "" else " + ", index });
+    try program.writer.writeAll("\nfunc run() int -> many(2) - 2168\n");
+    try Fixture.expectParity(program.written(), 42);
+    const fixture = try Fixture.init(program.written());
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "many")).*.?;
+    try testing.expectEqual(@as(usize, 0), countLocalStorage(body, .int));
+    try testing.expectEqual(@as(usize, 0), count(body, &.{.value_copy}));
+}
+
+fn countCalls(body: structures.FunctionBodyAnalysis) usize {
+    return count(body, &.{.call});
+}
+
+fn countPredicates(body: structures.FunctionBodyAnalysis) usize {
+    var total: usize = 0;
+    for (body.blocks) |block| total += @intFromBool(block.terminator == .predicate_branch);
+    return total;
+}
+
+const pipeline_source =
+    \\struct Pair
+    \\    copy = trivial
+    \\    pub first: int
+    \\    pub second: int
+    \\func swap(pair: Pair) Pair -> Pair{first = pair.second, second = pair.first}
+    \\func total(pair: Pair) int -> pair.first + pair.second
+    \\func countdown(n: int) int
+    \\    if n == 0 -> return 0
+    \\    return countdown(n - 1) + 1
+    \\func half(n: int) int | none
+    \\    if n < 0 -> return none
+    \\    return n / 2
+    \\func larger(a: int, b: int) int
+    \\    if a > b -> return a
+    \\    return b
+    \\func scan(n: int) int | none
+    \\    var values: List(int) = List(int).filled(3, n) else return none
+    \\    var index = 0
+    \\    var sum = 0
+    \\    loop
+    \\        if index >= values.len() -> break
+    \\        const value: int = values.get(index) else return none
+    \\        sum += value
+    \\        index += 1
+    \\    return sum
+    \\func spin(n: int) int
+    \\    var index = n
+    \\    loop
+    \\        if index == 0 -> break
+    \\        index -= 1
+    \\    return 5
+    \\func run() int
+    \\    const pair = swap(Pair{first = 30, second = 12})
+    \\    var sum = 0
+    \\    var index = 0
+    \\    loop
+    \\        if index == 10 -> break
+    \\        sum += larger(index, 3)
+    \\        index += 1
+    \\    if const scanned: int = scan(4)
+    \\        if const halved: int = half(total(pair)) -> return halved + countdown(3) + sum + scanned - 45 + spin(9) - 5
+    \\    return 90
+;
+
+test "inlining exposes callee bodies to scalar replacement selects and loop idioms" {
+    try Fixture.expectParity(pipeline_source, 42);
+    const program = try testing.allocator.print("{s}\nexit(run())", .{pipeline_source});
+    defer testing.allocator.free(program);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 256);
+    try fixture.expectExit(0, 42);
+
+    const run = (try optimizedBody(fixture, "run")).*.?;
+    try testing.expectEqual(@as(usize, 1), try countCallsTo(run, "countdown", fixture));
+    for ([_][]const u8{ "swap", "total", "half", "larger", "scan", "spin" }) |name| {
+        errdefer std.debug.print("Expected inlined callee: {s}\n", .{name});
+        try testing.expectEqual(@as(usize, 0), try countCallsTo(run, name, fixture));
+    }
+    try testing.expect(run.inline_frames.len != 0);
+    try testing.expect(count(run, &.{.select}) != 0);
+    try testing.expectEqual(@as(usize, 1), count(run, &.{.fill}));
+    try testing.expectEqual(@as(usize, 0), countLocalStorage(run, .int) + countLocalStorage(run, .bool));
+    const pair_item = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?.resolveStatic("Pair").?;
+    const pair_value = (try fixture.db.get(queries.ResolveStatic, pair_item)).*.?;
+    const pair_type = (try fixture.db.lookupInterned(queries.CompileTimeValues, pair_value)).type;
+    try testing.expectEqual(@as(usize, 0), countLocalStorage(run, pair_type));
+    const types: queries.TypeFacts(*test_sources.query.Database) = .{ .ctx = fixture.db };
+    for (run.instructions) |instruction| if (instruction == .local_storage) {
+        try testing.expect((try types.variantMembers(instruction.local_storage)) != null);
+    };
+
+    const scan = (try optimizedBody(fixture, "scan")).*.?;
+    try testing.expectEqual(@as(usize, 1), count(scan, &.{.fill}));
+    for (scan.blocks) |block| if (block.terminator == .predicate_branch) {
+        const predicate = block.terminator.predicate_branch;
+        if (predicate.operation == .lti) {
+            const bound = @backingInt(predicate.operands.rhs);
+            try testing.expect(bound >= scan.block_arguments.len);
+            try testing.expectEqualDeep(structures.FunctionInstruction{ .const_int = 0 }, scan.instructions[bound - scan.block_arguments.len]);
+        }
+    };
+
+    const spin = (try optimizedBody(fixture, "spin")).*.?;
+    try testing.expectEqual(@as(usize, 0), countPredicates(spin));
+}
+
+fn countCallsTo(body: structures.FunctionBodyAnalysis, name: []const u8, fixture: Fixture) !usize {
+    const item = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?.resolveFunction(name).?;
+    var total: usize = 0;
+    for (body.instructions) |instruction| {
+        if (instruction == .call and instruction.call.target == .direct and instruction.call.target.direct.item == item) total += 1;
+    }
+    return total;
+}
+
+test "scalar replacement preserves nested storage and cross-local snapshots" {
+    try Fixture.expectParity(
+        \\pub struct Pair
+        \\    copy = trivial
+        \\    pub first: int
+        \\    pub second: int
+        \\struct Nested
+        \\    copy = trivial
+        \\    pub pair: Pair
+        \\    pub extra: int
+        \\func run() int
+        \\    var left = Nested{pair = Pair{first = 10, second = 20}, extra = 3}
+        \\    var right = left
+        \\    left.pair.first = 30
+        \\    right.extra = 2
+        \\    var saved = right
+        \\    right = left
+        \\    var copied = left
+        \\    copied = right
+        \\    right.extra = 100
+        \\    saved.pair.second = 28
+        \\    return saved.pair.first + saved.pair.second + saved.extra + copied.extra - 1
+    , 42);
+}
+
+test "inlined callers recompute with their callees and keep recursive callees out of line" {
+    const program = try testing.allocator.print("{s}\nexit(run())", .{pipeline_source});
+    defer testing.allocator.free(program);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const run = try optimizedBody(fixture, "run");
+    try testing.expectEqual(@as(usize, 1), try countCallsTo(run.*.?, "countdown", fixture));
+
+    const recursive = try std.mem.replaceOwned(u8, testing.allocator, program, "return countdown(n - 1) + 1", "return countdown(n - 1) + 2");
+    defer testing.allocator.free(recursive);
+    try fixture.db.setInput(queries.SourceText, 0, recursive);
+    try fixture.expectExit(0, 45);
+    try testing.expectEqual(run, try optimizedBody(fixture, "run"));
+
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, recursive, "if a > b -> return a", "if a >= b -> return a");
+    defer testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(0, 45);
+    try testing.expect(run != try optimizedBody(fixture, "run"));
+}
+
+test "a zero inline limit keeps calls out of line" {
+    const program = try testing.allocator.print("{s}\nexit(run())", .{pipeline_source});
+    defer testing.allocator.free(program);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+    const run = (try optimizedBody(fixture, "run")).*.?;
+    try testing.expectEqual(@as(usize, 0), run.inline_frames.len);
+    try testing.expect(countCalls(run) >= 6);
 }

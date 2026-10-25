@@ -355,12 +355,11 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_const, .keyword_var, .keyword_ref, .keyword_static => try parseBinding(parser),
         .keyword_pub => try parsePublic(parser),
         .keyword_import => try parseImport(parser),
-        .keyword_func, .keyword_fallible, .keyword_extern => try parseFunction(parser),
+        .keyword_func, .keyword_extern => try parseFunction(parser),
         .keyword_converter => try parseConverter(parser),
         .keyword_overload => try parseOverload(parser),
         .keyword_return, .keyword_break => try parseReturnOrBreak(parser),
         .keyword_panic => try parsePanic(parser),
-        .keyword_fail => try parseTokenNode(parser, .keyword_fail, .fail_expr),
         .keyword_continue => try parseTokenNode(parser, .keyword_continue, .continue_expr),
         .number_literal,
         .string_literal,
@@ -412,7 +411,7 @@ fn parseCallableBody(parser: *ParserState, header_index: u32) !Node.Index {
     const expression = try parseRequiredExpression(parser);
     if (parser.current().tag == .indent) return parser.fail(.indented_block_after_inline_body);
     return switch (parser.nodes.items[expression.index()].tag) {
-        .break_nothing, .break_expr, .continue_expr, .return_nothing, .return_expr, .fail_expr => expression,
+        .break_nothing, .break_expr, .continue_expr, .return_nothing, .return_expr => expression,
         else => parser.addNode(.{
             .tag = .return_expr,
             .token_index = parser.nodes.items[expression.index()].token_index,
@@ -501,7 +500,8 @@ fn parseBinding(parser: *ParserState) !Node.Index {
         const pattern = try parseBindingPattern(parser, binding_keyword.tag);
         _ = try parser.expect(.equal);
         const value = try parseRequiredExpression(parser);
-        return parser.addNode(.{ .tag = .destructure_binding, .token_index = parser.nodes.items[pattern.index()].token_index, .data = .{ .node_node = .{ .a = pattern, .b = value } } });
+        const binding = try parser.addNode(.{ .tag = .destructure_binding, .token_index = parser.nodes.items[pattern.index()].token_index, .data = .{ .node_node = .{ .a = pattern, .b = value } } });
+        return parseBindingElse(parser, binding, parser.nodes.items[pattern.index()].token_index);
     }
     const name = try parseDeclarationName(parser, binding_keyword.tag == .keyword_static);
     const type_annotation = try parseTypeAnnotation(parser);
@@ -526,7 +526,13 @@ fn parseBinding(parser: *ParserState) !Node.Index {
     };
 
     const binding = try parser.addNode(.{ .tag = tag, .token_index = name.token_index, .data = .{ .node_node = .{ .a = type_annotation, .b = value } } });
-    return finishQualifiedDeclaration(parser, name, binding);
+    return finishQualifiedDeclaration(parser, name, try parseBindingElse(parser, binding, name.token_index));
+}
+
+fn parseBindingElse(parser: *ParserState, binding: Node.Index, token_index: u32) !Node.Index {
+    if (parser.eat(.keyword_else) == null) return binding;
+    const otherwise = if (parser.eat(.indent) != null) try parseBlock(parser, parser.index - 1) else try parseRequiredExpression(parser);
+    return parser.addNode(.{ .tag = .binding_else, .token_index = token_index, .data = .{ .node_node = .{ .a = binding, .b = otherwise } } });
 }
 
 fn parseDeclarationName(parser: *ParserState, allow_qualified: bool) !DeclarationName {
@@ -567,7 +573,7 @@ fn parsePublic(parser: *ParserState) !Node.Index {
     _ = try parser.expect(.keyword_pub);
     const inner = switch (parser.current().tag) {
         .keyword_const, .keyword_var, .keyword_ref, .keyword_static => try parseBinding(parser),
-        .keyword_func, .keyword_fallible, .keyword_extern => try parseFunction(parser),
+        .keyword_func, .keyword_extern => try parseFunction(parser),
         .keyword_converter => try parseConverter(parser),
         .keyword_overload => try parseOverload(parser),
         .keyword_struct => try parseStruct(parser),
@@ -677,17 +683,16 @@ fn parseMatchCapture(parser: *ParserState) ParseError!Node.Index {
     if (mode != null and mode.?.tag == .keyword_var) return parser.fail(.match_capture_must_be_immutable);
     const name_index = parser.index;
     _ = try parser.expect(.identifier);
-    return parser.addNode(.{ .tag = .param, .token_index = name_index, .data = .{ .parameter = .{ .access = if (mode) |token| token.tag else null } } });
+    return parser.addNode(.{ .tag = .param, .token_index = name_index, .data = .{ .parameter = .{ .access = if (mode) |token| token.tag else null, .annotation = try parseTypeAnnotation(parser) } } });
 }
 
 fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
     const token_index = parser.index;
-    var pattern = switch (parser.current().tag) {
-        .keyword_is => type_pattern: {
-            parser.index += 1;
-            break :type_pattern try parser.addNode(.{ .tag = .match_type, .token_index = token_index, .data = .{ .node = try parseType(parser) } });
-        },
-        .identifier, .keyword_ref, .keyword_var => try parseMatchCapture(parser),
+    const pattern = if (parser.current().tag == .identifier and parser.tokens[parser.index + 1].tag == .colon)
+        try parseMatchCapture(parser)
+    else switch (parser.current().tag) {
+        .identifier, .keyword_func => try parseType(parser),
+        .keyword_ref, .keyword_var => try parseMatchCapture(parser),
         .number_literal => try parseTokenNode(parser, .number_literal, .number_literal),
         .string_literal => try parseTokenNode(parser, .string_literal, .string_literal),
         .keyword_true, .keyword_false => literal: {
@@ -703,18 +708,27 @@ fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
         .l_paren => try parseMatchTuple(parser),
         else => return parser.fail(.{ .invalid_expression = parser.current().tag }),
     };
-    if (parser.eat(.keyword_as) != null) {
-        if (parser.nodes.items[pattern.index()].tag == .match_tuple) return parser.fail(.{ .unsupported_syntax = .keyword_as });
-        const capture = try parseMatchCapture(parser);
-        if (parser.nodes.items[pattern.index()].tag == .param) {
-            const token = parser.tokens[parser.nodes.items[pattern.index()].token_index];
-            if (!std.mem.eql(u8, parser.source[token.loc.start..token.loc.end], "_"))
-                return parser.fail(.match_multiple_captures);
-        }
-        pattern = try parser.addNode(.{ .tag = .match_capture, .token_index = token_index, .data = .{ .node_node = .{ .a = pattern, .b = capture } } });
+    if (parser.current().tag != .pipe) return pattern;
+    try matchPatternAsType(parser, pattern);
+    return parseVariantMembers(parser, token_index, pattern, true);
+}
+
+fn matchPatternAsType(parser: *ParserState, index: Node.Index) ParseError!void {
+    const node = parser.nodes.items[index.index()];
+    switch (node.tag) {
+        .match_tuple => {
+            // Recurse through indices: appending a reference type can relocate nodes.
+            const children = node.data.ref;
+            for (children.start..children.end) |child| try matchPatternAsType(parser, parser.node_refs.items[child]);
+            parser.nodes.items[index.index()].tag = .type_tuple;
+        },
+        .param => {
+            std.debug.assert(node.data.parameter.access == .keyword_ref);
+            const target = try parser.addNode(.{ .tag = .type, .token_index = node.token_index, .data = .{ .none = {} } });
+            parser.nodes.items[index.index()] = .{ .tag = .reference_type, .token_index = node.token_index - 1, .data = .{ .node = target } };
+        },
+        else => {},
     }
-    if (parser.current().tag == .keyword_as) return parser.fail(.match_multiple_captures);
-    return pattern;
 }
 
 fn parseMatchTuple(parser: *ParserState) ParseError!Node.Index {
@@ -744,7 +758,7 @@ fn parseFunction(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
     const external = parser.eat(.keyword_extern) != null;
     // Only `extern` can reach here without a function keyword.
-    if (parser.eatAny(&.{ .keyword_func, .keyword_fallible }) == null) _ = try parser.expect(.keyword_func);
+    if (parser.eatAny(&.{.keyword_func}) == null) _ = try parser.expect(.keyword_func);
     const name: ?DeclarationName = if (external or parser.current().tag == .identifier or isOperationName(parser.current().tag))
         try parseDeclarationName(parser, true)
     else
@@ -786,7 +800,7 @@ fn parseFuncSignature(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
     const params = try parseParenthesizedList(parser, .param_list, parseParameter, .{false});
     const return_type: Node.Index = switch (parser.current().tag) {
-        .identifier, .keyword_func, .keyword_fallible, .keyword_none, .keyword_ref, .l_paren => try parseType(parser),
+        .identifier, .keyword_func, .keyword_none, .keyword_ref, .l_paren => try parseType(parser),
         else => .null,
     };
     const where_token_index = parser.index;
@@ -850,16 +864,16 @@ fn parseVariantMembers(parser: *ParserState, token_index: u32, first: Node.Index
 fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.current().tag) {
         .identifier => blk: {
-            const is_call = parser.tokens[parser.index + 1].tag == .l_paren or parser.tokens[parser.index + 1].tag == .question_mark;
+            const is_call = parser.tokens[parser.index + 1].tag == .l_paren;
             var value = try parseTokenNode(parser, .identifier, if (is_call) .identifier else .type);
             while (parser.current().tag == .period) value = try parseFieldAccess(parser, value);
-            if (parser.current().tag == .l_paren or parser.current().tag == .question_mark)
+            if (parser.current().tag == .l_paren)
                 value = try parseCall(parser, value);
             break :blk value;
         },
         .keyword_none => try parseTokenNode(parser, .keyword_none, .type),
         .keyword_ref => try parseReferenceType(parser),
-        .keyword_func, .keyword_fallible => try parseFunctionType(parser),
+        .keyword_func => try parseFunctionType(parser),
         .l_paren => try parseParenthesized(parser, true),
         else => return parser.fail(.{ .invalid_expression = parser.current().tag }),
     };
@@ -867,7 +881,7 @@ fn parseTypePrimary(parser: *ParserState) ParseError!Node.Index {
 
 fn parseFunctionType(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
-    _ = parser.eatAny(&.{ .keyword_func, .keyword_fallible }).?;
+    _ = parser.eatAny(&.{.keyword_func}).?;
     const params = try parseParenthesizedList(parser, .type_list, parseTypeParameter, .{});
     const return_type = try parseType(parser);
     return parser.addNode(.{ .tag = .type_func, .token_index = token_index, .data = .{ .node_node = .{ .a = params, .b = return_type } } });
@@ -932,8 +946,8 @@ fn binaryOpInfo(token: Token.Tag) ?BinaryOpInfo {
         .angle_bracket_right => .{ .tag = .gt, .precedence = 3 },
         .angle_bracket_left_equal => .{ .tag = .le, .precedence = 3 },
         .angle_bracket_right_equal => .{ .tag = .ge, .precedence = 3 },
+        .keyword_in => .{ .tag = .membership, .precedence = 3 },
         .keyword_is => .{ .tag = .is, .precedence = 3 },
-        .keyword_as => .{ .tag = .as, .precedence = 3 },
         .ellipsis2 => .{ .tag = .range, .precedence = 4 },
         .plus => .{ .tag = .add, .precedence = 5 },
         .minus => .{ .tag = .sub, .precedence = 5 },
@@ -962,7 +976,7 @@ fn parseExpressionPrecedence(parser: *ParserState, min_precedence: u8) ParseErro
         const operator_index = parser.index;
         parser.index += 1;
         const rhs = switch (op_info.tag) {
-            .is, .as => try parseType(parser),
+            .is => try parseType(parser),
             else => try parseExpressionPrecedence(parser, op_info.precedence + 1),
         };
         lhs = try parser.addNode(.{ .tag = op_info.tag, .token_index = operator_index, .data = .{ .node_node = .{ .a = lhs, .b = rhs } } });
@@ -993,7 +1007,6 @@ fn parseRange(parser: *ParserState, first: ?Node.Index) ParseError!Node.Index {
         .keyword_sizeof,
         .keyword_struct,
         .keyword_func,
-        .keyword_fallible,
         .keyword_static,
         .l_paren,
         .l_bracket,
@@ -1039,10 +1052,6 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
         if (parser.atMatchArmBoundary()) break;
         switch (parser.current().tag) {
             .l_paren => lhs = try parseCall(parser, lhs),
-            .question_mark => lhs = if (parser.tokens[parser.index + 1].tag == .l_paren)
-                try parseCall(parser, lhs)
-            else
-                try parsePostfixNode(parser, lhs, .query),
             .l_brace => lhs = try parseStructInit(parser, lhs),
             .l_bracket => {
                 const token_index = parser.index;
@@ -1064,7 +1073,6 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
 
 fn parseCall(parser: *ParserState, callee: Node.Index) ParseError!Node.Index {
     const token_index = parser.index;
-    _ = parser.eat(.question_mark);
     const arguments = try parseParenthesizedList(parser, .call_arg_list, parseExpressionPrecedence, .{@as(u8, 0)});
     return parser.addNode(.{ .tag = .call, .token_index = token_index, .data = .{ .node_node = .{ .a = callee, .b = arguments } } });
 }
@@ -1085,7 +1093,7 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
         .keyword_comptime => try parseKeywordBody(parser, .keyword_comptime, .comptime_expr),
         .keyword_sizeof => try parseSizeof(parser),
         .keyword_struct => try parseStruct(parser),
-        .keyword_func, .keyword_fallible => try parseFunctionType(parser),
+        .keyword_func => try parseFunctionType(parser),
         .keyword_static => try parseStruct(parser),
         .identifier => try parseTokenNode(parser, .identifier, .identifier),
         .l_bracket => try parseCollectionLiteral(parser),
@@ -1215,7 +1223,7 @@ fn parseStructItem(parser: *ParserState) ParseError!Node.Index {
         .keyword_converter => return parser.fail(.invalid_converter),
         .keyword_ref => return parseStructField(parser),
         .keyword_const, .keyword_var, .keyword_static => return parseBinding(parser),
-        .keyword_func, .keyword_fallible, .keyword_struct, .keyword_overload => return parseExpression(parser),
+        .keyword_func, .keyword_struct, .keyword_overload => return parseExpression(parser),
         .keyword_pub => {
             if (next != .keyword_ref and (next != .identifier or parser.tokens[parser.index + 2].tag != .colon))
                 return parsePublic(parser);
@@ -1484,10 +1492,10 @@ test "parse string literals and indexed children preserve AST equality and rende
     );
 }
 
-test "parse fallible function declarations and callable types" {
+test "parse function declarations and callable types" {
     try testParsing(
-        \\fallible checked(value: int) int -> value
-        \\static typed: fallible(int) int = fallible(value: int) int -> value
+        \\func checked(value: int) int -> value
+        \\static typed: func(int) int = func(value: int) int -> value
     ,
         \\static_binding
         \\└─func
@@ -1613,45 +1621,6 @@ test "parse inline bare return before another declaration" {
     const first_binding = parsed.nodes[parsed.node_refs[root.data.ref.start].index()];
     const first_function = parsed.nodes[first_binding.data.node_node.b.index()];
     try std.testing.expectEqual(Node.Tag.return_nothing, parsed.nodes[first_function.data.node_node.b.index()].tag);
-    try std.testing.expectEqual(Node.Tag.static_binding, parsed.nodes[parsed.node_refs[root.data.ref.start + 1].index()].tag);
-}
-
-test "parse bare fail" {
-    const source =
-        \\fallible reject() int
-        \\  fail
-        \\  return 1
-    ;
-    var report = try parseReport(std.testing.allocator, 1, source);
-    defer report.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
-    const parsed = report.ast.?;
-    const binding = parsed.nodes[parsed.node_refs[parsed.nodes[0].data.ref.start].index()];
-    const function = parsed.nodes[binding.data.node_node.b.index()];
-    const body = parsed.nodes[function.data.node_node.b.index()];
-    try std.testing.expectEqual(Node.Tag.block, body.tag);
-    try std.testing.expectEqual(@as(u32, 2), body.data.ref.end - body.data.ref.start);
-    const failure = parsed.nodes[parsed.node_refs[body.data.ref.start].index()];
-    try std.testing.expectEqual(Node.Tag.fail_expr, failure.tag);
-    try std.testing.expectEqual(Token.Tag.keyword_fail, parsed.tokens[failure.token_index].tag);
-    try std.testing.expectEqual(Node.Tag.return_expr, parsed.nodes[parsed.node_refs[body.data.ref.start + 1].index()].tag);
-    try std.testing.expect(Ast.eql(parsed, parsed));
-}
-
-test "parse inline bare fail before another declaration" {
-    const source =
-        \\fallible reject() int -> fail
-        \\func value() int -> 1
-    ;
-    var report = try parseReport(std.testing.allocator, 1, source);
-    defer report.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
-    const parsed = report.ast.?;
-    const root = parsed.nodes[0];
-    try std.testing.expectEqual(@as(u32, 2), root.data.ref.end - root.data.ref.start);
-    const binding = parsed.nodes[parsed.node_refs[root.data.ref.start].index()];
-    const function = parsed.nodes[binding.data.node_node.b.index()];
-    try std.testing.expectEqual(Node.Tag.fail_expr, parsed.nodes[function.data.node_node.b.index()].tag);
     try std.testing.expectEqual(Node.Tag.static_binding, parsed.nodes[parsed.node_refs[root.data.ref.start + 1].index()].tag);
 }
 
@@ -1805,40 +1774,6 @@ test "parse function signatures with compound types" {
         \\    └─return_expr
         \\      └─none_literal : none
     );
-}
-
-test "parse fallible call syntax" {
-    for ([_][]const u8{ "callee?(1)", "owner.method?(1)" }) |source| {
-        var report = try parseReport(std.testing.allocator, 1, source);
-        defer report.deinit(std.testing.allocator);
-        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
-        const ast = &report.ast.?;
-        const call = ast.nodes[ast.node_refs[ast.nodes[0].data.ref.start].index()];
-        try std.testing.expectEqual(Node.Tag.call, call.tag);
-        try std.testing.expectEqual(Token.Tag.question_mark, ast.tokens[call.token_index].tag);
-        try std.testing.expectEqual(Node.Tag.number_literal, ast.nodes[ast.nodeList(call.data.node_node.b)[0].index()].tag);
-    }
-}
-
-test "parse query postfix independently from the fallible call marker" {
-    for ([_][]const u8{ "value?", "callee()?", "1?", "callee??()", "callee?(1)?" }) |source| {
-        var report = try parseReport(std.testing.allocator, 1, source);
-        defer report.deinit(std.testing.allocator);
-        try std.testing.expect(report.ast != null);
-        try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
-    }
-    var report = try parseReport(std.testing.allocator, 1, "callee?(1)?");
-    defer report.deinit(std.testing.allocator);
-    const ast = report.ast.?;
-    var found = false;
-    for (ast.nodes) |node| {
-        if (node.tag != .query) continue;
-        const call = ast.nodes[node.data.node.index()];
-        try std.testing.expectEqual(Node.Tag.call, call.tag);
-        try std.testing.expectEqual(Token.Tag.question_mark, ast.tokens[call.token_index].tag);
-        found = true;
-    }
-    try std.testing.expect(found);
 }
 
 test "parse direct calls in type positions" {
@@ -2041,7 +1976,7 @@ test "parse function defined inside struct" {
 test "parse public function inside struct" {
     const source =
         \\pub struct S
-        \\  pub fallible new() S -> return S{}
+        \\  pub func new() S -> return S{}
     ;
     var report = try parseReport(std.testing.allocator, 0, source);
     defer report.deinit(std.testing.allocator);
@@ -2286,7 +2221,7 @@ test "parse field assignment" {
 test "parse variant runtime operators" {
     try testParsing(
         \\if x is int | A -> print(1)
-        \\if const i = b as int -> print(i)
+        \\if const i: int = b -> print(i)
     ,
         \\if
         \\├─is
@@ -2300,9 +2235,8 @@ test "parse variant runtime operators" {
         \\    └─number_literal : 1
         \\if
         \\├─const_binding
-        \\│ └─as
-        \\│   ├─identifier : b
-        \\│   └─type : int
+        \\│ ├─type : int
+        \\│ └─identifier : b
         \\└─call
         \\  ├─identifier : print
         \\  └─call_arg_list
@@ -2357,12 +2291,12 @@ test "not binds below comparisons and above logical operators" {
     );
 }
 
-test "parse fallible calls and move postfix operators" {
+test "parse calls and move postfix operators" {
     try testParsing(
-        \\const a = value?()
+        \\const a = value()
         \\const b = a^
         \\take(b^)
-        \\if const v = maybe?() -> print(v)
+        \\if const v = maybe() -> print(v)
     ,
         \\const_binding
         \\└─call
@@ -2857,9 +2791,9 @@ test "external functions require a name" {
     );
 }
 
-test "external fallible declarations require a name" {
+test "external declarations require a name" {
     try testExpectDiagnosticTag(
-        "extern fallible (size: int) int",
+        "extern func (size: int) int",
         .{ .expected_token = .{ .expected = .identifier, .found = .l_paren } },
     );
 }
@@ -2946,12 +2880,12 @@ test "parse static struct modifier through named generated and expression sugar"
 
 test "truncated multiline sources preserve parser error boundaries" {
     const sources = [_][]const u8{
-        "ref value: Item = target.get?(index)",
+        "ref value: Item = target.get(index)",
         "import library.{\n  first as renamed,\n  second,\n}",
         "func calculate(\n  imm value: int | none,\n  init other: int,\n) int\n  if const result = value\n    return other\n  else return 0",
         "static struct Container(T: type)\n  value: T\n  func get(self: Self) T -> self.value",
         "const value = call(\n  [1, 2,\n    3],\n  Item{\n    field = 4,\n  },\n)",
-        "static Callback: type = fallible(imm int | none, init int) int",
+        "static Callback: type = func(imm int | none, init int) int",
     };
     for (sources) |source| {
         for (0..source.len + 1) |length| {

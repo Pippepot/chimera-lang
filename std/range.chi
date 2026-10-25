@@ -4,13 +4,9 @@ import std.text.{String}
 pub struct FromEnd
     copy = trivial
     distance: int
-
-    pub fallible resolve(self: FromEnd, length: int) int
-        length >= 0
-        self.distance >= 0
-        self.distance <= length
+    pub func resolve(self: FromEnd, length: int) int | none
+        if length < 0 or self.distance < 0 or self.distance > length -> return none
         return length - self.distance
-
 pub func from_end(distance: int) FromEnd -> FromEnd{distance = distance}
 
 pub struct Range
@@ -18,33 +14,34 @@ pub struct Range
     pub first: int | FromEnd | none
     pub limit: int | FromEnd | none
     inclusive: bool
-
+    pub func contains(imm self: Range, imm value: int) bool
+        const first: int = self.first else return false
+        const limit: int = self.limit else return false
+        return value >= first and (if self.inclusive -> value <= limit else value < limit)
     pub func iter(self: Range) RangeIterator
-        if const sequence = self.sequence() -> return sequence.iter()
-        panic "range iteration requires both endpoints as absolute integers"
+        const sequence: RangeSequence = self.sequence() else panic "range iteration requires both endpoints as absolute integers"
+        return sequence.iter()
     pub func reversed(self: Range) RangeSequence
-        if const sequence = self.sequence() -> return sequence.reversed()
-        panic "range reversal requires both endpoints as absolute integers"
-    pub fallible step_by(self: Range, factor: int) RangeSequence -> self.sequence?().step_by?(factor)
-
-    pub fallible resolve(self: Range, length: int) (int, int)
-        length >= 0
-        const start = resolve_bound?(self.first, length, 0)
-        const limit = resolve_bound?(self.limit, length, length)
-        start >= 0
-        start <= limit
-        if self.inclusive?
-            not (self.limit is none)
-            limit < length
+        const sequence: RangeSequence = self.sequence() else panic "range reversal requires both endpoints as absolute integers"
+        return sequence.reversed()
+    pub func step_by(self: Range, factor: int) RangeSequence | none
+        const sequence: RangeSequence = self.sequence() else return none
+        return sequence.step_by(factor)
+    pub func resolve(self: Range, length: int) (int, int) | none
+        if length < 0 -> return none
+        const start: int = resolve_bound(self.first, length, 0) else return none
+        const limit: int = resolve_bound(self.limit, length, length) else return none
+        if start < 0 or start > limit -> return none
+        if self.inclusive
+            if self.limit is none or limit >= length -> return none
             return (start, limit + 1)
-        limit <= length
+        if limit > length -> return none
         return (start, limit)
-
-    fallible sequence(self: Range) RangeSequence
-        const first = self.first as int
-        const limit = self.limit as int
-        if self.inclusive?
-            return RangeSequence{first = first, last = limit, stride = 1, descending = false, empty = bool(first > limit)}
+    func sequence(self: Range) RangeSequence | none
+        const first: int = self.first else return none
+        const limit: int = self.limit else return none
+        if self.inclusive
+            return RangeSequence{first = first, last = limit, stride = 1, descending = false, empty = first > limit}
         if first >= limit
             return RangeSequence{first = first, last = first, stride = 1, descending = false, empty = true}
         return RangeSequence{first = first, last = limit - 1, stride = 1, descending = false, empty = false}
@@ -72,18 +69,18 @@ pub struct RangeSequence
             first = self.last,
             last = self.first,
             stride = self.stride,
-            descending = not_direction(self.descending),
+            descending = not self.descending,
             empty = self.empty,
         }
 
-    pub fallible step_by(self: RangeSequence, factor: int) RangeSequence
-        factor > 0
-        if self.empty? or factor == 1 -> return self
-        if self.stride == 0 or not has_steps(self.first, self.last, self.stride, factor)?
+    pub func step_by(self: RangeSequence, factor: int) RangeSequence | none
+        if factor <= 0 -> return none
+        if self.empty or factor == 1 -> return self
+        if self.stride == 0 or not has_steps(self.first, self.last, self.stride, factor)
             return RangeSequence{first = self.first, last = self.first, stride = 1, descending = self.descending, empty = false}
         const stride = self.stride * factor
         if self.stride > 2147483647 / factor
-            const last = if self.descending? -> self.first - stride else self.first + stride
+            const last = if self.descending -> self.first - stride else self.first + stride
             return RangeSequence{first = self.first, last = last, stride = 0, descending = self.descending, empty = false}
         return RangeSequence{
             first = self.first,
@@ -103,13 +100,13 @@ pub struct RangeIterator
     finished: bool
 
     pub func next(mut self: RangeIterator) int | End
-        if self.finished? -> return End{}
-        if self.started?
+        if self.finished -> return End{}
+        if self.started
             if self.value == self.last
                 self.finished = true
                 return End{}
             if self.stride == 0 -> self.value = self.last
-            else if self.descending? -> self.value -= self.stride
+            else if self.descending -> self.value -= self.stride
             else self.value += self.stride
         self.started = true
         return self.value
@@ -121,31 +118,26 @@ pub func inclusive(first: int | FromEnd | none, limit: int | FromEnd | none) Ran
     return Range{first = first, limit = limit, inclusive = true}
 
 pub converter(imm value: Range) String
-    if const result = format_range(value) -> return result^
-    panic "string conversion allocation failed"
-
-fallible format_range(imm value: Range) String
-    var result = String.empty()
-    append_bound?(result, value.first)
-    result.append?("..")
-    if value.inclusive? -> result.append?("=")
-    append_bound?(result, value.limit)
+    const result: String = format_range(value) else panic "string conversion allocation failed"
     return result^
-
-fallible resolve_bound(bound: int | FromEnd | none, length: int, omitted: int) int
-    if const value = bound as int -> return value
-    if const value = bound as FromEnd -> return value.resolve?(length)
+func format_range(imm value: Range) String | none
+    var result = String.empty()
+    const _: unit = append_bound(result, value.first) else return none
+    const _: unit = result.append("..") else return none
+    if value.inclusive
+        const _: unit = result.append("=") else return none
+    const _: unit = append_bound(result, value.limit) else return none
+    return result^
+func resolve_bound(bound: int | FromEnd | none, length: int, omitted: int) int | none
+    if const value: int = bound -> return value
+    if const value: FromEnd = bound -> return value.resolve(length)
     return omitted
-
-fallible append_bound(mut result: String, bound: int | FromEnd | none)
-    if const value = bound as int -> result.append?(String(value))
-    else if const value = bound as FromEnd
-        result.append?("^")
-        result.append?(String(value.distance))
-
-func not_direction(value: bool) bool
-    if value? -> return false
-    return true
+func append_bound(mut result: String, bound: int | FromEnd | none) unit | none
+    if const value: int = bound -> return result.append(String(value))
+    if const value: FromEnd = bound
+        const _: unit = result.append("^") else return none
+        return result.append(String(value.distance))
+    return unit
 
 func has_steps(first: int, last: int, stride: int, count: int) bool
     const low = if first < last -> first else last
@@ -166,8 +158,8 @@ func aligned_last(first: int, last: int, stride: int, descending: bool) int
     if first_remainder < 0 -> first_remainder += stride
     var last_remainder = last % stride
     if last_remainder < 0 -> last_remainder += stride
-    const left = if descending? -> first_remainder else last_remainder
-    const right = if descending? -> last_remainder else first_remainder
+    const left = if descending -> first_remainder else last_remainder
+    const right = if descending -> last_remainder else first_remainder
     const remainder = if left >= right -> left - right else stride - (right - left)
-    if descending? -> return last + remainder
+    if descending -> return last + remainder
     return last - remainder

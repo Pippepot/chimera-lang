@@ -40,13 +40,15 @@ test "user remainder operations support expressions and compound field assignmen
 
 test "indexed remainder assignment uses checked getter and owned replacement" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var values = [17, 23]
         \\    values[0] %= 5
-        \\    if values[9] %= 5 -> return 90
+        \\    if ref value: int = values.get(9)
+        \\        value %= 5
+        \\        return 90
         \\    return values[0] + 40
         \\func run() int
-        \\    if const answer = calculate() -> return answer
+        \\    if const answer: int = calculate() -> return answer
         \\    return 91
     , 42);
 }
@@ -59,22 +61,30 @@ test "end relative indexing preserves eager setters and bounds first compound as
         \\func replacement(ref calls: int) int
         \\    calls += 10
         \\    return 42
-        \\fallible missing(ref calls: int) int
+        \\func missing(ref calls: int) int | none
         \\    calls += 100
-        \\    fail
-        \\fallible inspect() int
+        \\    return none
+        \\func inspect() int | none
         \\    var values = [40]
         \\    var calls = 0
-        \\    if values[^distance(calls)] = replacement(calls) -> return 90
-        \\    calls == 11
-        \\    if values[^distance(calls)] += replacement(calls) -> return 91
-        \\    calls == 12
-        \\    if values[^missing?(calls)] = replacement(calls) -> return 92
-        \\    calls == 112
+        \\    const index = ^distance(calls)
+        \\    const next = replacement(calls)
+        \\    if ref value: int = values.get(index)
+        \\        value = next
+        \\        return 90
+        \\    if not (calls == 11) -> return none
+        \\    if ref value: int = values.get(^distance(calls))
+        \\        value += replacement(calls)
+        \\        return 91
+        \\    if not (calls == 12) -> return none
+        \\    if const selected_index: int = missing(calls)
+        \\        values[^selected_index] = replacement(calls)
+        \\        return 92
+        \\    if not (calls == 112) -> return none
         \\    values[^1] += 2
         \\    return values[^1]
         \\func run() int
-        \\    if const result = inspect() -> return result
+        \\    if const result: int = inspect() -> return result
         \\    return 93
     , 42);
 }
@@ -82,21 +92,21 @@ test "end relative indexing preserves eager setters and bounds first compound as
 test "end relative setters preserve contextual byte conversion" {
     try Fixture.expectParity(
         \\import std.text.{byte_int}
-        \\fallible inspect() int
+        \\func inspect() int | none
         \\    var values: Array(byte, 2) = [0, 0]
         \\    values[0] = 20
         \\    values[^1] = 22
         \\    var view = values.span()
         \\    view[0] = 21
         \\    view[^1] = 23
-        \\    byte_int(values[0]) == 21
-        \\    byte_int(values[^1]) == 23
+        \\    if not (byte_int(values[0]) == 21) -> return none
+        \\    if not (byte_int(values[^1]) == 23) -> return none
         \\    var items: List(byte) = [0, 0]
         \\    items[0] = 20
         \\    items[^1] = 22
         \\    return byte_int(items[0]) + byte_int(items[^1])
         \\func run() int
-        \\    if const result = inspect() -> return result
+        \\    if const result: int = inspect() -> return result
         \\    return 90
     , 42);
 }
@@ -165,18 +175,18 @@ test "operation functions comparisons and queried logical data preserve parity a
     try Fixture.expectParity(
         \\struct Value
         \\    value: int
-        \\    pub fallible ==(imm left: Value, imm right: Value) unit -> left.value == right.value
-        \\    pub fallible <>(imm left: Value, imm right: Value) unit -> left.value <> right.value
-        \\    pub fallible <(imm left: Value, imm right: Value) unit -> left.value < right.value
-        \\    pub fallible >(imm left: Value, imm right: Value) unit -> left.value > right.value
-        \\    pub fallible <=(imm left: Value, imm right: Value) unit -> left.value <= right.value
-        \\    pub fallible >=(imm left: Value, imm right: Value) unit -> left.value >= right.value
+        \\    pub func ==(imm left: Value, imm right: Value) bool -> left.value == right.value
+        \\    pub func <>(imm left: Value, imm right: Value) bool -> left.value <> right.value
+        \\    pub func <(imm left: Value, imm right: Value) bool -> left.value < right.value
+        \\    pub func >(imm left: Value, imm right: Value) bool -> left.value > right.value
+        \\    pub func <=(imm left: Value, imm right: Value) bool -> left.value <= right.value
+        \\    pub func >=(imm left: Value, imm right: Value) bool -> left.value >= right.value
         \\func skipped() bool
         \\    exit(91)
         \\func zero_value(mut count: int) Value
         \\    count += 1
         \\    return Value{value = 0}
-        \\fallible missing() unit -> fail
+        \\func missing() unit | none -> return none
         \\func run() int
         \\    const left = Value{value = 19}
         \\    const right = Value{value = 23}
@@ -185,9 +195,9 @@ test "operation functions comparisons and queried logical data preserve parity a
         \\    const inverted = bool(not zero.value <> 0)
         \\    var count = 0
         \\    const inverted_call = bool(not zero_value(count).value <> 0)
-        \\    const short_or = bool(true? or skipped()?)
-        \\    const short_and = bool(false? and skipped()?)
-        \\    if comparisons? and inverted? and inverted_call? and count == 1 and short_or? and not short_and? and not missing() -> return 42
+        \\    const short_or = bool(true or skipped())
+        \\    const short_and = bool(false and skipped())
+        \\    if comparisons and inverted and inverted_call and count == 1 and short_or and not short_and and not (missing() is unit) -> return 42
         \\    return 90
     , 42);
 }
@@ -223,7 +233,7 @@ test "operation functions primitive namespace calls and callable values have par
         \\    const product = int.*(difference, 2)
         \\    const quotient = int./(product, 2)
         \\    const negative = int.-(quotient)
-        \\    if int.==(total, 42) and int.<>(total, quotient) and int.<(quotient, total) and int.>(total, quotient) and int.<=(quotient, total) and int.>=(total, quotient) and bool.==(true, true) and bool.<>(false, true) and not false?
+        \\    if int.==(total, 42) and int.<>(total, quotient) and int.<(quotient, total) and int.>(total, quotient) and int.<=(quotient, total) and int.>=(total, quotient) and bool.==(true, true) and bool.<>(false, true) and not false
         \\        return -negative + 2
         \\    return 90
     , 42);
@@ -244,10 +254,10 @@ test "operation functions primitive externs preserve arithmetic and evaluation o
         \\    var order = 0
         \\    const sum = digit(order, 1) + digit(order, 2)
         \\    const comparison = bool(digit(order, 3) < digit(order, 4))
-        \\    const inverted = bool(not flag(order)?)
+        \\    const inverted = bool(not flag(order))
         \\    const less = int.<
         \\    const negative = sum.-()
-        \\    const uninverted = bool(not inverted?)
+        \\    const uninverted = bool(not inverted)
         \\    const literal_sum = declared + 23
         \\    const literal_negative = declared.-()
         \\    const literal_copy = declared.copy()
@@ -259,7 +269,7 @@ test "operation functions primitive externs preserve arithmetic and evaluation o
         \\    const minimum = 2147483647 + 1
         \\    const maximum = minimum - 1
         \\    const doubled = 1073741824 * 2
-        \\    if order == 12345 and sum == 3 and comparison? and inverted? and negative == -3 and not uninverted? and literal_sum == 42 and literal_negative == -19 and literal_copy == 19 and total == 41 and minimum == -2147483648 and maximum == 2147483647 and doubled == minimum and -minimum == minimum and -7 / 3 == -2 and int./(7, -3) == -2 and less(-2, -1) and not less(-1, -2) and not false? and true? and not bool.==(true, false) and not bool.<>(true, true)
+        \\    if order == 12345 and sum == 3 and comparison and inverted and negative == -3 and not uninverted and literal_sum == 42 and literal_negative == -19 and literal_copy == 19 and total == 41 and minimum == -2147483648 and maximum == 2147483647 and doubled == minimum and -minimum == minimum and -7 / 3 == -2 and int./(7, -3) == -2 and less(-2, -1) and not less(-1, -2) and not false and true and not bool.==(true, false) and not bool.<>(true, true)
         \\        return 42
         \\    return 90
     , 42);
@@ -330,13 +340,13 @@ test "operation functions primitive signatures invalidate and recover every call
             .calls = &.{ "return 19 + 23", "return int.+(19, 23)", "const operation = int.+\n    return operation(19, 23)" },
         },
         .{
-            .valid = "pub extern fallible int.<(imm left: int, imm right: int) unit",
+            .valid = "pub extern func int.<(imm left: int, imm right: int) bool",
             .invalid = "pub extern func int.<(imm left: int, imm right: int) int",
             .calls = &.{ "if 19 < 23 -> return 42\n    return 90", "if int.<(19, 23) -> return 42\n    return 90", "const operation = int.<\n    if operation(19, 23) -> return 42\n    return 90" },
         },
         .{
-            .valid = "pub extern fallible bool.==(imm left: bool, imm right: bool) unit",
-            .invalid = "pub extern fallible bool.==(mut left: bool, imm right: bool) unit",
+            .valid = "pub extern func bool.==(imm left: bool, imm right: bool) bool",
+            .invalid = "pub extern func bool.==(mut left: bool, imm right: bool) bool",
             .calls = &.{
                 "if true == true -> return 42\n    return 90",
                 "if bool.==(true, true) -> return 42\n    return 90",
@@ -421,47 +431,53 @@ test "operation functions user indexers and qualified explicit bracket calls hav
     try Fixture.expectParity(
         \\struct Value
         \\    value: int
-        \\fallible Value.[](imm self: Value, index: int) int
-        \\    index == 0
+        \\func Value.[](imm self: Value, index: int) int | none
+        \\    if not (index == 0) -> return none
         \\    return self.value
-        \\fallible Value.[]=(mut self: Value, index: int, var replacement: int) unit
-        \\    index == 0
+        \\func Value.[]=(mut self: Value, index: int, var replacement: int) unit
+        \\    if not (index == 0) -> panic "invalid index"
         \\    self.value = replacement
-        \\fallible calculate() int
+        \\    return ()
+        \\func calculate() int | none
         \\    var value = Value{value = 19}
-        \\    value[0] += 2
-        \\    Value.[]=? (value, 0, 21)
-        \\    return Value.[]?(value, 0) + value[0]
+        \\    const initial: int = value[0] else return none
+        \\    value[0] = initial + 2
+        \\    Value.[]=(value, 0, 21)
+        \\    if const invalid: int = value[1] -> return 91
+        \\    const first: int = Value.[](value, 0) else return none
+        \\    const second: int = value[0] else return none
+        \\    return first + second
         \\func run() int
-        \\    if const calculated = calculate() -> return calculated
+        \\    if const calculated: int = calculate() -> return calculated
         \\    return 90
     , 42);
 }
 
-test "operation functions conditional compound indexing permits an infallible getter" {
+test "operation functions compound indexing permits a value getter" {
     try Fixture.expectParity(
         \\struct Value
         \\    value: int
         \\    pub func [](imm self: Value, index: int) int -> self.value
-        \\    pub fallible []=(mut self: Value, index: int, var item: int) unit
-        \\        index == 0
+        \\    pub func []=(mut self: Value, index: int, var item: int) unit
+        \\        if not (index == 0) -> panic "invalid index"
         \\        self.value = item
+        \\        return ()
         \\func run() int
         \\    var value = Value{value = 40}
-        \\    if value[0] += 2 -> return value.value
-        \\    return 90
+        \\    value[0] += 2
+        \\    return value.value
     , 42);
 }
 
-test "operation functions conditional compound indexing preserves diverging getters" {
+test "operation functions compound indexing preserves diverging getters" {
     try Fixture.expectSourceExit(
         \\struct Stop
         \\    copy = trivial
         \\    pub func [](imm self: Stop, index: int) never -> exit(42)
-        \\    pub fallible []=(mut self: Stop, index: int, var value: int) unit -> ()
+        \\    pub func []=(mut self: Stop, index: int, var value: int) unit -> ()
         \\func run() int
         \\    var values = Stop{}
-        \\    if values[0] += 1 -> return 91
+        \\    values[0] += 1
         \\    return 92
         \\exit(run())
     , 42);
@@ -473,7 +489,7 @@ test "operation functions reject signatures with extra operands modes results an
         "func +(mut left: Value, imm right: Value) Value -> left",
         "func +(imm left: Value, imm right: int) Value -> left",
         "func +(imm left: Value, imm right: Value) int -> 42",
-        "fallible +(imm left: Value, imm right: Value) Value -> left",
+        "func +(imm left: Value, imm right: Value) Value | none -> left",
         "func +(imm left: Value) Value -> left",
         "func +(imm left: Value, imm right: Value, init extra: Value) Value -> left",
     }) |declaration| {
@@ -593,9 +609,9 @@ test "operation functions reject comparison unary and indexer signature mismatch
         .{ .name = "==", .declaration = "func ==(imm left: Value, imm right: Value) Value -> left" },
         .{ .name = "-", .declaration = "func -(mut self: Value) Value -> self" },
         .{ .name = "not", .declaration = "func not(imm self: Value) Value -> self" },
-        .{ .name = "[]", .declaration = "fallible [](imm self: Value, mut index: bool) int -> 42" },
-        .{ .name = "[]=", .declaration = "fallible []=(imm self: Value, index: int, var replacement: int) unit -> fail" },
-        .{ .name = "[]=", .declaration = "fallible []=(mut self: Value, index: int, init replacement: int) unit -> fail" },
+        .{ .name = "[]", .declaration = "func [](imm self: Value, mut index: bool) int | none -> 42" },
+        .{ .name = "[]=", .declaration = "func []=(imm self: Value, index: int, var replacement: int) unit | none -> return none" },
+        .{ .name = "[]=", .declaration = "func []=(mut self: Value, index: int, init replacement: int) unit | none -> return none" },
     }) |case| {
         const source = try testing.allocator.print("struct Value\n    value: int\n    {s}\nconst operation = Value.{s}\nexit(42)", .{ case.declaration, case.name });
         defer testing.allocator.free(source);

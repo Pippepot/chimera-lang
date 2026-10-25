@@ -446,21 +446,21 @@ test "converters preserve temporal conflicts between captured referents" {
         \\    value: int
         \\converter(imm input: Input) Done
         \\    const view = input.left.value.view()
-        \\    if input.right.value.append("x") -> ()
+        \\    if (input.right.value.append("x") is unit) -> ()
         \\    return Done{value = view.byte_length() + 39}
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     ;
     try Fixture.expectParity(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var left: String = "abc"
         \\    var right: String = ""
         \\    const result: Done = Input{left = Ref.from(left), right = Ref.from(right)}
         \\    return result.value
     , 42);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var buffer: String = "abc"
         \\    const result: Done = Input{left = Ref.from(buffer), right = Ref.from(buffer)}
         \\    return result.value
@@ -475,39 +475,39 @@ test "converter mutations invalidate caller retained reads precisely" {
         \\struct Done
         \\    value: int
         \\converter(imm input: Input) Done
-        \\    if input.target.value.append("x") -> ()
+        \\    if (input.target.value.append("x") is unit) -> ()
         \\    return Done{value = 0}
-        \\fallible inspect(ref left: String, ref right: String) int
+        \\func inspect(ref left: String, ref right: String) int | none
         \\    const view = left.view()
         \\    const result: Done = Input{target = Ref.from(right)}
         \\    return view.byte_length() + result.value + 39
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     ;
     try Fixture.expectParity(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var left: String = "abc"
         \\    var right: String = ""
-        \\    return inspect?(left, right)
+        \\    return inspect(left, right)
     , 42);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var buffer: String = "abc"
-        \\    return inspect?(buffer, buffer)
+        \\    return inspect(buffer, buffer)
         \\_ = run()
     , .borrow_outlives_source);
 }
 
-test "optional generic inference uses payload evidence and captures failure" {
+test "optional generic inference uses payload evidence and preserves ordinary absence" {
     try Fixture.expectParity(
         \\func identity(static T: type, value: T | none) T | none -> value
-        \\fallible absent() int -> fail
+        \\func absent() int | none -> return none
         \\func run() int
         \\    const found = identity(42)
         \\    if not (found is int) -> return 90
-        \\    if identity(absent?()) is int -> return 91
-        \\    if const answer = found as int -> return answer
+        \\    if identity(absent()) is int -> return 91
+        \\    if const answer: int = found -> return answer
         \\    return 92
     , 42);
 }
@@ -519,7 +519,7 @@ test "optional generic inference strips fixed members independent of arm order" 
         \\func run() int
         \\    const original: int | bool | none = 42
         \\    const result = identity(original)
-        \\    if const answer = result as int -> return answer
+        \\    if const answer: int = result -> return answer
         \\    return 90
     , 42);
 }
@@ -532,7 +532,7 @@ test "optional generic inference recovers nominal payload specialization" {
         \\func identity(static T: type, value: Wrapper(T) | none) Wrapper(T) | none -> value
         \\func run() int
         \\    const original: Wrapper(int) | none = Wrapper(int){value = 42}
-        \\    if const found = identity(original) as Wrapper(int) -> return found.value
+        \\    if const found: Wrapper(int) = identity(original) -> return found.value
         \\    return 90
     , 42);
 }
@@ -540,10 +540,10 @@ test "optional generic inference recovers nominal payload specialization" {
 test "optional generic inference accepts none when another argument supplies the type" {
     try Fixture.expectParity(
         \\func before(static T: type, value: T | none, fallback: T) T
-        \\    if const found = value as T -> return found
+        \\    if const found: T = value -> return found
         \\    return fallback
         \\func after(static T: type, fallback: T, value: T | none) T
-        \\    if const found = value as T -> return found
+        \\    if const found: T = value -> return found
         \\    return fallback
         \\func run() int -> before(none, 20) + after(22, none)
     , 42);
@@ -571,7 +571,7 @@ test "optional generic struct fields infer from successful payloads" {
         \\    value: T | none
         \\func run() int
         \\    const wrapped = Optional{value = 42}
-        \\    if const answer = wrapped.value as int -> return answer
+        \\    if const answer: int = wrapped.value -> return answer
         \\    return 90
     , 42);
 }
@@ -608,7 +608,7 @@ test "optional generic inference recomputes after payload signature edits" {
     try fixture.expectExit(0, 42);
 }
 
-test "collection literals construct infallible arrays without failure handling" {
+test "collection literals construct infunc arrays without failure handling" {
     try Fixture.expectSourceExit(
         \\func count() int
         \\    const values: Array(int, 2) = [19, 23]
@@ -617,33 +617,19 @@ test "collection literals construct infallible arrays without failure handling" 
     , 2);
 }
 
-test "consuming converters propagate initializer failure but cannot introduce unrelated failure" {
-    try Fixture.expectAnySourceDiagnostic(
-        \\struct Target
-        \\    copy = trivial
-        \\    value: int
-        \\fallible unrelated() -> fail
-        \\converter(static N: int, init value: collection_literal(int, N)) Target
-        \\    const source: Array(int, N) = value
-        \\    unrelated?()
-        \\    return Target{value = source.len()}
-        \\const target: Target = [42]
-        \\exit(target.value)
-    , .fallible_expression_outside_fallible_function);
-}
-
-test "consuming collection converters inherit concrete effects with native and interpreter parity" {
+test "consuming collection converters preserve optional element data with native and interpreter parity" {
     try Fixture.expectParity(
         \\struct Target
         \\    copy = trivial
         \\    value: int
-        \\converter(static N: int, init value: collection_literal(int, N)) Target
-        \\    const source: Array(int, N) = value
+        \\converter(static N: int, init value: collection_literal(int | none, N)) Target
+        \\    const source: Array(int | none, N) = value
         \\    return Target{value = source.len() + 40}
-        \\fallible missing() int -> fail
+        \\func missing() int | none -> return none
         \\func run() int
         \\    const target: Target = [19, 23]
-        \\    if const failed: Target = [missing?()] -> return 91
+        \\    const absent: Target = [missing()]
+        \\    if absent.value <> 41 -> return 91
         \\    return target.value
     , 42);
 }
@@ -750,12 +736,12 @@ test "static struct eligibility propagates through stored aggregates" {
         \\    copy = trivial
         \\    value: int
         \\const data: Data | none = Data{value = 42}
-        \\if const selected = data as Data -> exit(selected.value) else exit(90)
+        \\if const selected: Data = data -> exit(selected.value) else exit(90)
         ,
         \\static struct Data
         \\    copy = trivial
         \\    value: int
-        \\const data = Array(Data, 0).filled(Data{value = 42})
+        \\const data: Array(Data, 0) = Array(Data, 0).filled(Data{value = 42}) else panic "unexpected none"
         \\exit(data.len())
         ,
     }) |source| try Fixture.expectAnySourceDiagnostic(source, .compile_time_only_type);
@@ -770,7 +756,7 @@ test "compile-time-only types reject runtime calls and raw heap storage" {
     ;
     try Fixture.expectAnySourceDiagnostic(declaration ++ "func make() Data -> Data{value = 42}\nconst data = make()\nexit(data.value)", .compile_time_only_type);
     try Fixture.expectAnySourceDiagnostic(declaration ++ "func use(data: Data) int -> data.value\nexit(use(Data{value = 42}))", .compile_time_only_type);
-    try Fixture.expectAnySourceDiagnostic(declaration ++ "import std.memory.{Allocation}\nif const storage = Allocation(Data).allocate(1)\n    storage^.deallocate()\nexit(0)", .compile_time_only_type);
+    try Fixture.expectAnySourceDiagnostic(declaration ++ "import std.memory.{Allocation}\nif const storage: Allocation(Data) = Allocation(Data).allocate(1)\n    storage^.deallocate()\nexit(0)", .compile_time_only_type);
     try Fixture.expectSourceExit(declaration ++ "func make() Data -> Data{value = 42}\nfunc compute() int -> make().value\nstatic answer = compute()\nexit(answer)", 42);
 }
 
@@ -838,7 +824,7 @@ test "converter to a variant member widens its result" {
         \\    value: int
         \\converter(value: Source) Target -> Target{value = value.value}
         \\const converted: Target | none = Source{value = 42}
-        \\if const selected = converted as Target -> exit(selected.value) else exit(90)
+        \\if const selected: Target = converted -> exit(selected.value) else exit(90)
     , 42);
 }
 
@@ -861,8 +847,8 @@ test "integer literal defaults and standard byte converter preserve distinct typ
         \\const minimum: int = -2147483648
         \\const byte_value: byte = 42
         \\const variant: int | byte = 42
-        \\const bytes = Array(byte, 1).filled(byte_value)
-        \\if const selected = variant as int
+        \\const bytes: Array(byte, 1) = Array(byte, 1).filled(byte_value) else panic "unexpected none"
+        \\if const selected: int = variant
         \\    if minimum < 0 -> exit(selected)
         \\exit(90)
     , 42);
@@ -879,7 +865,7 @@ test "direct converters can return a whole variant" {
         \\    value: int
         \\converter(value: Source) int | none -> value.value
         \\const result: int | none = Source{value = 42}
-        \\if const selected = result as int -> exit(selected) else exit(90)
+        \\if const selected: int = result -> exit(selected) else exit(90)
     , 42);
 }
 
@@ -893,7 +879,7 @@ test "converter where is demanded only after selection" {
         \\    value: int
         \\converter(value: Source) Unused where 1 == 2 -> Unused{value = value.value}
         \\const result: int | none = 42
-        \\if const selected = result as int -> exit(selected) else exit(90)
+        \\if const selected: int = result -> exit(selected) else exit(90)
     , 42);
     try Fixture.expectAnySourceDiagnostic(
         \\struct Source
@@ -949,12 +935,12 @@ test "variant conversion evaluates once borrows payloads and runs only the activ
         \\    return 23
         \\func make(choose: bool, calls: Ref(int), drops: Ref(int)) First | Second
         \\    calls.value += 1
-        \\    if choose? -> return First{calls = calls, drops = drops}
+        \\    if choose -> return First{calls = calls, drops = drops}
         \\    return Second{calls = calls, drops = drops}
         \\func run() int
         \\    var calls = 0
         \\    var drops = 0
-        \\    const total = int(make(true, Ref.from(calls), Ref.from(drops))) + int(make(false, Ref.from(calls), Ref.from(drops)))
+        \\    const total = int(make(true, (if const _selected_result_0: Ref(int) = Ref.from(calls) -> _selected_result_0 else panic "unexpected none"), (if const _selected_result_1: Ref(int) = Ref.from(drops) -> _selected_result_1 else panic "unexpected none"))) + int(make(false, (if const _selected_result_2: Ref(int) = Ref.from(calls) -> _selected_result_2 else panic "unexpected none"), (if const _selected_result_3: Ref(int) = Ref.from(drops) -> _selected_result_3 else panic "unexpected none")))
         \\    if calls <> 22 or drops <> 2 -> return 90
         \\    return total
     , 42);
@@ -991,14 +977,14 @@ test "variant conversion joins borrowed identity and owned results with exact cl
         \\    const identity: Source | Target = Target{value = 23, drops = drops}
         \\    const total = inspect(Target(source)) + inspect(Target(identity))
         \\    if drops.value <> 1 -> return 90
-        \\    if ref selected = identity as Target
+        \\    if ref selected: Target = identity
         \\        if selected.value <> 23 -> return 92
         \\    else
         \\        return 93
         \\    return total
         \\func run() int
         \\    var drops = 0
-        \\    const total = calculate(Ref.from(drops))
+        \\    const total = calculate((if const _selected_result_0: Ref(int) = Ref.from(drops) -> _selected_result_0 else panic "unexpected none"))
         \\    if drops <> 2 -> return 91
         \\    return total
     , 42);
@@ -1016,7 +1002,7 @@ test "variant conversion constructs immovable results into bindings fields argum
         \\    item: Pinned
         \\converter(imm value: First) Pinned -> Pinned{value = 19}
         \\converter(imm value: Second) Pinned -> Pinned{value = 23}
-        \\func make(choose: bool) First | Second -> if choose? -> First{} else Second{}
+        \\func make(choose: bool) First | Second -> if choose -> First{} else Second{}
         \\func convert(imm value: First | Second) Pinned -> value
         \\func receive(var value: Pinned) int -> value.value
         \\func run() int
@@ -1046,9 +1032,9 @@ test "variant conversion combines member conversion and builtin widening" {
         \\converter(imm value: Source) bool -> true
         \\func convert(imm value: Source | int) int | bool -> value
         \\func run() int
-        \\    if const integer = convert(40) as int
-        \\        if const boolean = convert(Source{}) as bool
-        \\            if boolean? -> return integer + 2
+        \\    if const integer: int = convert(40)
+        \\        if const boolean: bool = convert(Source{})
+        \\            if boolean -> return integer + 2
         \\    return 90
     , 42);
 }
@@ -1103,7 +1089,7 @@ test "builtin widening preserves members before converters" {
         \\converter(value: Source) Target -> panic "widening must not run converters"
         \\func run() int
         \\    const result: Source | Target = Source{value = 42}
-        \\    if ref selected = result as Source -> return selected.value
+        \\    if ref selected: Source = result -> return selected.value
         \\    return 90
     , 42);
     try Fixture.expectParity(
@@ -1111,8 +1097,8 @@ test "builtin widening preserves members before converters" {
         \\    const number = 10
         \\    const literal = [10, "Hello", [1, 2, 3]]
         \\    const bound = [number, "Hello", [1, 2, 3]]
-        \\    if const first = literal[0] as int
-        \\        if const second = bound[0] as int -> return first + second + 22
+        \\    if const first: int = literal[0]
+        \\        if const second: int = bound[0] -> return first + second + 22
         \\    return 90
     , 42);
     try Fixture.expectParity(
@@ -1264,10 +1250,10 @@ test "immovable converter outputs construct in returns variants branches and arg
         \\var assigned: Target = Source{value = 40}
         \\assigned = Source{value = 42}
         \\const choice: Target | none = if 1 == 1 -> Source{value = 42} else none
-        \\if const selected = select(1) as Target
+        \\if const selected: Target = select(1)
         \\    if selected.value == assigned.value
         \\        if check(Source{value = 42}) == make().value
-        \\            if const branch = choice as Target -> exit(branch.value)
+        \\            if const branch: Target = choice -> exit(branch.value)
         \\exit(90)
     , 42);
 }
@@ -1307,8 +1293,8 @@ test "initializer inference fails before converter constraints are evaluated" {
         \\    copy = trivial
         \\    value: int
         \\converter(value: Source) Target where 0 == 1 -> Target{value = value.value}
-        \\fallible unresolved(static T: type, init value: Target) int -> 42
-        \\if const answer = unresolved(Source{value = 42}) -> exit(answer)
+        \\func unresolved(static T: type, init value: Target) int | none -> 42
+        \\if const answer: int = unresolved(Source{value = 42}) -> exit(answer)
         \\exit(90)
     , .static_argument_cannot_be_inferred);
 }
@@ -1324,7 +1310,7 @@ test "nested conversions defer constraints until argument inference succeeds" {
         \\struct Wrapper
         \\    copy = trivial
         \\    inner: Target
-        \\fallible stop() unit -> exit(42)
+        \\func stop() unit | none -> exit(42)
         \\
     ;
     const cases = [_]struct { parameter: []const u8, expression: []const u8 }{
@@ -1336,7 +1322,7 @@ test "nested conversions defer constraints until argument inference succeeds" {
     for ([_][]const u8{ "0 == 1", "stop()" }) |constraint| {
         for ([_][]const u8{ "", "init " }) |mode| {
             for (cases) |case| {
-                const source = try std.fmt.allocPrint(testing.allocator, "{s}converter(value: Source) Target where {s} -> Target{{value = value.value}}\nfallible unresolved(static T: type, {s}value: {s}) int -> 42\nif const answer = unresolved({s}) -> exit(answer)\nexit(90)", .{ declarations, constraint, mode, case.parameter, case.expression });
+                const source = try std.fmt.allocPrint(testing.allocator, "{s}converter(value: Source) Target where {s} -> Target{{value = value.value}}\nfunc unresolved(static T: type, {s}value: {s}) int -> 42\nif const answer: int = unresolved({s}) -> exit(answer)\nexit(90)", .{ declarations, constraint, mode, case.parameter, case.expression });
                 defer testing.allocator.free(source);
                 try Fixture.expectAnySourceDiagnostic(source, .static_argument_cannot_be_inferred);
             }
@@ -1344,8 +1330,8 @@ test "nested conversions defer constraints until argument inference succeeds" {
     }
     try Fixture.expectAnySourceDiagnostic(declarations ++
         \\converter(value: Source) Target where 0 == 1 -> Target{value = value.value}
-        \\fallible construct(init value: Wrapper) Wrapper -> value
-        \\if const answer = construct(loop -> break Wrapper{inner = Source{value = 42}}) -> exit(answer.inner.value)
+        \\func construct(init value: Wrapper) Wrapper | none -> value
+        \\if const answer: Wrapper = construct(loop -> break Wrapper{inner = Source{value = 42}}) -> exit(answer.inner.value)
         \\exit(90)
     , .where_condition_failed);
 }
@@ -1365,18 +1351,18 @@ test "initializer inference does not execute converters inside static sources" {
         \\
     ;
     try Fixture.expectAnySourceDiagnostic(declarations ++
-        \\fallible unresolved(static T: type, init value: Wrapper) int -> 42
-        \\if const answer = unresolved(loop -> break Wrapper{inner = Source{value = 300}}) -> exit(answer)
+        \\func unresolved(static T: type, init value: Wrapper) int | none -> 42
+        \\if const answer: int = unresolved(loop -> break Wrapper{inner = Source{value = 300}}) -> exit(answer)
         \\exit(90)
     , .static_argument_cannot_be_inferred);
     try Fixture.expectAnySourceDiagnostic(declarations ++
-        \\fallible construct(init value: Wrapper) Wrapper -> value
-        \\if const answer = construct(loop -> break Wrapper{inner = Source{value = 300}}) -> exit(answer.inner.value)
+        \\func construct(init value: Wrapper) Wrapper | none -> value
+        \\if const answer: Wrapper = construct(loop -> break Wrapper{inner = Source{value = 300}}) -> exit(answer.inner.value)
         \\exit(90)
     , .where_condition_failed);
     try Fixture.expectSourceExit(declarations ++
-        \\fallible construct(init value: Wrapper) Wrapper -> value
-        \\if const answer = construct(loop -> break Wrapper{inner = Source{value = 42}}) -> exit(answer.inner.value)
+        \\func construct(init value: Wrapper) Wrapper | none -> value
+        \\if const answer: Wrapper = construct(loop -> break Wrapper{inner = Source{value = 42}}) -> exit(answer.inner.value)
         \\exit(90)
     , 42);
 }
@@ -1394,13 +1380,13 @@ test "specialized init arguments convert once only when constructed" {
         \\func make(mut counter: int) Source
         \\    counter += 1
         \\    return Source{value = 42}
-        \\fallible skip(init value: Target) Target -> fail
-        \\fallible construct(static T: type, init value: Target, marker: T) Target -> value
+        \\func skip(init value: Target) Target | none -> return none
+        \\func construct(static T: type, init value: Target, marker: T) Target | none -> value
         \\func run() int
         \\    var counter = 0
-        \\    if const unused = skip(make(counter)) -> return 90
+        \\    if const unused: Target = skip(make(counter)) -> return 90
         \\    if counter == 0
-        \\        if const target = construct(make(counter), 0)
+        \\        if const target: Target = construct(make(counter), 0)
         \\            if counter == 1 -> return target.value
         \\    return 91
         \\static result = run()
@@ -1449,7 +1435,7 @@ test "compile-time local literal values retain checked int defaults" {
         \\    const from_call = literalValue()
         \\    const holder = Holder{literal = 42}
         \\    const from_field = holder.literal
-        \\    if const selected = variant as int -> return direct + inferred + selected + take(literal) + infer(literal) + from_call + from_field + take(literalValue()) + literalValue() - 336
+        \\    if const selected: int = variant -> return direct + inferred + selected + take(literal) + infer(literal) + from_call + from_field + take(literalValue()) + literalValue() - 336
         \\    return 90
         \\static answer = compute()
         \\exit(answer)
@@ -1586,7 +1572,7 @@ test "compile-time static-only values retain builtin variant widening" {
         \\    var source = Source{value = 40}
         \\    source.value += 2
         \\    const variant: Source | none = source
-        \\    if const selected = variant as Source -> return selected.value else return 90
+        \\    if const selected: Source = variant -> return selected.value else return 90
         \\static result = compute()
         \\exit(result)
     , 42);
@@ -1653,7 +1639,7 @@ test "staged static conversion specializes and checks the current source value" 
         \\    var source = Source(int){value = 40}
         \\    source.value += 2
         \\    const target: Target | none = source
-        \\    if const selected = target as Target -> return selected.value else return 90
+        \\    if const selected: Target = target -> return selected.value else return 90
         \\static result = compute()
         \\exit(result)
     , 42);
@@ -1699,7 +1685,7 @@ test "converter candidates match source types before validating source modes" {
         \\    var source = StaticSource{value = 40}
         \\    source.value += 2
         \\    const converted: Target | none = source
-        \\    if const selected = converted as Target -> return selected.value
+        \\    if const selected: Target = converted -> return selected.value
         \\    return 90
         \\static answer = compute()
         \\exit(run() + answer - 42)
@@ -1796,83 +1782,86 @@ test "optional arguments convert predicate outcomes and query boolean data" {
         \\    const yes = bool(1 < 2)
         \\    const no = bool(2 < 1)
         \\    const identity = bool(false)
-        \\    if yes? and not no? and not identity? -> return 42
+        \\    if yes and not no and not identity -> return 42
         \\    return 7
     , 42);
 }
 
-test "optional arguments capture nested failures and repeated reads preserve the outcome" {
+test "optional arguments preserve ordinary absence through repeated reads" {
     try Fixture.expectParity(
-        \\fallible number(mut count: int) int
+        \\func number(mut count: int) int | none
         \\    count += 1
-        \\    fail
+        \\    return none
         \\func inspect(value: int | none) int
-        \\    if const first = value as int -> return first
+        \\    if const first: int = value -> return first
         \\    if value is int -> return 9
         \\    return 41
         \\func run() int
         \\    var count = 0
-        \\    return inspect(number?(count)) + count
+        \\    return inspect(number(count)) + count
     , 42);
 }
 
-test "optional arguments are eager and a captured failure does not skip later arguments" {
+test "optional arguments are eager and ordinary absence does not skip later arguments" {
     try Fixture.expectParity(
-        \\fallible mark(mut order: int, digit: int) int
+        \\func mark(mut order: int, digit: int) int | none
         \\    order = order * 10 + digit
-        \\    if digit == 1 -> fail
+        \\    if digit == 1 -> return none
         \\    return digit
         \\func receive(first: int | none, second: int | none, snapshot: int) int
         \\    if first is int -> return 99
-        \\    if const value = second as int -> return snapshot + value
+        \\    if const value: int = second -> return snapshot + value
         \\    return 98
         \\func run() int
         \\    var order = 0
-        \\    return receive(mark?(order, 1), mark?(order, 2), order)
+        \\    return receive(mark(order, 1), mark(order, 2), order)
     , 14);
 }
 
-test "failure handlers include nested predicate operands and queried calls" {
+test "predicate operands and optional Boolean results require explicit selection" {
     try Fixture.expectParity(
-        \\fallible number() int -> fail
-        \\fallible flag() bool -> fail
+        \\func number() int | none -> return none
+        \\func flag() bool | none -> return none
+        \\func below() bool | none
+        \\    const value: int = number() else return none
+        \\    return value < 3
         \\func run() int
-        \\    if number?() < 3 -> return 1
-        \\    if flag?()? -> return 2
-        \\    const result = bool(number?() < 3)
-        \\    if not result? -> return 42
+        \\    if const result: bool = below()
+        \\        if result -> return 1
+        \\    if const _: bool = flag() -> return 2
+        \\    if below() is none -> return 42
         \\    return 3
     , 42);
 }
 
 test "optional argument types survives callable values and forwarding" {
     try Fixture.expectParity(
-        \\fallible missing() int -> fail
+        \\func missing() int | none -> return none
         \\func value_or(value: int | none, fallback: int) int
-        \\    if const found = value as int -> return found
+        \\    if const found: int = value -> return found
         \\    return fallback
         \\func forward(value: int | none) int -> value_or(value, 42)
         \\func apply(handler: func(int | none) int, value: int | none) int -> handler(value)
-        \\func run() int -> apply(forward, missing?())
+        \\func run() int -> apply(forward, missing())
     , 42);
 }
 
 test "optional arguments use ordinary mutable variant places and optional references" {
     try Fixture.expectParity(
         \\func change(mut value: int | none)
-        \\    if const found = value as int -> value = found + 1
+        \\    if const found: int = value -> value = found + 1
         \\func forward(mut value: int | none) -> change(value)
         \\func update(var reference: Ref(int) | none)
-        \\    if ref found = reference as Ref(int) -> found.value += 1
-        \\fallible missing() Ref(int) -> fail
+        \\    if ref found: Ref(int) = reference -> found.value += 1
+        \\func missing() Ref(int) | none -> return none
         \\func run() int
         \\    var value: int | none = 40
         \\    forward(value)
         \\    var array = [0]
-        \\    update(Ref.from(array.get?(0)))
-        \\    update(missing?())
-        \\    if const found = value as int
-        \\        if const last = array[0] -> return found + last
+        \\    update(Ref.from(array[0]))
+        \\    update(missing())
+        \\    if const found: int = value
+        \\        if const last: int = array.get(0) -> return found + last
         \\    return 0
     , 42);
 }
@@ -1883,13 +1872,14 @@ test "optional arguments forward owned payloads and clean up after later argumen
         \\    value: int
         \\    drop = func(deinit self: Item)
         \\        if self.value <> 42 -> exit(91)
-        \\fallible missing() int -> fail
+        \\func missing() int | none -> return none
         \\func consume(var item: Item | none, value: int)
         \\    if item is Item -> ()
-        \\fallible work()
-        \\    consume(Item{value = 42}, missing?())
+        \\func work() unit | none
+        \\    consume(Item{value = 42}, (if const _selected_result_0: int = missing() -> _selected_result_0 else return none))
+        \\    return ()
         \\func run() int
-        \\    if work?() -> return 7
+        \\    if (work() is unit) -> return 7
         \\    return 42
     , 42);
 }
@@ -1902,15 +1892,16 @@ test "ordinary arguments destroy prepared copies after later failure" {
         \\    copy = func(imm self: Item) Item -> Item{value = self.value, trace = self.trace}
         \\    drop = func(deinit self: Item)
         \\        self.trace.value += self.value
-        \\fallible missing() int -> fail
+        \\func missing() int | none -> return none
         \\func consume(var item: Item, final: int) -> ()
-        \\fallible work(imm trace: Ref(int))
+        \\func work(imm trace: Ref(int)) unit | none
         \\    const original = Item{value = 21, trace = trace}
-        \\    consume(original, missing?())
+        \\    consume(original, (if const _selected_result_0: int = missing() -> _selected_result_0 else return none))
+        \\    return ()
         \\func run() int
         \\    var trace = [0]
-        \\    if ref handle = trace.get(0)
-        \\        if work(Ref.from(handle)) -> return 91
+        \\    if ref handle: int = trace.get(0)
+        \\        if (work((if const _selected_result_1: Ref(int) = Ref.from(handle) -> _selected_result_1 else panic "unexpected none")) is unit) -> return 91
         \\        return handle
         \\    return 92
     , 42);
@@ -1924,17 +1915,18 @@ test "optional arguments destroy captured owners after later ordinary failure" {
         \\    copy = none
         \\    drop = func(deinit self: Item)
         \\        self.trace.value += self.value
-        \\fallible make(imm trace: Ref(int), value: int, enabled: bool) Item
-        \\    if not enabled? -> fail
+        \\func make(imm trace: Ref(int), value: int, enabled: bool) Item | none
+        \\    if not enabled -> return none
         \\    return Item{value = value, trace = trace}
-        \\fallible missing() int -> fail
+        \\func missing() int | none -> return none
         \\func consume(var first: Item | none, var second: Item | none, var third: Item | none, final: int) -> ()
-        \\fallible work(imm trace: Ref(int))
-        \\    consume(make?(trace, 10, false), make?(trace, 11, false), make?(trace, 42, true), missing?())
+        \\func work(imm trace: Ref(int)) unit | none
+        \\    consume(make(trace, 10, false), make(trace, 11, false), make(trace, 42, true), (if const final: int = missing() -> final else return none))
+        \\    return ()
         \\func run() int
         \\    var trace = [0]
-        \\    if ref handle = trace.get(0)
-        \\        if work(Ref.from(handle)) -> return 91
+        \\    if ref handle: int = trace.get(0)
+        \\        if (work((if const _selected_result_4: Ref(int) = Ref.from(handle) -> _selected_result_4 else panic "unexpected none")) is unit) -> return 91
         \\        return handle
         \\    return 92
     , 42);
@@ -1946,22 +1938,23 @@ test "optional arguments destroy captured owners after later ordinary failure" {
         \\    copy = none
         \\    drop = func(deinit self: Item)
         \\        self.trace.value += self.value
-        \\fallible make(imm trace: Ref(int), value: int, enabled: bool) Item
-        \\    if not enabled? -> fail
+        \\func make(imm trace: Ref(int), value: int, enabled: bool) Item | none
+        \\    if not enabled -> return none
         \\    return Item{value = value, trace = trace}
-        \\fallible finish(enabled: bool) int
-        \\    if not enabled? -> fail
+        \\func finish(enabled: bool) int | none
+        \\    if not enabled -> return none
         \\    return 0
         \\func consume(var first: Item | none, var second: Item | none, var third: Item | none, final: int) -> ()
-        \\fallible work(imm trace: Ref(int), mask: int)
-        \\    consume(make?(trace, 1, mask % 2 == 1), make?(trace, 2, mask / 2 % 2 == 1), make?(trace, 4, mask / 4 % 2 == 1), finish?(mask / 8 == 1))
+        \\func work(imm trace: Ref(int), mask: int) unit | none
+        \\    consume(make(trace, 1, mask % 2 == 1), make(trace, 2, mask / 2 % 2 == 1), make(trace, 4, mask / 4 % 2 == 1), (if const final: int = finish(mask / 8 == 1) -> final else return none))
+        \\    return ()
         \\func run() int
         \\    var trace = [0]
-        \\    if ref handle = trace.get(0)
+        \\    if ref handle: int = trace.get(0)
         \\        var mask = 0
         \\        loop
         \\            if mask == 16 -> break
-        \\            if work(Ref.from(handle), mask) -> ()
+        \\            if (work((if const _selected_result_4: Ref(int) = Ref.from(handle) -> _selected_result_4 else panic "unexpected none"), mask) is unit) -> ()
         \\            mask += 1
         \\        return handle
         \\    return 92
@@ -1970,12 +1963,12 @@ test "optional arguments destroy captured owners after later ordinary failure" {
 
 test "optional arguments preserve variant values in deferred initializer captures" {
     try Fixture.expectParity(
-        \\fallible missing() int -> fail
-        \\fallible construct(init value: int | none) int | none -> value
+        \\func missing() int | none -> return none
+        \\func construct(init value: int | none) int | none -> value
         \\func receive(value: int | none) int
-        \\    if const found = construct?(value) as int -> return found
+        \\    if const found: int = construct(value) -> return found
         \\    return 42
-        \\func run() int -> receive(missing?())
+        \\func run() int -> receive(missing())
     , 42);
 }
 
@@ -1985,16 +1978,18 @@ test "optional arguments include nested construction and extraction failures" {
         \\    copy = trivial
         \\    first: int
         \\    second: int
-        \\fallible missing() int -> fail
+        \\func missing() int | none -> return none
+        \\func construct() Pair | none
+        \\    return Pair{first = 1, second = (if const second: int = missing() -> second else return none)}
         \\func receive(pair: Pair | none) int
-        \\    if const found = pair as Pair -> return found.first
+        \\    if const found: Pair = pair -> return found.first
         \\    return 40
         \\func value_or(value: int | none, fallback: int) int
-        \\    if const found = value as int -> return found
+        \\    if const found: int = value -> return found
         \\    return fallback
         \\func run() int
         \\    const variant: int | none = none
-        \\    return receive(Pair{first = 1, second = missing?()}) + value_or(variant as int, 2)
+        \\    return receive(construct()) + value_or(variant, 2)
     , 42);
 }
 
@@ -2002,7 +1997,7 @@ test "optional arguments capture complete loop expressions in converters" {
     try Fixture.expectParity(
         \\func run() int
         \\    const result = bool(loop -> break 2 < 1)
-        \\    if not result? -> return 42
+        \\    if not result -> return 42
         \\    return 7
     , 42);
 }
@@ -2014,11 +2009,11 @@ test "optional arguments accept immovable payloads without relocation" {
         \\    move = none
         \\    copy = none
         \\    value: int
-        \\fallible make() Pinned -> Pinned{value = 42}
+        \\func make() Pinned | none -> Pinned{value = 42}
         \\func receive(var value: Pinned | none) int
-        \\    if ref found = value as Pinned -> return found.value
+        \\    if ref found: Pinned = value -> return found.value
         \\    return 7
-        \\func run() int -> receive(make?())
+        \\func run() int -> receive(make())
     , 42);
 }
 
@@ -2028,10 +2023,13 @@ test "optional converter inputs handle whole expressions through ordinary varian
         \\    copy = trivial
         \\    value: int
         \\converter(value: int | none) Number
-        \\    if const found = value as int -> return Number{value = found}
+        \\    if const found: int = value -> return Number{value = found}
         \\    return Number{value = 42}
-        \\fallible missing() int -> fail
-        \\func run() int -> Number(missing?() + 1).value
+        \\func missing() int | none -> return none
+        \\func increment() int | none
+        \\    const value: int = missing() else return none
+        \\    return value + 1
+        \\func run() int -> Number(increment()).value
     , 42);
 }
 
@@ -2043,7 +2041,7 @@ test "optional arguments borrow existing variants and own newly constructed payl
         \\    value: int
         \\    drop = func(deinit self: Item) -> self.value = 0
         \\func inspect(item: Item | none) int
-        \\    if ref found = item as Item -> return found.value
+        \\    if ref found: Item = item -> return found.value
         \\    return 7
         \\func run() int
         \\    const existing: Item | none = Item{value = 21}
@@ -2051,14 +2049,14 @@ test "optional arguments borrow existing variants and own newly constructed payl
     , 42);
 }
 
-test "optional arguments capture failure-only extraction without a fake payload" {
+test "optional arguments receive explicit type mismatch results without a fake payload" {
     try Fixture.expectParity(
         \\func receive(value: int | none) int
-        \\    if const found = value as int -> return found
+        \\    if const found: int = value -> return found
         \\    return 42
         \\func run() int
         \\    const value: int | none = 1
-        \\    return receive(value as bool)
+        \\    return receive(if const _: bool = value -> 0 else none)
     , 42);
 }
 
@@ -2070,60 +2068,42 @@ test "optional deinit arguments use ordinary variant construction and cleanup" {
         \\    value: int
         \\    drop = func(deinit self: Item) -> ()
         \\func inspect(deinit item: Item | none) int
-        \\    if ref found = item as Item -> return found.value
+        \\    if ref found: Item = item -> return found.value
         \\    return 0
-        \\fallible absent() Item -> fail
-        \\func run() int -> inspect(Item{value = 42}) + inspect(absent?())
+        \\func absent() Item | none -> return none
+        \\func run() int -> inspect(Item{value = 42}) + inspect(absent())
     , 42);
 }
 
-test "optional arguments and predicates preserve declared function failure permission" {
-    try Fixture.expectAnySourceDiagnostic(
-        \\func bad(value: int | none) int -> value as int
-        \\exit(bad(42))
-    , .fallible_expression_outside_fallible_function);
-    try Fixture.expectAnySourceDiagnostic(
-        \\func bad() unit -> 2 < 1
-        \\bad()
-    , .fallible_expression_outside_fallible_function);
+test "optional callable inputs preserve ordinary variant return types" {
     try Fixture.expectParity(
-        \\fallible propagate(value: int | none) int -> value as int
-        \\fallible absent() int -> fail
-        \\func run() int
-        \\    if const found = propagate?(absent?()) -> return found
-        \\    return 42
-    , 42);
-}
-
-test "optional callable inputs preserve the callable failure permission" {
-    try Fixture.expectParity(
-        \\fallible identity(value: int) int -> value
-        \\func apply(handler: fallible(int) int) int
-        \\    if const value = handler?(42) -> return value
+        \\func identity(value: int) int | none -> value
+        \\func apply(handler: func(int) (int | none)) int
+        \\    if const value: int = handler(42) -> return value
         \\    return 0
-        \\func accepted(handler: (fallible(int) int) | none) int
-        \\    if const callable = handler as fallible(int) int
-        \\        if const value = callable?(42) -> return value
+        \\func accepted(handler: (func(int) (int | none)) | none) int
+        \\    if const callable: func(int) (int | none) = handler
+        \\        if const value: int = callable(42) -> return value
         \\    return 0
-        \\func relay(handler: func((fallible(int) int) | none) int) int -> handler(identity)
-        \\func ordinary(handler: func(fallible(int) int) int) int -> handler(identity)
+        \\func relay(handler: func((func(int) (int | none)) | none) int) int -> handler(identity)
+        \\func ordinary(handler: func(func(int) (int | none)) int) int -> handler(identity)
         \\func run() int -> relay(accepted) + ordinary(apply) - 42
     , 42);
 }
 
-test "optional arguments consume deferred initializers within the receiving failure handler" {
+test "optional deferred initializers are selected explicitly by their receiver" {
     try Fixture.expectParity(
-        \\fallible absent(mut count: int) unit
+        \\func absent(mut count: int) unit | none
         \\    count += 1
-        \\    fail
-        \\func outcome(init value: unit) bool -> bool(value)
+        \\    return none
+        \\func outcome(init value: unit | none) bool -> value is unit
         \\func queried(init value: bool) int
-        \\    if value? -> return 2
+        \\    if value -> return 2
         \\    return 1
         \\func run() int
         \\    var count = 0
-        \\    const flag = outcome(absent?(count))
-        \\    if flag? -> return 99
+        \\    const flag = outcome(absent(count))
+        \\    if flag -> return 99
         \\    return queried(false) + count + 40
     , 42);
 }
@@ -2135,7 +2115,7 @@ test "optional arguments bind owned copies of borrowed successful payloads" {
         \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
         \\    drop = func(deinit self: Item) -> self.value = 0
         \\func copied(item: Item | none) int
-        \\    if const owned = item as Item -> return owned.value
+        \\    if const owned: Item = item -> return owned.value
         \\    return 0
         \\func run() int
         \\    var item = Item{value = 41}
@@ -2147,15 +2127,15 @@ test "optional arguments bind owned copies of borrowed successful payloads" {
 test "optional arguments retain temporary owners behind returned borrows" {
     try Fixture.expectParity(
         \\import std.memory
-        \\fallible make() String
+        \\func make() String | none
         \\    var value = String.empty()
-        \\    value.append?("42")
+        \\    const _: unit = value.append("42") else return none
         \\    return value^
         \\func selected(text: String | none) StringView
-        \\    if ref found = text as String -> return found.view()
+        \\    if ref found: String = text -> return found.view()
         \\    return ""
         \\func run() int
-        \\    const view = selected(make?())
+        \\    const view = selected(make())
         \\    if view == "42" -> return 42
         \\    return 0
     , 42);
@@ -2169,10 +2149,10 @@ test "optional arguments require explicit destruction only for present owned pay
         \\    value: int
         \\func dispose(deinit token: Token) int -> token.value
         \\func accepted(var token: Token | none) int
-        \\    if const found = token^ as Token -> return dispose(found)
+        \\    if const found: Token = token^ -> return dispose(found)
         \\    return 0
-        \\fallible absent() Token -> fail
-        \\func run() int -> accepted(Token{value = 42}) + accepted(absent?())
+        \\func absent() Token | none -> return none
+        \\func run() int -> accepted(Token{value = 42}) + accepted(absent())
     , 42);
     try Fixture.expectAnySourceDiagnostic(
         \\struct Token
@@ -2186,85 +2166,93 @@ test "optional arguments require explicit destruction only for present owned pay
 test "optional values forward through deferred initializer captures" {
     try Fixture.expectParity(
         \\func materialize(init value: int | none) int
-        \\    if const found = value as int -> return found
+        \\    if const found: int = value -> return found
         \\    return 42
         \\func forward(value: int | none) int -> materialize(value)
-        \\fallible missing() int -> fail
-        \\func run() int -> forward(missing?())
+        \\func missing() int | none -> return none
+        \\func run() int -> forward(missing())
     , 42);
 }
 
-test "expected optional variants capture bindings assignments fields and returns" {
+test "ordinary optional variants work in bindings assignments fields and returns" {
     try Fixture.expectParity(
         \\struct Holder
         \\    copy = fieldwise
         \\    number: int | none
-        \\    predicate: unit | none
+        \\    predicate: bool
         \\    flag: bool
-        \\fallible missing() int -> fail
-        \\func optional() int | none -> missing?() + 1
+        \\func missing() int | none -> return none
+        \\func optional() int | none
+        \\    const value: int = missing() else return none
+        \\    return value + 1
         \\func run() int
-        \\    const saved: int | none = missing?()
+        \\    const saved: int | none = missing()
         \\    var assigned: int | none = 42
-        \\    assigned = missing?() + 1
-        \\    const holder = Holder{number = missing?(), predicate = 2 < 1, flag = 1 < 2}
-        \\    const numbers: Array(int | none, 2) = [missing?(), 42]
-        \\    if saved is none and assigned is none and holder.number is none and holder.predicate is none
-        \\        if holder.flag? and optional() is none
+        \\    assigned = optional()
+        \\    const holder = Holder{number = missing(), predicate = 2 < 1, flag = 1 < 2}
+        \\    const numbers: Array(int | none, 2) = [missing(), 42]
+        \\    if saved is none and assigned is none and holder.number is none and not holder.predicate
+        \\        if holder.flag and optional() is none
         \\            if numbers[0] is none
-        \\                if const found = numbers[1] as int -> return found
+        \\                if const found: int = numbers[1] -> return found
         \\    return 0
     , 42);
 }
 
-test "optional variants capture compound expressions exactly once without rollback" {
+test "explicit mismatch exits compound expressions exactly once without rollback" {
     try Fixture.expectParity(
-        \\fallible step(mut count: int, succeeds: bool) int
+        \\func step(mut count: int, succeeds: bool) int | none
         \\    count += 1
-        \\    if not succeeds? -> fail
+        \\    if not succeeds -> return none
         \\    return count
+        \\func total(mut count: int) int | none
+        \\    const first: int = step(count, true) else return none
+        \\    const second: int = step(count, false) else return none
+        \\    const third: int = step(count, true) else return none
+        \\    return first + second + third
         \\func inspect(value: int | none, count: int) int
         \\    if value is none and value is none -> return count
         \\    return 90
         \\func run() int
         \\    var count = 0
-        \\    const seen = inspect(step?(count, true) + step?(count, false) + step?(count, true), count)
+        \\    const seen = inspect(total(count), count)
         \\    return seen + count + 38
     , 42);
 }
 
 test "variants without none propagate failure and skip later arguments" {
     try Fixture.expectParity(
-        \\fallible step(mut count: int, succeeds: bool) int
+        \\func step(mut count: int, succeeds: bool) int | none
         \\    count += 1
-        \\    if not succeeds? -> fail
+        \\    if not succeeds -> return none
         \\    return count
         \\func receive(value: int | bool, later: int) unit -> exit(91)
-        \\fallible work(mut count: int)
-        \\    receive(step?(count, false), step?(count, true))
+        \\func work(mut count: int) unit | none
+        \\    receive((if const _selected_result_0: int = step(count, false) -> _selected_result_0 else return none), (if const _selected_result_1: int = step(count, true) -> _selected_result_1 else return none))
+        \\    return ()
         \\func run() int
         \\    var count = 0
-        \\    if work(count) -> return 92
+        \\    if (work(count) is unit) -> return 92
         \\    return count + 41
     , 42);
 }
 
 test "captured none and successful none are ordinary identical variant values" {
     try Fixture.expectParity(
-        \\fallible missing() int | none -> fail
+        \\func missing() int | none -> return none
         \\func inspect(value: int | none) int
-        \\    if const found = value as int -> return found
-        \\    if value -> return 14
+        \\    if const found: int = value -> return found
+        \\    if value is none -> return 14
         \\    return 90
         \\func run() int
-        \\    const yes = bool(unit)
-        \\    const no = bool(none)
-        \\    if yes? and not no? -> return inspect(none) + inspect(missing?()) + inspect(14)
+        \\    const yes = unit is unit
+        \\    const no = none is int
+        \\    if yes and not no -> return inspect(none) + inspect(missing()) + inspect(14)
         \\    return 91
     , 42);
 }
 
-test "optional variant failure destroys partially constructed successful prefixes" {
+test "explicit mismatch destroys partially constructed successful prefixes" {
     try Fixture.expectParity(
         \\struct Item
         \\    copy = none
@@ -2274,28 +2262,30 @@ test "optional variant failure destroys partially constructed successful prefixe
         \\    copy = none
         \\    first: Item
         \\    second: int
-        \\fallible missing() int -> fail
+        \\func missing() int | none -> return none
+        \\func construct(trace: Ref(int)) Pair | none
+        \\    return Pair{first = Item{trace = trace}, second = (if const value: int = missing() -> value else return none)}
         \\func receive(value: Pair | none) unit
         \\    if not (value is none) -> exit(91)
         \\func run() int
         \\    var trace = [0]
-        \\    if ref handle = trace.get(0)
-        \\        receive(Pair{first = Item{trace = Ref.from(handle)}, second = missing?()})
+        \\    if ref handle: int = trace.get(0)
+        \\        receive(construct(Ref.from(handle)))
         \\        return handle
         \\    return 92
     , 42);
 }
 
-test "optional receiver types catch failure while resolving methods on successful types" {
+test "optional receiver parameters accept ordinary variant values" {
     try Fixture.expectParity(
         \\struct Number
         \\    copy = trivial
         \\    value: int
         \\    pub func fallback(self: Number | none) int
-        \\        if const found = self as Number -> return found.value
+        \\        if const found: Number = self -> return found.value
         \\        return 42
-        \\fallible absent() Number -> fail
-        \\func run() int -> absent?().fallback()
+        \\func absent() Number | none -> return none
+        \\func run() int -> Number.fallback(absent()) + Number{value = 21}.fallback() - 21
     , 42);
 }
 
@@ -2305,16 +2295,16 @@ test "optional converter inputs preserve ordinary target construction" {
         \\    copy = trivial
         \\    value: int
         \\converter(value: int | none) Number
-        \\    if const found = value as int -> return Number{value = found}
+        \\    if const found: int = value -> return Number{value = found}
         \\    return Number{value = 21}
         \\struct Holder
         \\    number: Number
         \\    flag: bool
-        \\fallible missing() int -> fail
+        \\func missing() int | none -> return none
         \\func run() int
-        \\    const holder = Holder{number = missing?(), flag = 1 < 2}
-        \\    const saved: Number = missing?()
-        \\    if holder.flag? -> return holder.number.value + saved.value
+        \\    const holder = Holder{number = missing(), flag = 1 < 2}
+        \\    const saved: Number = missing()
+        \\    if holder.flag -> return holder.number.value + saved.value
         \\    return 0
     , 42);
 }
@@ -2327,34 +2317,37 @@ test "optional converter outputs construct immovable members in their final vari
         \\    copy = none
         \\    value: int
         \\converter(value: int | none) Pinned
-        \\    if const found = value as int -> return Pinned{value = found}
+        \\    if const found: int = value -> return Pinned{value = found}
         \\    return Pinned{value = 21}
         \\func receive(var value: Pinned | none) int
-        \\    if ref found = value as Pinned -> return found.value
+        \\    if ref found: Pinned = value -> return found.value
         \\    return 0
-        \\fallible missing() int -> fail
-        \\func run() int -> receive(21) + receive(missing?())
+        \\func missing() int | none -> return none
+        \\func run() int -> receive(21) + receive(Pinned(missing()))
     , 42);
 }
 
 test "specialized optional parameter types capture inferred integer inputs" {
     try Fixture.expectParity(
         \\func value_or(static T: type, value: T | none, fallback: T) T
-        \\    if const found = value as T -> return found
+        \\    if const found: T = value -> return found
         \\    return fallback
-        \\fallible missing() int -> fail
-        \\func run() int -> value_or(missing?(), 40) + value_or(2, 0)
+        \\func missing() int | none -> return none
+        \\func run() int -> value_or(missing(), 40) + value_or(2, 0)
     , 42);
 }
 
-test "optional converters accept expressions with no successful payload" {
+test "optional converters accept ordinary absence without a successful payload" {
     try Fixture.expectParity(
-        \\fallible missing() never -> fail
+        \\func missing() never | none -> return none
+        \\struct Flag
+        \\    value: bool
+        \\converter(value: int | none) Flag -> Flag{value = value is int}
         \\func run() int
         \\    const value: int | none = 1
-        \\    const first = bool(value as bool)
-        \\    const second = bool(missing?())
-        \\    if not first? and not second? -> return 42
+        \\    const first: Flag = if const _: bool = value -> 0 else none
+        \\    const second: Flag = missing()
+        \\    if not first.value and not second.value -> return 42
         \\    return 0
     , 42);
 }
@@ -2374,7 +2367,7 @@ test "converter selection preserves static literal converters before integer def
     , 42);
 }
 
-test "converter selection captures failure only inputs independently of placement" {
+test "converter selection handles absence independently of placement" {
     try Fixture.expectParity(
         \\struct Pinned
         \\    move = none
@@ -2383,9 +2376,9 @@ test "converter selection captures failure only inputs independently of placemen
         \\struct Holder
         \\    item: Pinned
         \\converter(value: int | none) Pinned
-        \\    if const found = value as int -> return Pinned{value = found}
+        \\    if const found: int = value -> return Pinned{value = found}
         \\    return Pinned{value = 21}
-        \\fallible absent() never -> fail
+        \\func absent() never | none -> return none
         \\func borrowed(imm value: Pinned) int -> value.value
         \\func owned(var value: Pinned) int -> value.value
         \\func optional_borrowed(imm value: Pinned | none) int
@@ -2394,14 +2387,15 @@ test "converter selection captures failure only inputs independently of placemen
         \\func optional_owned(var value: Pinned | none) int
         \\    if value is none -> return 91
         \\    return 21
-        \\func make() Pinned -> absent?()
+        \\func make() Pinned -> absent()
         \\func run() int
-        \\    const saved: Pinned = absent?()
-        \\    const holder = Holder{item = absent?()}
+        \\    const saved: Pinned = absent()
+        \\    const holder = Holder{item = absent()}
         \\    const returned = make()
         \\    if saved.value == 21 and holder.item.value == 21 and returned.value == 21
-        \\        if borrowed(absent?()) == 21 and owned(absent?()) == 21
-        \\            if optional_borrowed(absent?()) == 21 and optional_owned(absent?()) == 21 -> return 42
+        \\        if borrowed(absent()) == 21 and owned(absent()) == 21
+        \\            if optional_borrowed(absent()) <> 90 or optional_owned(absent()) <> 91 -> return 93
+        \\            if optional_borrowed(Pinned(absent())) == 21 and optional_owned(Pinned(absent())) == 21 -> return 42
         \\    return 92
     , 42);
 }
@@ -2409,23 +2403,23 @@ test "converter selection captures failure only inputs independently of placemen
 test "optional boolean variants preserve explicit none before considering converters" {
     try Fixture.expectParity(
         \\func score(value: bool | none) int
-        \\    if const found = value as bool
-        \\        if found? -> return 10
+        \\    if const found: bool = value
+        \\        if found -> return 10
         \\        return 0
         \\    return 12
         \\func run() int
         \\    const saved: bool | none = none
         \\    var assigned: bool | none = true
         \\    assigned = none
-        \\    const converted = bool(none)
-        \\    if converted? -> return 91
+        \\    const converted: bool | none = none
+        \\    if const _: bool = converted -> return 91
         \\    return score(saved) + score(assigned) + score(none) + 6
     , 42);
 }
 
 test "conditional literal conversions preserve permanent views and nested defaults" {
     try Fixture.expectParity(
-        \\func choose(flag: bool) StringView -> if flag? -> "yes" else "no"
+        \\func choose(flag: bool) StringView -> if flag -> "yes" else "no"
         \\func run() int
         \\    const first = choose(true)
         \\    const second = choose(false)
@@ -2433,14 +2427,14 @@ test "conditional literal conversions preserve permanent views and nested defaul
         \\    return 90
     , 42);
     try Fixture.expectParity(
-        \\fallible append(mut count: int) int
+        \\func append(mut count: int) int | none
         \\    var text = ""
         \\    count += 1
-        \\    text.append?(if count == 1 -> "a" else if count == 2 -> "bb" else "ccc")
+        \\    const _: unit = text.append(if count == 1 -> "a" else if count == 2 -> "bb" else "ccc") else return none
         \\    return text.byte_length() + count + 40
         \\func run() int
         \\    var count = 0
-        \\    if const result = append(count) -> return result
+        \\    if const result: int = append(count) -> return result
         \\    return 90
     , 42);
 }

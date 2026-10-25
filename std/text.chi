@@ -3,31 +3,41 @@ import std.array.{Array, collection_literal}
 import std.range.{Range, FromEnd}
 
 pub extern func byte_int(value: byte) int
-extern fallible io_write(descriptor: int, imm data: Span(byte)) int
+extern func io_write(descriptor: int, imm data: Span(byte)) int | none
 extern func panic_message(imm message: StringView) never
 
 pub struct BytesView
     copy = trivial
     data: Span(byte)
-
     pub func from_array(static N: int, ref value: Array(byte, N)) BytesView -> BytesView{data = Span(byte).from_array(N, value).as_imm()}
-    pub fallible unsafe_from_allocation(ref value: Allocation(byte), initialized: int) BytesView
-        return BytesView{data = Span(byte).unsafe_from_allocation?(value, initialized).as_imm()}
+    pub func unsafe_from_allocation(ref value: Allocation(byte), initialized: int) BytesView | none
+        const view: Span(byte) = Span(byte).unsafe_from_allocation(value, initialized) else return none
+        return BytesView{data = view.as_imm()}
     pub func from_span(imm span: Span(byte)) BytesView -> BytesView{data = span.as_imm()}
     pub func as_span(imm self: BytesView) Span(byte) -> self.data.as_imm()
-    pub fallible write_to(imm self: BytesView, descriptor: int) int -> io_write?(descriptor, self.data)
+    pub func write_to(imm self: BytesView, descriptor: int) int | none -> io_write(descriptor, self.data)
     pub func byte_length(imm self: BytesView) int -> self.data.len()
-    fallible get_at(imm self: BytesView, index: int) ref byte -> self.data.get?(index)
-    fallible get_from_end(imm self: BytesView, index: FromEnd) ref byte -> self.data.get?(index)
+    func get_at(imm self: BytesView, index: int) ref byte | none -> self.data.get(index)
+    func get_from_end(imm self: BytesView, index: FromEnd) ref byte | none -> self.data.get(index)
     pub overload get(get_at, get_from_end)
-    pub overload [](get_at, get_from_end, slice)
-    pub fallible slice(imm self: BytesView, bounds: Range) BytesView
-        return BytesView{data = self.data.slice?(bounds)}
-    pub fallible validate_utf8(imm self: BytesView) StringView
+    func at(imm self: BytesView, index: int) ref byte
+        ref item: byte = self.get(index) else panic "BytesView index out of bounds"
+        return item
+    func at_from_end(imm self: BytesView, index: FromEnd) ref byte
+        ref item: byte = self.get(index) else panic "BytesView index out of bounds"
+        return item
+    func slice_at(imm self: BytesView, bounds: Range) BytesView
+        const view: BytesView = self.slice(bounds) else panic "BytesView slice out of bounds"
+        return view
+    pub overload [](at, at_from_end, slice_at)
+    pub func slice(imm self: BytesView, bounds: Range) BytesView | none
+        const view: Span(byte) = self.data.slice(bounds) else return none
+        return BytesView{data = view}
+    pub func validate_utf8(imm self: BytesView) StringView | none
         var index = 0
         loop
             if index == self.byte_length() -> break
-            const first = byte_int(self.get?(index))
+            const first = byte_int(self[index])
             index += 1
             if first >= 128
                 var continuation = 0
@@ -42,19 +52,16 @@ pub struct BytesView
                     continuation = 3
                     if first == 240 -> minimum = 144
                     if first == 244 -> maximum = 143
-                else
-                    fail
-                continuation <= self.byte_length() - index
-                const second = byte_int(self.get?(index))
-                second >= minimum
-                second <= maximum
+                else return none
+                if continuation > self.byte_length() - index -> return none
+                const second = byte_int(self[index])
+                if second < minimum or second > maximum -> return none
                 index += 1
                 continuation -= 1
                 loop
                     if continuation == 0 -> break
-                    const next = byte_int(self.get?(index))
-                    next >= 128
-                    next <= 191
+                    const next = byte_int(self[index])
+                    if next < 128 or next > 191 -> return none
                     index += 1
                     continuation -= 1
         return StringView{bytes = self}
@@ -62,28 +69,30 @@ pub struct BytesView
 pub struct StringView
     copy = trivial
     bytes: BytesView
-
-    pub fallible ==(imm left: StringView, imm right: StringView) unit -> equal_bytes?(left.bytes, right.bytes)
-    pub fallible <>(imm left: StringView, imm right: StringView) unit -> not equal_bytes?(left.bytes, right.bytes)
+    pub func ==(imm left: StringView, imm right: StringView) bool -> equal_bytes(left.bytes, right.bytes)
+    pub func <>(imm left: StringView, imm right: StringView) bool -> not equal_bytes(left.bytes, right.bytes)
     pub func byte_length(imm self: StringView) int -> self.bytes.byte_length()
     pub func as_bytes(imm self: StringView) BytesView -> self.bytes
-    pub overload [](slice)
-    pub fallible slice(imm self: StringView, bounds: Range) StringView
-        const offsets = bounds.resolve?(self.byte_length())
+    func slice_at(imm self: StringView, bounds: Range) StringView
+        const view: StringView = self.slice(bounds) else panic "StringView slice out of bounds"
+        return view
+    pub overload [](slice_at)
+    pub func slice(imm self: StringView, bounds: Range) StringView | none
+        const offsets: (int, int) = bounds.resolve(self.byte_length()) else return none
         const start = offsets.0
         const end = offsets.1
         if start < self.byte_length()
-            const first = byte_int(self.bytes.get?(start))
-            if first >= 128 and first < 192 -> fail
+            const first = byte_int(self.bytes[start])
+            if first >= 128 and first < 192 -> return none
         if end < self.byte_length()
-            const last = byte_int(self.bytes.get?(end))
-            if last >= 128 and last < 192 -> fail
-        return StringView{bytes = self.bytes.slice?(bounds)}
+            const last = byte_int(self.bytes[end])
+            if last >= 128 and last < 192 -> return none
+        const view: BytesView = self.bytes.slice(bounds) else return none
+        return StringView{bytes = view}
 
 pub struct StaticString
     copy = trivial
     bytes: Span(byte)
-
     pub func byte_length(imm self: StaticString) int -> self.bytes.len()
     pub func as_bytes(imm self: StaticString) BytesView -> BytesView{data = self.bytes}
     pub func view(imm self: StaticString) StringView -> StringView{bytes = self.as_bytes()}
@@ -97,143 +106,126 @@ struct OwnedBytes
 pub struct String
     copy = none
     storage: StaticString | OwnedBytes
-
-    pub fallible ==(imm left: String, imm right: StringView) unit -> equal_bytes?(left.as_bytes(), right.as_bytes())
-    pub fallible <>(imm left: String, imm right: StringView) unit -> not equal_bytes?(left.as_bytes(), right.as_bytes())
-    pub fallible from_utf8(imm bytes: BytesView) String
-        const text = bytes.validate_utf8?()
+    pub func ==(imm left: String, imm right: StringView) bool -> equal_bytes(left.as_bytes(), right.as_bytes())
+    pub func <>(imm left: String, imm right: StringView) bool -> not equal_bytes(left.as_bytes(), right.as_bytes())
+    pub func from_utf8(imm bytes: BytesView) String | none
+        const text: StringView = bytes.validate_utf8() else return none
         var result = String.empty()
-        result.append?(text)
+        const _: unit = result.append(text) else return none
         return result^
     pub func empty() String -> String{storage = ""}
     pub func byte_length(imm self: String) int
-        if const literal = self.storage as StaticString -> return literal.byte_length()
-        if ref owned = self.storage as OwnedBytes -> return owned.size
+        if const literal: StaticString = self.storage -> return literal.byte_length()
+        if ref owned: OwnedBytes = self.storage -> return owned.size
         panic "invalid String storage"
     pub func capacity(imm self: String) int
-        if const literal = self.storage as StaticString -> return literal.byte_length()
-        if ref owned = self.storage as OwnedBytes -> return owned.allocation.capacity()
+        if const literal: StaticString = self.storage -> return literal.byte_length()
+        if ref owned: OwnedBytes = self.storage -> return owned.allocation.capacity()
         panic "invalid String storage"
     pub func as_bytes(imm self: String) BytesView
-        if const literal = self.storage as StaticString -> return literal.as_bytes()
-        if ref owned = self.storage as OwnedBytes
-            if const bytes = BytesView.unsafe_from_allocation(owned.allocation, owned.size) -> return bytes
-        panic "invalid String byte view"
+        if const literal: StaticString = self.storage -> return literal.as_bytes()
+        if ref owned: OwnedBytes = self.storage
+            const bytes: BytesView = BytesView.unsafe_from_allocation(owned.allocation, owned.size) else panic "invalid String byte view"
+            return bytes
+        panic "invalid String storage"
     pub func view(imm self: String) StringView -> StringView{bytes = self.as_bytes()}
-    pub fallible reserve(mut self: String, minimum_capacity: int)
-        minimum_capacity >= 0
-        if minimum_capacity <= self.capacity() -> return
+    pub func reserve(mut self: String, minimum_capacity: int) unit | none
+        if minimum_capacity < 0 -> return none
+        if minimum_capacity <= self.capacity() -> return unit
         const size = self.byte_length()
         var capacity = minimum_capacity
         if capacity < size -> capacity = size
-        var replacement = OwnedBytes{allocation = allocate?(byte, capacity), size = 0}
+        const storage: Allocation(byte) = allocate(byte, capacity) else return none
+        var replacement = OwnedBytes{allocation = storage^, size = 0}
         const bytes = self.as_bytes()
         var index = 0
         loop
             if index == size -> break
-            const item = bytes.get?(index)
-            unsafe_initialize?(byte, replacement.allocation, index, item)
+            unsafe_initialize(byte, replacement.allocation, index, bytes[index])
             index += 1
         replacement.size = size
         self.storage = replacement^
-    pub fallible append(mut self: String, imm text: StringView)
+        return unit
+    pub func append(mut self: String, imm text: StringView) unit | none
         const count = text.byte_length()
-        if count == 0 -> return
+        if count == 0 -> return unit
         const size = self.byte_length()
-        count <= 2147483647 - size
+        if count > 2147483647 - size -> return none
         const required = size + count
         var capacity = self.capacity()
         if capacity < required
             if capacity <= 1073741823 -> capacity *= 2
-            else
-                capacity = 2147483647
+            else capacity = 2147483647
             if capacity < required -> capacity = required
-        self.reserve?(capacity)
+        const _: unit = self.reserve(capacity) else return none
         const bytes = text.as_bytes()
-        if ref owned = self.storage as OwnedBytes
+        if ref owned: OwnedBytes = self.storage
             var index = 0
             loop
                 if index == count -> break
-                const item = bytes.get?(index)
-                unsafe_initialize?(byte, owned.allocation, size + index, item)
+                unsafe_initialize(byte, owned.allocation, size + index, bytes[index])
                 index += 1
             owned.size = required
-            return
+            return unit
         panic "invalid String storage during append"
-    pub fallible clone(imm self: String) String
+    pub func clone(imm self: String) String | none
         var result = String.empty()
-        result.append?(self.view())
+        const _: unit = result.append(self.view()) else return none
         return result^
 
-fallible equal_bytes(imm left: BytesView, imm right: BytesView) unit
+func equal_bytes(imm left: BytesView, imm right: BytesView) bool
     const count = left.byte_length()
-    if count <> right.byte_length() -> fail
+    if count <> right.byte_length() -> return false
     var index = 0
     loop
-        if index == count -> return
-        if const first = left.get(index)
-            if const second = right.get(index)
-                if byte_int(first) <> byte_int(second) -> fail
-                index += 1
-                continue
-        panic "invalid text equality byte access"
-
-fallible match_literal(static T: type, imm value: T, imm literal: StaticString) unit
-    equal_bytes?(value.as_bytes(), literal.as_bytes())
+        if index == count -> return true
+        if byte_int(left[index]) <> byte_int(right[index]) -> return false
+        index += 1
+func match_literal(static T: type, imm value: T, imm literal: StaticString) bool -> equal_bytes(value.as_bytes(), literal.as_bytes())
 
 pub converter(imm value: StaticString) String -> String{storage = value}
 pub converter(imm value: StaticString) StringView -> value.view()
 pub converter(imm value: StaticString) BytesView -> value.as_bytes()
-
 pub converter(imm value: String) StringView -> value.view()
 pub converter(imm value: String) BytesView -> value.as_bytes()
-
 pub converter(imm value: StringView) String
     var result = String.empty()
-    if result.append(value) -> return result^
-    panic "string conversion allocation failed"
-
+    const _: unit = result.append(value) else panic "string conversion allocation failed"
+    return result^
 pub converter(value: int) String
-    if const result = format_integer(value) -> return result^
-    panic "string conversion allocation failed"
-
+    const result: String = format_integer(value) else panic "string conversion allocation failed"
+    return result^
 pub converter(value: byte) String -> String(byte_int(value))
-pub converter(value: bool) String -> if value? -> "true" else "false"
+pub converter(value: bool) String -> if value -> "true" else "false"
 pub converter(value: unit) String -> "()"
 pub converter(value: none) String -> "none"
-
 pub converter(static T: type, static N: int, init value: collection_literal(T, N)) String
     const values: Array(T, N) = value
     return String(values)
-
 pub converter(static T: type, static N: int, imm value: Array(T, N)) String
-    if const result = format_span(value.span()) -> return result^
-    panic "string conversion allocation failed"
-
+    const result: String = format_span(value.span()) else panic "string conversion allocation failed"
+    return result^
 pub converter(static T: type, imm value: List(T)) String
-    if const result = format_span(value.span()) -> return result^
-    panic "string conversion allocation failed"
-
+    const result: String = format_span(value.span()) else panic "string conversion allocation failed"
+    return result^
 pub converter(static T: type, imm value: Span(T)) String
-    if const result = format_span(value) -> return result^
-    panic "string conversion allocation failed"
-
+    const result: String = format_span(value) else panic "string conversion allocation failed"
+    return result^
 pub converter(imm value: BytesView) String -> String(value.as_span())
-
 pub converter(static T: type, imm value: Box(T)) String
-    if const result = format_wrapped("Box(", value.borrow()) -> return result^
-    panic "string conversion allocation failed"
-
+    const result: String = format_wrapped("Box(", value.borrow()) else panic "string conversion allocation failed"
+    return result^
 pub converter(static T: type, imm value: Ref(T)) String
-    if const result = format_wrapped("Ref(", value.value) -> return result^
-    panic "string conversion allocation failed"
+    const result: String = format_wrapped("Ref(", value.value) else panic "string conversion allocation failed"
+    return result^
 
-fallible format_integer(value: int) String
-    var result = OwnedBytes{allocation = allocate?(byte, 11), size = 0}
+func format_integer(value: int) String | none
+    const storage: Allocation(byte) = allocate(byte, 11) else return none
+    var result = OwnedBytes{allocation = storage^, size = 0}
     const digits: BytesView = "0123456789-"
     var remaining = value
     if remaining < 0
-        unsafe_initialize?(byte, result.allocation, result.size, digits.get?(10))
+        unsafe_initialize(byte, result.allocation, result.size, digits[10])
         result.size += 1
     if remaining > 0 -> remaining = -remaining
     var divisor = 1
@@ -242,26 +234,24 @@ fallible format_integer(value: int) String
         divisor *= 10
     loop
         const digit = -(remaining / divisor)
-        unsafe_initialize?(byte, result.allocation, result.size, digits.get?(digit))
+        unsafe_initialize(byte, result.allocation, result.size, digits[digit])
         result.size += 1
         if divisor == 1 -> break
         remaining %= divisor
         divisor /= 10
     return String{storage = result^}
-
-fallible format_span(static T: type, imm values: Span(T)) String
+func format_span(static T: type, imm values: Span(T)) String | none
     var result = "["
     var separator: StringView = ""
     for value in values
-        result.append?(separator)
-        result.append?(String(value))
+        const _: unit = result.append(separator) else return none
+        const _: unit = result.append(String(value)) else return none
         separator = ", "
-    result.append?("]")
+    const _: unit = result.append("]") else return none
     return result^
-
-fallible format_wrapped(static T: type, imm prefix: StringView, imm value: T) String
+func format_wrapped(static T: type, imm prefix: StringView, imm value: T) String | none
     var result = String.empty()
-    result.append?(prefix)
-    result.append?(String(value))
-    result.append?(")")
+    const _: unit = result.append(prefix) else return none
+    const _: unit = result.append(String(value)) else return none
+    const _: unit = result.append(")") else return none
     return result^

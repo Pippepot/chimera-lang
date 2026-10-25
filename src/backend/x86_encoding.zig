@@ -43,7 +43,6 @@ const instructions = .{
     .ret = Encoding{ .prefix = &.{0xC3}, .asm_prefix = "ret" },
     .ud2 = Encoding{ .prefix = &.{ 0x0F, 0x0B }, .asm_prefix = "ud2" },
     .zero_edi = Encoding{ .prefix = &.{ 0x31, 0xFF }, .asm_prefix = "xor edi, edi" },
-    .sub_edi_edx = Encoding{ .prefix = &.{ 0x29, 0xD7 }, .asm_prefix = "sub edi, edx" },
     .cdq = Encoding{ .prefix = &.{0x99}, .asm_prefix = "cdq" },
     .idiv_ecx = Encoding{ .prefix = &.{ 0xF7, 0xF9 }, .asm_prefix = "idiv ecx" },
     .neg_eax = Encoding{ .prefix = &.{ 0xF7, 0xD8 }, .asm_prefix = "neg eax" },
@@ -138,6 +137,21 @@ const instructions = .{
     .add_eax_rcx = Encoding{ .prefix = &.{ 0x03, 0x01 }, .asm_prefix = "add eax, [rcx]" },
     .sub_eax_rcx = Encoding{ .prefix = &.{ 0x2B, 0x01 }, .asm_prefix = "sub eax, [rcx]" },
     .imul_eax_rcx = Encoding{ .prefix = &.{ 0x0F, 0xAF, 0x01 }, .asm_prefix = "imul eax, [rcx]" },
+    .sete_al = Encoding{ .prefix = &.{ 0x0F, 0x94, 0xC0 }, .asm_prefix = "sete al" },
+    .setne_al = Encoding{ .prefix = &.{ 0x0F, 0x95, 0xC0 }, .asm_prefix = "setne al" },
+    .setl_al = Encoding{ .prefix = &.{ 0x0F, 0x9C, 0xC0 }, .asm_prefix = "setl al" },
+    .setg_al = Encoding{ .prefix = &.{ 0x0F, 0x9F, 0xC0 }, .asm_prefix = "setg al" },
+    .setle_al = Encoding{ .prefix = &.{ 0x0F, 0x9E, 0xC0 }, .asm_prefix = "setle al" },
+    .setge_al = Encoding{ .prefix = &.{ 0x0F, 0x9D, 0xC0 }, .asm_prefix = "setge al" },
+    .movzx_eax_al = Encoding{ .prefix = &.{ 0x0F, 0xB6, 0xC0 }, .asm_prefix = "movzx eax, al" },
+    .test_eax = Encoding{ .prefix = &.{ 0x85, 0xC0 }, .asm_prefix = "test eax, eax" },
+    .cmove_eax_ecx = Encoding{ .prefix = &.{ 0x0F, 0x44, 0xC1 }, .asm_prefix = "cmove eax, ecx" },
+    .rep_stosd = Encoding{ .prefix = &.{ 0xF3, 0xAB }, .asm_prefix = "rep stosd" },
+    .std = Encoding{ .prefix = &.{0xFD}, .asm_prefix = "std" },
+    .cld = Encoding{ .prefix = &.{0xFC}, .asm_prefix = "cld" },
+    .rep_stosb = Encoding{ .prefix = &.{ 0xF3, 0xAA }, .asm_prefix = "rep stosb" },
+    .test_ecx = Encoding{ .prefix = &.{ 0x85, 0xC9 }, .asm_prefix = "test ecx, ecx" },
+    .mov_ecx_eax = Encoding{ .prefix = &.{ 0x89, 0xC1 }, .asm_prefix = "mov ecx, eax" },
 };
 
 pub const Operation = std.meta.FieldEnum(@TypeOf(instructions));
@@ -178,11 +192,98 @@ const forms = blk: {
     break :blk result;
 };
 
+pub const Register = enum(u4) {
+    rbx = 3,
+    rbp = 5,
+    r12 = 12,
+    r13 = 13,
+    r14 = 14,
+    r15 = 15,
+
+    fn low(self: Register) u8 {
+        return @as(u8, @backingInt(self)) & 7;
+    }
+
+    fn extended(self: Register) bool {
+        return @backingInt(self) >= 8;
+    }
+
+    fn name32(self: Register) []const u8 {
+        return switch (self) {
+            .rbx => "ebx",
+            .rbp => "ebp",
+            .r12 => "r12d",
+            .r13 => "r13d",
+            .r14 => "r14d",
+            .r15 => "r15d",
+        };
+    }
+};
+
+pub const RegisterOperation = enum { load_eax, store_eax, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, save, restore };
+
+fn registerEncoding(comptime operation: RegisterOperation, comptime register: Register) Encoding {
+    const r = register.low();
+    const extended = register.extended();
+    const name = register.name32();
+    return switch (operation) {
+        .load_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x89, 0xC0 | (r << 3) }, .asm_prefix = "mov eax, " ++ name },
+        .store_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x89, 0xC0 | r }, .asm_prefix = "mov " ++ name ++ ", eax" },
+        .add_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x01, 0xC0 | (r << 3) }, .asm_prefix = "add eax, " ++ name },
+        .sub_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x29, 0xC0 | (r << 3) }, .asm_prefix = "sub eax, " ++ name },
+        .imul_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x0F, 0xAF, 0xC0 | r }, .asm_prefix = "imul eax, " ++ name },
+        .cmp_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x39, 0xC0 | (r << 3) }, .asm_prefix = "cmp eax, " ++ name },
+        .load_ecx => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x89, 0xC1 | (r << 3) }, .asm_prefix = "mov ecx, " ++ name },
+        .save => .{ .prefix = &[_]u8{ if (extended) 0x4C else 0x48, 0x89, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "mov [rsp+", .asm_suffix = "], " ++ @tagName(register) },
+        .restore => .{ .prefix = &[_]u8{ if (extended) 0x4C else 0x48, 0x8B, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "mov " ++ @tagName(register) ++ ", [rsp+", .asm_suffix = "]" },
+    };
+}
+
+const register_forms = blk: {
+    @setEvalBranchQuota(20000);
+    const operations = std.enums.values(RegisterOperation);
+    const registers = std.enums.values(Register);
+    var result: [operations.len][registers.len]Forms = undefined;
+    for (operations, 0..) |operation, operation_index| for (registers, 0..) |register, register_index| {
+        const full = registerEncoding(operation, register);
+        result[operation_index][register_index] = .{ .full = full };
+        if (full.compact == .displacement) {
+            result[operation_index][register_index].small = displacementEncoding(full, .u8);
+            result[operation_index][register_index].zero = displacementEncoding(full, .none);
+        }
+    };
+    break :blk result;
+};
+
+fn registerForms(operation: RegisterOperation, register: Register) Forms {
+    const register_index = std.mem.indexOfScalar(Register, std.enums.values(Register), register).?;
+    return register_forms[@backingInt(operation)][register_index];
+}
+
+pub fn registerSelectedEncoding(operation: RegisterOperation, register: Register, bits: u64) Encoding {
+    const form = registerForms(operation, register);
+    if (form.full.compact == .displacement) {
+        if (bits == 0) return form.zero.?;
+        if (bits <= std.math.maxInt(i8)) return form.small.?;
+    }
+    return form.full;
+}
+
+pub fn appendRegister(code: *std.ArrayList(u8), allocator: std.mem.Allocator, operation: RegisterOperation, register: Register, bits: u64) !void {
+    try appendPattern(code, allocator, registerSelectedEncoding(operation, register, bits), bits);
+}
+
 /// Every encodable form, each operation's forms in order full, small, zero.
 pub const patterns = blk: {
-    var result: [3 * forms.len]Encoding = undefined;
+    @setEvalBranchQuota(20000);
+    const register_count = std.enums.values(RegisterOperation).len * std.enums.values(Register).len;
+    var result: [3 * (forms.len + register_count)]Encoding = undefined;
     var count: usize = 0;
     for (forms) |form| for ([_]?Encoding{ form.full, form.small, form.zero }) |maybe_pattern| if (maybe_pattern) |pattern| {
+        result[count] = pattern;
+        count += 1;
+    };
+    for (register_forms) |row| for (row) |form| for ([_]?Encoding{ form.full, form.small, form.zero }) |maybe_pattern| if (maybe_pattern) |pattern| {
         result[count] = pattern;
         count += 1;
     };
@@ -211,7 +312,10 @@ pub fn selectedEncoding(operation: Operation, bits: u64) Encoding {
 }
 
 pub fn append(code: *std.ArrayList(u8), allocator: std.mem.Allocator, operation: Operation, bits: u64) !void {
-    const pattern = selectedEncoding(operation, bits);
+    try appendPattern(code, allocator, selectedEncoding(operation, bits), bits);
+}
+
+fn appendPattern(code: *std.ArrayList(u8), allocator: std.mem.Allocator, pattern: Encoding, bits: u64) !void {
     const destination = try code.addManyAsSlice(allocator, pattern.length());
     @memcpy(destination[0..pattern.prefix.len], pattern.prefix);
     const operand = destination[pattern.prefix.len..];

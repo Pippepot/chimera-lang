@@ -4,13 +4,13 @@ const Fixture = test_sources.SourceFixture;
 
 test "pull standard cursors deliver items and End directly" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var cursor = (2..=3).iter()
         \\    var sum = 0
-        \\    if const first = cursor.next() as int -> sum += first
+        \\    if const first: int = cursor.next() -> sum += first
         \\    else
         \\        return 90
-        \\    if const second = cursor.next() as int -> sum += second
+        \\    if const second: int = cursor.next() -> sum += second
         \\    else
         \\        return 91
         \\    if not (cursor.next() is End) -> return 92
@@ -18,16 +18,16 @@ test "pull standard cursors deliver items and End directly" {
         \\    var values = [12, 17]
         \\    var span_cursor = values.iter()
         \\    const captured = span_cursor.next()
-        \\    if ref first = captured as int -> first += 13
+        \\    if ref first: int = captured -> first += 13
         \\    else
         \\        return 94
-        \\    if ref second = span_cursor.next() as int -> second += sum
+        \\    if ref second: int = span_cursor.next() -> second += sum
         \\    else
         \\        return 95
         \\    if not (span_cursor.next() is End) -> return 96
         \\    return values[0] + values[1] - sum
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 97
     , 42);
 }
@@ -45,7 +45,7 @@ test "pull for polls next exactly once for owned items" {
         \\        return value
         \\func run() int
         \\    var calls = 0
-        \\    var cursor = Cursor{value = 0, calls = Ref.from(calls)}
+        \\    var cursor = Cursor{value = 0, calls = (if const _selected_result_0: Ref(int) = Ref.from(calls) -> _selected_result_0 else panic "unexpected none")}
         \\    var sum = 0
         \\    for item in cursor -> sum += item
         \\    return calls * 10 + sum - 1
@@ -61,7 +61,7 @@ test "pull for preserves borrowed delivery and binding intent" {
         \\    source: Ref(Item)
         \\    ready: bool
         \\    func next(mut self: Cursor) ref Item | End
-        \\        if not self.ready? -> return End{}
+        \\        if not self.ready -> return End{}
         \\        self.ready = false
         \\        return self.source.value
     ;
@@ -119,7 +119,7 @@ test "pull for transfers noncopyable owned delivery" {
         \\struct Cursor
         \\    ready: bool
         \\    func next(mut self: Cursor) Item | End
-        \\        if not self.ready? -> return End{}
+        \\        if not self.ready -> return End{}
         \\        self.ready = false
         \\        return Item{value = 42}
         \\func consume(var value: Item) int -> value.value
@@ -142,12 +142,12 @@ test "pull for binds fresh immovable owned payloads in place" {
         \\    ready: bool
         \\    trace: Ref(int)
         \\    func next(mut self: Cursor) Item | End
-        \\        if not self.ready? -> return End{}
+        \\        if not self.ready -> return End{}
         \\        self.ready = false
         \\        return Item{value = 32, trace = self.trace}
         \\func run() int
         \\    var trace = 0
-        \\    var cursor = Cursor{ready = true, trace = Ref.from(trace)}
+        \\    var cursor = Cursor{ready = true, trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")}
         \\    var sum = 0
         \\    for item in cursor -> sum += item.value
         \\    return sum + trace
@@ -160,7 +160,7 @@ test "pull for supports borrowed whole carriers" {
         \\    item: int | End
         \\    ready: bool
         \\    func next(mut self: Cursor) ref (int | End)
-        \\        if self.ready?
+        \\        if self.ready
         \\            self.ready = false
         \\            return self.item
         \\        self.item = End{}
@@ -175,7 +175,7 @@ test "pull for supports borrowed whole carriers" {
 
 test "pull for integrates range and collection factories" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var values = [1, 2, 3]
         \\    for ref item in values -> item *= 7
         \\    var sum = 0
@@ -188,70 +188,9 @@ test "pull for integrates range and collection factories" {
         \\    for item in 2..=5 -> sum -= item
         \\    return sum - 31
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 92
     , 42);
-}
-
-test "pull for propagates producer failure before item matching" {
-    const declarations =
-        \\struct Cursor
-        \\    position: int
-        \\    calls: Ref(int)
-        \\    fallible next(mut self: Cursor) int | End
-        \\        self.calls.value += 1
-        \\        if self.position == 2 -> fail
-        \\        self.position += 1
-        \\        return self.position
-    ;
-    try Fixture.expectParity(declarations ++ "\n" ++
-        \\fallible calculate(ref calls: int) int
-        \\    var cursor = Cursor{position = 0, calls = Ref.from(calls)}
-        \\    var sum = 0
-        \\    for item in cursor -> sum += item
-        \\    return sum
-        \\func run() int
-        \\    var calls = 0
-        \\    if const unexpected = calculate(calls) -> return 90
-        \\    return calls * 14
-    , 42);
-    try Fixture.expectSourceExit(declarations ++ "\n" ++
-        \\var calls = 0
-        \\var cursor = Cursor{position = 0, calls = Ref.from(calls)}
-        \\for item in cursor -> _ = item
-        \\exit(99)
-    , 1);
-    inline for (.{
-        .{ .mode = "func", .failure = "" },
-        .{ .mode = "fallible", .failure = "if self.position == 3 -> fail" },
-    }) |producer| {
-        const source = try test_sources.renderTemplate(std.testing.allocator,
-            \\struct Cursor
-            \\    position: int
-            \\    $mode next(mut self: Cursor) int | none | End
-            \\        self.position += 1
-            \\        if self.position == 1 -> return none
-            \\        if self.position == 2 -> return 40
-            \\        $failure
-            \\        return End{}
-            \\fallible calculate(ref delivered: int) int
-            \\    var cursor = Cursor{position = 0}
-            \\    var sum = 0
-            \\    for item in cursor
-            \\        delivered += 1
-            \\        if const value = item as int -> sum += value
-            \\        if item is none -> sum += 2
-            \\    return sum
-            \\func run() int
-            \\    var delivered = 0
-            \\    if const result = calculate(delivered)
-            \\        if delivered <> 2 -> return 91
-            \\        return result
-            \\    return delivered + 40
-        , producer);
-        defer std.testing.allocator.free(source);
-        try Fixture.expectParity(source, 42);
-    }
 }
 
 test "pull for tracks reused buffer content lifetimes" {
@@ -259,49 +198,53 @@ test "pull for tracks reused buffer content lifetimes" {
         \\struct Cursor
         \\    position: int
         \\    buffered: String
-        \\    fallible next(mut self: Cursor) StringView | End
+        \\    func next(mut self: Cursor) StringView | End | none
         \\        self.position += 1
         \\        if self.position > 2 -> return End{}
-        \\        self.buffered.append?("next")
+        \\        const _: unit = self.buffered.append("next") else return none
         \\        return self.buffered.view()
     ;
     try Fixture.expectParity(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var total = 30
         \\    var cursor = Cursor{position = 0, buffered = ""}
-        \\    if const view = cursor.next?() as StringView -> total += view.byte_length()
-        \\    if const view = cursor.next?() as StringView -> total += view.byte_length()
+        \\    if const view: StringView = cursor.next() -> total += view.byte_length()
+        \\    if const view: StringView = cursor.next() -> total += view.byte_length()
         \\    return total
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
     try Fixture.expectParity(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var total = 30
-        \\    for view in Cursor{position = 0, buffered = ""}
+        \\    for outcome in Cursor{position = 0, buffered = ""}
+        \\        const view: StringView = outcome else return none
         \\        total += view.byte_length()
         \\    return total
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
-        \\fallible calculate()
+        \\func calculate() unit | none
         \\    var cursor = Cursor{position = 0, buffered = ""}
-        \\    const retained = cursor.next?()
-        \\    _ = cursor.next?()
-        \\    if ref view = retained as StringView -> print(view)
-        \\if calculate() -> exit(0)
+        \\    const retained = cursor.next()
+        \\    _ = cursor.next()
+        \\    if ref view: StringView = retained -> print(view)
+        \\    return ()
+        \\if (calculate() is unit) -> exit(0)
     , .borrow_outlives_source);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
-        \\fallible calculate()
+        \\func calculate() unit | none
         \\    var cursor = Cursor{position = 0, buffered = ""}
         \\    var retained: StringView | none = none
-        \\    for view in cursor
+        \\    for outcome in cursor
+        \\        const view: StringView = outcome else return none
         \\        if retained is none -> retained = view
-        \\    if ref view = retained as StringView -> print(view)
-        \\if calculate() -> exit(0)
+        \\    if ref view: StringView = retained -> print(view)
+        \\    return ()
+        \\if (calculate() is unit) -> exit(0)
     , .borrow_outlives_source);
 }
 
@@ -320,11 +263,11 @@ test "pull for preserves storage kinds across multiple item alternatives" {
         \\        return End{}
         \\func run() int
         \\    var owner = Item{value = 30}
-        \\    var cursor = Cursor{owner = Ref.from(owner), position = 0}
+        \\    var cursor = Cursor{owner = (if const _selected_result_0: Ref(Item) = Ref.from(owner) -> _selected_result_0 else panic "unexpected none"), position = 0}
         \\    var sum = 0
         \\    for item in cursor
-        \\        if ref borrowed = item as Item -> sum += borrowed.value
-        \\        if const owned = item as int -> sum += owned
+        \\        if ref borrowed: Item = item -> sum += borrowed.value
+        \\        if const owned: int = item -> sum += owned
         \\    return sum
     , 42);
     try Fixture.expectParity(
@@ -346,11 +289,11 @@ test "pull for preserves storage kinds across multiple item alternatives" {
         \\func run() int
         \\    var left = Left{value = 12}
         \\    var right = Right{value = 30}
-        \\    var cursor = Cursor{left = Ref.from(left), right = Ref.from(right), position = 0}
+        \\    var cursor = Cursor{left = (if const _selected_result_0: Ref(Left) = Ref.from(left) -> _selected_result_0 else panic "unexpected none"), right = (if const _selected_result_1: Ref(Right) = Ref.from(right) -> _selected_result_1 else panic "unexpected none"), position = 0}
         \\    var sum = 0
         \\    for item in cursor
-        \\        if ref value = item as Left -> sum += value.value
-        \\        if ref value = item as Right -> sum += value.value
+        \\        if ref value: Left = item -> sum += value.value
+        \\        if ref value: Right = item -> sum += value.value
         \\    return sum
     , 42);
 }
@@ -416,7 +359,7 @@ test "pull generic map handles owned and borrowed inputs without metadata" {
         \\    callback: func(A) B
         \\    func next(mut self: Mapped(S, A, B)) B | End
         \\        const result = self.source.next()
-        \\        if ref item = result as A -> return self.callback(item)
+        \\        if ref item: A = result -> return self.callback(item)
         \\        return End{}
         \\func scale(value: int) int -> value * 7
         \\func read(item: Item) int -> item.value
@@ -424,7 +367,7 @@ test "pull generic map handles owned and borrowed inputs without metadata" {
         \\    var mapped = Mapped(RangeIterator, int, int){source = (1..=3).iter(), callback = scale}
         \\    var sum = 0
         \\    loop
-        \\        if const item = mapped.next() as int -> sum += item
+        \\        if const item: int = mapped.next() -> sum += item
         \\        else
         \\            break
         \\    if sum <> 42 -> return 90
@@ -432,82 +375,11 @@ test "pull generic map handles owned and borrowed inputs without metadata" {
         \\    var borrowed = Mapped(SpanIterator(Item), Item, int){source = values.iter(), callback = read}
         \\    var total = 0
         \\    loop
-        \\        if const item = borrowed.next() as int -> total += item
+        \\        if const item: int = borrowed.next() -> total += item
         \\        else
         \\            break
         \\    return total
     , 42);
-}
-
-test "adapter feasibility type factories select exact next fallibility" {
-    const handled_poll = "if const result = mapped.next?()\n        if const item = result as int -> return item\n        return 91";
-    const ordinary_poll = "const result = mapped.next()\n    if const item = result as int -> return item";
-    inline for (.{ false, true }) |producer_fails| {
-        inline for (.{ false, true }) |callback_fails| {
-            const source = try test_sources.renderTemplate(std.testing.allocator,
-                \\struct Source
-                \\    position: int
-                \\    $producer next(mut self: Source) int | End
-                \\        $producer_failure
-                \\        if self.position > 0 -> return End{}
-                \\        self.position += 1
-                \\        return 6
-                \\$callback scale(value: int) int
-                \\    $callback_failure
-                \\    return value * 7
-                \\func Mapped(static S: type, static A: type, static B: type, static may_fail: bool) type
-                \\    if may_fail?
-                \\        return struct
-                \\            source: S
-                \\            callback: fallible(A) B
-                \\            fallible next(mut self: Mapped(S, A, B, may_fail)) B | End
-                \\                const poll: fallible(mut S) A | End = S.next
-                \\                const result = poll?(self.source)
-                \\                if ref item = result as A -> return self.callback?(item)
-                \\                return End{}
-                \\    return struct
-                \\        source: S
-                \\        callback: func(A) B
-                \\        func next(mut self: Mapped(S, A, B, may_fail)) B | End
-                \\            const result = self.source.next()
-                \\            if ref item = result as A -> return self.callback(item)
-                \\            return End{}
-                \\func run() int
-                \\    var mapped = Mapped(Source, int, int, $may_fail){source = Source{position = 0}, callback = scale}
-                \\    $poll
-                \\    return 90
-            , .{
-                .producer = if (producer_fails) "fallible" else "func",
-                .producer_failure = if (producer_fails) "if self.position < 0 -> fail" else "_ = 0",
-                .callback = if (callback_fails) "fallible" else "func",
-                .callback_failure = if (callback_fails) "if value < 0 -> fail" else "_ = 0",
-                .may_fail = if (producer_fails or callback_fails) "true" else "false",
-                .poll = if (producer_fails or callback_fails) handled_poll else ordinary_poll,
-            });
-            defer std.testing.allocator.free(source);
-            try Fixture.expectParity(source, 42);
-            if (producer_fails) {
-                const failed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "Source{position = 0}", "Source{position = -1}");
-                defer std.testing.allocator.free(failed);
-                try Fixture.expectParity(failed, 90);
-            }
-            if (callback_fails) {
-                const failed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "return 6", "return -6");
-                defer std.testing.allocator.free(failed);
-                try Fixture.expectParity(failed, 90);
-            }
-            if (producer_fails or callback_fails) {
-                const exhausted = try std.mem.replaceOwned(u8, std.testing.allocator, source, "Source{position = 0}", "Source{position = 1}");
-                defer std.testing.allocator.free(exhausted);
-                try Fixture.expectParity(exhausted, 91);
-                const unhandled = try std.mem.replaceOwned(u8, std.testing.allocator, source, handled_poll, ordinary_poll);
-                defer std.testing.allocator.free(unhandled);
-                const executed = try std.mem.concat(std.testing.allocator, u8, &.{ unhandled, "\n_ = run()" });
-                defer std.testing.allocator.free(executed);
-                try Fixture.expectAnySourceDiagnostic(executed, .fallible_call_requires_marker);
-            }
-        }
-    }
 }
 
 test "adapter feasibility type factories select owned or borrowed delivery" {
@@ -519,35 +391,35 @@ test "adapter feasibility type factories select owned or borrowed delivery" {
             \\    copy = none
             \\    pub value: int
             \\func Filtered(static S: type, static T: type, static borrowed: bool) type
-            \\    if borrowed?
+            \\    if borrowed
             \\        return struct
             \\            source: S
-            \\            predicate: fallible(T) unit
+            \\            predicate: func(T) bool
             \\            func next(mut self: Filtered(S, T, borrowed)) ref T | End
             \\                loop
             \\                    const result = self.source.next()
-            \\                    if ref item = result as T
-            \\                        if self.predicate?(item) -> return item
+            \\                    if ref item: T = result
+            \\                        if self.predicate(item) -> return item
             \\                    else
             \\                        return End{}
             \\    return struct
             \\        source: S
-            \\        predicate: fallible(T) unit
+            \\        predicate: func(T) bool
             \\        func next(mut self: Filtered(S, T, borrowed)) T | End
             \\            loop
             \\                const result = self.source.next()
-            \\                if const item = result^ as T
-            \\                    if self.predicate?(item) -> return item^
+            \\                if const item: T = result^
+            \\                    if self.predicate(item) -> return item^
             \\                else
             \\                    return End{}
-            \\fallible accept(item: $item_type) -> $predicate
+            \\func accept(item: $item_type) bool -> $predicate
             \\func run() int
             \\    var values = [Item{value = 19}, Item{value = 21}]
             \\    var filtered = Filtered($source_type, $item_type, $borrowed){source = $source, predicate = accept}
             \\    var total = 0
             \\    loop
             \\        const result = filtered.next()
-            \\        if ref item = result as $item_type
+            \\        if ref item: $item_type = result
             \\            $sum
             \\        else
             \\            break
@@ -584,7 +456,7 @@ test "adapter feasibility structural type construction and callable inference li
         \\func run() int
         \\    var source = Source{value = 42}
         \\    const result: NextType(Source, int | End, Source.next) = source.next()
-        \\    if const item = result as int -> return item
+        \\    if const item: int = result -> return item
         \\    return 90
     , 42);
     try Fixture.expectParity(declarations ++ "\n" ++
@@ -592,14 +464,14 @@ test "adapter feasibility structural type construction and callable inference li
         \\    var source = Source{value = 42}
         \\    const poll: TypeOf(Source.next) = Source.next
         \\    const result = poll(source)
-        \\    if const item = result as int -> return item
+        \\    if const item: int = result -> return item
         \\    return 90
     , 42);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
         \\func run() int
         \\    var source = Source{value = 42}
         \\    const result: NextType(Source.next) = source.next()
-        \\    if const item = result as int -> return item
+        \\    if const item: int = result -> return item
         \\    return 90
         \\_ = run()
     , .static_argument_cannot_be_inferred);
@@ -612,21 +484,21 @@ test "adapter feasibility logical matching cannot preserve a mixed physical carr
         \\    pub value: int
         \\func capture(ref owner: Item) ref Item | End -> owner
         \\func choose(ref owner: Item, borrowed: bool) Item | ref Item | End
-        \\    if borrowed? -> return capture(owner)
+        \\    if borrowed -> return capture(owner)
         \\    return Item{value = 12}
     ;
     try Fixture.expectParity(declarations ++ "\n" ++
         \\func run() int
         \\    var owner = Item{value = 41}
         \\    var result = choose(owner, true)
-        \\    if ref item = result as Item -> item.value += 1
+        \\    if ref item: Item = result -> item.value += 1
         \\    return owner.value
     , 42);
     inline for (.{ "const", "ref" }) |mode| {
         const source = try test_sources.renderTemplate(std.testing.allocator, declarations ++ "\n" ++
             \\func narrow(ref owner: Item) (Item | ref Item, int) | End
             \\    var result = choose(owner, true)
-            \\    if $mode item = result^ as Item
+            \\    if $mode item: Item = result^
             \\        const pair: (Item | ref Item, int) = ($item, 0)
             \\        return pair^
             \\    return End{}
@@ -650,20 +522,23 @@ test "pull generic borrowed filter handles predicate failure as rejection" {
         \\    pub value: int
         \\struct Filtered(S: type, T: type)
         \\    source: S
-        \\    predicate: fallible(T) unit
+        \\    predicate: func(T) (bool | none)
         \\    func next(mut self: Filtered(S, T)) ref T | End
         \\        loop
-        \\            if ref item = self.source.next() as T
-        \\                if self.predicate(item) -> return item
+        \\            if ref item: T = self.source.next()
+        \\                if const accepted: bool = self.predicate(item)
+        \\                    if accepted -> return item
         \\            else
         \\                return End{}
-        \\fallible accept(item: Item) -> item.value % 2 == 0
+        \\func accept(item: Item) bool | none
+        \\    if item.value % 2 == 0 -> return true
+        \\    return none
         \\func run() int
         \\    const values = [Item{value = 1}, Item{value = 20}, Item{value = 3}, Item{value = 22}]
         \\    var filtered = Filtered(SpanIterator(Item), Item){source = values.iter(), predicate = accept}
         \\    var sum = 0
         \\    loop
-        \\        if ref item = filtered.next() as Item -> sum += item.value
+        \\        if ref item: Item = filtered.next() -> sum += item.value
         \\        else
         \\            break
         \\    return sum
@@ -686,20 +561,20 @@ test "pull generic owned filter discharges rejected and delivered items" {
         \\        return Item{value = self.position, trace = self.trace}
         \\struct Filtered(S: type, T: type)
         \\    source: S
-        \\    predicate: fallible(T) unit
+        \\    predicate: func(T) bool
         \\    func next(mut self: Filtered(S, T)) T | End
         \\        loop
-        \\            if const item = self.source.next() as T
+        \\            if const item: T = self.source.next()
         \\                if self.predicate(item) -> return item^
         \\            else
         \\                return End{}
-        \\fallible accept(item: Item) -> item.value % 2 == 0
+        \\func accept(item: Item) bool -> item.value % 2 == 0
         \\func run() int
         \\    var trace = 0
-        \\    var filtered = Filtered(Source, Item){source = Source{position = 0, trace = Ref.from(trace)}, predicate = accept}
+        \\    var filtered = Filtered(Source, Item){source = Source{position = 0, trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")}, predicate = accept}
         \\    var sum = 0
         \\    loop
-        \\        if const item = filtered.next() as Item -> sum += item.value
+        \\        if const item: Item = filtered.next() -> sum += item.value
         \\        else
         \\            break
         \\    return sum + trace * 9
@@ -726,23 +601,23 @@ test "pull generic filter uses explicitly supplied disposal for explicit-drop it
         \\        return Item{value = self.position, trace = self.trace}
         \\struct Filtered(S: type, T: type)
         \\    source: S
-        \\    predicate: fallible(T) unit
+        \\    predicate: func(T) bool
         \\    dispose: func(deinit T) unit
         \\    func next(mut self: Filtered(S, T)) T | End
         \\        loop
-        \\            if const item = self.source.next() as T
+        \\            if const item: T = self.source.next()
         \\                if self.predicate(item) -> return item^
         \\                self.dispose(item^)
         \\            else
         \\                return End{}
-        \\fallible accept(item: Item) -> item.value % 2 == 0
+        \\func accept(item: Item) bool -> item.value % 2 == 0
         \\func dispose(deinit item: Item) -> item.trace.value += 1
         \\func run() int
         \\    var trace = 0
-        \\    var filtered = Filtered(Source, Item){source = Source{position = 0, trace = Ref.from(trace)}, predicate = accept, dispose = dispose}
+        \\    var filtered = Filtered(Source, Item){source = Source{position = 0, trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")}, predicate = accept, dispose = dispose}
         \\    var sum = 0
         \\    loop
-        \\        if const item = filtered.next() as Item
+        \\        if const item: Item = filtered.next()
         \\            sum += item.value
         \\            dispose(item^)
         \\        else
@@ -751,37 +626,37 @@ test "pull generic filter uses explicitly supplied disposal for explicit-drop it
     , 42);
 }
 
-test "pull generic fallible filter propagates producer failure after rejected predicates" {
+test "pull generic func filter propagates producer failure after rejected predicates" {
     try Fixture.expectParity(
         \\struct Source
         \\    polls: Ref(int)
-        \\    fallible next(mut self: Source) int | End
+        \\    func next(mut self: Source) int | End | none
         \\        self.polls.value += 1
-        \\        if self.polls.value > 2 -> fail
+        \\        if self.polls.value > 2 -> return none
         \\        if self.polls.value == 1 -> return 1
         \\        return 20
         \\struct Filtered(S: type, T: type)
         \\    source: S
-        \\    predicate: fallible(T) unit
-        \\    fallible next(mut self: Filtered(S, T)) T | End
+        \\    predicate: func(T) bool
+        \\    func next(mut self: Filtered(S, T)) T | End | none
         \\        loop
-        \\            const result = self.source.next?()
-        \\            if const item = result^ as T
+        \\            const result: int | End = self.source.next() else return none
+        \\            if const item: T = result^
         \\                if self.predicate(item) -> return item^
         \\            else
         \\                return End{}
-        \\fallible accept(item: int) -> item % 2 == 0
-        \\fallible calculate(ref polls: int) int
-        \\    var filtered = Filtered(Source, int){source = Source{polls = Ref.from(polls)}, predicate = accept}
-        \\    const first = filtered.next?()
-        \\    if const item = first as int
+        \\func accept(item: int) bool -> item % 2 == 0
+        \\func calculate(ref polls: int) int | none
+        \\    var filtered = Filtered(Source, int){source = Source{polls = (if const _selected_result_0: Ref(int) = Ref.from(polls) -> _selected_result_0 else return none)}, predicate = accept}
+        \\    const first: int | End = filtered.next() else return none
+        \\    if const item: int = first
         \\        if item <> 20 -> return 93
-        \\        const second = filtered.next?()
-        \\        if const impossible = second as int -> return 90
+        \\        const second: int | End = filtered.next() else return none
+        \\        if const impossible: int = second -> return 90
         \\    return 91
         \\func run() int
         \\    var polls = 0
-        \\    if const impossible = calculate(polls) -> return 92
+        \\    if const impossible: int = calculate(polls) -> return 92
         \\    return polls * 14
     , 42);
 }
@@ -796,7 +671,7 @@ test "pull generic mixed zip composes nested owned and reference tuples" {
         \\    source: Ref(T)
         \\    ready: bool
         \\    func next(mut self: Once(T)) ref T | End
-        \\        if not self.ready? -> return End{}
+        \\        if not self.ready -> return End{}
         \\        self.ready = false
         \\        return self.source.value
         \\struct Zip(L: type, R: type, A: type, B: type)
@@ -804,9 +679,9 @@ test "pull generic mixed zip composes nested owned and reference tuples" {
         \\    right: R
         \\    func next(mut self: Zip(L, R, A, B)) (A, ref B) | End
         \\        const left_result = self.left.next()
-        \\        if const left_item = left_result^ as A
+        \\        if const left_item: A = left_result^
         \\            const right_result = self.right.next()
-        \\            if ref right_item = right_result as B
+        \\            if ref right_item: B = right_result
         \\                const pair: (A, ref B) = (left_item^, right_item)
         \\                return pair^
         \\        return End{}
@@ -815,19 +690,19 @@ test "pull generic mixed zip composes nested owned and reference tuples" {
         \\    right: R
         \\    func next(mut self: NestedZip(L, M, R, A, B, C)) ((A, ref B), ref C) | End
         \\        const left_result = self.left.next()
-        \\        if const left_item = left_result^ as (A, ref B)
+        \\        if const left_item: (A, ref B) = left_result^
         \\            const right_result = self.right.next()
-        \\            if ref right_item = right_result as C
+        \\            if ref right_item: C = right_result
         \\                const pair: ((A, ref B), ref C) = (left_item^, right_item)
         \\                return pair^
         \\        return End{}
         \\func run() int
         \\    var item = Item{value = 30}
         \\    const other = Item{value = 7}
-        \\    var inner = Zip(RangeIterator, Once(Item), int, Item){left = (12..=12).iter(), right = Once(Item){source = Ref.from(item), ready = true}}
-        \\    var nested = NestedZip(RangeIterator, Once(Item), Once(Item), int, Item, Item){left = inner^, right = Once(Item){source = Ref.from(other), ready = true}}
+        \\    var inner = Zip(RangeIterator, Once(Item), int, Item){left = (12..=12).iter(), right = Once(Item){source = (if const _selected_result_0: Ref(Item) = Ref.from(item) -> _selected_result_0 else panic "unexpected none"), ready = true}}
+        \\    var nested = NestedZip(RangeIterator, Once(Item), Once(Item), int, Item, Item){left = inner^, right = Once(Item){source = (if const _selected_result_1: Ref(Item) = Ref.from(other) -> _selected_result_1 else panic "unexpected none"), ready = true}}
         \\    const result = nested.next()
-        \\    if const pair = result as ((int, ref Item), ref Item)
+        \\    if const pair: ((int, ref Item), ref Item) = result
         \\        if pair.0.0 <> 12 -> return 90
         \\        if pair.1.value <> 7 -> return 91
         \\        pair.0.1.value += 12
@@ -852,7 +727,7 @@ test "pull generic zip polls left first and drops unmatched owned items" {
         \\    ready: bool
         \\    func next(mut self: Left) Item | End
         \\        self.trace.value += 1
-        \\        if not self.ready? -> return End{}
+        \\        if not self.ready -> return End{}
         \\        self.ready = false
         \\        return Item{trace = self.trace, value = 30}
         \\struct Right
@@ -861,7 +736,7 @@ test "pull generic zip polls left first and drops unmatched owned items" {
         \\    ready: bool
         \\    func next(mut self: Right) ref int | End
         \\        self.trace.value += 10
-        \\        if not self.ready? -> return End{}
+        \\        if not self.ready -> return End{}
         \\        self.ready = false
         \\        return self.source.value
         \\struct Zip(L: type, R: type, A: type, B: type)
@@ -869,21 +744,21 @@ test "pull generic zip polls left first and drops unmatched owned items" {
         \\    right: R
         \\    func next(mut self: Zip(L, R, A, B)) (A, ref B) | End
         \\        const left_result = self.left.next()
-        \\        if const left_item = left_result^ as A
+        \\        if const left_item: A = left_result^
         \\            const right_result = self.right.next()
-        \\            if ref right_item = right_result as B
+        \\            if ref right_item: B = right_result
         \\                const pair: (A, ref B) = (left_item^, right_item)
         \\                return pair^
         \\        return End{}
         \\func exhaust(ref trace: int, left_ready: bool, right_ready: bool)
         \\    const owner = 12
-        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = Ref.from(trace), ready = left_ready}, right = Right{trace = Ref.from(trace), source = Ref.from(owner), ready = right_ready}}
+        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), ready = left_ready}, right = Right{trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else panic "unexpected none"), source = (if const _selected_result_2: Ref(int) = Ref.from(owner) -> _selected_result_2 else panic "unexpected none"), ready = right_ready}}
         \\    if not (zipped.next() is End) -> exit(90)
         \\func deliver(ref trace: int) int
         \\    const owner = 12
-        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = Ref.from(trace), ready = true}, right = Right{trace = Ref.from(trace), source = Ref.from(owner), ready = true}}
+        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = (if const _selected_result_3: Ref(int) = Ref.from(trace) -> _selected_result_3 else panic "unexpected none"), ready = true}, right = Right{trace = (if const _selected_result_4: Ref(int) = Ref.from(trace) -> _selected_result_4 else panic "unexpected none"), source = (if const _selected_result_5: Ref(int) = Ref.from(owner) -> _selected_result_5 else panic "unexpected none"), ready = true}}
         \\    const result = zipped.next()
-        \\    if const pair = result^ as (Item, ref int) -> return pair.0.value + pair.1
+        \\    if const pair: (Item, ref int) = result^ -> return pair.0.value + pair.1
         \\    return 91
         \\func run() int
         \\    var trace = 0
@@ -899,7 +774,7 @@ test "pull generic zip polls left first and drops unmatched owned items" {
     , 42);
 }
 
-test "pull generic fallible zip cleans up the retained left item on right failure" {
+test "pull generic func zip cleans up the retained left item on right failure" {
     try Fixture.expectParity(
         \\struct Item
         \\    copy = none
@@ -912,27 +787,28 @@ test "pull generic fallible zip cleans up the retained left item on right failur
         \\        return Item{trace = self.trace}
         \\struct Right
         \\    trace: Ref(int)
-        \\    fallible next(mut self: Right) ref int | End
+        \\    func next(mut self: Right) ref int | End | none
         \\        self.trace.value += 10
-        \\        fail
+        \\        return none
         \\struct Zip(L: type, R: type, A: type, B: type)
         \\    left: L
         \\    right: R
-        \\    fallible next(mut self: Zip(L, R, A, B)) (A, ref B) | End
+        \\    func next(mut self: Zip(L, R, A, B)) (A, ref B) | End | none
         \\        const left_result = self.left.next()
-        \\        if const left_item = left_result^ as A
-        \\            const right_result = self.right.next?()
-        \\            if ref right_item = right_result as B
+        \\        if const left_item: A = left_result^
+        \\            const right_result: ref B | End = self.right.next() else return none
+        \\            if ref right_item: B = right_result
         \\                const pair: (A, ref B) = (left_item^, right_item)
         \\                return pair^
         \\        return End{}
-        \\fallible calculate(ref trace: int)
-        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = Ref.from(trace)}, right = Right{trace = Ref.from(trace)}}
-        \\    const result = zipped.next?()
+        \\func calculate(ref trace: int) unit | none
+        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else return none)}, right = Right{trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else return none)}}
+        \\    const result: End | (Item, ref int) = zipped.next() else return none
         \\    _ = result
+        \\    return ()
         \\func run() int
         \\    var trace = 0
-        \\    if calculate(trace) -> return 90
+        \\    if (calculate(trace) is unit) -> return 90
         \\    return trace - 69
     , 42);
 }
@@ -944,41 +820,41 @@ test "pull generic zip rejects actual retained-view invalidation not unrelated m
         \\    func next(mut self: Left) StringView | End -> self.source.value.view()
         \\struct Right
         \\    source: Ref(String)
-        \\    fallible next(mut self: Right) int | End
-        \\        self.source.value.append?("x")
+        \\    func next(mut self: Right) int | End | none
+        \\        const _: unit = self.source.value.append("x") else return none
         \\        return 39
         \\struct Zip(L: type, R: type, A: type, B: type)
         \\    left: L
         \\    right: R
-        \\    fallible next(mut self: Zip(L, R, A, B)) (A, B) | End
+        \\    func next(mut self: Zip(L, R, A, B)) (A, B) | End | none
         \\        const left_result = self.left.next()
-        \\        if const left_item = left_result^ as A
-        \\            const right_result = self.right.next?()
-        \\            if const right_item = right_result^ as B
+        \\        if const left_item: A = left_result^
+        \\            const right_result: B | End = self.right.next() else return none
+        \\            if const right_item: B = right_result^
         \\                const pair: (A, B) = (left_item^, right_item^)
         \\                return pair^
         \\        return End{}
     ;
     try Fixture.expectParity(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var owner: String = "abc"
         \\    var unrelated: String = ""
         \\    var zipped = Zip(Left, Right, StringView, int){left = Left{source = Ref.from(owner)}, right = Right{source = Ref.from(unrelated)}}
-        \\    const result = zipped.next?()
-        \\    if const pair = result^ as (StringView, int) -> return pair.0.byte_length() + pair.1
+        \\    const result = zipped.next()
+        \\    if const pair: (StringView, int) = result^ -> return pair.0.byte_length() + pair.1
         \\    return 90
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 91
     , 42);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var owner: String = "abc"
         \\    var zipped = Zip(Left, Right, StringView, int){left = Left{source = Ref.from(owner)}, right = Right{source = Ref.from(owner)}}
-        \\    const result = zipped.next?()
-        \\    if const pair = result^ as (StringView, int) -> return pair.0.byte_length() + pair.1
+        \\    const result = zipped.next()
+        \\    if const pair: (StringView, int) = result^ -> return pair.0.byte_length() + pair.1
         \\    return 90
-        \\if const result = calculate() -> exit(result)
+        \\if const result: int = calculate() -> exit(result)
     , .borrow_outlives_source);
 }
 
@@ -989,7 +865,7 @@ test "ranges construct ordinary cursors with native and comptime parity" {
         \\    var cursor = bounds.iter()
         \\    var result = 0
         \\    loop
-        \\        if const value = cursor.next() as int -> result += value
+        \\        if const value: int = cursor.next() -> result += value
         \\        else
         \\            break
         \\    if not (cursor.next() is End) -> return 90
@@ -1018,41 +894,43 @@ test "ranges retain one value type while endpoint presence changes at runtime" {
 
 test "end relative ranges resolve stored bounds with checked native and comptime parity" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\import std.range.{RangeSequence}
+        \\func calculate() int | none
         \\    const distance = ^2
         \\    const bounds = 1..distance
-        \\    const first = bounds.resolve?(5)
-        \\    const second = bounds.resolve?(8)
-        \\    first.0 == 1 and first.1 == 3
-        \\    second.0 == 1 and second.1 == 6
-        \\    const suffix = (^2..).resolve?(5)
-        \\    suffix.0 == 3 and suffix.1 == 5
-        \\    const included = (..=^1).resolve?(5)
-        \\    included.0 == 0 and included.1 == 5
-        \\    const empty = (^0..).resolve?(0)
-        \\    empty.0 == 0 and empty.1 == 0
-        \\    if (..=^0).resolve(5) -> return 90
-        \\    if (^6..).resolve(5) -> return 91
-        \\    if (..^(-1)).resolve(5) -> return 92
-        \\    if (^(-2147483648)..).resolve(5) -> return 93
-        \\    if (..^2147483647).resolve(5) -> return 94
-        \\    if (3..^3).resolve(5) -> return 95
-        \\    if bounds.step_by(1) -> return 96
-        \\    String(bounds) == "1..^2"
-        \\    String(^2..=^1) == "^2..=^1"
+        \\    const first: (int, int) = bounds.resolve(5) else return none
+        \\    const second: (int, int) = bounds.resolve(8) else return none
+        \\    if not (first.0 == 1 and first.1 == 3) -> return none
+        \\    if not (second.0 == 1 and second.1 == 6) -> return none
+        \\    const suffix: (int, int) = (^2..).resolve(5) else return none
+        \\    if not (suffix.0 == 3 and suffix.1 == 5) -> return none
+        \\    const included: (int, int) = (..=^1).resolve(5) else return none
+        \\    if not (included.0 == 0 and included.1 == 5) -> return none
+        \\    const empty: (int, int) = (^0..).resolve(0) else return none
+        \\    if not (empty.0 == 0 and empty.1 == 0) -> return none
+        \\    if ((..=^0).resolve(5) is (int, int)) -> return 90
+        \\    if ((^6..).resolve(5) is (int, int)) -> return 91
+        \\    if ((..^(-1)).resolve(5) is (int, int)) -> return 92
+        \\    if ((^(-2147483648)..).resolve(5) is (int, int)) -> return 93
+        \\    if ((..^2147483647).resolve(5) is (int, int)) -> return 94
+        \\    if ((3..^3).resolve(5) is (int, int)) -> return 95
+        \\    if (bounds.step_by(1) is RangeSequence) -> return 96
+        \\    if not (String(bounds) == "1..^2") -> return none
+        \\    if not (String(^2..=^1) == "^2..=^1") -> return none
         \\    return 42
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 97
     , 42);
 }
 
-test "unresolved range stepping fails and infallible traversal panics" {
+test "unresolved range stepping fails and infunc traversal panics" {
     try Fixture.expectParity(
+        \\import std.range.{RangeSequence}
         \\func run() int
         \\    const ranges = [(..3), (2..), (..), (^1..2), (1..^1), (^2..^1)]
         \\    for bounds in ranges
-        \\        if const sequence = bounds.step_by(1) -> return 90
+        \\        if const sequence: RangeSequence = bounds.step_by(1) -> return 90
         \\    return 42
     , 42);
     for ([_][]const u8{ "..3", "2..", "..", "^1..2", "1..^1", "^2..^1" }) |bounds| {
@@ -1135,7 +1013,7 @@ test "for break values join with unit exhaustion" {
         \\func run() int
         \\    const found = for value in 0..10
         \\        if value == 7 -> break value
-        \\    if const result = found as int -> return result * 6
+        \\    if const result: int = found -> return result * 6
         \\    return 90
     , 42);
 }
@@ -1236,12 +1114,12 @@ test "for collections share borrowed span iteration with parity" {
 
 test "for ref collection items preserve writable backing" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var values = [1, 2, 3]
         \\    for ref value in values -> value *= 7
         \\    return values[0] + values[1] + values[2]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -1310,7 +1188,7 @@ test "for valued breaks construct fresh immovable results at the destination" {
         \\    pub value: int
         \\func run() int
         \\    const result: Item | unit = for value in 0..1 -> break Item{value = 42}
-        \\    if ref item = result as Item -> return item.value
+        \\    if ref item: Item = result -> return item.value
         \\    return 90
     , 42);
 }
@@ -1334,7 +1212,7 @@ test "for explicit owned collection bindings copy through ordinary hooks" {
 
 test "for var collection bindings change copies rather than backing elements" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var values = [5, 7]
         \\    var sum = 0
         \\    for var value in values
@@ -1344,7 +1222,7 @@ test "for var collection bindings change copies rather than backing elements" {
         \\    if values[1] <> 7 -> return 91
         \\    return sum + 6
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 92
     , 42);
 }
@@ -1410,81 +1288,93 @@ test "for collection item references can outlive the cursor when backing remains
         \\func run() int
         \\    var values = [42]
         \\    var retained: Ref(int) | none = none
-        \\    for ref value in values -> retained = Ref.from(value)
-        \\    if ref handle = retained as Ref(int) -> return handle.value
+        \\    for ref value in values -> retained = (if const _selected_result_0: Ref(int) = Ref.from(value) -> _selected_result_0 else panic "unexpected none")
+        \\    if ref handle: Ref(int) = retained -> return handle.value
         \\    return 90
     , 42);
 }
 
-test "for fallible polling propagates failure rather than exhausting" {
+test "for polling delivers ordinary absence for explicit handling rather than exhaustion" {
     try Fixture.expectParity(
         \\struct Cursor
         \\    position: int
-        \\    pub fallible next(mut self: Cursor) int | End
-        \\        if self.position == 2 -> fail
+        \\    pub func next(mut self: Cursor) int | End | none
+        \\        if self.position == 2 -> return none
         \\        self.position += 1
         \\        return self.position
-        \\fallible walk(mut sum: int)
+        \\func walk(mut sum: int) unit | none
         \\    var cursor = Cursor{position = 0}
-        \\    for value in cursor -> sum += value
+        \\    for outcome in cursor
+        \\        const value: int = outcome else return none
+        \\        sum += value
         \\    sum = 90
+        \\    return ()
         \\func run() int
         \\    var sum = 0
-        \\    if walk(sum) -> return 91
+        \\    if (walk(sum) is unit) -> return 91
         \\    if sum == 3 -> return 42
         \\    return 92
     , 42);
 }
 
-test "for item preparation failure propagates without an extra poll" {
+test "for item mismatch exits explicitly without an extra poll" {
     try Fixture.expectParity(
         \\struct Cursor
         \\    position: int
-        \\    pub fallible next(mut self: Cursor) int | End
+        \\    pub func next(mut self: Cursor) int | End | none
         \\        self.position += 1
-        \\        if self.position == 2 -> fail
+        \\        if self.position == 2 -> return none
         \\        return self.position
-        \\fallible walk(mut sum: int)
+        \\func walk(mut sum: int) unit | none
         \\    var cursor = Cursor{position = 0}
-        \\    for value in cursor -> sum += value
+        \\    for outcome in cursor
+        \\        const value: int = outcome else return none
+        \\        sum += value
         \\    sum = 90
+        \\    return ()
         \\func run() int
         \\    var sum = 0
-        \\    if walk(sum) -> return 91
+        \\    if (walk(sum) is unit) -> return 91
         \\    if sum == 1 -> return 42
         \\    return 92
     , 42);
 }
 
-test "for fallible iterator factory propagates before the body" {
+test "optional iterator factories require explicit selection before traversal" {
     try Fixture.expectParity(
         \\import std.range.{RangeIterator}
         \\struct Source
-        \\    pub fallible iter(ref self: Source) RangeIterator -> fail
-        \\fallible walk(mut sum: int)
+        \\    pub func iter(ref self: Source) RangeIterator | none -> return none
+        \\func walk(mut sum: int) unit | none
         \\    const source = Source{}
-        \\    for value in source -> sum += value
+        \\    var cursor: RangeIterator = source.iter() else return none
+        \\    for value in cursor -> sum += value
+        \\    return ()
         \\func run() int
         \\    var sum = 42
-        \\    if walk(sum) -> return 90
+        \\    if (walk(sum) is unit) -> return 90
         \\    return sum
     , 42);
 }
 
 test "range stepping and reversal compose as sequence operations" {
     const cases = [_]struct { expression: []const u8, digits: []const u8, count: []const u8 }{
-        .{ .expression = "(0..10).step_by?(4)", .digits = "48", .count = "3" },
-        .{ .expression = "(0..10).step_by?(4).reversed()", .digits = "840", .count = "3" },
-        .{ .expression = "(0..10).reversed().step_by?(4)", .digits = "951", .count = "3" },
-        .{ .expression = "(0..10).step_by?(2).step_by?(2)", .digits = "48", .count = "3" },
-        .{ .expression = "(0..10).reversed().step_by?(2).step_by?(2)", .digits = "951", .count = "3" },
-        .{ .expression = "(3..3).reversed().step_by?(2)", .digits = "0", .count = "0" },
-        .{ .expression = "(3..=3).reversed().step_by?(2147483647)", .digits = "3", .count = "1" },
-        .{ .expression = "(0..10).step_by?(2147483647)", .digits = "0", .count = "1" },
+        .{ .expression = "step(0..10, 4)", .digits = "48", .count = "3" },
+        .{ .expression = "step(0..10, 4).reversed()", .digits = "840", .count = "3" },
+        .{ .expression = "step((0..10).reversed(), 4)", .digits = "951", .count = "3" },
+        .{ .expression = "step(step(0..10, 2), 2)", .digits = "48", .count = "3" },
+        .{ .expression = "step(step((0..10).reversed(), 2), 2)", .digits = "951", .count = "3" },
+        .{ .expression = "step((3..3).reversed(), 2)", .digits = "0", .count = "0" },
+        .{ .expression = "step((3..=3).reversed(), 2147483647)", .digits = "3", .count = "1" },
+        .{ .expression = "step(0..10, 2147483647)", .digits = "0", .count = "1" },
     };
     for (cases) |case| {
         const source = try test_sources.renderTemplate(std.testing.allocator,
-            \\fallible calculate() int
+            \\import std.range.{RangeSequence}
+            \\func step(static S: type, values: S, factor: int) RangeSequence
+            \\    const selected: RangeSequence = values.step_by(factor) else panic "invalid step"
+            \\    return selected
+            \\func calculate() int
             \\    const values = $expression
             \\    var digits = 0
             \\    var count = 0
@@ -1506,19 +1396,22 @@ test "range stepping and reversal compose as sequence operations" {
 
 test "range stepping rejects zero and negative factors" {
     try Fixture.expectParity(
+        \\import std.range.{RangeSequence}
         \\func run() int
         \\    const values = 0..10
-        \\    if const invalid = values.step_by(0) -> return 90
-        \\    if const invalid = values.step_by(-1) -> return 91
+        \\    if const invalid: RangeSequence = values.step_by(0) -> return 90
+        \\    if const invalid: RangeSequence = values.step_by(-1) -> return 91
         \\    return 42
     , 42);
 }
 
 test "range stepping supports distances and composed strides wider than int" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\import std.range.{RangeSequence}
+        \\func calculate() int | none
         \\    const complete = -2147483648..=2147483647
-        \\    const huge = complete.step_by?(2147483647).step_by?(2)
+        \\    const initial: RangeSequence = complete.step_by(2147483647) else return none
+        \\    const huge: RangeSequence = initial.step_by(2) else return none
         \\    var count = 0
         \\    var sum = 0
         \\    for value in huge
@@ -1528,22 +1421,22 @@ test "range stepping supports distances and composed strides wider than int" {
         \\    if count <> 2 -> return 91
         \\    if sum <> -2 -> return 92
         \\    var reversed = huge.reversed().iter()
-        \\    if const first = reversed.next() as int
+        \\    if const first: int = reversed.next()
         \\        if first <> 2147483646 -> return 94
         \\    else
         \\        return 93
-        \\    if const second = reversed.next() as int
+        \\    if const second: int = reversed.next()
         \\        if second <> -2147483648 -> return 96
         \\    else
         \\        return 95
         \\    if not (reversed.next() is End) -> return 97
-        \\    const singleton = huge.step_by?(2)
+        \\    const singleton: RangeSequence = huge.step_by(2) else return none
         \\    var single_count = 0
         \\    for value in singleton -> single_count += 1
         \\    if single_count <> 1 -> return 98
         \\    return 42
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 99
     , 42);
 }
@@ -1583,11 +1476,11 @@ test "range wide boundary matrix matches independent selected sequences" {
                     selected_count += 1;
                 }
                 if (reverse_result) std.mem.reverse(i64, expected[0..selected_count]);
-                try checks.writer.print("    check?({d}, ({d}..{s}{d})", .{ selected_count, first, if (inclusive) "=" else "", limit });
+                try checks.writer.print("    check({d}, step(step(({d}..{s}{d})", .{ selected_count, first, if (inclusive) "=" else "", limit });
                 if (reverse_source) try checks.writer.writeAll(".reversed()");
-                try checks.writer.print(".step_by?({d})", .{initial_factor});
+                try checks.writer.print(", {d})", .{initial_factor});
                 if (reverse_middle) try checks.writer.writeAll(".reversed()");
-                try checks.writer.print(".step_by?({d})", .{following_factor});
+                try checks.writer.print(", {d})", .{following_factor});
                 if (reverse_result) try checks.writer.writeAll(".reversed()");
                 try checks.writer.writeAll(", [");
                 for (expected[0..selected_count], 0..) |value, value_index| {
@@ -1600,15 +1493,18 @@ test "range wide boundary matrix matches independent selected sequences" {
     }
     const source = try test_sources.renderTemplate(allocator,
         \\import std.range.{RangeSequence}
-        \\fallible check(static N: int, values: RangeSequence, imm expected: Array(int, N))
+        \\func step(static S: type, values: S, factor: int) RangeSequence
+        \\    const selected: RangeSequence = values.step_by(factor) else panic "invalid step"
+        \\    return selected
+        \\func check(static N: int, values: RangeSequence, imm expected: Array(int, N))
         \\    var cursor = values.iter()
         \\    for value in expected
-        \\        if const actual = cursor.next() as int
-        \\            actual == value
+        \\        if const actual: int = cursor.next()
+        \\            if actual <> value -> panic "wrong element"
         \\        else
-        \\            fail
-        \\    cursor.next() is End
-        \\fallible calculate() int
+        \\            panic "early exhaustion"
+        \\    if not (cursor.next() is End) -> panic "extra element"
+        \\func calculate() int
         \\$checks
         \\    return 42
         \\func run() int
@@ -1637,7 +1533,7 @@ test "for owned cursors and items clean up on continue and break" {
         \\        return Item{trace = self.trace, value = self.position}
         \\func run() int
         \\    var trace = 0
-        \\    for item in Cursor{trace = Ref.from(trace), position = 0}
+        \\    for item in Cursor{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), position = 0}
         \\        if item.value == 1 -> continue
         \\        break
         \\    return trace
@@ -1660,7 +1556,7 @@ test "for discards still acquire and destroy exactly one item per step" {
         \\        return Item{trace = self.trace}
         \\func run() int
         \\    var trace = 9
-        \\    for _ in Cursor{trace = Ref.from(trace), position = 0} -> ()
+        \\    for _ in Cursor{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), position = 0} -> ()
         \\    return trace
     , 42);
 }
@@ -1675,7 +1571,7 @@ test "for source temporaries retain borrowed items through their final use" {
         \\func run() int
         \\    var trace = 0
         \\    var sum = 0
-        \\    for item in [Item{trace = Ref.from(trace), value = 20}, Item{trace = Ref.from(trace), value = 22}]
+        \\    for item in [Item{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), value = 20}, Item{trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else panic "unexpected none"), value = 22}]
         \\        if trace <> 0 -> return 90
         \\        sum += item.value
         \\    if sum <> 42 -> return 91
@@ -1695,7 +1591,7 @@ test "for named cursor cleanup remains with its caller" {
         \\        return self.position
         \\func run() int
         \\    var trace = 0
-        \\    var cursor = Cursor{trace = Ref.from(trace), position = 0}
+        \\    var cursor = Cursor{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), position = 0}
         \\    for value in cursor -> break
         \\    if trace <> 0 -> return 90
         \\    for value in cursor -> break
@@ -1712,7 +1608,7 @@ test "for optional payload items never become exhaustion" {
         \\    var sum = 0
         \\    for value in values
         \\        count += 1
-        \\        if const number = value as int -> sum += number
+        \\        if const number: int = value -> sum += number
         \\    if count <> 3 -> return 90
         \\    return sum + 2
     , 42);
@@ -1733,7 +1629,7 @@ test "for map filter take compose without repeated materialization or overpull" 
         \\    source: RangeIterator
         \\    trace: Ref(int)
         \\    pub func next(mut self: Mapped) int | End
-        \\        if const value = self.source.next() as int
+        \\        if const value: int = self.source.next()
         \\            self.trace.value += 1
         \\            return value * 2
         \\        return End{}
@@ -1741,7 +1637,7 @@ test "for map filter take compose without repeated materialization or overpull" 
         \\    source: Mapped
         \\    pub func next(mut self: Filtered) int | End
         \\        loop
-        \\            if const value = self.source.next() as int
+        \\            if const value: int = self.source.next()
         \\                if value % 4 == 0 -> return value
         \\            else
         \\                return End{}
@@ -1750,7 +1646,7 @@ test "for map filter take compose without repeated materialization or overpull" 
         \\    remaining: int
         \\    pub func next(mut self: Taken) int | End
         \\        if self.remaining == 0 -> return End{}
-        \\        if const value = self.source.next() as int
+        \\        if const value: int = self.source.next()
         \\            self.remaining -= 1
         \\            return value
         \\        return End{}
@@ -1759,7 +1655,7 @@ test "for map filter take compose without repeated materialization or overpull" 
         \\    const bounds = 0..100
         \\    var cursor = Taken{
         \\        source = Filtered{
-        \\            source = Mapped{source = bounds.iter(), trace = Ref.from(trace)},
+        \\            source = Mapped{source = bounds.iter(), trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")},
         \\        },
         \\        remaining = 3,
         \\    }
@@ -1774,44 +1670,45 @@ test "for map filter take compose without repeated materialization or overpull" 
 test "range progression matrix matches explicit small integer sequences" {
     try Fixture.expectParity(
         \\import std.range.{RangeSequence}
-        \\fallible check(values: RangeSequence, first: int, last: int, stride: int, descending: bool)
+        \\func check(values: RangeSequence, first: int, last: int, stride: int, descending: bool) unit | none
         \\    var cursor = values.iter()
         \\    var expected = first
         \\    loop
-        \\        if descending?
+        \\        if descending
         \\            if expected < last -> break
         \\        else
         \\            if expected > last -> break
-        \\        if const value = cursor.next() as int
-        \\            value == expected
+        \\        if const value: int = cursor.next()
+        \\            if not (value == expected) -> return none
         \\        else
-        \\            fail
-        \\        if descending? -> expected -= stride
+        \\            return none
+        \\        if descending -> expected -= stride
         \\        else expected += stride
-        \\    cursor.next() is End
-        \\fallible calculate() int
+        \\    if not (cursor.next() is End) -> return none
+        \\    return ()
+        \\func calculate() int | none
         \\    for first in -4..=4
         \\        for limit in -4..=4
         \\            for stride in 1..=4
-        \\                const exclusive = (first..limit).step_by?(stride)
-        \\                const inclusive = (first..=limit).step_by?(stride)
-        \\                check?(exclusive, first, limit - 1, stride, false)
-        \\                check?(inclusive, first, limit, stride, false)
+        \\                const exclusive: RangeSequence = (first..limit).step_by(stride) else return none
+        \\                const inclusive: RangeSequence = (first..=limit).step_by(stride) else return none
+        \\                const _: unit = check(exclusive, first, limit - 1, stride, false) else return none
+        \\                const _: unit = check(inclusive, first, limit, stride, false) else return none
         \\                if first < limit
         \\                    const end = first + ((limit - first - 1) / stride) * stride
-        \\                    check?(exclusive.reversed(), end, first, stride, true)
+        \\                    const _: unit = check(exclusive.reversed(), end, first, stride, true) else return none
         \\                else
-        \\                    check?(exclusive.reversed(), 0, 1, stride, true)
+        \\                    const _: unit = check(exclusive.reversed(), 0, 1, stride, true) else return none
         \\                if first <= limit
         \\                    const end = first + ((limit - first) / stride) * stride
-        \\                    check?(inclusive.reversed(), end, first, stride, true)
+        \\                    const _: unit = check(inclusive.reversed(), end, first, stride, true) else return none
         \\                else
-        \\                    check?(inclusive.reversed(), 0, 1, stride, true)
-        \\                const twice = inclusive.step_by?(3)
-        \\                check?(twice, first, limit, stride * 3, false)
+        \\                    const _: unit = check(inclusive.reversed(), 0, 1, stride, true) else return none
+        \\                const twice: RangeSequence = inclusive.step_by(3) else return none
+        \\                const _: unit = check(twice, first, limit, stride * 3, false) else return none
         \\    return 42
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -1833,16 +1730,16 @@ test "for filter can buffer and transfer move only owned items once" {
         \\            self.position += 1
         \\            if self.position > 4 -> return End{}
         \\            self.buffered = Item{value = self.position, trace = self.trace}
-        \\            if ref item = self.buffered as Item
+        \\            if ref item: Item = self.buffered
         \\                if item.value % 2 == 0
-        \\                    if const selected = self.buffered^ as Item
+        \\                    if const selected: Item = self.buffered^
         \\                        self.buffered = none
         \\                        return selected^
         \\            self.buffered = none
         \\func run() int
         \\    var trace = 0
         \\    var sum = 0
-        \\    for item in Filtered{trace = Ref.from(trace), position = 0, buffered = none}
+        \\    for item in Filtered{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), position = 0, buffered = none}
         \\        sum += item.value
         \\    if trace <> 4 -> return 90
         \\    return sum * 7
@@ -1861,7 +1758,7 @@ test "for gives explicit iterator factories precedence over cursor fallback" {
         \\    pub func next(mut self: Source) int | End -> 99
         \\func run() int
         \\    var calls = 0
-        \\    const source = Source{calls = Ref.from(calls)}
+        \\    const source = Source{calls = (if const _selected_result_0: Ref(int) = Ref.from(calls) -> _selected_result_0 else panic "unexpected none")}
         \\    var sum = 0
         \\    for value in source -> sum += value
         \\    if calls <> 1 -> return 90
@@ -1880,22 +1777,19 @@ test "for invalid explicit iterator factories do not silently use fallback" {
 }
 
 test "for next must return an exhaustion-bearing variant rather than payload data" {
-    const result_types = [_][]const u8{ "int", "unit", "bool" };
-    const results = [_][]const u8{ "0", "()", "true" };
-    const effects = [_][]const u8{ "func", "fallible" };
+    const result_types = [_][]const u8{ "int", "unit", "bool", "int | none", "unit | none", "bool | none" };
+    const results = [_][]const u8{ "0", "()", "true", "none", "none", "none" };
     for (result_types, results) |result_type, result| {
-        for (effects) |effect| {
-            const source = try test_sources.renderTemplate(std.testing.allocator,
-                \\struct Cursor
-                \\    pub $effect next(mut self: Cursor) $result_type -> $result
-                \\fallible run()
-                \\    var cursor = Cursor{}
-                \\    for value in cursor -> exit(value)
-                \\if run() -> exit(0)
-            , .{ .effect = effect, .result_type = result_type, .result = result });
-            defer std.testing.allocator.free(source);
-            try Fixture.expectSourceDiagnostic(source, .iterator_result_requires_end);
-        }
+        const source = try test_sources.renderTemplate(std.testing.allocator,
+            \\struct Cursor
+            \\    pub func next(mut self: Cursor) $result_type -> $result
+            \\func run()
+            \\    var cursor = Cursor{}
+            \\    for value in cursor -> exit(value)
+            \\run()
+        , .{ .result_type = result_type, .result = result });
+        defer std.testing.allocator.free(source);
+        try Fixture.expectSourceDiagnostic(source, .iterator_result_requires_end);
     }
     try Fixture.expectSourceDiagnostic(
         \\struct Cursor
@@ -1917,11 +1811,11 @@ test "for zip polls independent borrowed cursors from left to right" {
         \\    right: SpanIterator(int)
         \\    ended: bool
         \\    pub func next(mut self: Zipped) Pair | End
-        \\        if self.ended? -> return End{}
+        \\        if self.ended -> return End{}
         \\        const left = self.left.next()
-        \\        if ref first = left as int
+        \\        if ref first: int = left
         \\            const right = self.right.next()
-        \\            if ref second = right as int -> return Pair{left = first, right = second}
+        \\            if ref second: int = right -> return Pair{left = first, right = second}
         \\        self.ended = true
         \\        return End{}
         \\func run() int
@@ -1943,10 +1837,10 @@ test "for flatten stores outer and active inner cursor state without suspension"
         \\    inner: RangeIterator | none
         \\    pub func next(mut self: Flattened) int | End
         \\        loop
-        \\            if ref inner = self.inner as RangeIterator
-        \\                if const value = inner.next() as int -> return value
+        \\            if ref inner: RangeIterator = self.inner
+        \\                if const value: int = inner.next() -> return value
         \\            self.inner = none
-        \\            if const limit = self.outer.next() as int
+        \\            if const limit: int = self.outer.next()
         \\                const values = 0..limit
         \\                self.inner = values.iter()
         \\            else
@@ -1978,34 +1872,36 @@ test "for retained cursor buffer references respect content invalidation" {
         \\struct Cursor
         \\    position: int
         \\    buffered: String
-        \\    pub fallible next(mut self: Cursor) StringView | End
+        \\    pub func next(mut self: Cursor) StringView | End | none
         \\        self.position += 1
         \\        if self.position > 2 -> return End{}
-        \\        self.buffered.append?("next")
+        \\        const _: unit = self.buffered.append("next") else return none
         \\        return self.buffered.view()
-        \\fallible run()
+        \\func run() unit | none
         \\    var cursor = Cursor{position = 0, buffered = ""}
         \\    var retained: StringView | none = none
         \\    for value in cursor
         \\        if retained is none -> retained = value
-        \\    if ref view = retained as StringView -> print(view)
-        \\if run() -> exit(0)
+        \\    if ref view: StringView = retained -> print(view)
+        \\    return ()
+        \\if (run() is unit) -> exit(0)
     , .borrow_outlives_source);
 }
 
 test "for cursor lifetimes permit lending reused buffer views within each body" {
-    for ([_][]const u8{ "func", "fallible" }) |effect| {
+    for ([_][]const u8{ "StringView", "StringView | none" }) |result_type| {
         const source = try test_sources.renderTemplate(std.testing.allocator,
             \\struct Cursor
             \\    position: int
             \\    buffered: String
-            \\    pub fallible next(mut self: Cursor) StringView | End
+            \\    pub func next(mut self: Cursor) StringView | End
             \\        self.position += 1
             \\        if self.position > 2 -> return End{}
-            \\        self.buffered.append?("next")
-            \\        return self.view$marker()
-            \\    pub $effect view(ref self: Cursor) StringView -> self.buffered.view()
-            \\fallible calculate() int
+            \\        const _: unit = self.buffered.append("next") else panic "append failed"
+            \\        const view: StringView = self.view() else panic "missing view"
+            \\        return view
+            \\    pub func view(ref self: Cursor) $result_type -> self.buffered.view()
+            \\func calculate() int
             \\    var total = 30
             \\    for view in Cursor{position = 0, buffered = ""}
             \\        total += view.byte_length()
@@ -2013,7 +1909,7 @@ test "for cursor lifetimes permit lending reused buffer views within each body" 
             \\func run() int
             \\    if const result = calculate() -> return result
             \\    return 90
-        , .{ .effect = effect, .marker = if (std.mem.eql(u8, effect, "fallible")) "?" else "" });
+        , .{ .result_type = result_type });
         defer std.testing.allocator.free(source);
         try Fixture.expectParity(source, 42);
     }
@@ -2046,10 +1942,10 @@ test "for cursor lifetimes preserve borrowed factory results and resume their st
 
 test "for cursor lifetimes clean owned sources cursors and items on all failure stages" {
     const stages = [_]struct { factory: []const u8, poll: []const u8, prepare: []const u8, body: []const u8, expected: u8 }{
-        .{ .factory = "fail", .poll = "_ = 0", .prepare = "return Item{trace = self.trace}", .body = "fail", .expected = 30 },
-        .{ .factory = "Cursor{trace = self.trace}", .poll = "fail", .prepare = "return Item{trace = self.trace}", .body = "fail", .expected = 40 },
-        .{ .factory = "Cursor{trace = self.trace}", .poll = "_ = 0", .prepare = "fail", .body = "fail", .expected = 40 },
-        .{ .factory = "Cursor{trace = self.trace}", .poll = "_ = 0", .prepare = "return Item{trace = self.trace}", .body = "fail", .expected = 41 },
+        .{ .factory = "none", .poll = "_ = 0", .prepare = "return Item{trace = self.trace}", .body = "return none", .expected = 30 },
+        .{ .factory = "Cursor{trace = self.trace}", .poll = "return none", .prepare = "return Item{trace = self.trace}", .body = "return none", .expected = 40 },
+        .{ .factory = "Cursor{trace = self.trace}", .poll = "_ = 0", .prepare = "return none", .body = "return none", .expected = 40 },
+        .{ .factory = "Cursor{trace = self.trace}", .poll = "_ = 0", .prepare = "return Item{trace = self.trace}", .body = "return none", .expected = 41 },
     };
     for (stages) |stage| {
         const source = try test_sources.renderTemplate(std.testing.allocator,
@@ -2061,19 +1957,24 @@ test "for cursor lifetimes clean owned sources cursors and items on all failure 
             \\    trace: Ref(int)
             \\    drop = func(deinit self: Cursor)
             \\        self.trace.value += 10
-            \\    pub fallible next(mut self: Cursor) Item | End
+            \\    pub func next(mut self: Cursor) Item | End | none
             \\        $poll
             \\        $prepare
             \\struct Source
             \\    trace: Ref(int)
             \\    drop = func(deinit self: Source)
             \\        self.trace.value += 30
-            \\    pub fallible iter(ref self: Source) Cursor -> $factory
-            \\fallible walk(mut trace: int)
-            \\    for item in Source{trace = Ref.from(trace)} -> $body
+            \\    pub func iter(ref self: Source) Cursor | none -> $factory
+            \\func walk(mut trace: int) unit | none
+            \\    const source = Source{trace = Ref.from(trace)}
+            \\    var cursor: Cursor = source.iter() else return none
+            \\    for outcome in cursor
+            \\        const item: Item = outcome^ else return none
+            \\        $body
+            \\    return unit
             \\func run() int
             \\    var trace = 0
-            \\    if walk(trace) -> return 90
+            \\    if const _: unit = walk(trace) -> return 90
             \\    return trace
         , .{ .factory = stage.factory, .poll = stage.poll, .prepare = stage.prepare, .body = stage.body });
         defer std.testing.allocator.free(source);
@@ -2085,16 +1986,17 @@ test "cursor method invalidation rejects a view retained across two calls" {
     try Fixture.expectSourceDiagnostic(
         \\struct Cursor
         \\    buffered: String
-        \\    pub fallible next(mut self: Cursor) StringView | End
-        \\        self.buffered.append?("next")
+        \\    pub func next(mut self: Cursor) StringView | End | none
+        \\        const _: unit = self.buffered.append("next") else return none
         \\        return self.buffered.view()
-        \\fallible run()
+        \\func run() unit | none
         \\    var cursor = Cursor{buffered = ""}
-        \\    const result = cursor.next?()
-        \\    if const retained = result as StringView
-        \\        _ = cursor.next?()
+        \\    const result: StringView | End = cursor.next() else return none
+        \\    if const retained: StringView = result
+        \\        cursor.next()
         \\        print(retained)
-        \\if run() -> exit(0)
+        \\    return ()
+        \\if (run() is unit) -> exit(0)
     , .borrow_outlives_source);
 }
 
@@ -2103,32 +2005,34 @@ test "cursor method invalidation rejects a view retained across manual loop iter
         \\struct Cursor
         \\    position: int
         \\    buffered: String
-        \\    pub fallible next(mut self: Cursor) StringView | End
+        \\    pub func next(mut self: Cursor) StringView | End | none
         \\        self.position += 1
         \\        if self.position > 2 -> return End{}
-        \\        self.buffered.append?("next")
+        \\        const _: unit = self.buffered.append("next") else return none
         \\        return self.buffered.view()
-        \\fallible run()
+        \\func run() unit | none
         \\    var cursor = Cursor{position = 0, buffered = ""}
         \\    var retained: StringView | none = none
         \\    loop
-        \\        const result = cursor.next?()
-        \\        if const value = result as StringView
+        \\        const result: StringView | End = cursor.next() else return none
+        \\        if const value: StringView = result
         \\            if retained is none -> retained = value
         \\        else
         \\            break
-        \\    if ref view = retained as StringView -> print(view)
-        \\if run() -> exit(0)
+        \\    if ref view: StringView = retained -> print(view)
+        \\    return ()
+        \\if (run() is unit) -> exit(0)
     , .borrow_outlives_source);
 }
 
 test "for live list cursors reject backing relocation" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible run()
+        \\func run() unit | none
         \\    var values: List(int) = [1, 2]
         \\    for value in values
         \\        print("value")
-        \\        values.reserve?(100)
-        \\if run() -> exit(0)
+        \\        const _: unit = values.reserve(100) else return none
+        \\    return ()
+        \\if (run() is unit) -> exit(0)
     , .borrow_outlives_source);
 }

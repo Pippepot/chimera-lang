@@ -7,63 +7,66 @@ const ValueId = structures.FunctionValueId;
 const BlockId = structures.FunctionBlockId;
 const Instruction = structures.FunctionInstruction;
 const Terminator = structures.FunctionTerminator;
+const InlineFrameId = structures.InlineFrameId;
+const Range = structures.FunctionValueRange;
 const Function = function_ir.Function;
 
-pub fn compact(scratch: std.mem.Allocator, function: *Function, regions: []const Body) !Body {
+pub fn compact(scratch: std.mem.Allocator, function: *Function) !Body {
     function.resolveReferences();
-    const body = function.body;
-    const reachable = try reachableBlocks(scratch, function);
+    const reachable = (try function.controlFlowEdges()).reachable;
     const live = try liveValues(scratch, function, reachable);
 
     const block_map = try scratch.alloc(?u32, function.blocks.items.len);
-    var block_count: u32 = 0;
-    for (block_map, reachable) |*mapped, kept| {
-        mapped.* = if (kept) block_count else null;
-        if (kept) block_count += 1;
-    }
+    @memset(block_map, null);
+    var layout: std.ArrayList(u32) = .empty;
+    try layout.append(scratch, function.entry);
+    for (function.order.items) |block| if (reachable[block] and block != function.entry) try layout.append(scratch, block);
+    for (layout.items, 0..) |block, position| block_map[block] = @intCast(position);
 
     const value_map = try scratch.alloc(?u32, function.valueCount());
     @memset(value_map, null);
     var block_arguments: std.ArrayList(structures.FunctionBlockArgument) = .empty;
-    const argument_ranges = try scratch.alloc(structures.FunctionValueRange, function.blocks.items.len);
-    for (function.blocks.items, reachable, argument_ranges) |block, kept, *range| {
+    const argument_ranges = try scratch.alloc(Range, function.blocks.items.len);
+    for (layout.items) |block_index| {
         const start: u32 = @intCast(block_arguments.items.len);
-        if (kept) for (block.parameters.items) |parameter| if (live[@backingInt(parameter)]) {
+        for (function.blocks.items[block_index].parameters.items) |parameter| if (live[@backingInt(parameter)]) {
             value_map[@backingInt(parameter)] = @intCast(block_arguments.items.len);
             try block_arguments.append(scratch, function.definitions.items[@backingInt(parameter)].argument.data);
         };
-        range.* = .{ .start = start, .end = @intCast(block_arguments.items.len) };
+        argument_ranges[block_index] = .{ .start = start, .end = @intCast(block_arguments.items.len) };
     }
     const argument_count: u32 = @intCast(block_arguments.items.len);
 
-    const layout = try scratch.alloc(u32, block_count);
-    for (block_map, 0..) |mapped, index| if (mapped) |position| {
-        layout[position] = @intCast(index);
-    };
-    std.mem.sort(u32, layout, function, layoutBefore);
+    var rebuilt: Rebuilt = .{ .function = function, .live = live, .frame_map = try scratch.alloc(?u32, function.inline_frames.items.len), .region_map = try scratch.alloc(?u32, function.regions.items.len) };
+    @memset(rebuilt.frame_map, null);
+    @memset(rebuilt.region_map, null);
 
     var instructions: std.ArrayList(Instruction) = .empty;
     var instruction_spans: std.ArrayList(structures.SourceSpan) = .empty;
-    const instruction_ranges = try scratch.alloc(structures.FunctionValueRange, function.blocks.items.len);
-    for (layout) |block_index| {
+    var instruction_frames: std.ArrayList(InlineFrameId) = .empty;
+    const instruction_ranges = try scratch.alloc(Range, function.blocks.items.len);
+    for (layout.items) |block_index| {
         const start: u32 = @intCast(instructions.items.len);
         for (function.blocks.items[block_index].instructions.items) |index| {
             const result = function.results.items[index];
             if (function.removed.items[index] or !live[@backingInt(result)]) continue;
             value_map[@backingInt(result)] = argument_count + @as(u32, @intCast(instructions.items.len));
-            try instructions.append(scratch, function.instructions.items[index]);
-            if (function.publishesSpans()) try instruction_spans.append(scratch, function.spans.items[index]);
+            var instruction = function.instructions.items[index];
+            try rebuilt.relocateInstruction(scratch, &instruction);
+            try instructions.append(scratch, instruction);
+            if (function.publishes_spans) {
+                try instruction_spans.append(scratch, function.spans.items[index]);
+                try instruction_frames.append(scratch, try rebuilt.frame(scratch, function.frames.items[index]));
+            }
         }
         instruction_ranges[block_index] = .{ .start = start, .end = @intCast(instructions.items.len) };
     }
 
-    var rebuilt: Rebuilt = .{ .function = function, .live = live };
-    for (instructions.items) |*instruction| try rebuilt.relocateInstruction(scratch, instruction);
-
     var blocks: std.ArrayList(structures.FunctionBlock) = .empty;
     var terminator_spans: std.ArrayList(structures.SourceSpan) = .empty;
-    for (function.blocks.items, reachable, 0..) |block, kept, index| {
-        if (!kept) continue;
+    var terminator_frames: std.ArrayList(InlineFrameId) = .empty;
+    for (layout.items) |index| {
+        const block = function.blocks.items[index];
         var terminator = block.terminator;
         try rebuilt.relocateTerminator(scratch, &terminator);
         remapTargets(&terminator, block_map);
@@ -74,7 +77,10 @@ pub fn compact(scratch: std.mem.Allocator, function: *Function, regions: []const
             .instruction_end = instruction_ranges[index].end,
             .terminator = terminator,
         });
-        if (function.publishesSpans()) try terminator_spans.append(scratch, body.terminator_spans[index]);
+        if (function.publishes_spans) {
+            try terminator_spans.append(scratch, block.span);
+            try terminator_frames.append(scratch, try rebuilt.frame(scratch, block.frame));
+        }
     }
 
     const view: structures.FunctionBodyFinalization = .{
@@ -83,6 +89,7 @@ pub fn compact(scratch: std.mem.Allocator, function: *Function, regions: []const
         .call_arguments = rebuilt.call_arguments.items,
         .branch_arguments = rebuilt.branch_arguments.items,
         .initializer_captures = rebuilt.initializer_captures.items,
+        .aggregate_fields = rebuilt.aggregate_fields.items,
     };
     view.visitValueReferences(value_map, remapValue);
     for (instructions.items) |*instruction| if (instruction.* == .initializer_capture_write) {
@@ -90,47 +97,55 @@ pub fn compact(scratch: std.mem.Allocator, function: *Function, regions: []const
         write.parameter_index = value_map[write.parameter_index].?;
     };
 
+    const framed = rebuilt.inline_frames.items.len != 0;
     return .{
-        .return_type = body.return_type,
-        .is_fallible = body.is_fallible,
-        .is_initializer_region = body.is_initializer_region,
-        .initializer_regions = regions,
+        .return_type = function.return_type,
+        .is_initializer_region = function.is_initializer_region,
+        .initializer_regions = rebuilt.regions.items,
         .initializer_captures = rebuilt.initializer_captures.items,
-        .parameter_modes = body.parameter_modes,
+        .parameter_modes = function.parameter_modes,
         .block_arguments = block_arguments.items,
-        .variant_coercion_tags = body.variant_coercion_tags,
-        .borrow_fields = body.borrow_fields,
+        .variant_coercion_tags = rebuilt.variant_coercion_tags.items,
+        .borrow_fields = rebuilt.borrow_fields.items,
         .branch_arguments = rebuilt.branch_arguments.items,
         .call_arguments = rebuilt.call_arguments.items,
+        .aggregate_fields = rebuilt.aggregate_fields.items,
         .instructions = instructions.items,
         .instruction_spans = instruction_spans.items,
         .terminator_spans = terminator_spans.items,
+        .root_instance = function.root_instance,
+        .inline_frames = rebuilt.inline_frames.items,
+        .instruction_frames = if (framed) instruction_frames.items else &.{},
+        .terminator_frames = if (framed) terminator_frames.items else &.{},
         .blocks = blocks.items,
-        .entry = @fromBackingInt(block_map[@backingInt(body.entry)].?),
+        .entry = @fromBackingInt(0),
     };
-}
-
-fn layoutBefore(function: *const Function, a: u32, b: u32) bool {
-    const left = function.blocks.items[a].layout;
-    const right = function.blocks.items[b].layout;
-    return left < right or left == right and a < b;
 }
 
 const Rebuilt = struct {
     function: *const Function,
     live: []const bool,
+    frame_map: []?u32,
+    region_map: []?u32,
     call_arguments: std.ArrayList(structures.FunctionCallArgument) = .empty,
     branch_arguments: std.ArrayList(structures.FunctionValueUse) = .empty,
     initializer_captures: std.ArrayList(ValueId) = .empty,
+    aggregate_fields: std.ArrayList(ValueId) = .empty,
+    variant_coercion_tags: std.ArrayList(u32) = .empty,
+    borrow_fields: std.ArrayList(structures.BorrowProjection) = .empty,
+    inline_frames: std.ArrayList(structures.InlineFrame) = .empty,
+    regions: std.ArrayList(Body) = .empty,
 
     fn relocateInstruction(self: *Rebuilt, scratch: std.mem.Allocator, instruction: *Instruction) !void {
         switch (instruction.*) {
             .call => |*call| try self.relocateCall(scratch, call),
             .initializer_ref => |*reference| {
-                const start: u32 = @intCast(self.initializer_captures.items.len);
-                try self.initializer_captures.appendSlice(scratch, self.function.initializer_captures.items[reference.captures.start..reference.captures.end]);
-                reference.captures = .{ .start = start, .end = @intCast(self.initializer_captures.items.len) };
+                reference.captures = try relocate(ValueId, scratch, &self.initializer_captures, self.function.initializer_captures.items, reference.captures);
+                reference.region = try self.region(scratch, reference.region);
             },
+            .aggregate => |*aggregate| aggregate.fields = try relocate(ValueId, scratch, &self.aggregate_fields, self.function.aggregate_fields.items, aggregate.fields),
+            inline .variant_coerce, .variant_extract => |*operation| operation.tag_mapping = try self.tagMapping(scratch, operation.tag_mapping),
+            .borrow_address => |*operation| operation.fields = try relocate(structures.BorrowProjection, scratch, &self.borrow_fields, self.function.borrow_fields.items, operation.fields),
             else => {},
         }
     }
@@ -142,14 +157,18 @@ const Rebuilt = struct {
                 try self.relocateBranch(scratch, &predicate.then_branch);
                 try self.relocateBranch(scratch, &predicate.else_branch);
             },
-            .fallible_call => |*fallible| try self.relocateCall(scratch, &fallible.call),
-            .return_unit, .return_value, .return_failure, .diverge => {},
+            .return_value => |*use| use.variant_tag_mapping = try self.tagMapping(scratch, use.variant_tag_mapping),
+            .return_unit, .diverge => {},
         }
     }
 
     fn relocateCall(self: *Rebuilt, scratch: std.mem.Allocator, call: *structures.FunctionCall) !void {
         const start: u32 = @intCast(self.call_arguments.items.len);
-        try self.call_arguments.appendSlice(scratch, self.function.call_arguments.items[call.arguments.start..call.arguments.end]);
+        for (self.function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
+            var relocated = argument;
+            if (relocated == .prepared) relocated.prepared.variant_tag_mapping = try self.tagMapping(scratch, argument.prepared.variant_tag_mapping);
+            try self.call_arguments.append(scratch, relocated);
+        }
         call.arguments = .{ .start = start, .end = @intCast(self.call_arguments.items.len) };
     }
 
@@ -159,11 +178,78 @@ const Rebuilt = struct {
         const arguments = self.function.branch_arguments.items[branch.arguments.start..branch.arguments.end];
         std.debug.assert(parameters.len == arguments.len);
         for (parameters, arguments) |parameter, argument| {
-            if (self.live[@backingInt(parameter)]) try self.branch_arguments.append(scratch, argument);
+            if (!self.live[@backingInt(parameter)]) continue;
+            var relocated = argument;
+            relocated.variant_tag_mapping = try self.tagMapping(scratch, argument.variant_tag_mapping);
+            try self.branch_arguments.append(scratch, relocated);
         }
         branch.arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) };
     }
+
+    fn tagMapping(self: *Rebuilt, scratch: std.mem.Allocator, mapping: ?Range) !?Range {
+        return try relocate(u32, scratch, &self.variant_coercion_tags, self.function.variant_coercion_tags.items, mapping orelse return null);
+    }
+
+    fn frame(self: *Rebuilt, scratch: std.mem.Allocator, original: InlineFrameId) !InlineFrameId {
+        if (original == .root) return .root;
+        const index = @backingInt(original);
+        if (self.frame_map[index]) |mapped| return @fromBackingInt(mapped);
+        var copied = self.function.inline_frames.items[index];
+        copied.parent = try self.frame(scratch, copied.parent);
+        const mapped: u32 = @intCast(self.inline_frames.items.len);
+        try self.inline_frames.append(scratch, copied);
+        self.frame_map[index] = mapped;
+        return @fromBackingInt(mapped);
+    }
+
+    fn region(self: *Rebuilt, scratch: std.mem.Allocator, original: u32) !u32 {
+        if (self.region_map[original]) |mapped| return mapped;
+        const mapped: u32 = @intCast(self.regions.items.len);
+        try self.regions.append(scratch, self.function.regions.items[original]);
+        self.region_map[original] = mapped;
+        return mapped;
+    }
 };
+
+fn relocate(comptime T: type, scratch: std.mem.Allocator, table: *std.ArrayList(T), source: []const T, range: Range) !Range {
+    const start: u32 = @intCast(table.items.len);
+    try table.appendSlice(scratch, source[range.start..range.end]);
+    return .{ .start = start, .end = @intCast(table.items.len) };
+}
+
+pub fn removeDead(function: *Function) !function_ir.Changes {
+    function.resolveReferences();
+    const reachable = (try function.controlFlowEdges()).reachable;
+    const live = try liveValues(function.scratch, function, reachable);
+    var changes: function_ir.Changes = .{};
+    for (function.results.items, function.removed.items, function.instructions.items) |result, *removed, *instruction| {
+        if (!removed.* and !live[@backingInt(result)]) {
+            changes.storage = changes.storage or function_ir.usesStorage(function, instruction);
+            removed.* = true;
+            changes.changed = true;
+        }
+    }
+    for (function.blocks.items, reachable) |*block, kept| if (!kept) {
+        if (block.instructions.items.len != 0 or block.terminator != .diverge) changes.changed = true;
+        block.instructions.clearRetainingCapacity();
+        block.terminator = .diverge;
+    };
+    const incoming = (try function.controlFlowEdges()).incoming;
+    for (function.blocks.items, reachable, 0..) |block, kept, index| {
+        if (!kept) continue;
+        var position = block.parameters.items.len;
+        while (position > 0) {
+            position -= 1;
+            if (!live[@backingInt(function.blocks.items[index].parameters.items[position])]) {
+                try function.removeParameter(@intCast(index), position, incoming[index].items);
+                changes.changed = true;
+                changes.storage = true;
+            }
+        }
+    }
+    if (changes.changed) function.invalidateOperands();
+    return changes;
+}
 
 fn remapTargets(terminator: *Terminator, block_map: []const ?u32) void {
     switch (terminator.*) {
@@ -172,11 +258,7 @@ fn remapTargets(terminator: *Terminator, block_map: []const ?u32) void {
             remapBlock(&predicate.then_branch.target, block_map);
             remapBlock(&predicate.else_branch.target, block_map);
         },
-        .fallible_call => |*fallible| {
-            remapBlock(&fallible.success, block_map);
-            if (fallible.failure) |*failure| remapBlock(failure, block_map);
-        },
-        .return_unit, .return_value, .return_failure, .diverge => {},
+        .return_unit, .return_value, .diverge => {},
     }
 }
 
@@ -186,24 +268,6 @@ fn remapBlock(block: *BlockId, block_map: []const ?u32) void {
 
 fn remapValue(value_map: []const ?u32, value: *ValueId) void {
     value.* = @fromBackingInt(value_map[@backingInt(value.*)].?);
-}
-
-pub fn reachableBlocks(scratch: std.mem.Allocator, function: *Function) ![]bool {
-    const reachable = try scratch.alloc(bool, function.blocks.items.len);
-    @memset(reachable, false);
-    var pending: std.ArrayList(u32) = .empty;
-    const entry = @backingInt(function.body.entry);
-    try pending.append(scratch, entry);
-    reachable[entry] = true;
-    while (pending.pop()) |block| {
-        for (Function.edges(&function.blocks.items[block].terminator)) |maybe_edge| if (maybe_edge) |edge| {
-            const target = @backingInt(Function.edgeTarget(edge));
-            if (reachable[target]) continue;
-            reachable[target] = true;
-            try pending.append(scratch, target);
-        };
-    }
-    return reachable;
 }
 
 const Liveness = struct {
@@ -224,9 +288,9 @@ const Liveness = struct {
 fn liveValues(scratch: std.mem.Allocator, function: *Function, reachable: []const bool) ![]const bool {
     var liveness: Liveness = .{ .function = function, .live = try scratch.alloc(bool, function.valueCount()) };
     @memset(liveness.live, false);
-    const incoming = try incomingBranches(scratch, function, reachable);
+    const incoming = (try function.controlFlowEdges()).incoming;
     const tables = function_ir.tableView(function);
-    for (function.blocks.items[@backingInt(function.body.entry)].parameters.items) |parameter| liveness.mark(parameter);
+    for (function.blocks.items[function.entry].parameters.items) |parameter| liveness.mark(parameter);
     for (function.blocks.items, reachable) |*block, kept| {
         if (!kept) continue;
         for (block.instructions.items) |index| {
@@ -234,9 +298,6 @@ fn liveValues(scratch: std.mem.Allocator, function: *Function, reachable: []cons
                 liveness.mark(function.results.items[index]);
         }
         function_ir.visitTerminatorOperands(tables, &block.terminator, &liveness, Liveness.mark);
-        for (Function.edges(&block.terminator)) |maybe_edge| if (maybe_edge) |edge| if (edge == .fallible) {
-            for (function.blocks.items[@backingInt(edge.fallible)].parameters.items) |result| liveness.mark(result);
-        };
     }
     while (liveness.pending.pop()) |value| switch (function.definitions.items[@backingInt(value)]) {
         .instruction => |index| {
@@ -245,30 +306,21 @@ fn liveValues(scratch: std.mem.Allocator, function: *Function, reachable: []cons
         },
         .argument => |argument| {
             const position = std.mem.indexOfScalar(ValueId, function.blocks.items[argument.block].parameters.items, value).?;
-            for (incoming[argument.block].items) |branch| liveness.mark(function.branch_arguments.items[branch.arguments.start + position].value);
+            for (incoming[argument.block].items) |edge| {
+                const branch = edge.branch(function);
+                liveness.mark(function.branch_arguments.items[branch.arguments.start + position].value);
+            }
         },
     };
     if (liveness.failed) |err| return err;
     return liveness.live;
 }
 
-pub fn incomingBranches(scratch: std.mem.Allocator, function: *Function, reachable: []const bool) ![]std.ArrayList(*structures.FunctionBranch) {
-    const incoming = try scratch.alloc(std.ArrayList(*structures.FunctionBranch), function.blocks.items.len);
-    @memset(incoming, .empty);
-    for (function.blocks.items, reachable) |*block, kept| {
-        if (!kept) continue;
-        for (Function.edges(&block.terminator)) |maybe_edge| if (maybe_edge) |edge| if (edge == .branch) {
-            try incoming[@backingInt(edge.branch.target)].append(scratch, edge.branch);
-        };
-    }
-    return incoming;
-}
-
-fn removableWhenUnused(function: *const Function, instruction: Instruction) bool {
+pub fn removableWhenUnused(function: *const Function, instruction: Instruction) bool {
     return switch (instruction) {
-        .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .local_storage, .addi, .subi, .muli, .negi, .byte_to_int => true,
+        .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .variant_tag, .field_access, .borrow_address, .borrow_read, .borrow_box, .storage_projection, .allocation_element, .array_element, .storage_cursor, .cursor_offset, .cursor_element => true,
         .divsi => |operands| if (function.definition(operands.rhs)) |divisor| divisor == .const_int and divisor.const_int != 0 else false,
-        .value_copy => |copy| copy.destination == null and isScalar(copy.type_id),
+        inline .value_copy, .variant_coerce, .variant_extract => |operation| operation.destination == null,
         else => false,
     };
 }

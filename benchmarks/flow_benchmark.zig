@@ -46,7 +46,6 @@ const Measure = struct {
             resolved.file_id,
             signature.parameters,
             signature.return_type,
-            signature.is_fallible,
             .{ .measurements = if (collect_measurements) &measurements else null },
             analysis,
             unresolved,

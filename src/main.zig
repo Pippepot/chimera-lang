@@ -211,7 +211,7 @@ fn compileAndRun(
     if (input.debug_flags.timing) {
         if (bundled) |loader| {
             const loaded = loader.stats();
-            try errors.print("precompiled std: {d} bodies, {d} functions loaded on demand\n", .{ loaded.bodies, loaded.functions });
+            try errors.print("precompiled std: {d} typed, {d} prepared, {d} optimized bodies, {d} call components, {d} native functions loaded on demand\n", .{ loaded.bodies, loaded.prepared, loaded.optimized, loaded.components, loaded.functions });
         }
     }
     const emitted = try db.transitiveAccumulatorValues(
@@ -530,8 +530,9 @@ test "zero one and four workers produce identical multi-file artifacts" {
     const io = std.testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     const source_files = [_]modules.SourceFile{
-        .{ .path = "a.chi", .module_path = "", .source = "static a = func() int -> return 10" },
-        .{ .path = "b.chi", .module_path = "", .source = "static b = func() int -> return 11" },
+        .{ .path = "a.chi", .module_path = "", .source = "static a = func() int -> shared() + 5" },
+        .{ .path = "b.chi", .module_path = "", .source = "static b = func() int -> shared() + 6" },
+        .{ .path = "shared.chi", .module_path = "", .source = "func shared() int -> 5" },
     };
     var first_artifact: ?[]u8 = null;
     defer if (first_artifact) |bytes| std.testing.allocator.free(bytes);
@@ -731,10 +732,10 @@ test "CLI supports compile-time allocation with scalar publication" {
     const result = try compileAndRun(io, std.testing.allocator, .{
         .source_path = "allocation.chi",
         .source =
-        \\fallible compute() int
-        \\  const owner = Box.new?(42)
+        \\func compute() int | none
+        \\  const owner: Box(int) = Box.new(42) else return none
         \\  return owner.borrow()
-        \\static answer = compute?()
+        \\static answer = (if const _selected_result_0: int = compute() -> _selected_result_0 else panic "unexpected none")
         \\exit(answer)
         ,
         .program_args = &.{},

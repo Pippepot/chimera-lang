@@ -42,11 +42,12 @@ flowchart TD
    bindings; standard-library files never receive those defaults.
 3. `ValidateModuleGraph` checks imports, exports, and converter declarations
    before entry compilation. `AnalyzeFunctionInstance` builds typed SSA for each
-   demanded runtime instance, including the implicitly fallible top-level entry.
+   demanded runtime instance, including the ordinary unit top-level entry.
    Reference analysis and lifetime planning finish before publication.
 4. `CompileFunction` checks runtime eligibility on the typed body, obtains host
    layout, and emits one artifact from `OptimizeFunctionInstance` without
-   compiling callees. Reachability starts at the
+   compiling callees. Optimization inlines small non-recursive callees from
+   their own optimized bodies, so editing such a callee recomputes its callers. Reachability starts at the
    designated entry and follows callable references breadth-first. Unreachable
    bodies remain unanalyzed; a function named `main` has no special role.
 5. `BuildExecutable` links the reachable artifacts and, when needed, panic trace
@@ -98,8 +99,14 @@ queued dependency, avoiding spurious cycles through unrelated work. With zero
 workers, spawned work stays queued until demanded. Cycle detection distinguishes
 currently verified edges from stale dependencies.
 
-An idle input update advances the revision only when its value changes. Cached
-queries reverify dependencies and rerun after changes or dependency failures.
+An idle input update advances the revision only when its value changes. Each
+completed query summarizes its transitive input dependencies with a conservative
+fingerprint. A bounded journal of changed input hashes lets unrelated revisions
+verify whole subgraphs without walking their edges. Possible fingerprint matches,
+expired history, and failed subtrees use ordinary dependency verification.
+Summaries refresh even when a recomputation returns an equal result, preserving
+changes to dynamic dependencies. Cached queries rerun after dependency changes
+or failures.
 Recomputation atomically replaces dependencies, output, and diagnostics. Equal
 observable results retain the previous allocation and change revision. Changed
 diagnostics are observable even when the ordinary output is equal.
@@ -127,12 +134,17 @@ accepted only after dependency and representation checks. Damaged or stale state
 is discarded or recomputed. Successful builds update caches by atomic replace.
 
 Ordinary runs also install the embedded std bundle, independently of disk cache.
-Installation indexes encoded results without decoding every body. Demanded body
-or native-function queries load through the normal scheduler and output ownership.
+Installation indexes encoded results without decoding every body. Typed,
+prepared, and optimized bodies, call components, and native functions load
+through the normal scheduler and output ownership. Inlining reuses the bundled
+optimized body without rerunning std preparation or optimization.
 `StandardLibraryUnchanged` validates registered std text, paths, ownership,
 membership, and prelude identity. File-ID changes reset translation memoization;
 incompatible variant representations or source overrides use ordinary queries.
-AST, SSA, and assembly debug views bypass bundled results.
+Optimized bodies and native functions also depend on the bundle's inline limit;
+a different limit uses ordinary optimization while prepared bodies and call
+components remain reusable. Reads of an absent limit still track later overrides.
+AST, SSA, optimized SSA, and assembly debug views bypass bundled results.
 
 ## Lifetimes
 
@@ -148,3 +160,11 @@ AST, SSA, and assembly debug views bypass bundled results.
 
 Equal recomputation retains result pointers; changed recomputation may invalidate
 them. Consumers needing longer lifetimes copy owned data or retain stable IDs.
+
+Most structurally owned query outputs compact from computation scratch into a
+result arena. Queries opting into `result_arena` must allocate every owned output
+payload through `Context.resultAllocator`; scratch must not escape.
+`BuildExecutable` builds its immutable byte image there while temporary linker
+indexes use scratch, avoiding a full-image publication copy. Restored outputs
+still compact normally. Failed or observably equal computations discard their
+fresh result arena without replacing the previous output.

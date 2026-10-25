@@ -15,15 +15,14 @@ fn relativeTarget(code: []const u8, cursor: usize, pattern: Pattern) i64 {
     return @as(i64, @intCast(cursor + pattern.length())) + relative;
 }
 
-/// Maps every instruction start to its label, if a branch targets it.
-fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(i64, ?usize) {
-    var targets = std.AutoHashMap(i64, ?usize).init(gpa);
+fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(i64, usize) {
+    var targets = std.AutoHashMap(i64, usize).init(gpa);
     errdefer targets.deinit();
     var next_label: usize = 0;
     var cursor: usize = 0;
     while (cursor < code.len) {
         const pat = matchPattern(code[cursor..]) orelse break;
-        try targets.put(@intCast(cursor), null);
+        try targets.put(@intCast(cursor), std.math.maxInt(usize));
         cursor += pat.length();
     }
     cursor = 0;
@@ -31,7 +30,7 @@ fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(i64
         const pat = matchPattern(code[cursor..]) orelse break;
         if (pat.operand == .rel) {
             const target = relativeTarget(code, cursor, pat);
-            if (targets.getPtr(target)) |label| if (label.* == null) {
+            if (targets.getPtr(target)) |label| if (label.* == std.math.maxInt(usize)) {
                 label.* = next_label;
                 next_label += 1;
             };
@@ -48,28 +47,42 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
     defer targets.deinit();
     var cursor: usize = 0;
     while (cursor < code.len) {
-        if (targets.get(@intCast(cursor)) orelse null) |label| try out.print(gpa, "L{d}:\n", .{label});
+        if (targets.get(@intCast(cursor))) |label_idx| if (label_idx != std.math.maxInt(usize)) {
+            try out.print(gpa, "L{d}:\n", .{label_idx});
+        };
         const pat = matchPattern(code[cursor..]) orelse {
             for (code[cursor..]) |byte| try out.print(gpa, "  db 0x{x:0>2}\n", .{byte});
             break;
         };
-        try out.print(gpa, "  {s}", .{pat.asm_prefix});
-        const operand = code[cursor + pat.prefix.len ..];
         switch (pat.operand) {
-            .none => {},
-            .i8 => try out.print(gpa, "{d}", .{@as(i8, @bitCast(operand[0]))}),
-            .u8 => try out.print(gpa, "{d}", .{operand[0]}),
-            .i32 => try out.print(gpa, "{d}", .{std.mem.readInt(i32, operand[0..4], .little)}),
-            .u32 => try out.print(gpa, "{d}", .{std.mem.readInt(u32, operand[0..4], .little)}),
-            .u64 => try out.print(gpa, "0x{x}", .{std.mem.readInt(u64, operand[0..8], .little)}),
+            .none => try out.print(gpa, "  {s}{s}\n", .{ pat.asm_prefix, pat.asm_suffix }),
+            .i8 => {
+                const val: i8 = @bitCast(code[cursor + pat.prefix.len]);
+                try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
+            },
+            .u8 => try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, code[cursor + pat.prefix.len], pat.asm_suffix }),
+            .i32 => {
+                const val = std.mem.readInt(i32, code[cursor + pat.prefix.len ..][0..4], .little);
+                try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
+            },
+            .u32 => {
+                const val = std.mem.readInt(u32, code[cursor + pat.prefix.len ..][0..4], .little);
+                try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
+            },
+            .u64 => {
+                const val = std.mem.readInt(u64, code[cursor + pat.prefix.len ..][0..8], .little);
+                try out.print(gpa, "  {s}0x{x}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
+            },
             .rel => {
                 const target = relativeTarget(code, cursor, pat);
-                if (targets.get(target) orelse null) |label| {
-                    try out.print(gpa, "L{d}", .{label});
-                } else try out.print(gpa, "{d}", .{target});
+                const label = targets.get(target) orelse std.math.maxInt(usize);
+                if (label != std.math.maxInt(usize)) {
+                    try out.print(gpa, "  {s}L{d}{s}\n", .{ pat.asm_prefix, label, pat.asm_suffix });
+                } else {
+                    try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, target, pat.asm_suffix });
+                }
             },
         }
-        try out.print(gpa, "{s}\n", .{pat.asm_suffix});
         cursor += pat.length();
     }
     return out.toOwnedSlice(gpa);
@@ -90,7 +103,7 @@ test "disassembly handles truncated instructions and external branch targets" {
     }
 }
 
-test "disassembly decodes stack comparisons byte copies and fallible status" {
+test "disassembly decodes stack comparisons byte copies and register writes" {
     const code = [_]u8{
         0x3B, 0x84, 0x24, 4,    0, 0, 0,
         0x0F, 0xB6, 0x84, 0x24, 8, 0, 0,

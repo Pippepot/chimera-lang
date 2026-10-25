@@ -8,19 +8,18 @@ pub struct Allocation(T: type)
     storage: HostStorage
     count: int
     drop = explicit
-
-    pub fallible allocate(count: int) Allocation(T) -> std.memory.allocate?(T, count)
+    pub func allocate(count: int) Allocation(T) | none -> std.memory.allocate(T, count)
     pub func deallocate(deinit self: Allocation(T)) -> std.memory.deallocate(T, self^)
     pub func capacity(imm self: Allocation(T)) int -> allocation_count(T, self)
-    pub fallible unsafe_initialize(mut self: Allocation(T), index: int, init item: T) -> std.memory.unsafe_initialize?(T, self, index, item)
+    pub func unsafe_initialize(mut self: Allocation(T), index: int, init item: T) -> std.memory.unsafe_initialize(T, self, index, item)
     pub func unsafe_take(mut self: Allocation(T), index: int) T -> std.memory.unsafe_take(T, self, index)
     pub func unsafe_destroy(mut self: Allocation(T), index: int) -> std.memory.unsafe_destroy(T, self, index)
     pub func unsafe_borrow(ref self: Allocation(T), index: int) ref T -> std.memory.unsafe_borrow(T, self, index)
 
-pub extern fallible allocate(static T: type, count: int) Allocation(T)
+pub extern func allocate(static T: type, count: int) Allocation(T) | none
 pub extern func deallocate(static T: type, deinit allocation: Allocation(T))
 extern func allocation_count(static T: type, imm allocation: Allocation(T)) int
-pub extern fallible unsafe_initialize(static T: type, mut allocation: Allocation(T), index: int, init item: T)
+pub extern func unsafe_initialize(static T: type, mut allocation: Allocation(T), index: int, init item: T)
 pub extern func unsafe_take(static T: type, mut allocation: Allocation(T), index: int) T
 pub extern func unsafe_destroy(static T: type, mut allocation: Allocation(T), index: int)
 pub extern func unsafe_borrow(static T: type, ref allocation: Allocation(T), index: int) ref T
@@ -28,7 +27,7 @@ pub extern func unsafe_borrow(static T: type, ref allocation: Allocation(T), ind
 pub struct collection_sequence(T: type)
     move = none
     copy = none
-    value: List(T)
+    value: List(T) | none
 
 pub struct List(T: type)
     copy = none
@@ -42,22 +41,19 @@ pub struct List(T: type)
             unsafe_destroy(T, self.storage, index)
         deallocate(T, self.storage^)
 
-    pub fallible from(static N: int, init values: collection_literal(T, N)) List(T)
-        var result = List(T){storage = allocate?(T, N), initialized = 0}
+    pub func from(static N: int, init values: collection_literal(T, N)) List(T) | none
+        const storage: Allocation(T) = allocate(T, N) else return none
+        var result = List(T){storage = storage^, initialized = 0}
         initialize_collection(T, N, result.storage, values)
         result.initialized = N
         return result^
-
-    pub fallible collect(init values: collection_sequence(T)) List(T)
-        var result: List(T) = values
-        return result^
-
-    pub fallible new(reserved: int) List(T)
-        const storage = allocate?(T, reserved)
+    pub func collect(init values: collection_sequence(T)) List(T) | none -> values
+    pub func new(reserved: int) List(T) | none
+        const storage: Allocation(T) = allocate(T, reserved) else return none
         return List(T){storage = storage^, initialized = 0}
-
-    pub fallible filled(imm value: T, count: int) List(T) where T.copy is func(imm T) T
-        var result = List(T){storage = allocate?(T, count), initialized = 0}
+    pub func filled(imm value: T, count: int) List(T) | none where T.copy is func(imm T) T
+        const storage: Allocation(T) = allocate(T, count) else return none
+        var result = List(T){storage = storage^, initialized = 0}
         loop
             if result.initialized == count -> break
             initialize_collection_element(T, result.storage, result.initialized, value)
@@ -72,58 +68,68 @@ pub struct List(T: type)
         return view.iter()
     pub func consume_iter(deinit self: List(T)) ListIterator(T)
         return ListIterator(T){storage = self.storage^, first = 0, limit = self.initialized}
-    pub fallible slice(ref self: List(T), bounds: Range) Span(T)
+    pub func slice(ref self: List(T), bounds: Range) Span(T) | none
         var view = self.span()
-        return view.slice?(bounds)
-    pub fallible bytes(imm self: List(byte)) BytesView -> BytesView.unsafe_from_allocation?(self.storage, self.initialized)
-    pub fallible read_bytes(mut self: List(byte), descriptor: int, count: int) int
-        count >= 0
-        count <= 2147483647 - self.initialized
+        return view.slice(bounds)
+    pub func bytes(imm self: List(byte)) BytesView
+        const view: BytesView = BytesView.unsafe_from_allocation(self.storage, self.initialized) else panic "invalid List byte view"
+        return view
+    pub func read_bytes(mut self: List(byte), descriptor: int, count: int) int | none
+        if count < 0 or count > 2147483647 - self.initialized -> return none
         if count == 0 -> return 0
-        self.reserve?(self.initialized + count)
-        const actual = io_read?(descriptor, self.storage, self.initialized, count)
+        const _: unit = self.reserve(self.initialized + count) else return none
+        const actual: int = io_read(descriptor, self.storage, self.initialized, count) else return none
         self.initialized += actual
         return actual
 
-    pub fallible reserve(mut self: List(T), minimum_capacity: int)
-        minimum_capacity >= 0
-        if minimum_capacity <= self.capacity() -> return
-        var replacement = allocate?(T, minimum_capacity)
+    pub func reserve(mut self: List(T), minimum_capacity: int) unit | none
+        if minimum_capacity < 0 -> return none
+        if minimum_capacity <= self.capacity() -> return unit
+        var replacement: Allocation(T) = allocate(T, minimum_capacity) else return none
         var index = self.initialized
         loop
             if index == 0 -> break
             index -= 1
-            var item = unsafe_take(T, self.storage, index)
+            const item = unsafe_take(T, self.storage, index)
             initialize_collection_element(T, replacement, index, item^)
         const previous = self.storage^
         self.storage = replacement^
         deallocate(T, previous^)
+        return unit
 
-    pub fallible append(mut self: List(T), var item: T)
+    pub func append(mut self: List(T), var item: T) unit | none
         const capacity = self.capacity()
         if self.initialized == capacity
-            capacity < 2147483647
+            if capacity == 2147483647 -> return none
             var next_capacity = 1
             if capacity > 0
                 if capacity <= 1073741823 -> next_capacity = capacity * 2
                 else next_capacity = 2147483647
-            self.reserve?(next_capacity)
-        unsafe_initialize?(T, self.storage, self.initialized, item^)
+            const _: unit = self.reserve(next_capacity) else return none
+        unsafe_initialize(T, self.storage, self.initialized, item^)
         self.initialized += 1
+        return unit
 
-    fallible get_at(ref self: List(T), index: int) ref T
-        index >= 0
-        index < self.initialized
+    func get_at(ref self: List(T), index: int) ref T | none
+        if index < 0 or index >= self.initialized -> return none
         return unsafe_borrow(T, self.storage, index)
-
-    fallible get_from_end(ref self: List(T), index: FromEnd) ref T
-        return self.get_at?(index.resolve?(self.initialized))
-
+    func get_from_end(ref self: List(T), index: FromEnd) ref T | none
+        const resolved: int = index.resolve(self.initialized) else return none
+        return self.get_at(resolved)
     pub overload get(get_at, get_from_end)
+    func at(ref self: List(T), index: int) ref T
+        if index < 0 or index >= self.initialized -> panic "List index out of bounds"
+        return unsafe_borrow(T, self.storage, index)
+    func at_from_end(ref self: List(T), index: FromEnd) ref T
+        const resolved: int = index.resolve(self.initialized) else panic "List index out of bounds"
+        return self.at(resolved)
+    func slice_at(ref self: List(T), bounds: Range) Span(T)
+        var view: Span(T) = self.slice(bounds) else panic "List slice out of bounds"
+        return view
+    pub overload [](at, at_from_end, slice_at)
 
-    pub fallible remove(mut self: List(T), index: int) T
-        index >= 0
-        index < self.initialized
+    pub func remove(mut self: List(T), index: int) T | none
+        if index < 0 or index >= self.initialized -> return none
         const result = unsafe_take(T, self.storage, index)
         var position = index
         loop
@@ -134,11 +140,8 @@ pub struct List(T: type)
             position = next
         self.initialized -= 1
         return result^
-
-    pub overload [](get_at, get_from_end, slice)
-
-    pub fallible []=(static Index: type, mut self: List(T), index: Index, var item: T) unit where Index is int or Index is FromEnd
-        ref element = self.get?(index)
+    pub func []=(static Index: type, mut self: List(T), index: Index, var item: T) unit where Index is int or Index is FromEnd
+        ref element = self[index]
         element = item^
 
 pub struct ListIterator(T: type)
@@ -153,7 +156,6 @@ pub struct ListIterator(T: type)
             position -= 1
             unsafe_destroy(T, self.storage, position)
         deallocate(T, self.storage^)
-
     pub func next(mut self: ListIterator(T)) T | End
         if self.first >= self.limit -> return End{}
         const item = unsafe_take(T, self.storage, self.first)
@@ -161,81 +163,55 @@ pub struct ListIterator(T: type)
         return item^
 
 func allocate_literal(static T: type, count: int) Allocation(T)
-    if const storage = allocate(T, count) -> return storage^
-    panic "List literal allocation failed"
-
+    const storage: Allocation(T) = allocate(T, count) else panic "List literal allocation failed"
+    return storage^
 extern func initialize_collection(static T: type, static N: int, mut storage: Allocation(T), init values: collection_literal(T, N))
-
 pub converter(static T: type, static N: int, init values: collection_literal(T, N)) List(T)
     var result = List(T){storage = allocate_literal(T, N), initialized = 0}
     initialize_collection(T, N, result.storage, values)
     result.initialized = N
     return result^
 
-# Compiler-generated collection construction uses these internal declarations.
 extern func static_iteration_item(static T: type, imm item: T) unit
-
 func collection_array_iterator(static T: type, static N: int, ref value: Array(T, N)) SpanIterator(T)
     return SpanIterator(T){source = Span(T){data = array_cursor(T, N, value), size = N}, position = 0}
-
-fallible destructure_list(static T: type, static N: int, deinit value: List(T)) Array(T, N)
+func destructure_list(static T: type, static N: int, deinit value: List(T)) Array(T, N)
     var owner = value^
-    owner.initialized == N
+    if owner.initialized <> N -> panic "invalid List destructuring length"
     owner.initialized = 0
     return [unsafe_take(T, owner.storage, index) static for index in 0..N]
-
 func new_collection_list(static T: type, static capacity: int) List(T)
     return List(T){storage = allocate_literal(T, capacity), initialized = 0}
-
-fallible new_collection_list_fallible(static T: type, static capacity: int) List(T)
-    return List(T){storage = allocate?(T, capacity), initialized = 0}
-
+func new_collection_list_optional(static T: type, static capacity: int) List(T) | none -> List(T).new(capacity)
 extern func initialize_collection_element(static T: type, mut storage: Allocation(T), index: int, init item: T) unit
-
 func append_collection_bounded(static T: type, mut result: List(T), init item: T)
     if result.initialized >= result.capacity() -> panic "Collection construction bound exceeded"
     initialize_collection_element(T, result.storage, result.initialized, item)
     result.initialized += 1
-
 func append_collection_growing(static T: type, mut result: List(T), init item: T)
+    const _: unit = append_collection_optional(T, result, item) else panic "List literal allocation failed"
+func append_collection_optional(static T: type, mut result: List(T), init item: T) unit | none
     const capacity = result.capacity()
     if result.initialized == capacity
+        if capacity == 2147483647 -> return none
         var next = 1
         if capacity > 0
             if capacity <= 1073741823 -> next = capacity * 2
             else next = 2147483647
-        if result.initialized == 2147483647 -> panic "List literal capacity exceeded"
-        if result.reserve(next) -> ()
-        else panic "List literal allocation failed"
+        const _: unit = result.reserve(next) else return none
     initialize_collection_element(T, result.storage, result.initialized, item)
     result.initialized += 1
-
-fallible append_collection_fallible(static T: type, mut result: List(T), init item: T)
-    const capacity = result.capacity()
-    if result.initialized == capacity
-        result.initialized < 2147483647
-        var next = 1
-        if capacity > 0
-            if capacity <= 1073741823 -> next = capacity * 2
-            else next = 2147483647
-        result.reserve?(next)
-    initialize_collection_element(T, result.storage, result.initialized, item)
-    result.initialized += 1
+    return unit
 
 pub struct Box(T: type)
     allocation: Allocation(T)
     drop = func(deinit self: Box(T))
         unsafe_destroy_box(T, self)
         deallocate_box(T, self^)
-
-    pub fallible new(init item: T) Box(T)
-        var storage = allocate?(T, 1)
-        if unsafe_initialize(T, storage, 0, item)
-            return unsafe_own_box(T, storage)
-        else
-            deallocate(T, storage)
-            fail
-
+    pub func new(init item: T) Box(T) | none
+        var storage: Allocation(T) = allocate(T, 1) else return none
+        unsafe_initialize(T, storage, 0, item)
+        return unsafe_own_box(T, storage^)
     pub func borrow(ref self: Box(T)) ref T -> std.memory.borrow(T, self)
     pub func take(deinit self: Box(T)) T -> std.memory.take(T, self^)
 
@@ -248,29 +224,35 @@ pub struct Span(T: type)
     copy = trivial
     data: StorageCursor(T)
     size: int
-
     pub func empty() Span(T) -> Span(T){data = empty_cursor(T), size = 0}
     pub func from_array(static N: int, ref array: Array(T, N)) Span(T) -> Span(T){data = array_cursor(T, N, array), size = N}
-    pub fallible unsafe_from_allocation(ref allocation: Allocation(T), initialized: int) Span(T)
-        initialized >= 0
-        initialized <= allocation.capacity()
+    pub func unsafe_from_allocation(ref allocation: Allocation(T), initialized: int) Span(T) | none
+        if initialized < 0 or initialized > allocation.capacity() -> return none
         return Span(T){data = allocation_cursor(T, allocation), size = initialized}
     pub func len(imm self: Span(T)) int -> self.size
-    pub func iter(ref self: Span(T)) SpanIterator(T)
-        return SpanIterator(T){source = self, position = 0}
-    fallible get_at(ref self: Span(T), index: int) ref T
-        index >= 0
-        index < self.size
+    pub func iter(ref self: Span(T)) SpanIterator(T) -> SpanIterator(T){source = self, position = 0}
+    func get_at(ref self: Span(T), index: int) ref T | none
+        if index < 0 or index >= self.size -> return none
         return cursor_element(T, self.data, index)
-    fallible get_from_end(ref self: Span(T), index: FromEnd) ref T
-        return self.get_at?(index.resolve?(self.size))
+    func get_from_end(ref self: Span(T), index: FromEnd) ref T | none
+        const resolved: int = index.resolve(self.size) else return none
+        return self.get_at(resolved)
     pub overload get(get_at, get_from_end)
-    pub overload [](get_at, get_from_end, slice)
-    pub fallible []=(static Index: type, mut self: Span(T), index: Index, var item: T) unit where Index is int or Index is FromEnd
-        ref element = self.get?(index)
+    func at(ref self: Span(T), index: int) ref T
+        if index < 0 or index >= self.size -> panic "Span index out of bounds"
+        return cursor_element(T, self.data, index)
+    func at_from_end(ref self: Span(T), index: FromEnd) ref T
+        const resolved: int = index.resolve(self.size) else panic "Span index out of bounds"
+        return self.at(resolved)
+    func slice_at(ref self: Span(T), bounds: Range) Span(T)
+        var view: Span(T) = self.slice(bounds) else panic "Span slice out of bounds"
+        return view
+    pub overload [](at, at_from_end, slice_at)
+    pub func []=(static Index: type, mut self: Span(T), index: Index, var item: T) unit where Index is int or Index is FromEnd
+        ref element = self[index]
         element = item^
-    pub fallible slice(ref self: Span(T), bounds: Range) Span(T)
-        const offsets = bounds.resolve?(self.size)
+    pub func slice(ref self: Span(T), bounds: Range) Span(T) | none
+        const offsets: (int, int) = bounds.resolve(self.size) else return none
         return Span(T){data = cursor_offset(T, self.data, offsets.0), size = offsets.1 - offsets.0}
     pub func as_imm(imm self: Span(T)) Span(T) -> Span(T){data = cursor_attenuate(T, self.data), size = self.size}
 
@@ -278,13 +260,11 @@ pub struct SpanIterator(T: type)
     copy = trivial
     source: Span(T)
     position: int
-
     pub func next(mut self: SpanIterator(T)) ref T | End
         if self.position >= self.source.len() -> return End{}
         const position = self.position
         self.position += 1
-        if ref item = self.source.get(position) -> return item
-        panic "invalid span iterator element"
+        return self.source[position]
 
 extern func empty_cursor(static T: type) StorageCursor(T)
 extern func array_cursor(static T: type, static N: int, ref array: Array(T, N)) StorageCursor(T)
@@ -296,19 +276,14 @@ extern func cursor_attenuate(static T: type, imm source: StorageCursor(T)) Stora
 pub struct Ref(T: type)
     copy = trivial
     pub ref value: T
-
     pub func from(ref item: T) Ref(T) -> Ref(T){value = item}
-
 pub extern func borrow(static T: type, ref owner: Box(T)) ref T
-
 pub func take(static T: type, deinit owner: Box(T)) T
     const result = unsafe_take_box(T, owner)
     deallocate_box(T, owner^)
     return result^
-
 extern func unsafe_own_box(static T: type, deinit allocation: Allocation(T)) Box(T)
 extern func unsafe_take_box(static T: type, mut owner: Box(T)) T
 extern func unsafe_destroy_box(static T: type, mut owner: Box(T))
 extern func deallocate_box(static T: type, deinit owner: Box(T))
-
-extern fallible io_read(descriptor: int, imm allocation: Allocation(byte), start: int, count: int) int
+extern func io_read(descriptor: int, imm allocation: Allocation(byte), start: int, count: int) int | none

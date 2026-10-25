@@ -18,32 +18,32 @@ const ValueSnapshot = interpreter.ValueSnapshot;
 
 test "evaluation heap empty oversized and zero sized allocations preserve native size handling" {
     try test_sources.SourceFixture.expectParity(
-        \\import std.memory.{allocate, deallocate, List}
+        \\import std.memory.{Allocation, allocate, deallocate, List}
         \\struct Empty
         \\    copy = trivial
-        \\fallible compute() int
-        \\    const empty = allocate?(Array(int, 536870912), 0)
+        \\func compute() int | none
+        \\    const empty: Allocation(Array(int, 536870912)) = allocate(Array(int, 536870912), 0) else return none
         \\    const empty_capacity = empty.capacity()
         \\    deallocate(Array(int, 536870912), empty^)
         \\    if empty_capacity <> 0 -> return 90
-        \\    if const oversized = allocate(Array(int, 536870912), 1)
+        \\    if const oversized: Allocation(Array(int, 536870912)) = allocate(Array(int, 536870912), 1)
         \\        deallocate(Array(int, 536870912), oversized^)
         \\        return 91
-        \\    const logical = allocate?(Empty, 2147483647)
+        \\    const logical: Allocation(Empty) = allocate(Empty, 2147483647) else return none
         \\    const logical_capacity = logical.capacity()
         \\    deallocate(Empty, logical^)
         \\    if logical_capacity <> 2147483647 -> return 92
-        \\    var buffer = List(Empty).new?(0)
-        \\    if buffer.get(0) -> return 93
-        \\    const empty_view = buffer.slice?(0..0)
-        \\    if empty_view.get(0) -> return 94
-        \\    buffer.append?(Empty{})
-        \\    buffer.append?(Empty{})
-        \\    if buffer.get(-1) -> return 95
-        \\    if buffer.get(2) -> return 96
+        \\    var buffer: List(Empty) = List(Empty).new(0) else return none
+        \\    if (buffer.get(0) is Empty) -> return 93
+        \\    const empty_view: Span(Empty) = buffer.slice(0..0) else return none
+        \\    if (empty_view.get(0) is Empty) -> return 94
+        \\    const _: unit = buffer.append(Empty{}) else return none
+        \\    const _: unit = buffer.append(Empty{}) else return none
+        \\    if (buffer.get(-1) is Empty) -> return 95
+        \\    if (buffer.get(2) is Empty) -> return 96
         \\    return 40 + buffer.len()
         \\func run() int
-        \\    if const value = compute() -> return value
+        \\    if const value: int = compute() -> return value
         \\    return 97
     , 42);
     try std.testing.expectEqual(@as(?u32, 0), interpreter.allocationByteSize(std.math.maxInt(u32), 0));
@@ -59,15 +59,21 @@ test "evaluation heap immovable partial failure reverse destruction and extracti
         \\    trace: Ref(int)
         \\    value: int
         \\    drop = func(deinit self: Item) -> self.trace.value = self.trace.value * 10 + self.value
-        \\fallible missing() Item -> fail
+        \\func missing() Item | none -> return none
         \\func forbidden() Item -> exit(90)
+        \\func construct(trace: Ref(int)) unit | none
+        \\    const prefix: List(Item) = [Item{trace = trace, value = 2}, Item{trace = trace, value = 4}]
+        \\    prefix.len()
+        \\    const _: Item = missing() else return none
+        \\    forbidden()
+        \\    return unit
         \\func run() int
-        \\    var trace = Array(int, 1).filled(0)
-        \\    if ref target = trace.get(0)
-        \\        if const items: List(Item) = [Item{trace = Ref.from(target), value = 2}, Item{trace = Ref.from(target), value = 4}, missing?(), forbidden()]
+        \\    var trace: Array(int, 1) = Array(int, 1).filled(0) else panic "unexpected none"
+        \\    if ref target: int = trace.get(0)
+        \\        if const _: unit = construct(Ref.from(target))
         \\            return 91
         \\        if target <> 42 -> return 92
-        \\        if const owner = Box(int).new(target) -> return owner.take()
+        \\        if const owner: Box(int) = Box(int).new(target) -> return owner.take()
         \\    return 93
     , 42);
     try test_sources.SourceFixture.expectParity(
@@ -80,11 +86,14 @@ test "evaluation heap immovable partial failure reverse destruction and extracti
         \\    first: Leaf
         \\    second: int
         \\    drop = func(deinit self: Item) -> exit(90)
-        \\fallible missing() int -> fail
+        \\func missing() int | none -> return none
+        \\func construct(trace: Ref(int)) unit | none
+        \\    const item = Item{first = Leaf{trace = trace}, second = (if const value: int = missing() -> value else return none)}
+        \\    return unit
         \\func run() int
-        \\    var trace = Array(int, 1).filled(0)
-        \\    if ref target = trace.get(0)
-        \\        if const owner = Box(Item).new(Item{first = Leaf{trace = Ref.from(target)}, second = missing?()}) -> return 91
+        \\    var trace: Array(int, 1) = Array(int, 1).filled(0) else panic "unexpected none"
+        \\    if ref target: int = trace.get(0)
+        \\        if const _: unit = construct(Ref.from(target)) -> return 91
         \\        return target
         \\    return 92
     , 42);
@@ -93,7 +102,7 @@ test "evaluation heap immovable partial failure reverse destruction and extracti
 test "evaluation heap escaping aggregates variants static arguments and conversions have a consuming diagnostic" {
     const prefix =
         \\func factory() Box(int)
-        \\    if const owner = Box(int).new(42) -> return owner^
+        \\    if const owner: Box(int) = Box(int).new(42) -> return owner^
         \\    exit(90)
         \\struct Holder
         \\    owner: Box(int)
@@ -131,7 +140,7 @@ test "evaluation heap allocator edits skip deferred construction and recompute s
     const fixture = try test_sources.SourceFixture.init(
         \\func forbidden() int -> exit(90)
         \\func run() int
-        \\    if const owner = Box(int).new(forbidden()) -> return owner.take()
+        \\    if const owner: Box(int) = Box(int).new(forbidden()) -> return owner.take()
         \\    return 42
         \\exit(comptime -> run())
     );
@@ -139,7 +148,8 @@ test "evaluation heap allocator edits skip deferred construction and recompute s
     const standard_library = @import("standard_library");
     const file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_allocation))).*;
     const original = standard_library.source("memory/allocation.chi");
-    const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "var storage = allocate?(T, 1)", "var storage = allocate?(T, -1)");
+    try std.testing.expect(std.mem.indexOf(u8, original, "allocate(T, 1)") != null);
+    const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "allocate(T, 1)", "allocate(T, -1)");
     defer std.testing.allocator.free(failed);
     try fixture.db.setInput(queries.SourceText, file, failed);
     try fixture.expectExit(0, 42);
@@ -171,8 +181,8 @@ test "evaluation heap compiler allocation failure is retryable without publishin
     defer db.deinit();
     try modules.registerSources(db, failing.allocator(),
         \\func compute() int
-        \\    if const owner = Box(Array(int, 2048)).new(Array(int, 2048).filled(42))
-        \\        if ref first = owner.borrow().get(0) -> return first
+        \\    if const owner: Box(Array(int, 2048)) = Box(Array(int, 2048)).new((if const _selected_result_0: Array(int, 2048) = Array(int, 2048).filled(42) -> _selected_result_0^ else panic "unexpected none"))
+        \\        if ref first: int = owner.borrow().get(0) -> return first
         \\    return 90
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
@@ -192,7 +202,7 @@ test "evaluation heap compiler allocation failure is retryable without publishin
 test "evaluation heap rejects transient mutable copy back through the canonical call boundary" {
     const fixture = try test_sources.SourceFixture.init(
         \\func factory() Box(int)
-        \\    if const owner = Box(int).new(42) -> return owner^
+        \\    if const owner: Box(int) = Box(int).new(42) -> return owner^
         \\    exit(90)
         \\func populate(mut value: int | Box(int))
         \\    value = factory()
@@ -227,7 +237,7 @@ test "evaluation heap independent workers share no storage and recursive snapsho
     defer db.deinit();
     const source =
         \\func factory(seed: int) Box(int)
-        \\    if const owner = Box(int).new(seed) -> return owner^
+        \\    if const owner: Box(int) = Box(int).new(seed) -> return owner^
         \\    exit(90)
         \\func advance(ref reference: int) int
         \\    if reference == 0 -> return 42
@@ -266,29 +276,29 @@ test "evaluation heap executes independent factories nested aliases and ordinary
     try test_sources.SourceFixture.expectParity(
         \\import std.memory.{Box, Ref, List}
         \\func factory() Box(int)
-        \\    if const owner = Box(int).new(19) -> return owner^
+        \\    if const owner: Box(int) = Box(int).new(19) -> return owner^
         \\    exit(90)
         \\func update(var target: Ref(int)) -> target.value = target.value + 4
         \\func forward(var target: Ref(int)) -> update(target)
-        \\fallible compute() int
+        \\func compute() int | none
         \\    var first = factory()
         \\    const second = factory()
-        \\    forward(Ref.from(first.borrow()))
+        \\    forward((if const _selected_result_0: Ref(int) = Ref.from(first.borrow()) -> _selected_result_0 else return none))
         \\    if first.borrow() <> 23 -> return 91
         \\    if second.borrow() <> 19 -> return 92
-        \\    var buffer = List(int).new?(0)
-        \\    buffer.append?(19)
-        \\    buffer.append?(23)
-        \\    buffer.reserve?(8)
-        \\    const view = buffer.slice?(0..2)
-        \\    ref left = view.get?(0)
-        \\    ref right = view.get?(1)
+        \\    var buffer: List(int) = List(int).new(0) else return none
+        \\    const _: unit = buffer.append(19) else return none
+        \\    const _: unit = buffer.append(23) else return none
+        \\    const _: unit = buffer.reserve(8) else return none
+        \\    const view: Span(int) = buffer.slice(0..2) else return none
+        \\    ref left: int = view.get(0) else return none
+        \\    ref right: int = view.get(1) else return none
         \\    const values: List(int) = [left, right]
-        \\    ref first_value = values.get?(0)
-        \\    ref second_value = values.get?(1)
+        \\    ref first_value: int = values.get(0) else return none
+        \\    ref second_value: int = values.get(1) else return none
         \\    return first_value + second_value
         \\func run() int
-        \\    if const result = compute() -> return result
+        \\    if const result: int = compute() -> return result
         \\    return 93
     , 42);
 }
@@ -296,11 +306,11 @@ test "evaluation heap executes independent factories nested aliases and ordinary
 test "evaluation heap regenerated byte views retain recursive call identity" {
     try test_sources.SourceFixture.expectSourceDiagnostic(
         \\func repeat(imm text: String, imm view: BytesView) int -> repeat(text, text.as_bytes())
-        \\fallible run() int
+        \\func run() int | none
         \\    var text = "hi"
-        \\    text.append?("!")
+        \\    const _: unit = text.append("!") else return none
         \\    return repeat(text, text.as_bytes())
-        \\static answer = if const value = run() -> value else 90
+        \\static answer = if const value: int = run() -> value else 90
         \\exit(answer)
     , .compile_time_call_cycle);
 }
@@ -697,8 +707,8 @@ test "interpreter call cycles reject unchanged references and allow changed refe
         \\    reference = reference - 1
         \\    return advance(reference)
         \\func changing() int
-        \\    var values = Array(int, 1).filled(3)
-        \\    if ref reference = values.get(0) -> return advance(reference)
+        \\    var values: Array(int, 1) = Array(int, 1).filled(3) else panic "unexpected none"
+        \\    if ref reference: int = values.get(0) -> return advance(reference)
         \\    return 90
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
@@ -1008,99 +1018,16 @@ test "initializer capture cell subtrees survive the constructing region storage"
     };
 }
 
-test "fallible initializer calls route ordinary failure without a value" {
-    const Executor = struct {
-        pub fn convertStaticValue(_: *@This(), _: structures.TypeId, _: structures.CompileTimeValue.RuntimeValue, _: structures.TypeId, _: ?structures.SourceSpan, _: std.mem.Allocator) !Result {
-            unreachable;
-        }
-        pub fn byteString(_: *@This(), _: structures.ByteStringId) ![]const u8 {
-            unreachable;
-        }
-
-        pub fn call(_: *@This(), _: structures.InstanceId, _: []Value, _: ?structures.SourceSpan) !Result {
-            unreachable;
-        }
-        pub fn callInStorage(self: *@This(), instance: structures.InstanceId, arguments: []Value, span: ?structures.SourceSpan, _: std.mem.Allocator) !Result {
-            return self.call(instance, arguments, span);
-        }
-        pub fn arrayType(_: *@This(), _: structures.TypeId) !?structures.ArrayType {
-            return null;
-        }
-        pub fn structFieldType(_: *@This(), _: structures.TypeId, _: usize) !?structures.TypeId {
-            return null;
-        }
-        pub fn structFieldCount(_: *@This(), _: structures.TypeId) !?usize {
-            unreachable;
-        }
-        pub fn lookupTuple(_: *@This(), _: structures.CompileTimeValueTupleId) ![]const structures.CompileTimeValueId {
-            unreachable;
-        }
-        pub fn lookupRuntime(_: *@This(), _: structures.CompileTimeValueId) !?structures.CompileTimeValue.Runtime {
-            unreachable;
-        }
-        pub fn staticString(_: *@This(), _: structures.StaticStringConstant) !structures.CompileTimeValue.RuntimeValue {
-            return error.Unavailable;
-        }
-
-        pub fn internRuntime(_: *@This(), _: structures.TypeId, _: structures.CompileTimeValue.RuntimeValue) !structures.CompileTimeValueId {
-            unreachable;
-        }
-        pub fn internTuple(_: *@This(), _: []const structures.CompileTimeValueId) !structures.CompileTimeValueTupleId {
-            unreachable;
-        }
-        pub fn variantMembers(_: *@This(), _: structures.TypeId) !?[]const structures.TypeId {
-            unreachable;
-        }
-        pub fn argumentPassing(_: *@This(), _: structures.TypeId) !structures.ArgumentPassing {
-            unreachable;
-        }
-    };
-    var executor: Executor = .{};
-    var region_blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = 0, .terminator = .return_failure }};
-    const region: structures.FunctionBodyAnalysis = .{
-        .return_type = .int,
-        .is_fallible = true,
-        .is_initializer_region = true,
-        .blocks = &region_blocks,
-        .entry = @fromBackingInt(@intCast(0)),
-    };
-    var arguments = [_]Value{.{ .initializer = .{ .body = &region, .captures = &.{} } }};
-    var modes = [_]structures.ParameterMode{.init};
-    var block_arguments = [_]structures.FunctionBlockArgument{
-        .{ .type_id = .int, .representation = .initializer },
-        .{ .type_id = .int },
-    };
-    var blocks = [_]structures.FunctionBlock{
-        .{ .argument_end = 1, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .fallible_call = .{
-            .call = .{ .target = .{ .initializer = @fromBackingInt(@intCast(0)) }, .arguments = .{ .start = 0, .end = 0 }, .return_type = .int },
-            .success = @fromBackingInt(@intCast(1)),
-            .failure = @fromBackingInt(@intCast(2)),
-        } } },
-        .{ .argument_start = 1, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .return_value = .{ .value = @fromBackingInt(@intCast(1)) } } },
-        .{ .argument_start = 2, .argument_end = 2, .instruction_start = 0, .instruction_end = 0, .terminator = .return_failure },
-    };
-    const body: structures.FunctionBodyAnalysis = .{
-        .return_type = .int,
-        .is_fallible = true,
-        .parameter_modes = &modes,
-        .block_arguments = &block_arguments,
-        .blocks = &blocks,
-        .entry = @fromBackingInt(@intCast(0)),
-    };
-    const result = try execute(&body, &arguments, &executor, std.testing.allocator);
-    try std.testing.expect(result == .failure);
-}
-
-test "explicit fail evaluates in direct nested and initializer calls" {
+test "optional results publish ordinary values through nested initializer calls" {
     const allocator = std.testing.allocator;
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
     defer db.deinit();
     try modules.registerSources(db, allocator,
-        \\fallible fail_value() int -> fail
-        \\fallible nested() int -> fail_value?()
-        \\fallible materialize(init item: int) int -> return item
-        \\fallible initialized() int -> materialize?(if true == true -> fail else 0)
-        \\func handled() int -> if const value = initialized() -> value else 42
+        \\func fail_value() int | none -> return none
+        \\func nested() int | none -> (if const _selected_result_0: int = fail_value() -> _selected_result_0 else return none)
+        \\func materialize(init item: int | none) int | none -> return item
+        \\func initialized() int | none -> materialize(nested())
+        \\func handled() int -> if const value: int = initialized() -> value else 42
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
     const arguments = try db.intern(queries.CompileTimeValueTuples, .{ .values = &.{} });
@@ -1114,6 +1041,10 @@ test "explicit fail evaluates in direct nested and initializer calls" {
             try std.testing.expect(result.completed.outcome == .returned);
             const value = (try db.lookupInterned(queries.CompileTimeValues, result.completed.outcome.returned)).*;
             try std.testing.expectEqual(@as(i32, 42), value.runtime.value.int);
-        } else try std.testing.expect(result.completed.outcome == .failure);
+        } else {
+            try std.testing.expect(result.completed.outcome == .returned);
+            const value = (try db.lookupInterned(queries.CompileTimeValues, result.completed.outcome.returned)).*;
+            try std.testing.expectEqual(structures.TypeId.none, value.runtime.value.variant.member_type);
+        }
     }
 }

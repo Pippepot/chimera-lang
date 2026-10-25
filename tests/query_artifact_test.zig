@@ -18,6 +18,7 @@ test "portable functions remap files and interned identities and recompute after
     };
     const first = try sources.SourceFixture.initFiles("import lib\nexit(lib.answer())", &.{library});
     defer first.deinit();
+    try first.db.addInput(queries.InlineLimit, {}, 0);
     _ = try first.executable(0);
     const bytes = try artifact.encode(first.db, allocator);
     defer allocator.free(bytes);
@@ -25,6 +26,7 @@ test "portable functions remap files and interned identities and recompute after
     var profile: sources.profiling.Collector = .{ .io = std.testing.io };
     const db = try query.Database.init(allocator, .{ .worker_count = 0, .profile = &profile });
     defer db.deinit();
+    try db.addInput(queries.InlineLimit, {}, 0);
     var registry: modules.SourceRegistry = .{ .entry_path = "another.chi" };
     defer registry.deinit(allocator);
     const padding: modules.SourceFile = .{ .path = "extra.chi", .module_path = "", .source = "struct Unrelated\n    value: bool" };
@@ -73,25 +75,112 @@ test "bundled std reuses native functions on a fresh project without disk cachin
     const fixture: sources.SourceFixture = .{ .db = db };
     try fixture.expectExit(0, 42);
     const after = profile.snapshot();
-    try std.testing.expectEqual(@as(usize, 4), loader.stats().functions);
+    try std.testing.expectEqual(@as(usize, 1), loader.stats().functions);
     // Unrelated std functions and their interned identities stay undecoded.
     var undecoded: usize = 0;
     for (loader.identities.interns.items) |identity| if (!identity.ready) {
         undecoded += 1;
     };
     try std.testing.expect(undecoded > 0);
-    // Only the project's entry needs code generation; clamp, min, max, and
-    // exit already have translated native artifacts.
+    // Only the project's entry needs code generation; it inlines clamp, min,
+    // and max from bundled bodies, and exit already has a native artifact.
     try std.testing.expectEqual(@as(usize, 1), after.get(.codegen).runs - before.get(.codegen).runs);
     const math = try db.intern(queries.ModulePaths, .{ .path = "std.math" });
     const scope = (try db.get(queries.ModuleDeclarations, math)).*.?;
     const instance: structures.InstanceId = .{ .item = scope.resolve("clamp").? };
+    const loaded = loader.stats().bodies;
+    try std.testing.expect(loaded != 0);
     const body = try db.get(queries.AnalyzeFunctionInstance, instance);
     try std.testing.expect(body.* != null);
-    try std.testing.expectEqual(@as(usize, 1), loader.stats().bodies);
+    try std.testing.expectEqual(loaded, loader.stats().bodies);
     try std.testing.expectEqual(after.get(.body_typing).runs, profile.snapshot().get(.body_typing).runs);
     try std.testing.expect(body == try db.get(queries.AnalyzeFunctionInstance, instance));
-    try std.testing.expectEqual(@as(usize, 1), loader.stats().bodies);
+    try std.testing.expectEqual(loaded, loader.stats().bodies);
+}
+
+test "bundled std restores optimizer bodies and call components without running passes" {
+    const allocator = std.testing.allocator;
+    var profile: sources.profiling.Collector = .{ .io = std.testing.io };
+    const db = try query.Database.init(allocator, .{ .worker_count = 0, .profile = &profile });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{ .entry_path = "fresh.chi" };
+    defer registry.deinit(allocator);
+    try registry.update(db, allocator, "import std.math\nexit(std.math.clamp(50, 0, 42))", &.{.{ .path = "extra.chi", .module_path = "", .source = "struct Extra\n    value: bool" }}, &.{});
+    // Force translation of both source locations and interned identities.
+    _ = try db.get(queries.ModuleDeclarations, try db.intern(queries.ModulePaths, .{ .path = "" }));
+    _ = try db.intern(queries.Types, .{ .array = .{ .element_type = .byte, .length = 7 } });
+    const loader = try bundle.install(db, sources.standard_bundle);
+    const math = try db.intern(queries.ModulePaths, .{ .path = "std.math" });
+    const scope = (try db.get(queries.ModuleDeclarations, math)).*.?;
+    const clamp: structures.InstanceId = .{ .item = scope.resolve("clamp").? };
+    const prepared = try db.get(queries.PrepareFunctionInstance, clamp);
+    const component = try db.get(queries.CallComponent, clamp);
+    const optimized = try db.get(queries.OptimizeFunctionInstance, clamp);
+    try std.testing.expect(prepared.* != null);
+    try std.testing.expectEqual(@as(usize, 0), component.*.?.members.len);
+    try std.testing.expect(optimized.* != null);
+    try std.testing.expectEqual(@as(usize, 1), loader.stats().prepared);
+    try std.testing.expectEqual(@as(usize, 1), loader.stats().components);
+    try std.testing.expectEqual(@as(usize, 1), loader.stats().optimized);
+    try std.testing.expectEqual(@as(usize, 0), loader.stats().bodies);
+    try std.testing.expectEqual(@as(usize, 0), profile.snapshot().get(.body_typing).runs);
+    try std.testing.expectEqual(@as(usize, 0), profile.snapshot().get(.optimization_setup).runs);
+    try std.testing.expectEqual(@as(usize, 0), profile.snapshot().get(.optimization_inline).runs);
+    try std.testing.expectEqual(optimized, try db.get(queries.OptimizeFunctionInstance, clamp));
+    const fixture: sources.SourceFixture = .{ .db = db };
+    try fixture.expectExit(0, 42);
+    try std.testing.expectEqual(@as(usize, 1), loader.stats().optimized);
+}
+
+test "bundled std tracks inline policy for optimized bodies and native functions" {
+    const allocator = std.testing.allocator;
+    var profile: sources.profiling.Collector = .{ .io = std.testing.io };
+    const db = try query.Database.init(allocator, .{ .worker_count = 0, .profile = &profile });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{};
+    defer registry.deinit(allocator);
+    try registry.update(db, allocator, "import std.math\nexit(std.math.clamp(50, 0, 42))", &.{}, &.{});
+    const loader = try bundle.install(db, sources.standard_bundle);
+    const math = try db.intern(queries.ModulePaths, .{ .path = "std.math" });
+    const scope = (try db.get(queries.ModuleDeclarations, math)).*.?;
+    const clamp: structures.InstanceId = .{ .item = scope.resolve("clamp").? };
+    const prepared = try db.get(queries.PrepareFunctionInstance, clamp);
+    const optimized = (try db.get(queries.OptimizeFunctionInstance, clamp)).*.?;
+    try std.testing.expectEqual(@as(usize, 0), directCalls(optimized));
+    _ = try db.get(queries.CompileFunction, clamp);
+    try std.testing.expectEqual(@as(usize, 1), loader.stats().functions);
+    const before = profile.snapshot();
+
+    // The initial input was absent. Adding an override must invalidate both
+    // optimized IR and native code, while retaining policy-independent IR.
+    try db.addInput(queries.InlineLimit, {}, 0);
+    const out_of_line = (try db.get(queries.OptimizeFunctionInstance, clamp)).*.?;
+    try std.testing.expectEqual(@as(usize, 2), directCalls(out_of_line));
+    try std.testing.expectEqual(@as(usize, 1), loader.stats().optimized);
+    try std.testing.expectEqual(prepared, try db.get(queries.PrepareFunctionInstance, clamp));
+    _ = try db.get(queries.CompileFunction, clamp);
+    try std.testing.expect(profile.snapshot().get(.codegen).runs > before.get(.codegen).runs);
+    try std.testing.expectEqual(@as(usize, 1), loader.stats().functions);
+    const fixture: sources.SourceFixture = .{ .db = db };
+    try fixture.expectExit(0, 42);
+
+    try db.setInput(queries.InlineLimit, {}, queries.default_inline_limit);
+    const inlined = (try db.get(queries.OptimizeFunctionInstance, clamp)).*.?;
+    try std.testing.expectEqual(@as(usize, 0), directCalls(inlined));
+    try std.testing.expectEqual(@as(usize, 2), loader.stats().optimized);
+    const restored = profile.snapshot();
+    _ = try db.get(queries.CompileFunction, clamp);
+    try std.testing.expectEqual(restored.get(.codegen).runs, profile.snapshot().get(.codegen).runs);
+    try std.testing.expectEqual(@as(usize, 2), loader.stats().functions);
+    try fixture.expectExit(0, 42);
+}
+
+fn directCalls(body: structures.FunctionBodyAnalysis) usize {
+    var calls: usize = 0;
+    for (body.instructions) |instruction| if (instruction == .call and instruction.call.target == .direct) {
+        calls += 1;
+    };
+    return calls;
 }
 
 test "unused std functions and identities remain undecoded" {
@@ -101,6 +190,9 @@ test "unused std functions and identities remain undecoded" {
     try fixture.expectExit(0, 0);
     try std.testing.expectEqual(@as(usize, 0), loader.stats().functions);
     try std.testing.expectEqual(@as(usize, 0), loader.stats().bodies);
+    try std.testing.expectEqual(@as(usize, 0), loader.stats().prepared);
+    try std.testing.expectEqual(@as(usize, 0), loader.stats().components);
+    try std.testing.expectEqual(@as(usize, 0), loader.stats().optimized);
     try std.testing.expect(loader.current_files == null);
     for (loader.identities.interns.items) |identity| try std.testing.expect(!identity.ready);
 }
@@ -247,6 +339,7 @@ test "lazy std refreshes identities after registered file numbers change" {
     try reassigned.update(db, allocator, entry, &.{}, &.{});
     try fixture.expectExit(0, 42);
     try std.testing.expect(loader.stats().functions > before.functions);
+    try std.testing.expect(loader.stats().optimized > before.optimized);
     try db.setInput(queries.SourceText, reassigned.fileId("$std/math.chi").?, "pub func clamp(value: int, lower: int, upper: int) int -> 43");
     try fixture.expectExit(0, 43);
 }
@@ -292,12 +385,14 @@ test "portable artifacts recompute conditional and match tags when canonical mem
         \\    copy = trivial
         \\    pub value: int
         \\pub func answer(choice: A | B) int
-        \\    if const selected = choice as A -> return selected.value
+        \\    if const selected: A = choice -> return selected.value
         \\    return 0
         \\pub func match_answer(choice: A | B) int
         \\    return match choice
-        \\        is B as selected -> selected.value
-        \\        is A -> 0
+        \\        B ->
+        \\            if const selected: B = choice -> return selected.value
+        \\            return 91
+        \\        A -> 0
     };
     const entry = "import lib\nexit(lib.answer(lib.A{value = 19}) + lib.match_answer(lib.B{value = 23}))";
     const first = try sources.SourceFixture.initFiles(entry, &.{library});

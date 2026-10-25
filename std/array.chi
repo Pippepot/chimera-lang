@@ -12,23 +12,31 @@ pub struct Array(T: type, N: int)
     pub func iter(ref self: Array(T, N)) SpanIterator(T)
         var view = self.span()
         return view.iter()
-    pub fallible slice(ref self: Array(T, N), bounds: Range) Span(T)
+    pub func slice(ref self: Array(T, N), bounds: Range) Span(T) | none
         var view = self.span()
-        return view.slice?(bounds)
+        return view.slice(bounds)
 
-    fallible get_at(ref self: Array(T, N), index: int) ref T
-        index >= 0
-        index < N
+    func get_at(ref self: Array(T, N), index: int) ref T | none
+        if index < 0 or index >= N -> return none
         return array_borrow(T, N, self, index)
-
-    fallible get_from_end(ref self: Array(T, N), index: FromEnd) ref T
-        return self.get_at?(index.resolve?(N))
-
+    func get_from_end(ref self: Array(T, N), index: FromEnd) ref T | none
+        const resolved: int = index.resolve(N) else return none
+        return self.get_at(resolved)
     pub overload get(get_at, get_from_end)
-    pub overload [](get_at, get_from_end, slice)
 
-    pub fallible []=(static Index: type, mut self: Array(T, N), index: Index, var value: T) unit where Index is int or Index is FromEnd
-        ref element = self.get?(index)
+    func at(ref self: Array(T, N), index: int) ref T
+        if index < 0 or index >= N -> panic "Array index out of bounds"
+        return array_borrow(T, N, self, index)
+    func at_from_end(ref self: Array(T, N), index: FromEnd) ref T
+        const resolved: int = index.resolve(N) else panic "Array index out of bounds"
+        return self.at(resolved)
+    func slice_at(ref self: Array(T, N), bounds: Range) Span(T)
+        var view: Span(T) = self.slice(bounds) else panic "Array slice out of bounds"
+        return view
+    pub overload [](at, at_from_end, slice_at)
+
+    pub func []=(static Index: type, mut self: Array(T, N), index: Index, var value: T) unit where Index is int or Index is FromEnd
+        ref element = self[index]
         element = value^
 
 extern func array_filled(static T: type, static N: int, imm value: T) Array(T, N)

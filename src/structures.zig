@@ -80,8 +80,6 @@ pub const Token = struct {
         .keyword_init = null,
         .keyword_else = null,
         .keyword_extern = null,
-        .keyword_fail = null,
-        .keyword_fallible = null,
         .keyword_false = null,
         .keyword_func = null,
         .keyword_for = null,
@@ -175,6 +173,7 @@ pub const Node = struct {
         ge,
         is,
         as,
+        membership,
         range,
         range_inclusive,
         @"if",
@@ -201,6 +200,7 @@ pub const Node = struct {
         static_binding,
         destructure_binding,
         binding_annotation,
+        binding_else,
         binding_tuple,
         binding_sequence,
         namespace_declaration,
@@ -217,13 +217,11 @@ pub const Node = struct {
         param,
         param_list,
         move_expr,
-        query,
         break_nothing,
         break_expr,
         continue_expr,
         return_nothing,
         return_expr,
-        fail_expr,
         panic_expr,
         signature,
         where_clauses,
@@ -250,8 +248,6 @@ pub const Node = struct {
         tuple_literal,
         match_expr,
         match_arm,
-        match_type,
-        match_capture,
         match_guard,
         match_tuple,
         from_end,
@@ -286,9 +282,9 @@ pub const Node = struct {
 
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
         return switch (self.tag) {
-            .break_nothing, .continue_expr, .return_nothing, .fail_expr, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
-            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .from_end, .reference_type, .move_expr, .query, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread, .match_type => .node,
-            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .func, .type_func, .@"if", .collection_if, .match_arm, .match_capture, .match_guard => .node_node,
+            .break_nothing, .continue_expr, .return_nothing, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
+            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .from_end, .reference_type, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread => .node,
+            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .membership, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .binding_else, .func, .type_func, .@"if", .collection_if, .match_arm, .match_guard => .node_node,
             .param => .parameter,
             .struct_field => .field,
             .signature => .signature,
@@ -789,7 +785,6 @@ pub const CompileTimeValueTuple = struct {
 /// control remain execution outcomes rather than value kinds.
 pub const CompileTimeOutcome = union(enum) {
     returned: CompileTimeValueId,
-    failure,
     exit: i32,
 };
 
@@ -874,7 +869,6 @@ pub const CallableType = struct {
     parameters: []const CallableParameter,
     return_type: TypeId,
     result_mode: ResultMode = .owned,
-    is_fallible: bool,
 
     pub fn parametersEql(a: CallableType, b: CallableType) bool {
         return value_operations.equal([]const CallableParameter, a.parameters, b.parameters);
@@ -914,7 +908,7 @@ pub const TupleType = struct {
 pub const InitializerConstruction = struct {
     type_id: TypeId,
     projection: ?u32 = null,
-    fallible_allocation: bool = false,
+    optional_allocation: bool = false,
 };
 
 pub const ArrayType = struct {
@@ -1094,6 +1088,21 @@ pub const PredicateOperation = enum {
     eqt,
     net,
 
+    pub fn negated(self: PredicateOperation) PredicateOperation {
+        return switch (self) {
+            .lti => .gei,
+            .gti => .lei,
+            .lei => .gti,
+            .gei => .lti,
+            .eqi => .nei,
+            .nei => .eqi,
+            .eqb => .neb,
+            .neb => .eqb,
+            .eqt => .net,
+            .net => .eqt,
+        };
+    }
+
     pub fn holds(self: PredicateOperation, order: std.math.Order) bool {
         return switch (self) {
             .lti => order == .lt,
@@ -1119,22 +1128,15 @@ pub const FunctionTerminator = union(enum) {
         then_branch: FunctionBranch,
         else_branch: FunctionBranch,
     },
-    fallible_call: struct {
-        call: FunctionCall,
-        success: FunctionBlockId,
-        failure: ?FunctionBlockId,
-    },
     return_unit,
     return_value: FunctionValueUse,
-    return_failure,
     diverge,
 
     pub fn operands(self: anytype) [2]?OperandPointer(@TypeOf(self)) {
         return switch (self.*) {
             .predicate_branch => |*branch| .{ &branch.operands.lhs, &branch.operands.rhs },
-            .fallible_call => |*fallible| fallible.call.operands(),
             .return_value => |*use| .{ &use.value, null },
-            .branch, .return_unit, .return_failure, .diverge => .{ null, null },
+            .branch, .return_unit, .diverge => .{ null, null },
         };
     }
 
@@ -1142,7 +1144,7 @@ pub const FunctionTerminator = union(enum) {
         return switch (self.*) {
             .branch => |*branch| .{ branch, null },
             .predicate_branch => |*branch| .{ &branch.then_branch, &branch.else_branch },
-            .fallible_call, .return_unit, .return_value, .return_failure, .diverge => .{ null, null },
+            .return_unit, .return_value, .diverge => .{ null, null },
         };
     }
 
@@ -1150,8 +1152,7 @@ pub const FunctionTerminator = union(enum) {
         return switch (self.*) {
             .branch => |*branch| .{ &branch.target, null },
             .predicate_branch => |*branch| .{ &branch.then_branch.target, &branch.else_branch.target },
-            .fallible_call => |*call| callSuccessors(call),
-            .return_unit, .return_value, .return_failure, .diverge => .{ null, null },
+            .return_unit, .return_value, .diverge => .{ null, null },
         };
     }
 
@@ -1159,12 +1160,6 @@ pub const FunctionTerminator = union(enum) {
         var terminator = self;
         const targets = terminator.successors();
         return @as(u2, @intFromBool(targets[0] != null)) + @intFromBool(targets[1] != null);
-    }
-
-    fn callSuccessors(call: *@FieldType(FunctionTerminator, "fallible_call")) [2]?*FunctionBlockId {
-        const failure: ?*FunctionBlockId = if (call.failure) |*failure| failure else null;
-        if (call.call.return_type == .never) return .{ failure, null };
-        return .{ &call.success, failure };
     }
 };
 
@@ -1211,7 +1206,6 @@ pub const FunctionParameterShape = struct {
 /// substituted yet.
 pub const FunctionShape = struct {
     returns_type: bool = false,
-    is_fallible: bool = false,
     parameters: []const FunctionParameterShape,
     static_names: []const []const u8 = &.{},
 
@@ -1320,6 +1314,38 @@ pub const FieldAccessOperation = struct {
     field_type: TypeId,
 };
 
+pub const CompareOperation = struct {
+    operation: PredicateOperation,
+    operands: BinaryOperands,
+};
+
+pub const SelectOperation = struct {
+    condition: FunctionValueId,
+    then_value: FunctionValueId,
+    else_value: FunctionValueId,
+    type_id: TypeId,
+};
+
+pub const FillOperation = struct {
+    first: FunctionValueId,
+    count: FunctionValueId,
+    value: FunctionValueId,
+    type_id: TypeId,
+};
+
+pub const MoveOperation = struct {
+    destination: FunctionValueId,
+    source: FunctionValueId,
+    count: FunctionValueId,
+    type_id: TypeId,
+    backward: bool,
+};
+
+pub const AggregateOperation = struct {
+    fields: FunctionValueRange,
+    type_id: TypeId,
+};
+
 pub const InitializerCaptureWrite = struct {
     parameter_index: u32,
     value: FunctionValueId,
@@ -1346,7 +1372,6 @@ pub const FunctionInstruction = union(enum) {
     variant_tag: FunctionValueId,
     variant_coerce: VariantOperation,
     variant_extract: VariantOperation,
-    callable_coerce: VariantOperation,
     local_storage: TypeId,
     result_storage: TypeId,
     storage_projection: StorageProjection,
@@ -1366,23 +1391,32 @@ pub const FunctionInstruction = union(enum) {
     subi: BinaryOperands,
     muli: BinaryOperands,
     divsi: BinaryOperands,
+    compare: CompareOperation,
+    select: SelectOperation,
+    aggregate: AggregateOperation,
+    fill: FillOperation,
+    move: MoveOperation,
 
-    pub fn operands(self: anytype) [2]?OperandPointer(@TypeOf(self)) {
+    pub fn operands(self: anytype) [3]?OperandPointer(@TypeOf(self)) {
         return switch (self.*) {
-            .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage => .{ null, null },
-            .variant_tag, .negi, .byte_to_int => |*operand| .{ operand, null },
-            inline .variant_coerce, .variant_extract, .callable_coerce, .static_conversion => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null },
-            .storage_projection => |*operation| .{ &operation.owner, null },
-            .allocation_element => |*operation| .{ &operation.allocation, &operation.index },
-            .array_element => |*operation| .{ &operation.array, &operation.index },
-            inline .borrow_box, .borrow_read, .storage_cursor, .borrow_address => |*operation| .{ &operation.source, null },
-            .cursor_offset, .cursor_element => |*operation| .{ &operation.cursor, &operation.index },
-            .borrow_write => |*operation| .{ &operation.reference, &operation.value },
-            .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null },
-            .field_access => |*operation| .{ &operation.operand, null },
-            .initializer_capture_write => |*operation| .{ &operation.value, null },
-            .call => |*call| call.operands(),
-            .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs },
+            .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage, .aggregate => .{ null, null, null },
+            .variant_tag, .negi, .byte_to_int => |*operand| .{ operand, null, null },
+            inline .variant_coerce, .variant_extract, .static_conversion => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null, null },
+            .storage_projection => |*operation| .{ &operation.owner, null, null },
+            .allocation_element => |*operation| .{ &operation.allocation, &operation.index, null },
+            .array_element => |*operation| .{ &operation.array, &operation.index, null },
+            inline .borrow_box, .borrow_read, .storage_cursor, .borrow_address => |*operation| .{ &operation.source, null, null },
+            .cursor_offset, .cursor_element => |*operation| .{ &operation.cursor, &operation.index, null },
+            .borrow_write => |*operation| .{ &operation.reference, &operation.value, null },
+            .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null, null },
+            .field_access => |*operation| .{ &operation.operand, null, null },
+            .initializer_capture_write => |*operation| .{ &operation.value, null, null },
+            .call => |*call| call.operands() ++ .{null},
+            .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs, null },
+            .compare => |*operation| .{ &operation.operands.lhs, &operation.operands.rhs, null },
+            .select => |*operation| .{ &operation.condition, &operation.then_value, &operation.else_value },
+            .fill => |*operation| .{ &operation.first, &operation.count, &operation.value },
+            .move => |*operation| .{ &operation.destination, &operation.source, &operation.count },
         };
     }
 
@@ -1401,12 +1435,14 @@ pub const FunctionInstruction = union(enum) {
             // Each primitive constant is named after the type of its value.
             inline .const_int, .const_int_literal, .const_string_literal, .const_byte, .const_bool, .const_type, .const_unit, .const_none => |_, tag| @field(TypeId, @tagName(tag)["const_".len..]),
             .variant_tag, .negi, .addi, .subi, .muli, .divsi, .byte_to_int => .int,
-            .borrow_write, .initializer_capture_write => .unit,
+            .borrow_write, .initializer_capture_write, .fill, .move => .unit,
+            .compare => .bool,
+            inline .select, .aggregate => |operation| operation.type_id,
             .local_storage, .result_storage => |type_id| type_id,
             .field_access => |operation| operation.field_type,
             inline .const_static_string, .const_storage_cursor, .storage_cursor, .cursor_offset, .cursor_element, .function_ref, .initializer_ref, .storage_projection, .allocation_element, .array_element, .borrow_box, .borrow_read, .borrow_address => |operation| operation.type_id,
             // Results written to a destination leave only unit in their own value.
-            .variant_coerce, .variant_extract, .callable_coerce => |operation| if (operation.destination == null) operation.target_type else .unit,
+            .variant_coerce, .variant_extract => |operation| if (operation.destination == null) operation.target_type else .unit,
             inline .value_copy, .static_conversion => |operation| if (operation.destination == null) operation.type_id else .unit,
             .call => |call| if (call.destination == null) call.return_type else .unit,
         };
@@ -1472,7 +1508,6 @@ pub const ReferenceSourceKind = enum { place, contents };
 
 pub const ReferenceOriginContract = struct {
     output_parameter: ?u32 = null,
-    failure: bool = false,
     parameter: ?u32,
     kind: ReferenceSourceKind,
     source_path: FunctionValueRange,
@@ -1531,7 +1566,7 @@ pub const ReferenceContract = struct {
     }
 
     pub fn sameOrigin(left: @This(), a: ReferenceOriginContract, right: @This(), b: ReferenceOriginContract) bool {
-        return a.output_parameter == b.output_parameter and a.failure == b.failure and a.parameter == b.parameter and a.kind == b.kind and a.readonly == b.readonly and a.readonly_owned == b.readonly_owned and
+        return a.output_parameter == b.output_parameter and a.parameter == b.parameter and a.kind == b.kind and a.readonly == b.readonly and a.readonly_owned == b.readonly_owned and
             a.storage_depth == b.storage_depth and a.recursive_storage == b.recursive_storage and a.variant_guard == b.variant_guard and a.stable == b.stable and a.after_write == b.after_write and a.reads_contents == b.reads_contents and
             samePath(left, a.source_path, right, b.source_path) and samePath(left, a.result_path, right, b.result_path);
     }
@@ -1546,11 +1581,18 @@ pub const ReferenceContract = struct {
     }
 };
 
+pub const InlineFrameId = enum(u32) { root = std.math.maxInt(u32), _ };
+
+pub const InlineFrame = struct {
+    instance: InstanceId,
+    call_span: SourceSpan,
+    parent: InlineFrameId,
+};
+
 pub const FunctionBodyAnalysis = struct {
     reference_contract: ReferenceContract = .{},
     return_type: TypeId,
     /// ABI failure permission; init regions and consuming converters may inherit failure.
-    is_fallible: bool = false,
     /// Region entry arguments are addresses supplied by its private environment.
     is_initializer_region: bool = false,
     initializer_regions: []const FunctionBodyAnalysis = &.{},
@@ -1561,9 +1603,14 @@ pub const FunctionBodyAnalysis = struct {
     borrow_fields: []const BorrowProjection = &.{},
     branch_arguments: []const FunctionValueUse = &.{},
     call_arguments: []const FunctionCallArgument = &.{},
+    aggregate_fields: []const FunctionValueId = &.{},
     instructions: []const Instruction = &.{},
     instruction_spans: []const SourceSpan = &.{},
     terminator_spans: []const SourceSpan = &.{},
+    root_instance: ?InstanceId = null,
+    inline_frames: []const InlineFrame = &.{},
+    instruction_frames: []const InlineFrameId = &.{},
+    terminator_frames: []const InlineFrameId = &.{},
     blocks: []const Block = &.{},
     entry: BlockId,
 
@@ -1594,11 +1641,6 @@ pub const FunctionBodyAnalysis = struct {
         visitFunctionValueReferences(self, context, visit);
     }
 
-    pub fn hasFailureExit(self: @This()) bool {
-        for (self.blocks) |block| if (block.terminator == .return_failure) return true;
-        return false;
-    }
-
     pub const eql = value_operations.Owned(@This()).eql;
 
     pub const deinit = value_operations.Owned(@This()).deinit;
@@ -1610,6 +1652,7 @@ pub const FunctionBodyFinalization = struct {
     call_arguments: []FunctionCallArgument,
     branch_arguments: []FunctionValueUse,
     initializer_captures: []FunctionValueId,
+    aggregate_fields: []FunctionValueId = &.{},
 
     pub fn visitValueReferences(self: @This(), context: anytype, comptime visit: anytype) void {
         visitFunctionValueReferences(self, context, visit);
@@ -1630,6 +1673,7 @@ fn visitFunctionValueReferences(view: anytype, context: anytype, comptime visit:
     for (view.call_arguments) |*argument| visit(context, argument.operand());
     for (view.branch_arguments) |*argument| visit(context, &argument.value);
     for (view.initializer_captures) |*capture| visit(context, capture);
+    for (view.aggregate_fields) |*field| visit(context, field);
 }
 
 /// Callable-instance key. Static argument tuples are interned separately so
@@ -1796,8 +1840,9 @@ pub const Diagnostic = struct {
         },
         .invalid_expression = Token.Tag,
         .unsupported_syntax = Token.Tag,
+        .binding_else_must_exit = "a binding mismatch handler must exit its scope",
+        .refutable_binding_requires_else = "this binding can mismatch; use an if binding or an explicit else handler",
         .unexpected_indented_block = "unexpected indented block; the previous expression does not introduce a block",
-        .match_multiple_captures = "a match pattern may bind its value only once; add further bindings in the arm body",
         .match_capture_must_be_immutable = "a match capture is immutable; use a bare name or `ref`, not `var`",
         .match_requires_arm = "a match requires at least one arm",
         .match_redundant_arm = "this match arm is fully covered by preceding arms",
@@ -1807,13 +1852,11 @@ pub const Diagnostic = struct {
         .match_tuple_capture_type_ambiguous = "a tuple capture must have the same element type in every matching tuple alternative; use separate type arms",
         .match_tuple_pattern_incompatible = "no alternative of the matched value has a tuple shape compatible with this pattern",
         .match_guard_invalidates_subject = "a match condition cannot consume, mutate, or invalidate the retained subject or its captures",
-        .match_capture_unavailable_in_condition = "this capture requires a consuming representation change and is available only in the selected arm body",
         .indented_block_after_inline_body = "indented block cannot follow an inline function body; `->` starts the body, and the return type goes before it",
         .duplicate_top_level_declaration = Message{ .text = "top-level name is already declared", .source_label = true },
         .declaration_cycle = Message{ .text = "declaration depends on itself", .source_label = true },
         .static_initializer_not_supported = "this static initializer is not supported yet",
         .compile_time_call_cycle = "compile-time call recursively depends on the same function and arguments",
-        .compile_time_unhandled_failure = "compile-time expression failed without handling the failure",
         .compile_time_division_by_zero = "division by zero during compile-time execution",
         .compile_time_unsupported_operation = "operation is not supported during compile-time execution",
         .compile_time_escaping_storage = "evaluation-owned storage cannot escape compile-time execution",
@@ -1822,6 +1865,7 @@ pub const Diagnostic = struct {
         .unsupported_external_declaration = "external function has no compiler-provided implementation",
         .invalid_external_signature = "external function signature does not match its compiler-provided implementation",
         .invalid_operation_signature = "operation function must match its exact compiler-specified signature",
+        .invalid_membership_signature = "membership requires contains to borrow its receiver and tested value with imm and return bool",
         .ambiguous_operation_reference = "operator reference requires an unambiguous operand count or a function-type annotation",
         .empty_overload = "an overload declaration requires at least one function",
         .invalid_overload_candidate = "overload alternatives must name function declarations",
@@ -1849,7 +1893,7 @@ pub const Diagnostic = struct {
         .destructure_requires_sequence = "sequence binding requires an Array, List, or Span value",
         .destructure_length_mismatch = struct { expected: u32, found: u32 },
         .tuple_member_count_mismatch = struct { expected: u32, found: u32 },
-        .invalid_converter = "converter must have one immutable runtime source or one compile-time-only static source and an infallible result",
+        .invalid_converter = "converter must have one immutable runtime source, one compile-time-only static source, or one deferred collection source",
         .invalid_converter_owner = "converter must be declared in the defining module of its source or target type",
         .value_used_as_type = Message{ .text = "expected a type, found a value", .source_label = true },
         .reference_projection_requires_member = "a reference condition must select one variant member or retain the full target type",
@@ -1857,11 +1901,10 @@ pub const Diagnostic = struct {
         .generic_struct_requires_specialization = void,
         .function_annotation_not_supported = "type annotations on function bindings are not supported yet",
         .parameter_mode_not_supported = "this parameter access mode is not supported yet",
-        .initializer_not_consumed = "every successful return must construct or forward each init parameter",
         .initializer_already_consumed = "this init parameter has already been constructed or forwarded on a possible path",
         .initializer_requires_construction = "an init parameter can only be constructed into owned storage or forwarded to init",
         .initializer_consumed_in_loop = "a loop backedge cannot change an init parameter's pending state",
-        .initializer_exit_outside_boundary = "return, break, and continue cannot exit a deferred initializer; fail can only fail its current initializer region",
+        .initializer_exit_outside_boundary = "return, break, and continue cannot exit a deferred initializer",
         .initializer_capture_conflict = "this write or consumption conflicts with a pending initializer capture",
         .static_parameter_requires_specialization = "a function with static parameters must be called with compile-time arguments",
         .static_argument_cannot_be_inferred = "cannot infer every static argument from the runtime argument types",
@@ -1943,9 +1986,7 @@ pub const Diagnostic = struct {
         .integer_literal_out_of_range = "integer literal is outside the supported i32 range",
         .invalid_string_escape = "invalid string escape",
         .invalid_string_utf8 = "string literal is not valid UTF-8",
-        .fallible_condition_not_supported = "this condition syntax is not supported yet",
-        .if_condition_not_fallible = "this expression is not supported as a condition",
-        .query_operand_not_bool = TypeId,
+        .condition_not_bool = TypeId,
         .inspection_type_not_supported = "this inspection type is not supported yet",
         .variant_inspection_operand_not_variant = TypeId,
         .iterator_result_requires_end = TypeMismatch,
@@ -1956,9 +1997,6 @@ pub const Diagnostic = struct {
         .comparison_operand_not_int = TypeId,
         .equality_operand_not_supported = TypeId,
         .equality_operand_type_mismatch = TypeMismatch,
-        .fallible_expression_outside_fallible_function = "this expression can fail; handle it with `if` or use it inside a `fallible` function",
-        .fallible_call_requires_marker = "fallible invocation requires `?(...)` unless this call itself is required to be fallible",
-        .fallible_call_not_fallible = "`?(...)` requires a fallible callable; this callable is infallible",
         .missing_return_value = TypeId,
         .return_type_mismatch = TypeMismatch,
         .unknown_function = Message{ .text = "unknown function", .source_label = true },

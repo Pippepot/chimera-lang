@@ -7,24 +7,24 @@ test "static comprehensions select shape while elements retain runtime evaluatio
         \\func element(mut calls: int, value: int) int
         \\    calls += 1
         \\    return value
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var calls = 0
         \\    const offset = 19
         \\    const values = [element(calls, i + offset) static for i in 0..4 static if i % 2 == 0]
         \\    return values[0] + values[1] + calls
         \\func run() int
-        \\    if const answer = calculate() -> return answer
+        \\    if const answer: int = calculate() -> return answer
         \\    return 90
     , 42);
 }
 
 test "nested static comprehension bindings distinguish evaluation environments" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const values = [i * 10 + j static for i in 1..3 static for j in 0..2]
         \\    return values[0] + values[3] + values.len() + 7
         \\func run() int
-        \\    if const answer = calculate() -> return answer
+        \\    if const answer: int = calculate() -> return answer
         \\    return 90
     , 42);
 }
@@ -42,11 +42,11 @@ test "static empty and excluded comprehension bodies remain unanalyzed" {
 
 test "static comprehensions traverse canonical arrays" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const values = [x static for x in [19, 23]]
         \\    return values[0] + values[1]
         \\func run() int
-        \\    if const answer = calculate() -> return answer
+        \\    if const answer: int = calculate() -> return answer
         \\    return 90
     , 42);
 }
@@ -56,12 +56,12 @@ test "Array spreading retains structural size and source order" {
         \\func source(mut calls: int) Array(int, 2)
         \\    calls += 1
         \\    return [18, 17]
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var calls = 0
         \\    const values = [1, ..source(calls), 5]
         \\    return values[0] + values[1] + values[2] + values[3] + calls
         \\func run() int
-        \\    if const answer = calculate() -> return answer
+        \\    if const answer: int = calculate() -> return answer
         \\    return 90
     , 42);
 }
@@ -77,12 +77,12 @@ test "empty typed Array spreads determine element type" {
 
 test "runtime filtered comprehensions construct Lists" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const values = [x * 2 for x in [10, -1, 11] if x > 0]
-        \\    values.len() == 2
+        \\    if not (values.len() == 2) -> return none
         \\    return values[0] + values[1]
         \\func run() int
-        \\    if const answer = calculate() -> return answer
+        \\    if const answer: int = calculate() -> return answer
         \\    return 90
     , 42);
 }
@@ -91,12 +91,12 @@ test "runtime collection clauses emit immutable parameters" {
     try Fixture.expectParity(
         \\func repeated(imm value: int) List(int) -> [value for i in 0..2]
         \\func selected(imm value: int) List(int) -> [value if value > 0]
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const first = repeated(19)
         \\    const second = selected(23)
         \\    return first[0] + second[0]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -112,8 +112,8 @@ test "diverging collection elements preserve inferred bottom types and empty res
         \\func forward(ref item: never) int -> ignored(item)
         \\func run() int
         \\    const values = [exit(90) for i in 0..0]
-        \\    if ref item = values.get(0) -> return forward(item)
-        \\    if values.get(0) -> return 92
+        \\    if ref item: never = values.get(0) -> return forward(item)
+        \\    if (values.get(0) is never) -> return 92
         \\    return values.len() + 42
     , 42);
 }
@@ -138,49 +138,49 @@ test "fixed Array variant context precedes List and competing converter contexts
         \\converter(static N: int, init values: collection_literal(byte, N)) Other
         \\    const data: Array(byte, N) = values
         \\    return Other{count = N}
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const first = 19
         \\    const second = 23
         \\    const with_list: Array(int, 2) | List(byte) = [first, second]
         \\    const with_converter: Array(int, 2) | Other = [first, second]
         \\    const contextual: Array(byte, 2) | List(int) = [19, 23]
         \\    const empty: Array(byte, 0) | List(int) = []
-        \\    const a = with_list as Array(int, 2)
-        \\    const b = with_converter as Array(int, 2)
-        \\    const c = contextual as Array(byte, 2)
-        \\    const d = empty as Array(byte, 0)
+        \\    const a: Array(int, 2) = with_list else return none
+        \\    const b: Array(int, 2) = with_converter else return none
+        \\    const c: Array(byte, 2) = contextual else return none
+        \\    const d: Array(byte, 0) = empty else return none
         \\    return a[0] + b[1] + byte_int(c[0]) - 19 + d.len()
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
 
 test "multiple matching Array members retain ordinary element inference" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const values: Array(byte, 2) | Array(int, 2) | List(byte) = [19, 23]
-        \\    const integers = values as Array(int, 2)
+        \\    const integers: Array(int, 2) = values else return none
         \\    return integers[0] + integers[1]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
 
 test "runtime comprehensions nest and support mixed items and spreads" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const input: List(int) = [9, 10]
         \\    const values = [1, ..input, x + y for x in 10..12 for y in 0..2, 4]
         \\    return values[0] + values[1] + values[2] + values[3] + values[7] + 8
         \\func run() int
-        \\    if const answer = calculate() -> return answer
+        \\    if const answer: int = calculate() -> return answer
         \\    return 90
     , 42);
 }
 
-test "bounded runtime comprehension constructs immovable elements and cleans failure prefix" {
+test "bounded runtime comprehension stores ordinary absence and cleans immovable payloads" {
     try Fixture.expectParity(
         \\struct Item
         \\    move = none
@@ -189,26 +189,28 @@ test "bounded runtime comprehension constructs immovable elements and cleans fai
         \\    value: int
         \\    drop = func(deinit self: Item)
         \\        self.trace.value = self.trace.value * 10 + self.value
-        \\fallible make(imm trace: Ref(int), value: int) Item
-        \\    value < 6
+        \\func make(imm trace: Ref(int), value: int) Item | none
+        \\    if not (value < 6) -> return none
         \\    return Item{trace = trace, value = value}
         \\func run() int
         \\    var trace = 0
-        \\    if const values: List(Item) = [make?(Ref.from(trace), i) for i in [2, 4, 6]]
-        \\        return 90
+        \\    if true
+        \\        const values: List(Item | none) = [make(Ref.from(trace), i) for i in [2, 4, 6]]
+        \\        if values.len() <> 3 -> return 90
+        \\        if ref item: Item = values.get(2) -> return 91
         \\    return trace
     , 42);
 }
 
 test "runtime collection growth retains external reference origins" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var original = 41
         \\    const values = [Ref.from(original) for i in 0..3]
         \\    original = 42
         \\    return values[2].value
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -218,13 +220,13 @@ test "runtime comprehension List destinations construct inside their consumers" 
         \\struct Holder
         \\    values: List(byte)
         \\func make() List(byte) -> [x for x in Array(byte, 2)([19, 23])]
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var holder = Holder{values = [x for x in Array(byte, 2)([1, 2])]}
         \\    holder.values = make()
-        \\    const collected = List(byte).collect?([x for x in Array(byte, 2)([19, 23])])
+        \\    const collected: List(byte) = List(byte).collect([x for x in Array(byte, 2)([19, 23])]) else return none
         \\    return byte_int(holder.values[0]) + byte_int(collected[1])
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -241,7 +243,7 @@ test "static comprehension clauses reject runtime capture" {
         \\build(2)
     , .comptime_runtime_capture);
     try Fixture.expectSourceDiagnostic(
-        \\func build(selected: bool) Array(int, 1) -> [42 static if selected?]
+        \\func build(selected: bool) Array(int, 1) -> [42 static if selected]
         \\build(true)
     , .comptime_runtime_capture);
 }
@@ -249,11 +251,11 @@ test "static comprehension clauses reject runtime capture" {
 test "collection static bounds and predicates recompute after edits" {
     const source =
         \\static limit = 4
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const values = [i + 19 static for i in 0..limit static if i % 2 == 0]
         \\    return values[0] + values[values.len() - 1] + values.len()
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
         \\exit(run())
     ;
@@ -277,11 +279,11 @@ test "static traversal snapshots borrowed items without custom copies" {
         \\struct Item
         \\    value: int
         \\    copy = func(imm self: Item) Item -> Item{value = self.value + 10}
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const values = [item.value static for item in [Item{value = 19}, Item{value = 23}]]
         \\    return values[0] + values[1]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -295,13 +297,13 @@ test "Array spread uses ordinary custom copies and retains the source" {
         \\    copy = func(imm self: Item) Item
         \\        self.count.value += 1
         \\        return Item{value = self.value, count = self.count}
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var copies = 0
-        \\    const input = [Item{value = 19, count = Ref.from(copies)}, Item{value = 21, count = Ref.from(copies)}]
+        \\    const input = [Item{value = 19, count = (if const _selected_result_0: Ref(int) = Ref.from(copies) -> _selected_result_0 else return none)}, Item{value = 21, count = (if const _selected_result_1: Ref(int) = Ref.from(copies) -> _selected_result_1 else return none)}]
         \\    const values = [..input]
         \\    return values[0].value + values[1].value + copies
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -321,17 +323,17 @@ test "runtime filtering releases owned cursor payloads including rejected items"
         \\        if self.position >= 3 -> return End{}
         \\        self.position += 1
         \\        return Item{trace = self.trace, value = self.position}
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    var trace = 0
         \\    const values = [item.value for item in Cursor{trace = Ref.from(trace), position = 0} if item.value % 2 == 0]
         \\    return trace + values[0] + 34
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
 
-test "producer failure cleans the output prefix and preserves named cursor state" {
+test "producer absence remains item data and preserves named cursor state and cleanup" {
     try Fixture.expectParity(
         \\struct Item
         \\    value: int
@@ -339,28 +341,31 @@ test "producer failure cleans the output prefix and preserves named cursor state
         \\    drop = func(deinit self: Item) -> self.trace.value = self.trace.value * 10 + self.value
         \\struct Cursor
         \\    position: int
-        \\    fallible next(mut self: Cursor) int | End
+        \\    func next(mut self: Cursor) int | End | none
         \\        self.position += 1
-        \\        self.position < 3
+        \\        if self.position > 3 -> return End{}
+        \\        if self.position == 3 -> return none
         \\        return self.position * 2
         \\func run() int
         \\    var trace = 0
         \\    var cursor = Cursor{position = 0}
-        \\    if const values = [Item{value = value, trace = Ref.from(trace)} for value in cursor]
-        \\        return 90
-        \\    return trace + cursor.position - 3
+        \\    if true
+        \\        const values: List(Item | none) = [if const selected: int = value -> Item{value = selected, trace = Ref.from(trace)} else none for value in cursor]
+        \\        if values.len() <> 3 -> return 90
+        \\        if ref item: Item = values.get(2) -> return 91
+        \\    return trace + cursor.position - 4
     , 42);
 }
 
 test "runtime collection optional destinations retain contextual element types" {
     try Fixture.expectParity(
         \\func make() List(byte) | none -> [7 for i in [0, 1]]
-        \\fallible calculate() int
-        \\    if const values = make() as List(byte)
+        \\func calculate() int | none
+        \\    if const values: List(byte) = make()
         \\        return byte_int(values[0]) + byte_int(values[1]) + 28
         \\    return 90
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 91
     , 42);
 }
@@ -372,13 +377,13 @@ test "static clauses diagnose mutable binding modes" {
 
 test "mixed runtime construction spreads Arrays structurally after iter edits" {
     const source =
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const input = [19, 23]
         \\    const fixed = [..input]
         \\    const dynamic = [i for i in 0..0, ..input]
         \\    return fixed[0] + dynamic[1]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
         \\exit(run())
     ;
@@ -396,24 +401,24 @@ test "mixed runtime construction spreads Arrays structurally after iter edits" {
 test "static iteration environments specialize ordinary calls" {
     try Fixture.expectParity(
         \\func element(static index: int) int -> index + 19
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const values = [element(i) static for i in [1, 3]]
         \\    return values[0] + values[1]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
 
 test "static expansion preserves generated method environments" {
     try Fixture.expectParity(
-        \\fallible calculate() int
+        \\func calculate() int | none
         \\    const values = [(struct
         \\        pub func amount() int -> i + 19
         \\    ).amount() static for i in [1, 3]]
         \\    return values[0] + values[1]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }
@@ -433,19 +438,18 @@ fn expectLimitedExit(source: []const u8, status: u8, limit: []const u8) !void {
 
 test "collection allocation policy runs before bounded element evaluation" {
     try expectLimitedExit(
-        \\fallible skipped() Array(int, 262144) -> exit(91)
+        \\func skipped() Array(int, 262144) -> exit(91)
         \\func run() int
-        \\    if const values = List(Array(int, 262144)).collect([skipped?() for i in [1]])
+        \\    if const values: List(Array(int, 262144)) = List(Array(int, 262144)).collect([skipped() for i in [1]])
         \\        return 92
         \\    return 42
         \\exit(run())
     , 42, "--as=1048576");
     try expectLimitedExit(
-        \\fallible skipped() Array(int, 262144) -> exit(91)
+        \\func skipped() Array(int, 262144) -> exit(91)
         \\func run() int
-        \\    if const values = [skipped?() for i in [1]]
-        \\        return 92
-        \\    return 42
+        \\    const values: List(Array(int, 262144)) = [skipped() for i in [1]]
+        \\    return values.len() + 91
         \\exit(run())
     , 134, "--as=1048576");
 }
@@ -464,16 +468,17 @@ test "collection results reject cursor views invalidated by later polls" {
         \\struct Cursor
         \\    position: int
         \\    buffered: String
-        \\    pub fallible next(mut self: Cursor) StringView | End
+        \\    pub func next(mut self: Cursor) StringView | End | none
         \\        self.position += 1
         \\        if self.position > 2 -> return End{}
-        \\        self.buffered.append?("next")
+        \\        const _: unit = self.buffered.append("next") else return none
         \\        return self.buffered.view()
-        \\fallible run()
+        \\func run() unit | none
         \\    var cursor = Cursor{position = 0, buffered = ""}
         \\    const values = [view for view in cursor]
         \\    print(values)
-        \\if run() -> exit(0)
+        \\    return ()
+        \\if (run() is unit) -> exit(0)
     , .borrow_outlives_source);
 }
 
@@ -485,7 +490,7 @@ test "recoverable growth allocation failure destroys only the completed prefix" 
         \\    drop = func(deinit self: Item) -> self.trace.value += 1
         \\func run() int
         \\    var trace = 0
-        \\    if const values = List(Item).collect([Item{payload = Array(int, 65536).filled(0), trace = Ref.from(trace)} for i in 0..100])
+        \\    if const values: List(Item) = List(Item).collect([Item{payload = (if const _selected_result_0: Array(int, 65536) = Array(int, 65536).filled(0) -> _selected_result_0^ else panic "unexpected none"), trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else panic "unexpected none")} for i in 0..100])
         \\        return 90
         \\    if trace == 8 -> return 42
         \\    return 91
@@ -525,54 +530,55 @@ test "entry static expansion retains lexical environments in callable values" {
 
 test "collection references cannot escape fresh iteration sources" {
     try Fixture.expectSourceDiagnostic(
-        \\fallible run()
+        \\func run() unit | none
         \\    const values = [Ref.from(item) for item in [19, 23]]
         \\    print(values)
-        \\if run() -> exit(0)
+        \\    return ()
+        \\if (run() is unit) -> exit(0)
     , .borrow_outlives_source);
 }
 
 test "recoverable construction follows init parameter types through callable values" {
     try Fixture.expectParity(
-        \\fallible forward(init values: collection_sequence(int)) List(int)
-        \\    return List(int).collect?(values)
-        \\fallible invoke(imm collect: fallible(init collection_sequence(int)) List(int)) int
-        \\    const fixed = collect?([19, 23])
-        \\    const dynamic = collect?([value for value in fixed])
+        \\func forward(init values: collection_sequence(int)) List(int) | none
+        \\    return List(int).collect(values)
+        \\func invoke(imm collect: func(init collection_sequence(int)) (List(int) | none)) int | none
+        \\    const fixed: List(int) = collect([19, 23]) else return none
+        \\    const dynamic: List(int) = collect([value for value in fixed]) else return none
         \\    return dynamic[0] + dynamic[1]
         \\func run() int
-        \\    if const result = invoke(forward) -> return result
+        \\    if const result: int = invoke(forward) -> return result
         \\    return 90
     , 42);
 }
 
 test "callable collection construction retains contained reference origins" {
     try Fixture.expectParity(
-        \\fallible invoke(imm collect: fallible(init collection_sequence(Ref(int))) List(Ref(int)), ref source: Array(int, 2)) List(Ref(int))
-        \\    return collect?([Ref.from(value) for ref value in source])
-        \\fallible calculate() int
+        \\func invoke(imm collect: func(init collection_sequence(Ref(int))) (List(Ref(int)) | none), ref source: Array(int, 2)) List(Ref(int)) | none
+        \\    return collect([Ref.from(value) for ref value in source])
+        \\func calculate() int | none
         \\    var source = [19, 23]
-        \\    const values = invoke?(List(Ref(int)).collect, source)
+        \\    const values: List(Ref(int)) = invoke(List(Ref(int)).collect, source) else return none
         \\    return values[0].value + values[1].value
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
     try Fixture.expectSourceDiagnostic(
-        \\fallible invoke(imm collect: fallible(init collection_sequence(Ref(int))) List(Ref(int))) List(Ref(int))
+        \\func invoke(imm collect: func(init collection_sequence(Ref(int))) (List(Ref(int)) | none)) List(Ref(int)) | none
         \\    var local = 42
-        \\    return collect?([Ref.from(local) for i in [0]])
-        \\if const values = invoke(List(Ref(int)).collect) -> print(values)
+        \\    return collect([Ref.from(local) for i in [0]])
+        \\if const values: List(Ref(int)) = invoke(List(Ref(int)).collect) -> print(values)
     , .borrow_outlives_source);
 }
 
 test "indirect collection allocation failure precedes element evaluation" {
     try expectLimitedExit(
-        \\fallible skipped() Array(int, 262144) -> exit(91)
-        \\fallible invoke(imm collect: fallible(init collection_sequence(Array(int, 262144))) List(Array(int, 262144))) List(Array(int, 262144))
-        \\    return collect?([skipped?() for i in [1]])
+        \\func skipped() Array(int, 262144) -> exit(91)
+        \\func invoke(imm collect: func(init collection_sequence(Array(int, 262144))) (List(Array(int, 262144)) | none)) List(Array(int, 262144)) | none
+        \\    return collect([skipped() for i in [1]])
         \\func run() int
-        \\    if const values = invoke(List(Array(int, 262144)).collect) -> return 92
+        \\    if const values: List(Array(int, 262144)) = invoke(List(Array(int, 262144)).collect) -> return 92
         \\    return 42
         \\exit(run())
     , 42, "--as=1048576");
@@ -586,16 +592,16 @@ test "collection sequence carriers cannot become ordinary values" {
 
 test "generic sequence consumers infer fixed runtime and forwarded element types" {
     try Fixture.expectParity(
-        \\fallible gather(static T: type, init values: collection_sequence(T)) List(T)
-        \\    return List(T).collect?(values)
-        \\fallible forward(static T: type, init values: collection_sequence(T)) List(T)
-        \\    return gather?(values)
-        \\fallible calculate() int
-        \\    const fixed = gather?([19, 23])
-        \\    const dynamic = forward?([value for value in fixed])
+        \\func gather(static T: type, init values: collection_sequence(T)) List(T) | none
+        \\    return List(T).collect(values)
+        \\func forward(static T: type, init values: collection_sequence(T)) List(T) | none
+        \\    return gather(values)
+        \\func calculate() int | none
+        \\    const fixed: List(int) = gather([19, 23]) else return none
+        \\    const dynamic: List(int) = forward([value for value in fixed]) else return none
         \\    return dynamic[0] + dynamic[1]
         \\func run() int
-        \\    if const result = calculate() -> return result
+        \\    if const result: int = calculate() -> return result
         \\    return 90
     , 42);
 }

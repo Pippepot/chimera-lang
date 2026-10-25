@@ -3,6 +3,7 @@ pub const query = @import("query/engine.zig");
 pub const query_artifact = @import("query_artifact.zig");
 pub const standard_bundle = @import("standard_bundle.zig");
 pub const profiling = @import("profiling.zig");
+pub const diagnostics = @import("diagnostics.zig");
 pub const modules = @import("modules.zig");
 pub const queries = @import("queries.zig");
 pub const structures = @import("structures.zig");

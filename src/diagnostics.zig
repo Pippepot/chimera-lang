@@ -119,7 +119,21 @@ const work_rows = [_]WorkRow{
     } },
     .{ .label = "type facts", .categories = &.{.type_facts} },
     .{ .label = "comptime", .categories = &.{.comptime_execution} },
-    .{ .label = "optimization", .categories = &.{.optimization}, .unit = .function },
+    .{ .label = "optimization", .categories = &.{ .optimization, .optimization_setup, .optimization_graph, .optimization_inline, .optimization_sroa, .optimization_promotion, .optimization_canonicalize, .optimization_numbering, .optimization_dead_code, .optimization_cleanup, .optimization_hoist, .optimization_idioms, .optimization_compaction, .optimization_clone }, .unit = .function, .parts = &.{
+        .{ .label = "setup / type layout", .categories = &.{.optimization_setup}, .unit = .phase },
+        .{ .label = "dominance", .categories = &.{.optimization_graph}, .unit = .phase },
+        .{ .label = "inlining", .categories = &.{.optimization_inline}, .unit = .phase },
+        .{ .label = "scalar replacement", .categories = &.{.optimization_sroa}, .unit = .phase },
+        .{ .label = "promotion", .categories = &.{.optimization_promotion}, .unit = .phase },
+        .{ .label = "canonicalization", .categories = &.{.optimization_canonicalize}, .unit = .phase },
+        .{ .label = "value numbering", .categories = &.{.optimization_numbering}, .unit = .phase },
+        .{ .label = "dead code", .categories = &.{.optimization_dead_code}, .unit = .phase },
+        .{ .label = "CFG cleanup", .categories = &.{.optimization_cleanup}, .unit = .phase },
+        .{ .label = "loop hoisting", .categories = &.{.optimization_hoist}, .unit = .phase },
+        .{ .label = "loop idioms", .categories = &.{.optimization_idioms}, .unit = .phase },
+        .{ .label = "compaction", .categories = &.{.optimization_compaction}, .unit = .phase },
+        .{ .label = "result cloning", .categories = &.{.optimization_clone}, .unit = .phase },
+    } },
     .{ .label = "codegen", .categories = &.{.codegen}, .unit = .function },
     .{ .label = "other queries", .categories = &.{.query_other} },
 };
@@ -164,7 +178,7 @@ fn writeWorkRows(
     depth: usize,
     stage_thread: i96,
 ) std.Io.Writer.Error!void {
-    var sorted: [work_rows.len]WorkRow = undefined;
+    var sorted: [@typeInfo(profiling.Category).@"enum".field_names.len]WorkRow = undefined;
     var count: usize = 0;
     for (rows) |row| {
         if (!hasWork(work, row)) continue;
@@ -457,7 +471,7 @@ pub fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structure
         return writer.writeAll(name);
     }
     if (try types.callable(type_id)) |callable| {
-        try writer.writeAll(if (callable.is_fallible) "fallible(" else "func(");
+        try writer.writeAll("func(");
         for (callable.parameters, 0..) |parameter, index| {
             if (index != 0) try writer.writeAll(", ");
             if (parameter.mode != .imm) try writer.print("{s} ", .{@tagName(parameter.mode)});
@@ -706,7 +720,7 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .field_access_not_struct => |found| try writeTypedMessage(types, writer, "field access requires a struct value, found ", found, ""),
         .private_struct_field => |type_id| try writeTypedMessage(types, writer, "cannot name a private field of ", type_id, " outside its defining module"),
         .assignment_type_mismatch => |mismatch| try writeMismatch(types, writer, "assignment type mismatch: ", mismatch),
-        .query_operand_not_bool => |found| try writeTypedMessage(types, writer, "query `?` requires bool, found ", found, ""),
+        .condition_not_bool => |found| try writeTypedMessage(types, writer, "condition requires bool, found ", found, ""),
         .variant_inspection_operand_not_variant => |found| try writeTypedMessage(types, writer, "variant inspection requires a variant value, found ", found, ""),
         .iterator_result_requires_end => |mismatch| try writeTypePair(types, writer, "next must return an item variant with owned ", mismatch.expected, ", found ", mismatch.found),
         .local_type_mismatch => |mismatch| try writeMismatch(types, writer, "initializer type mismatch: ", mismatch),
@@ -805,7 +819,6 @@ test "diagnostic types display array elements lengths and nested variants" {
     const callable: structures.TypeId = .fromInterned(try db.intern(queries.Types, .{ .callable = .{
         .parameters = &.{.{ .mode = .imm, .type_id = .int }},
         .return_type = .int,
-        .is_fallible = false,
     } }));
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
     var output: std.Io.Writer.Allocating = .init(allocator);

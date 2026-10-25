@@ -9,7 +9,7 @@ const structures = @import("structures.zig");
 const value_operations = @import("value.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHISTD02";
+const format = "CHISTD05";
 const Files = [standard_library.paths.len]structures.FileId;
 
 const Table = struct {
@@ -20,22 +20,25 @@ const Table = struct {
 /// Build a seekable bundle from validated portable query records. Dependency
 /// values become a closed-source fact and a per-record set of variant ABIs.
 pub fn encode(db: *query.Database, allocator: std.mem.Allocator) ![]u8 {
-    const portable = try artifact.encode(db, allocator);
-    defer allocator.free(portable);
+    var portable: codec.Writer = .{ .allocator = allocator };
+    defer portable.deinit();
+    try db.writeInputs(queries.SourcePath, &portable);
+    try db.writePortableInterns(&portable, disk_cache.interners);
+    inline for (Loader.query_types) |Q| try db.writePortableQueries(Q, &portable, disk_cache.persisted_inputs, disk_cache.persisted_query_dependencies);
     var scratch: std.heap.ArenaAllocator = .init(allocator);
     defer scratch.deinit();
-    var reader: codec.Reader = .{ .allocator = scratch.allocator(), .bytes = portable };
-    std.debug.assert(std.mem.eql(u8, try reader.take(artifact.format.len), artifact.format));
+    var reader: codec.Reader = .{ .allocator = scratch.allocator(), .bytes = portable.bytes.items };
     var writer: codec.Writer = .{ .allocator = allocator };
     defer writer.deinit();
     try writer.bytes.appendSlice(allocator, format);
+    try writer.write(u32, try inlineLimit(db));
     const files_start = reader.offset;
     const file_count = try reader.read(u64);
     for (0..file_count) |_| {
         _ = try reader.read(structures.FileId);
         _ = try reader.read([]const u8);
     }
-    try writer.bytes.appendSlice(allocator, portable[files_start..reader.offset]);
+    try writer.bytes.appendSlice(allocator, portable.bytes.items[files_start..reader.offset]);
     const intern_count = try reader.read(u64);
     var index: codec.Writer = .{ .allocator = allocator };
     defer index.deinit();
@@ -58,7 +61,7 @@ pub fn encode(db: *query.Database, allocator: std.mem.Allocator) ![]u8 {
         try index.write(u8, kind);
         try index.write(u64, @intCast(data.bytes.items.len));
         try index.write(u64, @intCast(reader.offset - start));
-        try data.bytes.appendSlice(allocator, portable[start..reader.offset]);
+        try data.bytes.appendSlice(allocator, portable.bytes.items[start..reader.offset]);
     }
     try writeTable(&writer, intern_count, &index, &data);
     inline for (Loader.query_types) |Q| try encodeRecords(Q, db, &reader, &writer, &scratch);
@@ -177,6 +180,7 @@ pub fn install(db: *query.Database, bytes: []const u8) !*Loader {
     errdefer loader.deinit();
     var reader: codec.Reader = .{ .allocator = db.allocator, .bytes = bytes };
     if (!std.mem.eql(u8, try reader.take(format.len), format)) return error.InvalidCache;
+    loader.inline_limit = try reader.read(u32);
     const file_count = try readCount(&reader);
     for (0..file_count) |_| {
         const file = try reader.read(structures.FileId);
@@ -190,24 +194,31 @@ pub fn install(db: *query.Database, bytes: []const u8) !*Loader {
     loader.interns = try readTable(&reader, 17);
     try loader.identities.interns.resize(db.allocator, loader.interns.index.len / 17);
     loader.resetIdentities();
-    loader.bodies = try readTable(&reader, 48);
-    loader.functions = try readTable(&reader, 48);
+    for (&loader.tables) |*table| table.* = try readTable(&reader, 48);
     if (!reader.finished()) return error.InvalidCache;
     try db.installMemoProvider(Loader, loader);
     return loader;
 }
 
 pub const Loader = struct {
-    pub const query_types = .{ queries.AnalyzeFunctionInstance, queries.CompileFunction };
+    pub const query_types = .{ queries.AnalyzeFunctionInstance, queries.PrepareFunctionInstance, queries.CallComponent, queries.OptimizeFunctionInstance, queries.CompileFunction };
+    pub const Stats = struct {
+        bodies: usize = 0,
+        prepared: usize = 0,
+        components: usize = 0,
+        optimized: usize = 0,
+        functions: usize = 0,
+    };
+
     db: *query.Database,
     mutex: std.Io.Mutex = .init,
     files: std.AutoHashMapUnmanaged(structures.FileId, ?usize) = .empty,
     interns: Table = .{},
     identities: artifact.Identities,
     current_files: ?Files = null,
-    bodies: Table = .{},
-    functions: Table = .{},
-    loaded: artifact.ImportResult = .{},
+    inline_limit: u32 = queries.default_inline_limit,
+    tables: [query_types.len]Table = @splat(.{}),
+    loaded: Stats = .{},
 
     pub fn deinit(self: *Loader) void {
         const allocator = self.db.allocator;
@@ -216,7 +227,7 @@ pub const Loader = struct {
         allocator.destroy(self);
     }
 
-    pub fn stats(self: *Loader) artifact.ImportResult {
+    pub fn stats(self: *Loader) Stats {
         self.mutex.lockUncancelable(self.db.io());
         defer self.mutex.unlock(self.db.io());
         return self.loaded;
@@ -231,9 +242,15 @@ pub const Loader = struct {
         if (location.origin != .module) return null;
         const module = try ctx.lookupInterned(queries.ModulePaths, location.origin.module);
         if (!std.mem.eql(u8, module.path, "std") and !std.mem.startsWith(u8, module.path, "std.")) return null;
+        // Prepared bodies and the call graph do not depend on inline policy.
+        // Optimized IR and native code must track even an absent input so that
+        // a later override invalidates results loaded from the bundle.
+        if (Q == queries.OptimizeFunctionInstance or Q == queries.CompileFunction) {
+            if (try inlineLimit(ctx) != self.inline_limit) return null;
+        }
         const digest = try logicalDigest(ctx.db, ctx.allocator(), Q.Input, key);
-        const records = if (Q == queries.AnalyzeFunctionInstance) self.bodies else self.functions;
-        const record = (try findRecord(records, digest)) orelse return null;
+        const table_index = comptime tableIndex(Q);
+        const record = (try findRecord(self.tables[table_index], digest)) orelse return null;
         // Validate before taking the loader lock: this is an ordinary query
         // dependency and can itself need work on another worker.
         const files = (try ctx.get(queries.StandardLibraryUnchanged, {})).* orelse return null;
@@ -264,10 +281,22 @@ pub const Loader = struct {
         try self.identities.translate(Q.Output, &output);
         if (!reader.finished() or output == null) return error.InvalidCache;
         if (!self.identities.available or !self.identities.compatible) return null;
-        if (Q == queries.AnalyzeFunctionInstance) self.loaded.bodies += 1 else self.loaded.functions += 1;
+        @field(self.loaded, @typeInfo(Stats).@"struct".field_names[table_index]) += 1;
         return output;
     }
+
+    fn tableIndex(comptime Q: type) usize {
+        inline for (query_types, 0..) |Query, index| if (Q == Query) return index;
+        unreachable;
+    }
 };
+
+fn inlineLimit(ctx: anytype) !u32 {
+    return (ctx.input(queries.InlineLimit, {}) catch |err| switch (err) {
+        error.InputNotFound => return queries.default_inline_limit,
+        else => return err,
+    }).*;
+}
 
 const Demand = struct {
     loader: *Loader,

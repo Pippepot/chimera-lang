@@ -79,7 +79,7 @@ const TestTypes = struct {
 
     pub fn callable(_: @This(), type_id: structures.TypeId) !?structures.CallableType {
         return if (type_id == callable_type)
-            .{ .parameters = &.{}, .return_type = .int, .is_fallible = false }
+            .{ .parameters = &.{}, .return_type = .int }
         else
             null;
     }
@@ -380,7 +380,7 @@ test "single aligned function artifact builds and runs without borrowing code" {
     };
     defer executable.deinit(std.testing.allocator);
 
-    const artifact_code = [_]u8{ 0xBA, 1, 0, 0, 0, 0xC3 };
+    const artifact_code = [_]u8{0xC3};
     const artifact_file_offset = std.mem.indexOf(u8, executable.bytes, &artifact_code).?;
     try std.testing.expectEqual(@as(u64, 0), (0x400000 + artifact_file_offset) % 16);
 
@@ -435,10 +435,10 @@ test "ordinary function artifacts encode signed 32-bit literal returns" {
         var artifact = try codegen.compileFunction(&ssa, TestTypes{}, std.testing.allocator);
         defer artifact.deinit(std.testing.allocator);
 
-        try std.testing.expectEqual(@as(usize, 11), artifact.code.len);
+        try std.testing.expectEqual(@as(usize, 6), artifact.code.len);
         try std.testing.expectEqual(@as(u8, 0xB8), artifact.code[0]);
         try std.testing.expectEqual(return_value, std.mem.readInt(i32, artifact.code[1..5], .little));
-        try std.testing.expectEqualSlices(u8, &.{ 0xBA, 1, 0, 0, 0, 0xC3 }, artifact.code[5..]);
+        try std.testing.expectEqualSlices(u8, &.{0xC3}, artifact.code[5..]);
         try std.testing.expectEqual(@as(u32, 1), artifact.required_alignment);
         try std.testing.expectEqual(@as(usize, 0), artifact.relocations.len);
         try std.testing.expectEqual(@as(usize, 0), artifact.referenced_instances.len);
@@ -525,7 +525,7 @@ test "function references relocate absolute addresses for indirect calls" {
 }
 
 fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: structures.InstanceId) !void {
-    try std.testing.expectEqualSlices(u8, &.{ 0xE8, 0, 0, 0, 0, 0xBA, 1, 0, 0, 0, 0xC3 }, artifact.code);
+    try std.testing.expectEqualSlices(u8, &.{ 0xE8, 0, 0, 0, 0, 0xC3 }, artifact.code);
     try std.testing.expectEqual(@as(u32, 1), artifact.required_alignment);
     try std.testing.expectEqual(@as(usize, 1), artifact.relocations.len);
     try std.testing.expectEqual(@as(u32, 1), artifact.relocations[0].offset);
@@ -556,7 +556,6 @@ test "multiple calls produce ordered relocations and deduplicate references" {
         0xE8, 0,  0, 0, 0,
         0xE8, 0,  0, 0, 0,
         0xB8, 42, 0, 0, 0,
-        0xBA, 1,  0, 0, 0,
         0xC3,
     }, artifact.code);
     try std.testing.expectEqual(@as(usize, 2), artifact.relocations.len);
@@ -757,50 +756,6 @@ test "native parallel backedge copies preserve cycles while falling through to e
     }
 }
 
-test "native fallible calls select success and failure across physical layouts" {
-    const allocator = std.testing.allocator;
-    for ([_]u8{ 0, 1 }) |status| {
-        for ([_][4]usize{ .{ 0, 1, 2, 3 }, .{ 0, 2, 1, 3 }, .{ 2, 0, 1, 3 }, .{ 2, 1, 0, 3 }, .{ 1, 2, 3, 0 } }) |order| {
-            var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int }};
-            var calls = [_]structures.FunctionCallArgument{ .{ .prepared = .{ .value = @fromBackingInt(0) } }, .{ .prepared = .{ .value = @fromBackingInt(1) } } };
-            var instructions = [_]structures.FunctionInstruction{
-                integerConstant(7),
-                .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 1, .end = 2 }, .return_type = .never } },
-                .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
-            };
-            var blocks: [4]structures.FunctionBlock = undefined;
-            blocks[order[0]] = .{ .instruction_start = 0, .instruction_end = 0, .terminator = .{ .fallible_call = .{
-                .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(2) } }, .arguments = .{ .start = 0, .end = 0 }, .return_type = .int },
-                .success = @fromBackingInt(@intCast(order[1])),
-                .failure = @fromBackingInt(@intCast(order[2])),
-            } } };
-            blocks[order[1]] = .{ .argument_end = 1, .instruction_start = 2, .instruction_end = 3, .terminator = .diverge };
-            blocks[order[2]] = .{ .instruction_start = 0, .instruction_end = 2, .terminator = .diverge };
-            blocks[order[3]] = .{ .instruction_start = 0, .instruction_end = 0, .terminator = .return_unit };
-            var body = functionSsa(&instructions, &blocks);
-            body.entry = @fromBackingInt(@intCast(order[0]));
-            body.block_arguments = &arguments;
-            body.call_arguments = &calls;
-            var artifact = try codegen.compileFunction(&body, TestTypes{}, allocator);
-            defer artifact.deinit(allocator);
-            var exit_artifact = try codegen.compileExternalExit(allocator);
-            defer exit_artifact.deinit(allocator);
-            var callee_code = [_]u8{ 0xb8, 42, 0, 0, 0, 0xba, status, 0, 0, 0, 0xc3 };
-            const functions = [_]codegen.ReachableFunction{
-                .{ .instance = .{ .item = @fromBackingInt(0) }, .artifact = artifact },
-                .{ .instance = .{ .item = @fromBackingInt(1) }, .artifact = exit_artifact },
-                .{ .instance = .{ .item = @fromBackingInt(2) }, .artifact = .{ .code = &callee_code, .required_alignment = 1 } },
-            };
-            var executable = try codegen.buildExecutable(.{ .item = @fromBackingInt(0) }, &functions, allocator);
-            defer executable.deinit(allocator);
-            try test_sources.expectProgramExit(executable.bytes, if (status == 1) 42 else 7);
-            const listing = try test_sources.disasm.disassemble(artifact.code, allocator);
-            defer allocator.free(listing);
-            try std.testing.expectEqual(@as(usize, if (order[0] == 1) 2 else 1), std.mem.count(u8, listing, "  j"));
-        }
-    }
-}
-
 test "native copies preserve byte tails and adjacent guards across the bulk threshold" {
     const allocator = std.testing.allocator;
     for ([_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 255, 256, 257 }) |count| {
@@ -820,7 +775,7 @@ test "native copies preserve byte tails and adjacent guards across the bulk thre
             \\    return value
             \\func replace(mut target: Array(byte, $count), value: Array(byte, $count))
             \\    target = value
-            \\fallible calculate() int
+            \\func calculate() int
             \\    const original: Array(byte, $count) = $bytes
             \\    var guarded = Guard{before = 7, payload = original, after = 9}
             \\    replace(guarded.payload, roundtrip(original))
@@ -860,9 +815,9 @@ test "native nested array addressing handles native scales zero sizes and multip
         const source = try test_sources.renderTemplate(allocator,
             \\func index(value: int) int
             \\    return value
-            \\fallible calculate() int
+            \\func calculate() int
             \\    var grid: Array(Array(byte, $width), 3) = $bytes
-            \\    if const invalid = grid[-1] -> return 91
+            \\    if ref invalid: Array(byte, $width) = grid.get(-1) -> return 91
             \\    var outer = 0
             \\    loop
             \\        if outer >= 3 -> break

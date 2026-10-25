@@ -301,9 +301,6 @@ const LocationPlan = struct {
             for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
                 markBranchArguments(ssa, branch.*, needed, addressable);
             };
-            if (terminator == .fallible_call) {
-                markCallArguments(ssa, terminator.fallible_call.call, needed, addressable);
-            }
         }
         for (ssa.blocks) |block| {
             if (block.instruction_start == block.instruction_end or block.terminator != .return_value) continue;
@@ -323,9 +320,6 @@ const LocationPlan = struct {
         errdefer deinitCallLayouts(&calls, gpa);
         for (ssa.instructions) |instruction| if (instruction == .call) {
             outgoing_size = @max(outgoing_size, try planCallStorage(ssa, types, value_types, instruction.call, &calls, gpa));
-        };
-        for (ssa.blocks) |block| if (block.terminator == .fallible_call) {
-            outgoing_size = @max(outgoing_size, try planCallStorage(ssa, types, value_types, block.terminator.fallible_call.call, &calls, gpa));
         };
         var edge_scratch_end = outgoing_size;
         for (ssa.blocks) |block| {
@@ -591,11 +585,6 @@ fn FunctionEmitter(comptime Types: type) type {
                     self.resultLocation(coercion.destination, destination),
                 ),
                 .variant_extract => |extraction| try self.emitVariantExtract(extraction, destination),
-                .callable_coerce => |coercion| try self.copyValue(
-                    coercion.target_type,
-                    self.valueLocation(coercion.operand),
-                    self.resultLocation(coercion.destination, destination),
-                ),
                 .value_copy => |operation| try self.copyValue(
                     operation.type_id,
                     self.valueLocation(operation.source),
@@ -630,33 +619,10 @@ fn FunctionEmitter(comptime Types: type) type {
                     try self.emitJump(branch.target, fallthrough);
                 },
                 .predicate_branch => |predicate| try self.emitPredicateBranch(predicate, fallthrough),
-                .fallible_call => |fallible| try self.emitFallibleCall(fallible, fallthrough),
-                .return_unit => try self.emitEpilogue(1),
+                .return_unit => try self.emitEpilogue(),
                 .return_value => |value| try self.emitReturn(value),
-                .return_failure => {
-                    std.debug.assert(self.ssa.is_fallible);
-                    try self.emitEpilogue(0);
-                },
                 .diverge => try self.encoder.emit(.ud2),
             }
-        }
-
-        fn emitFallibleCall(self: *Self, fallible: @FieldType(structures.FunctionTerminator, "fallible_call"), fallthrough: ?structures.FunctionBlockId) !void {
-            const success = self.ssa.blocks[@backingInt(fallible.success)];
-            std.debug.assert(success.argument_end - success.argument_start == 1);
-            std.debug.assert(fallible.call.destination != null or self.plan.locations[success.argument_start] != .indirect);
-            try self.emitCall(fallible.call, self.plan.locations[success.argument_start]);
-            if (fallible.failure) |failure| {
-                try self.encoder.emit(.test_edx);
-                if (fallthrough == fallible.success) {
-                    try self.emitConditionalJump(.eqi, failure);
-                } else {
-                    try self.emitConditionalJump(.nei, fallible.success);
-                    try self.emitJump(failure, fallthrough);
-                }
-                return;
-            }
-            try self.emitJump(fallible.success, fallthrough);
         }
 
         fn emitPredicateBranch(self: *Self, predicate: @FieldType(structures.FunctionTerminator, "predicate_branch"), fallthrough: ?structures.FunctionBlockId) !void {
@@ -731,12 +697,10 @@ fn FunctionEmitter(comptime Types: type) type {
             else
                 .eax;
             try self.emitUse(returned, return_type, destination);
-            try self.emitEpilogue(1);
+            try self.emitEpilogue();
         }
 
-        /// Releases the frame and returns with success status `status` in edx.
-        fn emitEpilogue(self: *Self, status: i32) !void {
-            try self.encoder.immediate(.mov_edx, status);
+        fn emitEpilogue(self: *Self) !void {
             if (self.plan.stack_size != 0) try self.encoder.offset(.add_rsp, self.plan.stack_size);
             try self.encoder.emit(.ret);
         }
@@ -1457,19 +1421,22 @@ fn emitPanicTrace(encoder: *X86Encoder) !u32 {
     return table_address;
 }
 
-pub fn compileExternalAllocateHostStorage(gpa: std.mem.Allocator) !structures.CompiledFunction {
-    return compileExternalAllocateStorage(gpa, 1, false);
+pub fn compileExternalAllocateHostStorage(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
+    return compileExternalAllocateStorage(signature, types, gpa, 1, false);
 }
 
-pub fn compileExternalAllocateHostTypedStorage(gpa: std.mem.Allocator, element: structures.TypeLayout) !structures.CompiledFunction {
+pub fn compileExternalAllocateHostTypedStorage(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator, element: structures.TypeLayout) !structures.CompiledFunction {
     if (element.byte_alignment > 4096) return error.UnsupportedAllocationAlignment;
-    return compileExternalAllocateStorage(gpa, element.byte_size, true);
+    return compileExternalAllocateStorage(signature, types, gpa, element.byte_size, true);
 }
 
-fn compileExternalAllocateStorage(gpa: std.mem.Allocator, element_size: u32, with_count: bool) !structures.CompiledFunction {
+fn compileExternalAllocateStorage(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator, element_size: u32, with_count: bool) !structures.CompiledFunction {
     var encoder: X86Encoder = .{ .gpa = gpa };
     defer encoder.deinit();
-    const argument_offset: u32 = if (with_count) 24 else 20;
+    var call = try signatureLayout(types, signature, gpa);
+    defer call.deinit(gpa);
+    const result = try optionalReturn(types, signature.return_type);
+    const argument_offset = call.arguments[0].stack + 8;
     try encoder.offset(.mov_esi_rsp, argument_offset);
     try encoder.emit(.test_esi);
     const invalid_size = try encoder.patchable(.jl);
@@ -1497,20 +1464,20 @@ fn compileExternalAllocateStorage(gpa: std.mem.Allocator, element_size: u32, wit
     try encoder.emit(.syscall);
     try encoder.immediate(.cmp_rax, -4095);
     const allocation_failed = try encoder.patchable(.jae);
-    try encoder.offset(.mov_rsp_eax, 8);
+    try encoder.offset(.mov_rsp_eax, result.payload);
     try encoder.emit(.shr_rax_32);
-    try encoder.offset(.mov_rsp_eax, 12);
+    try encoder.offset(.mov_rsp_eax, result.payload + 4);
     try encoder.emit(.mov_eax_esi);
-    try encoder.offset(.mov_rsp_eax, 16);
+    try encoder.offset(.mov_rsp_eax, result.payload + 8);
     if (with_count) {
         try encoder.offset(.mov_eax_rsp, argument_offset);
-        try encoder.offset(.mov_rsp_eax, 20);
+        try encoder.offset(.mov_rsp_eax, result.payload + 12);
     }
-    try emitExternalReturn(&encoder, true);
+    try emitOptionalReturn(&encoder, result, true);
     for ([_]?u32{ invalid_size, allocation_failed, size_overflow, oversized_element }) |failure| {
         if (failure) |field| try encoder.patchHere(field);
     }
-    try emitExternalReturn(&encoder, false);
+    try emitOptionalReturn(&encoder, result, false);
     return externalArtifact(&encoder);
 }
 
@@ -1525,7 +1492,7 @@ pub fn compileExternalDeallocateHostStorage(gpa: std.mem.Allocator) !structures.
     try encoder.emit(.mov_esi_eax);
     try encoder.immediate(.mov_eax, linux_munmap_syscall);
     try encoder.emit(.syscall);
-    try emitExternalReturn(&encoder, true);
+    try encoder.emit(.ret);
     return externalArtifact(&encoder);
 }
 
@@ -1533,7 +1500,7 @@ pub fn compileExternalAllocationCount(gpa: std.mem.Allocator, count_offset: u32)
     var encoder: X86Encoder = .{ .gpa = gpa };
     defer encoder.deinit();
     try encoder.offset(.mov_eax_rsp, count_offset + 8);
-    try emitExternalReturn(&encoder, true);
+    try encoder.emit(.ret);
     return externalArtifact(&encoder);
 }
 
@@ -1543,6 +1510,7 @@ pub fn compileExternalByteIo(read: bool, signature: structures.FunctionSignature
     // Arguments are (descriptor, allocation, offset, count) to read and
     // (descriptor, span) to write.
     const arguments = layout.arguments;
+    const result = try optionalReturn(types, signature.return_type);
     var encoder: X86Encoder = .{ .gpa = gpa };
     defer encoder.deinit();
     if (read) try encoder.offset(.mov_eax_rsp, 8 + arguments[3].stack) else try emitIncomingSize(&encoder, arguments[1]);
@@ -1565,9 +1533,10 @@ pub fn compileExternalByteIo(read: bool, signature: structures.FunctionSignature
     try encoder.immediate(.cmp_eax, 0);
     const failed = try encoder.patchable(.jl);
     try encoder.patchHere(empty);
-    try emitExternalReturn(&encoder, true);
+    try encoder.offset(.mov_rsp_eax, result.payload);
+    try emitOptionalReturn(&encoder, result, true);
     try encoder.patchHere(failed);
-    try emitExternalReturn(&encoder, false);
+    try emitOptionalReturn(&encoder, result, false);
     var artifact = try externalArtifact(&encoder);
     artifact.requires_sigpipe_ignore = !read;
     return artifact;
@@ -1580,9 +1549,19 @@ fn signatureLayout(types: anytype, signature: structures.FunctionSignature, gpa:
     return CallLayout.init(types, signature.return_type, parameters, gpa);
 }
 
-/// Returns from an external function with its success status in edx.
-fn emitExternalReturn(encoder: *X86Encoder, success: bool) !void {
-    if (success) try encoder.immediate(.mov_edx, 1) else try encoder.emit(.zero_edx);
+const OptionalReturn = struct { tag: u32, payload: u32, present: i32, absent: i32 };
+
+fn optionalReturn(types: anytype, type_id: structures.TypeId) !OptionalReturn {
+    const members = (try types.facts().variantMembers(type_id)).?;
+    std.debug.assert(members.len == 2);
+    const absent = std.mem.indexOfScalar(structures.TypeId, members, .none).?;
+    const layout = try types.variantLayout(type_id);
+    return .{ .tag = 8, .payload = 8 + layout.payload_offset, .present = @intCast(1 - absent), .absent = @intCast(absent) };
+}
+
+fn emitOptionalReturn(encoder: *X86Encoder, result: OptionalReturn, present: bool) !void {
+    try encoder.immediate(.mov_eax, if (present) result.present else result.absent);
+    try encoder.offset(.mov_rsp_eax, result.tag);
     try encoder.emit(.ret);
 }
 
@@ -1633,8 +1612,7 @@ pub fn buildExecutable(
         break;
     };
     const entry_call = try image.patchable(.call_relative);
-    try image.immediate(.mov_edi, 1);
-    try image.emit(.sub_edi_edx);
+    try image.immediate(.mov_edi, 0);
     try image.immediate(.mov_eax, linux_exit_syscall);
     try image.emit(.syscall);
 
@@ -1716,7 +1694,7 @@ fn appendPanicTrace(image: *X86Encoder, functions: []const ReachableFunction, fu
     try image.code.appendNTimes(image.gpa, 0, @sizeOf(u64));
 }
 
-// A broken stream is an ordinary fallible write, including a closed pipe.
+// A broken stream returns none, including a closed pipe.
 // Install SIG_IGN once before entry rather than changing it on every write.
 fn emitIgnoreSigpipe(encoder: *X86Encoder) !void {
     try encoder.offset(.sub_rsp, 32);

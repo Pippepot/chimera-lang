@@ -88,7 +88,7 @@ fn record(writer: *std.Io.Writer, case_name: []const u8, lane: []const u8, phase
     });
 }
 
-fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usize, samples: usize) !void {
+fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usize, samples: usize, workers: usize) !void {
     var workload = try workload_generator.generate(init.gpa, lines);
     defer workload.deinit();
     const allocator = init.arena.allocator();
@@ -96,12 +96,13 @@ fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usi
     for (workload.files, files) |source, *file|
         file.* = .{ .path = source.path, .source = source.source, .module_path = source.module_path };
     const name = if (lines == 1_000_000) compilation_case else try std.fmt.allocPrint(allocator, "probe-core-{d}", .{lines});
-    std.debug.print("history: {s}: {d} code lines, {d} modules, {d} mixed-feature units\n", .{
-        name, workload.lines, workload.files.len, workload.units,
+    const lane = if (workers == 0) "normal" else try std.fmt.allocPrint(allocator, "workers-{d}", .{workers});
+    std.debug.print("history: {s}: {d} code lines, {d} modules, {d} mixed-feature units, {d} workers\n", .{
+        name, workload.lines, workload.files.len, workload.units, workers,
     });
     for (0..samples + 1) |sample| {
         var started = std.Io.Clock.awake.now(init.io);
-        const db = try compiler.query.Database.init(init.gpa, .{ .worker_count = 0 });
+        const db = try compiler.query.Database.init(init.gpa, .{ .worker_count = workers });
         defer db.deinit();
         var registry: compiler.modules.SourceRegistry = .{};
         defer registry.deinit(init.gpa);
@@ -109,13 +110,13 @@ fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usi
         if (has_standard_bundle) _ = try compiler.standard_bundle.install(db, standard_bundle);
         var bytes = try executable(db, init.gpa);
         var ended = std.Io.Clock.awake.now(init.io);
-        try record(writer, name, "normal", "cold", sample, started, ended, bytes.len);
+        try record(writer, name, lane, "cold", sample, started, ended, bytes.len);
         try validate(init, bytes, 42);
         started = std.Io.Clock.awake.now(init.io);
         try db.setInput(queries.SourceText, registry.fileId(files[files.len - 1].path).?, workload.edited_leaf);
         bytes = try executable(db, init.gpa);
         ended = std.Io.Clock.awake.now(init.io);
-        try record(writer, name, "normal", "leaf-edit", sample, started, ended, bytes.len);
+        try record(writer, name, lane, "leaf-edit", sample, started, ended, bytes.len);
         try validate(init, bytes, 43);
         try writer.flush();
     }
@@ -124,15 +125,15 @@ fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usi
 fn measureRuntime(init: std.process.Init, writer: *std.Io.Writer, skip_c: bool) !void {
     const source =
         \\import std.io.{stdin, read_bytes}
-        \\fallible run()
+        \\func run() unit | none
         \\  var input: List(byte) = []
         \\  loop
         \\    if input.len() == 4 -> break
-        \\    const received = read_bytes?(stdin, input, 4 - input.len())
-        \\    received > 0
+        \\    const received: int = read_bytes(stdin, input, 4 - input.len()) else return none
+        \\    if not (received > 0) -> return none
         \\  const limit = byte_int(input[0]) + 256 * byte_int(input[1]) + 65536 * byte_int(input[2]) + 16777216 * byte_int(input[3])
-        \\  limit >= 2
-        \\  var composite = List(int).filled?(0, limit + 1)
+        \\  if not (limit >= 2) -> return none
+        \\  var composite: List(int) = List(int).filled(0, limit + 1) else return none
         \\  var factor = 2
         \\  loop
         \\    if factor * factor > limit -> break
@@ -147,7 +148,8 @@ fn measureRuntime(init: std.process.Init, writer: *std.Io.Writer, skip_c: bool) 
         \\  for number in 2..(limit + 1)
         \\    if composite[number] == 0 -> count += 1
         \\  print(count)
-        \\if run() -> exit(0)
+        \\  return ()
+        \\if (run() is unit) -> exit(0)
         \\exit(1)
     ;
     const db = try compiler.query.Database.init(init.gpa, .{ .worker_count = 0 });
@@ -162,7 +164,7 @@ fn measureRuntime(init: std.process.Init, writer: *std.Io.Writer, skip_c: bool) 
     try measureRuntimeProgram(init, writer, "normal", "./history-program", bytes.len);
     if (skip_c) return;
     defer std.Io.Dir.cwd().deleteFile(init.io, "history-c-program") catch {};
-    for ([_][]const u8{ "-O0", "-O1", "-O2", "-O3" }) |optimization| {
+    for ([_][]const u8{ "-O0", "-O3" }) |optimization| {
         var child = try std.process.spawn(init.io, .{ .argv = &.{ "cc", "-std=c11", optimization, "benchmarks/history_runtime.c", "-o", "history-c-program" } });
         switch (try child.wait(init.io)) {
             .exited => |code| if (code != 0) return error.CCompilationFailed,
@@ -206,6 +208,7 @@ pub fn main(init: std.process.Init) !void {
     var selected: ?[]const u8 = null;
     var lines: usize = 1_000_000;
     var samples: usize = compilation_samples;
+    var workers: usize = 0;
     for (args[1..]) |argument| {
         if (std.mem.eql(u8, argument, "--skip-c")) {
             skip_c = true;
@@ -215,9 +218,12 @@ pub fn main(init: std.process.Init) !void {
             lines = try std.fmt.parseInt(usize, argument["--lines=".len..], 10);
         } else if (std.mem.startsWith(u8, argument, "--samples=")) {
             samples = try std.fmt.parseInt(usize, argument["--samples=".len..], 10);
+        } else if (std.mem.startsWith(u8, argument, "--workers=")) {
+            workers = try std.fmt.parseInt(usize, argument["--workers=".len..], 10);
         } else return error.InvalidArgument;
     }
     if (samples == 0 or samples > sample_count) return error.InvalidArgument;
+    if (workers > 64) return error.InvalidArgument;
     if (selected) |name| {
         if (!std.mem.eql(u8, name, compilation_case) and
             !std.mem.eql(u8, name, runtime_case)) return error.InvalidArgument;
@@ -227,7 +233,7 @@ pub fn main(init: std.process.Init) !void {
     const writer = &output.interface;
     try writer.writeAll("case,lane,phase,sample,nanoseconds,executable_bytes\n");
     if (selected == null or std.mem.eql(u8, selected.?, compilation_case))
-        try measureCompilation(init, writer, lines, samples);
+        try measureCompilation(init, writer, lines, samples, workers);
     if (selected == null or std.mem.eql(u8, selected.?, runtime_case))
         try measureRuntime(init, writer, skip_c);
     try writer.flush();

@@ -34,11 +34,14 @@ LEGACY_RUNTIME = {
     "identity": {"protocol": "sieve-88000000-i32-wall-v1",
                  "source": "6daad48db9d9581f742de5185243d81c1ca139dd5a3029355bd383aa616ad9e4"},
 }
-COLORS = ("#147d64", "#b43c44", "#3567ad")
-C_LANES = ("c-O0", "c-O1", "c-O2", "c-O3")
+C_LANES = ("c-O0", "c-O3")
 COMPILATION_CASE = "core-1000000"
 RUNTIME_CASE = "sieve-88000000"
+COMPILATION_LANES = {"normal": "Compile", "workers-8": "Compile (8 workers)"}
 CORE_CASES = {COMPILATION_CASE: ("cold", "leaf-edit"), RUNTIME_CASE: ("runtime",)}
+COMPILATION_ESTIMATES = {
+    "cold": ("C++ -O0: 160 s", "C++ -O2: 268 s"),
+}
 COMPILER_BRIDGE = '''pub const optimize_mode = @import("builtin").mode;
 pub const query = @import("query/engine.zig");
 pub const modules = @import("modules.zig");
@@ -140,16 +143,20 @@ def parse_samples(text: str, case: str | None = None) -> list[dict]:
             raise ValueError("invalid benchmark measurement")
         groups[(sample["case"], sample["lane"], sample["phase"])].append(sample["sample"])
     for (name, lane, phase), indices in groups.items():
-        count = 3 if name == COMPILATION_CASE and lane == "normal" and phase in CORE_CASES[COMPILATION_CASE] else 9
+        count = 3 if name == COMPILATION_CASE and lane in COMPILATION_LANES and phase in CORE_CASES[COMPILATION_CASE] else 9
         if sorted(indices) != list(range(count)):
             raise ValueError(f"benchmark must supply exactly {count} samples per measurement")
-    expected = {(COMPILATION_CASE, "normal", phase) for phase in CORE_CASES[COMPILATION_CASE]}
+    compilation = [{(COMPILATION_CASE, lane, phase) for phase in CORE_CASES[COMPILATION_CASE]}
+                   for lane in COMPILATION_LANES]
+    compilation.append(set.union(*compilation))
     runtime = {(RUNTIME_CASE, "normal", "runtime")}
     references = {(RUNTIME_CASE, lane, "runtime") for lane in C_LANES}
-    allowed = (expected, expected | runtime, expected | runtime | references)
-    if case is not None:
-        expected = {(case, "normal", phase) for phase in CORE_CASES[case]}
-        allowed = (expected, expected | references) if case == RUNTIME_CASE else (expected,)
+    allowed = tuple(expected | extra for expected in compilation
+                    for extra in (set(), runtime, runtime | references))
+    if case == COMPILATION_CASE:
+        allowed = tuple(compilation)
+    elif case == RUNTIME_CASE:
+        allowed = (runtime, runtime | references)
     if set(groups) not in allowed:
         raise ValueError("benchmark workload set changed; update the recording protocol")
     return samples
@@ -232,22 +239,29 @@ def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: boo
                  f"-Dbundled-std={'true' if bundled else 'false'}", "--"]
     if cached is not None:
         arguments.append("--skip-c")
-        print("Reusing cached C reference (-O0 through -O3)", flush=True)
+        print("Reusing cached C reference (-O0 and -O3)", flush=True)
     print(f"Benchmarking {identity[:12]} (ReleaseFast)", flush=True)
     measured = []
-    for case in CORE_CASES:
+    for case, workers in ((COMPILATION_CASE, 0), (COMPILATION_CASE, 8), (RUNTIME_CASE, 0)):
         try:
-            measured.extend(parse_samples(command([*arguments, f"--case={case}"], snapshot), case))
+            worker_arguments = ["--workers=8"] if workers else []
+            rows = parse_samples(command([*arguments, f"--case={case}", *worker_arguments], snapshot), case)
+            if case == COMPILATION_CASE:
+                expected_lane = "workers-8" if workers else "normal"
+                if {sample["lane"] for sample in rows} != {expected_lane}:
+                    raise ValueError(f"compilation benchmark must supply the {expected_lane} lane")
+            measured.extend(rows)
         except (subprocess.CalledProcessError, ValueError) as error:
             details = str(error)
             if isinstance(error, subprocess.CalledProcessError):
                 details += "\n" + (error.stdout or "") + "\n" + (error.stderr or "")
             logs = data / "failures"
             logs.mkdir(parents=True, exist_ok=True)
-            filename = f"{record['recorded_at'].replace(':', '-')}-{commit[:12]}-{case}.log"
+            suffix = "-workers-8" if workers else ""
+            filename = f"{record['recorded_at'].replace(':', '-')}-{commit[:12]}-{case}{suffix}.log"
             (logs / filename).write_text(details + "\n")
-            record["failures"].append({"case": case, "log": f"failures/{filename}"})
-            print(f"  {case}: unavailable (see failures/{filename})", flush=True)
+            record["failures"].append({"case": case, "workers": workers, "log": f"failures/{filename}"})
+            print(f"  {case}{suffix}: unavailable (see failures/{filename})", flush=True)
     if cached is not None:
         if any(sample["lane"] in C_LANES for sample in measured):
             raise ValueError("benchmark did not skip cached C measurements")
@@ -261,10 +275,11 @@ def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: boo
 
 def chart(series: dict[str, list[tuple[float, float, str]]], history: list[tuple[str, str]],
     unit: str, png: Path | None = None, title: str | None = None, markers: bool = True,
-    references: dict[str, tuple[float, str]] | None = None) -> str:
+    references: dict[str, tuple[float, str]] | None = None, estimates: tuple[str, ...] = ()) -> str:
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib import font_manager, pyplot, ticker
+    from matplotlib.lines import Line2D
 
     references = references or {}
     points = [point for values in series.values() for point in values]
@@ -285,19 +300,26 @@ def chart(series: dict[str, list[tuple[float, float, str]]], history: list[tuple
         figure, axis = pyplot.subplots(figsize=(9, 3.8), layout="constrained")
         try:
             for index, (name, values) in enumerate(series.items()):
-                color = "#444444" if len(series) == 1 else COLORS[index % len(COLORS)]
+                color = "#444444"
+                line_style, line_width = (("-", 1.8), (":", 2.6), ("--", 1.5), ("-.", 2.2))[index % 4]
                 label = name
-                if name == "Runtime" and values:
+                if (name.startswith("Compile") or name == "Runtime" or estimates) and values:
                     label = f"{name}: {max(values, key=lambda point: point[0])[1]:.3f} {unit}"
-                axis.plot([point[0] for point in values], [point[1] for point in values],
-                          color=color, linewidth=1.8, label=label)
+                line, = axis.plot([point[0] for point in values], [point[1] for point in values],
+                                  color=color, linestyle=line_style, linewidth=line_width, label=label,
+                                  gid=f"series-{index}")
+                if line_style != "-":
+                    line.set_path_effects([])
+                    line.set_sketch_params(None)
                 if markers:
                     for point_index, (position, value, _) in enumerate(values):
                         axis.plot(position, value, "o", color=color, markersize=3.5, path_effects=[],
+                                  markerfacecolor=color if index == 0 else "white",
                                   gid=f"point-{index}-{point_index}")
-            reference_colors = ("#888888", "#3567ad", "#147d64", "#b43c44")
+            reference_color = next((line.get_color() for line in axis.lines
+                                    if line.get_label().startswith("Runtime")), "#444444")
             for index, (name, (value, _)) in enumerate(references.items()):
-                line = axis.axhline(value, color=reference_colors[index % len(reference_colors)],
+                line = axis.axhline(value, color=reference_color,
                                     linestyle=(":", "--", "-.", ":")[index % 4], linewidth=1.2,
                                     label=f"{name}: {value:.3f} {unit}", path_effects=[], gid=f"reference-{index}")
                 line.set_sketch_params(None)
@@ -319,8 +341,14 @@ def chart(series: dict[str, list[tuple[float, float, str]]], history: list[tuple
                 axis.grid(axis="y", alpha=0.2)
             if title:
                 axis.set_title(title, fontsize=12, pad=14)
-            if len(series) > 1 or references:
-                axis.legend(frameon=False, loc="upper right")
+            compilation = any(name.startswith("Compile") for name in series)
+            if len(series) > 1 or references or estimates or compilation:
+                handles, labels = axis.get_legend_handles_labels()
+                handles.extend(Line2D([], [], linestyle="none") for _ in estimates)
+                labels.extend(estimates)
+                side_legend = bool(estimates) or compilation
+                axis.legend(handles, labels, frameon=False, loc="upper left" if side_legend else "upper right",
+                            bbox_to_anchor=(1.02, 1) if side_legend else (1, 1))
             for text in figure.findobj(matplotlib.text.Text):
                 text.set_path_effects([])
             output = io.StringIO()
@@ -351,11 +379,12 @@ def chart(series: dict[str, list[tuple[float, float, str]]], history: list[tuple
 
 def graph_artifact(data: Path, name: str, series: dict, history: list[tuple[str, str]],
                    unit: str, title: str, markers: bool = True,
-                   references: dict[str, tuple[float, str]] | None = None) -> str:
+                   references: dict[str, tuple[float, str]] | None = None,
+                   estimates: tuple[str, ...] = ()) -> str:
     directory = data / "graphs"
     directory.mkdir(parents=True, exist_ok=True)
     svg = chart(series, history, unit, png=directory / f"{name}.png", title=title, markers=markers,
-                references=references)
+                references=references, estimates=estimates)
     (directory / f"{name}.svg").write_text(svg + "\n")
     label = html.escape(title, quote=True)
     return (f"<object type='image/svg+xml' data='graphs/{name}.svg' aria-label='{label}'>"
@@ -409,11 +438,9 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
         loc_sections.append("<section><h2>Lines of Code</h2>" + graph_artifact(
             data, "loc", series, history, "lines", "Lines of Code", markers=False) + "</section>")
     groups = defaultdict(dict)
-    compatible = [record for record in records if record.get("protocol") == PROTOCOL]
-    suite = compatible[-1]["suite"] if compatible else None
     runtime_suite = next((runtime_identity(record) for record in reversed(records) if runtime_identity(record) is not None), None)
     for record in records:
-        current = record.get("protocol") == PROTOCOL and record.get("suite") == suite
+        current = record.get("protocol") == PROTOCOL
         runtime_compatible = runtime_identity(record) is not None and runtime_identity(record) == runtime_suite
         if not current and not runtime_compatible:
             continue
@@ -426,9 +453,11 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
                 selected = [sample for sample in benchmark["samples"]
                             if (sample["phase"] == "runtime") == runtime
                             and sample["phase"] in CORE_CASES.get(sample["case"], ())]
-                if not any(sample["lane"] == "normal" for sample in selected):
+                lanes = ("normal",) if runtime else COMPILATION_LANES
+                if not any(sample["lane"] in lanes for sample in selected):
                     continue
-                provenance = {key: record[key] for key in ("zig", "runner")}
+                provenance = {"zig": record["zig"],
+                              "runner": {key: value for key, value in record["runner"].items() if key != "affinity"}}
                 if runtime:
                     provenance["runtime_suite"] = runtime_identity(record)
                     if "c_compiler" in record:
@@ -456,7 +485,8 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
         for record, benchmark in entries.values():
             samples = defaultdict(list)
             for sample in benchmark["samples"]:
-                if sample["lane"] != "normal" or sample["phase"] not in CORE_CASES.get(sample["case"], ()):
+                lanes = COMPILATION_LANES if sample["case"] == COMPILATION_CASE else ("normal",)
+                if sample["lane"] not in lanes or sample["phase"] not in CORE_CASES.get(sample["case"], ()):
                     continue
                 divisor = 1_000_000_000 if sample["phase"] == "runtime" or sample["case"] == COMPILATION_CASE else 1_000_000
                 samples[(sample["case"], sample["lane"], sample["phase"])].append(sample["nanoseconds"] / divisor)
@@ -466,8 +496,8 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
                 measurements[key].append((positions[record["commit"]] + (0.35 if record["worktree"] else 0),
                                           statistics.median(values), description(record) + "\n" + spread))
         plots = defaultdict(dict)
-        for (case, _, phase), values in sorted(measurements.items()):
-            label = "Runtime" if phase == "runtime" else "Compile"
+        for (case, lane, phase), values in sorted(measurements.items()):
+            label = "Runtime" if phase == "runtime" else COMPILATION_LANES[lane]
             plots[(case, phase)][label] = sorted(values)
         configuration_id = hashlib.sha256((configuration + mode).encode()).hexdigest()[:12]
         for heading, runtime in (("ReleaseFast Compilation", False), ("Generated Program Runtime", True)):
@@ -478,7 +508,8 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
             for (case, phase), series in sorted(selected.items()):
                 name = f"{mode}-{configuration_id}-{case}-{phase}"
                 graph = graph_artifact(data, name, series, history, "s", f"{case} / {phase}",
-                                       references=references.get(case) if runtime else None)
+                                       references=references.get(case) if runtime else None,
+                                       estimates=COMPILATION_ESTIMATES.get(phase, ()) if case == COMPILATION_CASE else ())
                 benchmark_sections.append("<article>" + graph + "</article>")
                 benchmark_images.append(data / "graphs" / f"{name}.png")
             benchmark_sections.append("</div></section>")
@@ -551,7 +582,7 @@ def main() -> None:
                         record.update(current)
                         record["failures"] = [{"case": case, "error": str(error)} for case in CORE_CASES]
                     save(data, record)
-                    count = sum(sample["lane"] == "normal" for benchmark in record["benchmarks"] for sample in benchmark["samples"])
+                    count = sum(sample["lane"] in COMPILATION_LANES for benchmark in record["benchmarks"] for sample in benchmark["samples"])
                     print(f"Recorded {commit[:12]}: {record['loc']['code']:,} production lines, {count} benchmark samples", flush=True)
         report = render(data, history)
         print(f"Report: {report}")

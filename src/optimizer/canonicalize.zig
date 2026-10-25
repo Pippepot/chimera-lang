@@ -8,24 +8,42 @@ const Instruction = structures.FunctionInstruction;
 const Terminator = structures.FunctionTerminator;
 const Function = function_ir.Function;
 
-pub fn canonicalize(function: *Function) !void {
+pub fn canonicalize(function: *Function) !function_ir.Changes {
+    function.resolveReferences();
     var rules: Rules = .{ .function = function, .address_taken = try addressTaken(function) };
     var changed = true;
+    var changes: function_ir.Changes = .{};
     while (changed) {
-        function.resolveReferences();
         changed = false;
         for (function.instructions.items, function.results.items, function.removed.items) |*instruction, result, removed| {
-            if (!removed and rules.simplify(instruction, result)) changed = true;
+            if (removed) continue;
+            const original = instruction.*;
+            if (rules.simplify(instruction, result)) {
+                changed = true;
+                changes.storage = changes.storage or switch (original) {
+                    .borrow_read, .borrow_write, .borrow_address => true,
+                    else => function_ir.usesStorage(function, &original) or function_ir.usesStorage(function, instruction),
+                };
+            }
         }
         for (function.blocks.items) |*block| {
             if (rules.simplifyTerminator(&block.terminator)) changed = true;
         }
+        changes.changed = changes.changed or changed;
+        if (changed) {
+            function.invalidateOperands();
+            function.resolveReferences();
+        }
     }
+    if (rules.graph_changed) function.invalidateControlFlow();
+    changes.control_flow = rules.graph_changed;
+    return changes;
 }
 
 const Rules = struct {
     function: *Function,
     address_taken: []const bool,
+    graph_changed: bool = false,
 
     fn simplify(self: *Rules, instruction: *Instruction, result: ValueId) bool {
         if (self.function.find(result) != result) return false;
@@ -38,6 +56,14 @@ const Rules = struct {
                 return true;
             },
             .value_copy => |copy| return self.simplifyCopy(copy, result),
+            .borrow_read => |operation| return self.simplifyBorrowRead(instruction, operation, result),
+            .borrow_address => |operation| return self.simplifyBorrowAddress(operation, result),
+            .field_access => |operation| return self.simplifyFieldAccess(operation, result),
+            .variant_tag => |operand| return self.simplifyVariantTag(instruction, operand),
+            .variant_extract => |operation| return self.simplifyVariantExtract(operation, result),
+            .compare => |operation| return self.simplifyCompare(instruction, operation),
+            .borrow_write => |operation| return self.simplifyBorrowWrite(instruction, operation),
+            .select => |operation| return self.simplifySelect(operation, result),
             else => return false,
         }
     }
@@ -86,16 +112,87 @@ const Rules = struct {
     }
 
     fn simplifyCopy(self: *Rules, copy: structures.ValueCopy, result: ValueId) bool {
-        if (copy.destination != null or !compaction.isScalar(copy.type_id)) return false;
+        if (copy.destination != null) return false;
         if (self.function.valueType(copy.source) != copy.type_id or !self.function.plainValue(copy.source)) return false;
         return self.alias(result, copy.source);
+    }
+
+    fn simplifyBorrowRead(self: *Rules, instruction: *Instruction, operation: structures.BorrowOperation, result: ValueId) bool {
+        const reference = self.function.definition(operation.source) orelse return false;
+        if (reference != .borrow_address or reference.borrow_address.base_is_reference) return false;
+        const address = reference.borrow_address;
+        const fields = self.function.borrow_fields.items[address.fields.start..address.fields.end];
+        if (fields.len == 0) {
+            if (self.function.valueType(address.source) != operation.type_id) return false;
+            self.function.replace(result, address.source);
+            return true;
+        }
+        if (fields.len != 1) return false;
+        instruction.* = .{ .storage_projection = .{
+            .owner = address.source,
+            .type_id = operation.type_id,
+            .projection = switch (fields[0]) {
+                .field => |index| .{ .field = index },
+                .variant => .variant,
+            },
+        } };
+        return true;
+    }
+
+    fn simplifyBorrowWrite(self: *Rules, instruction: *Instruction, operation: structures.BorrowWriteOperation) bool {
+        const reference = self.function.definition(operation.reference) orelse return false;
+        if (reference != .borrow_address or reference.borrow_address.base_is_reference) return false;
+        const address = reference.borrow_address;
+        if (address.fields.start != address.fields.end or self.function.valueType(address.source) != operation.type_id) return false;
+        instruction.* = .{ .value_copy = .{ .source = operation.value, .type_id = operation.type_id, .destination = address.source } };
+        return true;
+    }
+
+    fn simplifyBorrowAddress(self: *Rules, operation: structures.BorrowAddressOperation, result: ValueId) bool {
+        if (!operation.base_is_reference or operation.fields.start != operation.fields.end) return false;
+        if (self.function.valueType(operation.source) != operation.type_id) return false;
+        return self.alias(result, operation.source);
+    }
+
+    fn simplifyFieldAccess(self: *Rules, operation: structures.FieldAccessOperation, result: ValueId) bool {
+        const aggregate = self.function.definition(operation.operand) orelse return false;
+        if (aggregate != .aggregate) return false;
+        const field = self.function.aggregate_fields.items[aggregate.aggregate.fields.start + operation.field_index];
+        if (self.function.valueType(field) != operation.field_type) return false;
+        return self.alias(result, field);
+    }
+
+    fn simplifyVariantTag(self: *Rules, instruction: *Instruction, operand: ValueId) bool {
+        const coercion = self.function.definition(operand) orelse return false;
+        if (coercion != .variant_coerce or coercion.variant_coerce.destination != null) return false;
+        const mapping = coercion.variant_coerce.tag_mapping orelse return false;
+        if (mapping.end - mapping.start != 1) return false;
+        instruction.* = .{ .const_int = @intCast(self.function.variant_coercion_tags.items[mapping.start]) };
+        return true;
+    }
+
+    fn simplifyVariantExtract(self: *Rules, operation: structures.VariantOperation, result: ValueId) bool {
+        if (operation.destination != null) return false;
+        const coercion = self.function.definition(operation.operand) orelse return false;
+        if (coercion != .variant_coerce or coercion.variant_coerce.destination != null) return false;
+        const source = coercion.variant_coerce.operand;
+        if (self.function.valueType(source) != operation.target_type) return false;
+        return self.alias(result, source);
     }
 
     fn simplifyTerminator(self: *Rules, terminator: *Terminator) bool {
         if (terminator.* != .predicate_branch) return false;
         const predicate = terminator.predicate_branch;
+        if (predicate.operation == .eqb or predicate.operation == .neb) if (self.function.definition(predicate.operands.lhs)) |definition| if (definition == .compare) if (self.constantBool(predicate.operands.rhs)) |expected| {
+            const holds = (predicate.operation == .eqb) == expected;
+            const compare = definition.compare;
+            terminator.predicate_branch.operation = if (holds) compare.operation else compare.operation.negated();
+            terminator.predicate_branch.operands = compare.operands;
+            return true;
+        };
         const order = self.operandOrder(predicate.operands) orelse return false;
         terminator.* = .{ .branch = if (predicate.operation.holds(order)) predicate.then_branch else predicate.else_branch };
+        self.graph_changed = true;
         return true;
     }
 
@@ -104,8 +201,25 @@ const Rules = struct {
         return std.math.order(self.constant(operands.lhs) orelse return null, self.constant(operands.rhs) orelse return null);
     }
 
+    fn constantBool(self: *const Rules, value: ValueId) ?bool {
+        const definition = self.function.definition(value) orelse return null;
+        return if (definition == .const_bool) definition.const_bool else null;
+    }
+
+    fn simplifyCompare(self: *Rules, instruction: *Instruction, operation: structures.CompareOperation) bool {
+        const order = self.operandOrder(operation.operands) orelse return false;
+        instruction.* = .{ .const_bool = operation.operation.holds(order) };
+        return true;
+    }
+
+    fn simplifySelect(self: *Rules, operation: structures.SelectOperation, result: ValueId) bool {
+        if (operation.then_value == operation.else_value) return self.alias(result, operation.then_value);
+        const condition = self.constantBool(operation.condition) orelse return false;
+        return self.alias(result, if (condition) operation.then_value else operation.else_value);
+    }
+
     fn alias(self: *Rules, result: ValueId, target: ValueId) bool {
-        if (self.address_taken[@backingInt(result)] or self.address_taken[@backingInt(target)]) return false;
+        if (self.address_taken[@backingInt(result)] or self.address_taken[@backingInt(target)] or !self.function.plainValue(target)) return false;
         self.function.replace(result, target);
         return true;
     }
@@ -146,59 +260,58 @@ fn binaryOperands(instruction: *Instruction) *structures.BinaryOperands {
 }
 
 pub fn addressTaken(function: *Function) ![]const bool {
-    const scratch = function.scratch;
-    const tables = function_ir.tableView(function);
-    const uses = try scratch.alloc(u32, function.valueCount());
-    @memset(uses, 0);
-    const reads = try scratch.alloc(u32, function.valueCount());
-    @memset(reads, 0);
+    if (function.address_taken) |taken| return taken;
+    const taken = try function.scratch.alloc(bool, function.valueCount());
+    @memset(taken, false);
     for (function.instructions.items, function.removed.items) |*instruction, removed| {
         if (removed) continue;
-        function_ir.visitInstructionReferences(tables, instruction, uses, countUse);
         switch (instruction.*) {
-            .addi, .subi, .muli, .divsi => |operands| {
-                countUse(reads, operands.lhs);
-                countUse(reads, operands.rhs);
+            inline .value_copy, .variant_coerce, .variant_extract => |operation| {
+                if (operation.destination) |destination| taken[@backingInt(destination)] = true;
             },
-            .negi, .byte_to_int => |operand| countUse(reads, operand),
-            .value_copy => |operation| countUse(reads, operation.source),
-            .call => |call| countCallReads(function, call, reads),
+            .static_conversion => |operation| {
+                taken[@backingInt(operation.operand)] = true;
+                if (operation.destination) |destination| taken[@backingInt(destination)] = true;
+            },
+            .storage_projection => |projection| taken[@backingInt(projection.owner)] = true,
+            .array_element => |element| taken[@backingInt(element.array)] = true,
+            .storage_cursor => |cursor| taken[@backingInt(cursor.source)] = true,
+            .borrow_address => |address| if (!address.base_is_reference) {
+                taken[@backingInt(address.source)] = true;
+            },
+            .initializer_ref => |reference| {
+                for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |capture| taken[@backingInt(capture)] = true;
+            },
+            .call => |call| markCallAddresses(function, call, taken),
+            .fill => |operation| taken[@backingInt(operation.first)] = true,
+            .move => |operation| {
+                taken[@backingInt(operation.destination)] = true;
+                taken[@backingInt(operation.source)] = true;
+            },
             else => {},
         }
     }
     for (function.blocks.items) |*block| {
-        function_ir.visitTerminatorReferences(tables, &block.terminator, uses, countUse);
-        switch (block.terminator) {
-            .branch => |branch| countBranchReads(function, branch, reads),
-            .predicate_branch => |predicate| {
-                countUse(reads, predicate.operands.lhs);
-                countUse(reads, predicate.operands.rhs);
-                countBranchReads(function, predicate.then_branch, reads);
-                countBranchReads(function, predicate.else_branch, reads);
-            },
-            .fallible_call => |fallible| countCallReads(function, fallible.call, reads),
-            .return_value => |use| countUse(reads, use.value),
-            .return_unit, .return_failure, .diverge => {},
-        }
+        for (block.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| markBranchAddresses(function, branch.*, taken);
     }
-    const taken = try scratch.alloc(bool, function.valueCount());
-    for (taken, uses, reads) |*value_taken, use_count, read_count| value_taken.* = use_count != read_count;
+    function.address_taken = taken;
     return taken;
 }
 
-fn countUse(counts: []u32, value: ValueId) void {
-    counts[@backingInt(value)] += 1;
-}
-
-fn countCallReads(function: *const Function, call: structures.FunctionCall, reads: []u32) void {
+fn markCallAddresses(function: *const Function, call: structures.FunctionCall, taken: []bool) void {
+    if (call.destination) |destination| taken[@backingInt(destination)] = true;
     for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
-        if (argument == .prepared) countUse(reads, argument.prepared.value);
+        if (argument != .prepared) taken[@backingInt(argument.valueId())] = true;
     }
 }
 
-fn countBranchReads(function: *const Function, branch: structures.FunctionBranch, reads: []u32) void {
+fn markBranchAddresses(function: *const Function, branch: structures.FunctionBranch, taken: []bool) void {
+    const arguments = function.branch_arguments.items[branch.arguments.start..branch.arguments.end];
     const parameters = function.blocks.items[@backingInt(branch.target)].parameters.items;
-    for (function.branch_arguments.items[branch.arguments.start..branch.arguments.end], parameters) |argument, parameter| {
-        if (function.definitions.items[@backingInt(parameter)].argument.data.representation == .value) countUse(reads, argument.value);
+    const count = @min(arguments.len, parameters.len);
+    for (arguments[0..count], parameters[0..count]) |argument, parameter| {
+        const data = function.definitions.items[@backingInt(parameter)].argument.data;
+        if (data.representation != .value or !function.direct(data.type_id)) taken[@backingInt(argument.value)] = true;
     }
+    for (arguments[count..]) |argument| taken[@backingInt(argument.value)] = true;
 }

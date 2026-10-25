@@ -9,18 +9,18 @@ pub static stdin = Stream{descriptor = 0}
 pub static stdout = Stream{descriptor = 1}
 pub static stderr = Stream{descriptor = 2}
 
-pub fallible write_once(stream: Stream, imm bytes: BytesView) int -> bytes.write_to?(stream.descriptor)
-pub fallible write_all(stream: Stream, imm bytes: BytesView)
+pub func write_once(stream: Stream, imm bytes: BytesView) int | none -> bytes.write_to(stream.descriptor)
+pub func write_all(stream: Stream, imm bytes: BytesView) unit | none
     var offset = 0
     loop
-        if offset == bytes.byte_length() -> break
-        const remaining = bytes.slice?(offset..)
-        const written = write_once?(stream, remaining)
-        written > 0
+        if offset == bytes.byte_length() -> return unit
+        const remaining: BytesView = bytes.slice(offset..) else return none
+        const written: int = write_once(stream, remaining) else return none
+        if written <= 0 -> return none
         offset += written
-pub fallible write_text(stream: Stream, imm text: StringView) -> write_all?(stream, text.as_bytes())
+pub func write_text(stream: Stream, imm text: StringView) unit | none -> write_all(stream, text.as_bytes())
 pub overload print(print_value)
 func print_value(static T: type, imm value: T)
-    if not write_text(stdout, String(value)) -> panic "standard output write failed"
-    if not write_text(stdout, "\n") -> panic "standard output newline write failed"
-pub fallible read_bytes(stream: Stream, mut bytes: List(byte), count: int) int -> bytes.read_bytes?(stream.descriptor, count)
+    const _: unit = write_text(stdout, String(value)) else panic "standard output write failed"
+    const _: unit = write_text(stdout, "\n") else panic "standard output newline write failed"
+pub func read_bytes(stream: Stream, mut bytes: List(byte), count: int) int | none -> bytes.read_bytes(stream.descriptor, count)
