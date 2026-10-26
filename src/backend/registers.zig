@@ -89,7 +89,7 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
             const instruction = instructions[index];
             if (instruction != .register) continue;
             const value = mapping[@backingInt(instruction.register.value)].?;
-            if (instruction.register.operation == .store_eax) {
+            if (instruction.register.operation == .store_eax or instruction.register.operation == .store_rax) {
                 defined.set(value);
             } else {
                 if (!defined.isSet(value)) used.set(value);
@@ -151,7 +151,7 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
             if (instruction != .register) continue;
             const value = mapping[@backingInt(instruction.register.value)].?;
             const position: u32 = @intCast(index * 2);
-            if (instruction.register.operation == .store_eax) {
+            if (instruction.register.operation == .store_eax or instruction.register.operation == .store_rax) {
                 const end = if (next.isSet(value)) range_ends[value] else position + 1;
                 try ranges[value].append(scratch, .{ .start = position + 1, .end = end });
                 next.unset(value);

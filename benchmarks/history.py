@@ -286,6 +286,11 @@ def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: boo
     print(f"Benchmarking {identity[:12]} (ReleaseFast)", flush=True)
     measured = []
     for case, workers in ((COMPILATION_CASE, 0), (COMPILATION_CASE, 8), (RUNTIME_CASE, 0)):
+        if workers > len(record["runner"]["affinity"]):
+            print(f"Warning: {workers} workers share only {len(record['runner']['affinity'])} allowed CPU(s); "
+                  "this measures oversubscription, not multicore scaling. "
+                  "Use taskset with at least 8 CPUs and omit --cpu for worker comparisons.",
+                  file=sys.stderr, flush=True)
         try:
             worker_arguments = ["--workers=8"] if workers else []
             rows = parse_samples(command([*arguments, f"--case={case}", *worker_arguments], snapshot), case)
@@ -357,10 +362,10 @@ def chart(series: dict[str, list[tuple[float, float, str]]], history: list[tuple
                 if markers:
                     for point_index, (position, value, _) in enumerate(values):
                         axis.plot(position, value, "o", color=color, markersize=3.5, path_effects=[],
-                                  markerfacecolor=color if index == 0 else "white",
+                                                                    markerfacecolor=color if index == 0 else "white",
                                   gid=f"point-{index}-{point_index}")
             reference_color = next((line.get_color() for line in axis.lines
-                                    if line.get_label().startswith("Runtime")), "#444444")
+                                                                        if line.get_label().startswith("Runtime")), "#444444")
             for index, (name, (value, _)) in enumerate(references.items()):
                 line = axis.axhline(value, color=reference_color,
                                     linestyle=(":", "--", "-.", ":")[index % 4], linewidth=1.2,
@@ -505,8 +510,6 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
                     provenance["runtime_suite"] = runtime_identity(record)
                     if "c_compiler" in record:
                         provenance["c_compiler"] = record["c_compiler"]
-                else:
-                    provenance["compilation_protocol"] = record.get("compilation_protocol", "core-million-modules-one-line-leaf-v1")
                 configuration = json.dumps(provenance, sort_keys=True)
                 key = (configuration, benchmark["mode"])
                 point = (record["commit"], "worktree" if record["worktree"] else "commit")

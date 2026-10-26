@@ -480,7 +480,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         options: BodyOptions = .{},
         type_check_only: bool = false,
-        values: []?Value = &.{},
+        values: flow_snapshot.Buffer(?Value, null) = .{},
         state: State = .{},
         initializer_regions: std.ArrayList(structures.FunctionBodyAnalysis) = .empty,
         initializer_captures: std.ArrayList(structures.FunctionValueId) = .empty,
@@ -492,7 +492,6 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         collection_emission: ?*CollectionEmission = null,
         optional_collection_allocation: bool = false,
         captured_locals: []?u32 = &.{},
-        captured_values: []bool = &.{},
         initializer_writes: std.ArrayList(InitializerWrite) = .empty,
         initializer_reference_writes: std.ArrayList(InitializerReferenceWrite) = .empty,
         initializer_write_checks: std.ArrayList(struct {
@@ -581,8 +580,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn init(self: *Self, parameters: []const structures.CallableParameter) !void {
             std.debug.assert(parameters.len == self.unresolved.parameter_count);
             std.debug.assert(parameters.len == self.unresolved.parameter_spans.len);
-            self.values = try self.gpa.alloc(?Value, parameters.len + self.unresolved.expressions.len);
-            @memset(self.values, null);
+            self.values = @TypeOf(self.values).init(parameters.len + self.unresolved.expressions.len);
             self.state.initializers = @TypeOf(self.state.initializers).init(parameters.len);
             self.state.values = @TypeOf(self.state.values).init(self.unresolved.local_count);
             var locals: std.MultiArrayList(LocalMetadata) = .empty;
@@ -606,18 +604,18 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 const stores_borrow = try self.analysis_context.canStoreBorrow(parameter.type_id);
                 switch (parameter.mode) {
                     .init => {
-                        self.values[index] = .{ .id = entry_value.id, .type_id = entry_value.type_id, .initializer_parameter = @intCast(index), .reference_origins = if (stores_borrow) try self.addReferenceOrigin(null, .{ .parameter = @intCast(index) }) else null };
+                        try self.values.set(self.gpa, index, .{ .id = entry_value.id, .type_id = entry_value.type_id, .initializer_parameter = @intCast(index), .reference_origins = if (stores_borrow) try self.addReferenceOrigin(null, .{ .parameter = @intCast(index) }) else null });
                         try self.state.initializers.set(self.gpa, index, .pending);
                     },
                     .imm => {
-                        self.values[index] = .{
+                        try self.values.set(self.gpa, index, .{
                             .id = entry_value.id,
                             .type_id = entry_value.type_id,
                             .writable = false,
                             .borrowed_type = entry_value.type_id,
                             .reference_origins = try self.addReferenceOrigin(null, .{ .parameter = @intCast(index), .source_kind = if (stores_borrow) .contents else .place }),
                             .place_origins = if (stores_borrow) try self.parameterPlaceOrigins(@intCast(index), entry_value) else null,
-                        };
+                        });
                     },
                     .ref, .mut, .@"var", .deinit => {
                         if (stores_borrow) entry_value.reference_origins = try self.addReferenceOrigin(null, .{ .parameter = @intCast(index) });
@@ -937,16 +935,16 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     .move => return self.buildOwnershipMember(.move),
                     .initialize_slot => return self.buildInitializedTarget(2, .{ .allocation_element = .{
                         .allocation = self.state.values.get(0).?.id,
-                        .index = self.values[1].?.id,
-                        .type_id = self.values[2].?.type_id,
-                    } }, self.elementProjection(self.values[1].?.id)),
+                        .index = self.values.get(1).?.id,
+                        .type_id = self.values.get(2).?.type_id,
+                    } }, self.elementProjection(self.values.get(1).?.id)),
                     .array_filled => return self.buildArrayFilled(),
                     .array_from => return self.buildArrayFrom(),
                     .initialize_collection => return self.buildCollectionInitializer(),
                     .array_borrow, .array_borrow_mut => return self.buildArrayBorrow(),
                     .box_borrow, .box_own, .box_take, .box_destroy, .allocation_borrow, .allocation_take, .allocation_destroy => return self.buildMemoryOperation(operation),
                     .literal_byte => return self.buildLiteralByte(),
-                    .byte_to_int => return self.returnValue(try self.appendInstruction(.{ .byte_to_int = self.values[0].?.id }), .{ .start = 0, .end = 0 }),
+                    .byte_to_int => return self.returnValue(try self.appendInstruction(.{ .byte_to_int = self.values.get(0).?.id }), .{ .start = 0, .end = 0 }),
                     .empty_cursor, .storage_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => return self.buildCursorOperation(operation),
                 }
             }
@@ -964,9 +962,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn buildPrimitiveOperation(self: *Self, operation: structures.Operation) !void {
             switch (operation) {
-                .@"+", .@"-", .@"*", .@"/" => return self.returnValue(try self.primitiveArithmetic(operation, .{ .lhs = self.values[0].?.id, .rhs = self.values[1].?.id }), .{ .start = 0, .end = 0 }),
+                .@"+", .@"-", .@"*", .@"/" => return self.returnValue(try self.primitiveArithmetic(operation, .{ .lhs = self.values.get(0).?.id, .rhs = self.values.get(1).?.id }), .{ .start = 0, .end = 0 }),
                 .@"%" => return self.buildPrimitiveRemainder(),
-                .unary_minus => return self.returnValue(try self.appendInstruction(.{ .negi = self.values[0].?.id }), .{ .start = 0, .end = 0 }),
+                .unary_minus => return self.returnValue(try self.appendInstruction(.{ .negi = self.values.get(0).?.id }), .{ .start = 0, .end = 0 }),
                 .@"==", .@"<>", .@"<", .@">", .@"<=", .@">=", .not => return self.buildPrimitivePredicate(operation),
                 .@"[]", .@"[]=" => unreachable,
             }
@@ -984,16 +982,16 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn buildPrimitiveRemainder(self: *Self) !void {
-            const left = self.values[0].?.id;
-            const right = self.values[1].?.id;
+            const left = self.values.get(0).?.id;
+            const right = self.values.get(1).?.id;
             const quotient = try self.appendInstruction(.{ .divsi = .{ .lhs = left, .rhs = right } });
             const product = try self.appendInstruction(.{ .muli = .{ .lhs = quotient.id, .rhs = right } });
             try self.returnValue(try self.appendInstruction(.{ .subi = .{ .lhs = left, .rhs = product.id } }), .{ .start = 0, .end = 0 });
         }
 
         fn buildPrimitivePredicate(self: *Self, operation: structures.Operation) !void {
-            const left = self.values[0].?;
-            const right = if (operation == .not) try self.appendInstruction(.{ .const_bool = false }) else self.values[1].?;
+            const left = self.values.get(0).?;
+            const right = if (operation == .not) try self.appendInstruction(.{ .const_bool = false }) else self.values.get(1).?;
             const predicate = primitivePredicateOperation(operation, left.type_id);
             const matched = try self.newEmptyBlock();
             const unmatched = try self.newEmptyBlock();
@@ -1031,11 +1029,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn buildCursorOperation(self: *Self, body: BuiltinBody) !void {
             if (body == .empty_cursor) return self.returnValue(try self.permanentStorageCursor(.{ .type_id = self.return_type }), .{ .start = 0, .end = 0 });
-            const source = self.values[0] orelse self.borrowLocalValue(@fromBackingInt(@as(u32, 0)));
+            const source = self.values.get(0) orelse self.borrowLocalValue(@fromBackingInt(@as(u32, 0)));
             var result = switch (body) {
                 .storage_cursor => try self.appendInstruction(.{ .storage_cursor = .{ .source = source.id, .type_id = self.return_type } }),
-                .cursor_offset => try self.appendInstruction(.{ .cursor_offset = .{ .cursor = source.id, .index = self.values[1].?.id, .type_id = self.return_type } }),
-                .cursor_element => try self.appendInstruction(.{ .cursor_element = .{ .cursor = source.id, .index = self.values[1].?.id, .type_id = self.return_type } }),
+                .cursor_offset => try self.appendInstruction(.{ .cursor_offset = .{ .cursor = source.id, .index = self.values.get(1).?.id, .type_id = self.return_type } }),
+                .cursor_element => try self.appendInstruction(.{ .cursor_element = .{ .cursor = source.id, .index = self.values.get(1).?.id, .type_id = self.return_type } }),
                 .cursor_attenuate => try self.appendInstruction(.{ .value_copy = .{ .source = source.id, .type_id = self.return_type } }),
                 else => unreachable,
             };
@@ -1056,7 +1054,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn buildCollectionInitializer(self: *Self) !void {
-            const shape = (try self.analysis_context.collectionLiteralType(self.values[1].?.type_id)) orelse unreachable;
+            const shape = (try self.analysis_context.collectionLiteralType(self.values.get(1).?.type_id)) orelse unreachable;
             try self.buildInitializedTarget(1, .{ .storage_projection = .{
                 .owner = self.state.values.get(0).?.id,
                 .type_id = try self.analysis_context.internArrayType(shape),
@@ -1069,7 +1067,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const span = self.unresolved.parameter_spans[parameter];
             const boundary = try self.newBoundary(span);
             self.current_boundary = boundary;
-            const result = try self.constructInitializer(self.values[parameter].?, span, try self.appendInstruction(destination));
+            const result = try self.constructInitializer(self.values.get(parameter).?, span, try self.appendInstruction(destination));
             if (self.current_block == null) return;
             try self.recordConsume(result);
             const previous = self.state.values.get(0).?.reference_origins;
@@ -1091,7 +1089,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             else
                 null;
             const result = switch (operation) {
-                .copy => try self.copyValue(self.values[0].?, span, storage),
+                .copy => try self.copyValue(self.values.get(0).?, span, storage),
                 .move => try self.moveValue(self.state.values.get(0).?, span, storage),
             };
             if (storage != null) return self.returnConstructed(result, span);
@@ -1103,7 +1101,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const boundary = try self.newBoundary(span);
             self.current_boundary = boundary;
             const storage = try self.appendInstruction(.{ .result_storage = self.return_type });
-            const result = try self.constructInitializer(self.values[0].?, span, storage);
+            const result = try self.constructInitializer(self.values.get(0).?, span, storage);
             if (self.current_block != null) {
                 try self.closeBoundary(boundary);
                 self.current_boundary = null;
@@ -1113,7 +1111,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn buildArrayFilled(self: *Self) !void {
             const span = self.unresolved.parameter_spans[0];
-            const source = self.values[0].?;
+            const source = self.values.get(0).?;
             const array = (try self.analysis_context.facts().arrayType(self.return_type)) orelse unreachable;
             std.debug.assert(source.type_id == array.element_type);
             const capabilities = (try self.analysis_context.facts().ownershipCapabilities(source.type_id)) orelse return error.Unavailable;
@@ -1154,13 +1152,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 return self.returnValue(result, span);
             }
             const boxed = operation == .box_borrow or operation == .box_take or operation == .box_destroy;
-            const step: structures.ReferencePathStep = if (boxed) .element else self.elementProjection(self.values[1].?.id);
+            const step: structures.ReferencePathStep = if (boxed) .element else self.elementProjection(self.values.get(1).?.id);
             const facts = self.analysis_context.facts();
             const element_type = (if (boxed) try facts.boxElement(source.type_id) else try facts.allocationElement(source.type_id)) orelse unreachable;
             var element = if (boxed)
                 try self.projectStorage(source, element_type, .box_element)
             else
-                try self.appendInstruction(.{ .allocation_element = .{ .allocation = source.id, .index = self.values[1].?.id, .type_id = element_type } });
+                try self.appendInstruction(.{ .allocation_element = .{ .allocation = source.id, .index = self.values.get(1).?.id, .type_id = element_type } });
             if (operation == .box_borrow or operation == .allocation_borrow) {
                 const reference = try self.appendInstruction(.{ .borrow_address = .{ .source = element.id, .type_id = self.return_type } });
                 var result = try self.withReferenceOrigin(source, reference);
@@ -1190,13 +1188,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const source = self.borrowLocalValue(@fromBackingInt(@as(u32, 0)));
             const array = (try self.analysis_context.facts().arrayType(source.type_id)) orelse unreachable;
             try self.recordUse(source);
-            const element = try self.arrayElement(source, self.values[1].?, array.element_type);
+            const element = try self.arrayElement(source, self.values.get(1).?, array.element_type);
             const reference = try self.appendInstruction(.{ .borrow_address = .{
                 .source = element.id,
                 .type_id = self.return_type,
             } });
             var result = try self.withReferenceOrigin(source, reference);
-            result.reference_origins = try self.projectElementReferenceOrigins(result.reference_origins, false, self.elementProjection(self.values[1].?.id));
+            result.reference_origins = try self.projectElementReferenceOrigins(result.reference_origins, false, self.elementProjection(self.values.get(1).?.id));
             try self.returnValue(result, span);
         }
 
@@ -1943,13 +1941,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (try self.captureExpectedVariant(id, context)) |captured| return captured;
             const contextual_collection = source_operation != null and source_operation.?.* == .collection_literal;
             if (context.allow_converters and !contextual_collection) if (try self.prepareConversion(id, context)) |converted| {
-                self.values[index] = converted;
+                try self.values.set(self.gpa, index, converted);
                 try self.rememberCleanupOrigins(converted);
                 return converted;
             };
             if (request.destination) |destination| {
                 const span = request.destination_span orelse self.valueSpan(id);
-                if (self.values[index]) |pending| if (pending.initializer_parameter != null) return self.constructInitializer(pending, span, destination.storage);
+                if (self.values.get(index)) |pending| if (pending.initializer_parameter != null) return self.constructInitializer(pending, span, destination.storage);
                 if (!try self.constructsDirectly(id, destination.storage.type_id)) return self.placeEvaluated(id, span, destination);
             }
             if (context.access == .borrow) std.debug.assert(context.expected_type != null);
@@ -1969,7 +1967,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     return selected;
                 }
             }
-            if (self.values[index]) |resolved| {
+            if (self.values.get(index)) |resolved| {
                 return self.contextualValue(resolved, context, self.valueSpan(id));
             }
             std.debug.assert(index >= self.unresolved.parameter_count);
@@ -2044,7 +2042,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             };
             const result = if (request.destination != null) resolved else try self.contextualValue(resolved, context, expression.span);
             if (self.current_block != null) try self.closeBoundary(scope.boundary);
-            self.values[index] = result;
+            try self.values.set(self.gpa, index, result);
             try self.rememberCleanupOrigins(result);
             return result;
         }
@@ -2162,7 +2160,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const target = context.expected_type orelse return null;
             const index = @backingInt(id);
             if (index < self.unresolved.parameter_count) {
-                const source = self.values[index].?;
+                const source = self.values.get(index).?;
                 if (source.initializer_parameter != null or !try self.needsStaticConversion(source.type_id, target)) return null;
                 return try self.stageStaticConversion(id, source.type_id, context, self.valueSpan(id));
             }
@@ -2511,7 +2509,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn constructsDirectly(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: structures.TypeId) !bool {
-            if (self.values[@backingInt(id)] != null) return false;
+            if (self.values.get(@backingInt(id)) != null) return false;
             const operation = self.expressionOperation(id) orelse return false;
             if (operation.* != .struct_init and !try self.usesIndirectStorage(expected_type)) return false;
             if (operation.* == .struct_init or operation.* == .array_init or operation.* == .call) if (try self.unevaluatedType(id, null)) |source_type| {
@@ -3218,7 +3216,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     const index = @backingInt(item);
                     if (self.values[index]) return;
                     self.values[index] = true;
-                    if (self.parent.values[index]) |cached| if (cached.borrow_root) |local| try self.visit(local);
+                    if (self.parent.values.get(index)) |cached| if (cached.borrow_root) |local| try self.visit(local);
                     if (index < self.parent.unresolved.parameter_count) return;
                     return self.visit(self.parent.unresolved.expressions[index - self.parent.unresolved.parameter_count].operation);
                 }
@@ -3386,9 +3384,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             for (parameters, self.block_arguments.items[0..parameters.len]) |*parameter, source| parameter.* = .{ .mode = if (source.representation == .initializer) .init else .imm, .type_id = source.type_id };
             var capture_count = parameters.len;
             var transfer_count: usize = 0;
-            for (self.values[parameters.len..], parameters.len..) |source, index| {
+            for (parameters.len..self.values.len) |index| {
                 if (dependencies) |selected| if (!selected.values[index]) continue;
-                capture_count += @intFromBool(source != null);
+                capture_count += @intFromBool(self.values.get(index) != null);
             }
             for (0..self.state.values.len) |index| {
                 if (dependencies) |selected| if (!selected.locals[index]) continue;
@@ -3409,32 +3407,28 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             try region.parameter_modes.ensureTotalCapacity(gpa, capture_count);
             try region.capture_transfers.ensureTotalCapacity(gpa, transfer_count);
             try region.init(parameters);
-            region.captured_values = try gpa.alloc(bool, self.values.len);
-            @memset(region.captured_values, false);
             region.captured_locals = try gpa.alloc(?u32, self.state.values.len);
             @memset(region.captured_locals, null);
             for (parameters, 0..) |parameter, index| {
-                const source = self.values[index] orelse Value{ .id = @fromBackingInt(@intCast(index)), .type_id = parameter.type_id };
+                const source = self.values.get(index) orelse Value{ .id = @fromBackingInt(@intCast(index)), .type_id = parameter.type_id };
                 try captures.values.append(gpa, source);
                 try captures.locals.append(gpa, null);
                 region.block_arguments.items[index].representation = if (parameter.mode == .init) .initializer else .storage;
-                if (self.values[index] != null) {
-                    region.values[index] = .{
+                if (self.values.get(index) != null) {
+                    try region.values.set(gpa, index, .{
                         .id = @fromBackingInt(@intCast(index)),
                         .type_id = source.type_id,
                         .borrowed_type = if (parameter.mode == .init) null else source.type_id,
                         .initializer_parameter = source.initializer_parameter,
-                        .reference_origins = region.values[index].?.reference_origins,
-                    };
-                    region.captured_values[index] = true;
-                } else region.values[index] = null;
+                        .reference_origins = region.values.get(index).?.reference_origins,
+                    });
+                } else try region.values.set(gpa, index, null);
             }
-            for (self.values[parameters.len..], parameters.len..) |maybe_source, index| {
+            for (parameters.len..self.values.len) |index| {
                 if (dependencies) |selected| if (!selected.values[index]) continue;
-                const source = maybe_source orelse continue;
+                const source = self.values.get(index) orelse continue;
                 const argument = try region.appendRegionCapture(&captures, .{ .source = source, .local = source.borrow_root });
-                region.values[index] = .{ .id = @fromBackingInt(@intCast(argument)), .type_id = source.type_id, .borrowed_type = source.type_id, .reference_origins = if (try self.analysis_context.canStoreBorrow(source.type_id)) try region.addReferenceOrigin(null, .{ .parameter = argument }) else null };
-                region.captured_values[index] = true;
+                try region.values.set(gpa, index, .{ .id = @fromBackingInt(@intCast(argument)), .type_id = source.type_id, .borrowed_type = source.type_id, .reference_origins = if (try self.analysis_context.canStoreBorrow(source.type_id)) try region.addReferenceOrigin(null, .{ .parameter = argument }) else null });
             }
             for (0..self.state.values.len) |index| {
                 if (dependencies) |selected| if (!selected.locals[index]) continue;
@@ -3491,7 +3485,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn inferExpressionType(self: *Self, raw: semantic.UnresolvedBody.ValueUse, expected_type: ?structures.TypeId, initializer_boundary: bool) anyerror!structures.TypeId {
-            if (self.values[@backingInt(raw.value)]) |pending| if (pending.initializer_parameter != null) return pending.type_id;
+            if (self.values.get(@backingInt(raw.value))) |pending| if (pending.initializer_parameter != null) return pending.type_id;
             const types = self.shared_initializer_types orelse &self.initializer_types;
             const key: InitializerTypeKey = .{ .expression = raw.value, .expected = expected_type, .initializer_boundary = initializer_boundary };
             if (types.get(key)) |type_id| return type_id;
@@ -3512,7 +3506,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn prepareInitializer(self: *Self, raw: semantic.UnresolvedBody.ValueUse, type_id: structures.TypeId) !Value {
-            if (self.values[@backingInt(raw.value)]) |pending| if (pending.initializer_parameter != null) {
+            if (self.values.get(@backingInt(raw.value))) |pending| if (pending.initializer_parameter != null) {
                 if (pending.type_id != type_id) return self.reject(raw.span, .{ .call_argument_type_mismatch = self.typeMismatch(type_id, pending.type_id) });
                 try self.consumeInitializer(pending, raw.span);
                 return pending;
@@ -4889,8 +4883,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn unevaluatedType(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: ?structures.TypeId) anyerror!?structures.TypeId {
             if (self.options.measurements) |measurements| measurements.unevaluated_type_visits += 1;
             const index = @backingInt(id);
-            if (index < self.unresolved.parameter_count) return self.values[index].?.type_id;
-            if (self.values[index]) |resolved| return resolved.type_id;
+            if (index < self.unresolved.parameter_count) return self.values.get(index).?.type_id;
+            if (self.values.get(index)) |resolved| return resolved.type_id;
             return switch (self.unresolved.expressions[index - self.unresolved.parameter_count].operation) {
                 .integer_literal => if (expected_type == .int_literal) .int_literal else if (expected_type == .byte) .byte else .int,
                 .int_literal_value => .int_literal,
@@ -4974,7 +4968,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             var expression = id;
             while (true) {
                 const index = @backingInt(expression);
-                if (index < self.unresolved.parameter_count or self.values[index] != null) return null;
+                if (index < self.unresolved.parameter_count or self.values.get(index) != null) return null;
                 switch (self.unresolved.expressions[index - self.unresolved.parameter_count].operation) {
                     .annotation => |annotation| expression = annotation.value.value,
                     .if_else, .match, .loop, .scope => break,
@@ -5070,7 +5064,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (structural_array) if (try self.analysis_context.facts().arrayType(source_type)) |array| return self.arraySpreadIterator(source, array, span);
             const definition = try self.analysis_context.structDefinition(source_type);
             var factory: []const u8 = "iter";
-            const transferred = if (self.values[@backingInt(acquisition)]) |prepared| prepared.explicit_transfer else false;
+            const transferred = if (self.values.get(@backingInt(acquisition))) |prepared| prepared.explicit_transfer else false;
             if (transferred and
                 ((definition != null and definition.?.resolveField("consume_iter") != null) or
                     try self.analysis_context.typeNamespaceCallMember(source_type, "consume_iter", 1, span) != null)) factory = "consume_iter";
@@ -5201,18 +5195,22 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     runtime_count += 1;
                 };
                 if (provided.len != runtime_count and provided.len != shape.parameters.len) continue;
+                const concrete_header = if (runtime_count == shape.parameters.len and !try self.analysis_context.needsInheritedInference(candidate))
+                    (try self.analysis_context.candidateSignature(candidate)) orelse return error.Unavailable
+                else
+                    null;
                 candidate_arguments.clearRetainingCapacity();
                 argument_types.clearRetainingCapacity();
                 static_arguments.clearRetainingCapacity();
                 var instance = candidate;
                 if (provided.len == runtime_count) {
                     for (provided, 0..) |argument, runtime_index| {
-                        const expected = try self.analysis_context.independentParameterType(candidate, runtime_index);
+                        const expected = if (concrete_header) |header| header.parameters[runtime_index].type_id else try self.analysis_context.independentParameterType(candidate, runtime_index);
                         const actual = (try self.overloadArgumentType(argument.value, expected, &discovered_types[runtime_index])) orelse continue :candidates;
                         try candidate_arguments.append(self.gpa, argument.value);
                         try argument_types.append(self.gpa, if (operation != null and actual == .int_literal) .int else actual);
                     }
-                    instance = (try self.overloadInstance(candidate, argument_types.items)) orelse continue;
+                    if (concrete_header == null) instance = (try self.overloadInstance(candidate, argument_types.items)) orelse continue;
                 } else {
                     if (try self.analysis_context.needsInheritedInference(candidate)) continue;
                     for (provided, shape.parameters, 0..) |argument, parameter, parameter_index| {
@@ -5229,7 +5227,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     }
                     instance = try self.analysis_context.specializeFunction(candidate, static_arguments.items);
                 }
-                const header = (try self.analysis_context.candidateSignature(instance)) orelse return error.Unavailable;
+                const header = concrete_header orelse (try self.analysis_context.candidateSignature(instance)) orelse return error.Unavailable;
                 try self.analysis_context.validateOverloadHeader(overload, instance, header, span);
                 if (provided.len != runtime_count) for (provided, shape.parameters, 0..) |argument, parameter, argument_index| {
                     if (parameter.mode == .static) continue;
@@ -6300,7 +6298,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (field.kind != .reference) continue;
                 var root = switch (place.root) {
                     .local => |local| self.borrowLocalValue(local),
-                    .parameter => |parameter| self.values[@backingInt(parameter)].?,
+                    .parameter => |parameter| self.values.get(@backingInt(parameter)).?,
                     .reference => |reference| try self.readReference(reference, (try self.analysis_context.facts().borrowElement(reference.type_id)).?),
                 };
                 if (place.root == .parameter) root.writable = false;
@@ -6349,7 +6347,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 },
                 .parameter => |parameter| {
                     if (writable) return self.reject(span, .mutable_borrow_requires_writable_place);
-                    const value_to_borrow = self.values[@backingInt(parameter)].?;
+                    const value_to_borrow = self.values.get(@backingInt(parameter)).?;
                     if (value_to_borrow.borrowed_type == null) return self.reject(span, .borrow_requires_place);
                     return value_to_borrow;
                 },
@@ -6363,7 +6361,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn placeRootType(self: *Self, root: @FieldType(BorrowPlace, "root")) !structures.TypeId {
             return switch (root) {
                 .local => |local| if (self.locals.items(.reference)[@backingInt(local)]) (try self.analysis_context.facts().borrowElement(stateValue(self.state.values, @backingInt(local)).?.type_id)).? else stateValue(self.state.values, @backingInt(local)).?.type_id,
-                .parameter => |parameter| self.values[@backingInt(parameter)].?.type_id,
+                .parameter => |parameter| self.values.get(@backingInt(parameter)).?.type_id,
                 .reference => |reference| (try self.analysis_context.facts().borrowElement(reference.type_id)).?,
             };
         }
@@ -7794,9 +7792,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 const owner = if (origin.root) |root|
                     self.state.values.get(@backingInt(root)) orelse continue
                 else if (origin.parameter != null and origin.parameter.? < self.unresolved.parameter_count)
-                    self.values[origin.parameter.?] orelse continue
+                    self.values.get(origin.parameter.?) orelse continue
                 else if (origin.frame_type != null and origin.cleanup_value != null and @backingInt(origin.cleanup_value.?) < self.unresolved.parameter_count)
-                    self.values[@backingInt(origin.cleanup_value.?)] orelse continue
+                    self.values.get(@backingInt(origin.cleanup_value.?)) orelse continue
                 else
                     continue;
                 var path: std.ArrayList(structures.ReferencePathStep) = .empty;
@@ -9985,13 +9983,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const dispatch_loan = try self.readReferenceOrigins(dispatch_origins, null, @truncate(@backingInt(checkpoint.id)), false);
             // Tuple alternatives can instantiate one source arm on several
             // disjoint paths. Cached expressions belong to their path's SSA.
-            const dispatch_values = try self.gpa.dupe(?Value, self.values);
-            defer @memcpy(self.values, dispatch_values);
+            const dispatch_values = self.values.snapshot();
+            defer self.values = dispatch_values.snapshot();
             var exits: std.ArrayList(FlowExit) = .empty;
             const outer_testing = self.match_testing_scope;
             defer self.match_testing_scope = outer_testing;
             for (arms) |arm| {
-                @memcpy(self.values, dispatch_values);
+                self.values = dispatch_values.snapshot();
                 var testing: MatchTestingScope = .{ .parent = outer_testing, .origins = dispatch_origins };
                 self.match_testing_scope = &testing;
                 try self.protectMatchLocal(source.carrier);
@@ -11399,6 +11397,24 @@ const TestMeasureBody = struct {
         return measurements;
     }
 };
+
+test "expression value pages isolate branch results without allocating untouched slots" {
+    var context: TestMaterializerContext = .{ .gpa = std.testing.allocator };
+    defer context.deinit();
+    var builder = testInitMaterializerBuilder(&context);
+    builder.values = @TypeOf(builder.values).init(4097);
+    try std.testing.expectEqual(@as(?TestMaterializerBuilder.Value, null), builder.values.get(2048));
+    try builder.values.set(context.allocator(), 4096, .{ .id = @fromBackingInt(1), .type_id = .int });
+    var seen: std.AutoHashMap(usize, void) = .init(std.testing.allocator);
+    defer seen.deinit();
+    try std.testing.expect(try builder.values.retainedBytes(&seen) < 8192);
+    const saved = builder.values.snapshot();
+    try builder.values.set(context.allocator(), 4096, .{ .id = @fromBackingInt(2), .type_id = .int });
+    try builder.values.set(context.allocator(), 0, .{ .id = @fromBackingInt(3), .type_id = .bool });
+    builder.values = saved.snapshot();
+    try std.testing.expectEqual(@as(u32, 1), @backingInt(builder.values.get(4096).?.id));
+    try std.testing.expectEqual(@as(?TestMaterializerBuilder.Value, null), builder.values.get(0));
+}
 
 test "inference and initializer captures exclude unrelated live state" {
     const queries = @import("../queries.zig");

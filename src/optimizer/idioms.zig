@@ -1,6 +1,7 @@
 const std = @import("std");
 const structures = @import("../structures.zig");
 const function_ir = @import("function.zig");
+const canonicalize = @import("canonicalize.zig");
 const loops = @import("loops.zig");
 const Graph = @import("graph.zig").Graph;
 
@@ -25,6 +26,10 @@ fn once(function: *Function, filled: *std.AutoHashMapUnmanaged(u32, void)) !bool
     for (found) |loop| {
         const preheader = loops.preheader(function, graph, loop) orelse continue;
         if (loop.latches.len != 1) continue;
+        if (try rotateCarriedExit(function, graph, loop)) {
+            function.invalidateControlFlow();
+            return true;
+        }
         if (try removeDeadLoop(function, graph, loop, preheader)) {
             function.invalidateControlFlow();
             return true;
@@ -46,6 +51,116 @@ const Induction = struct {
     start: ValueId,
     step: i32,
 };
+
+fn boolean(function: *const Function, value: ValueId) ?bool {
+    const definition = function.definition(function.find(value)) orelse return null;
+    return if (definition == .const_bool) definition.const_bool else null;
+}
+
+const LoopParameters = struct {
+    function: *Function,
+    from: []const ValueId,
+    to: []const ValueId = &.{},
+    found: bool = false,
+
+    fn check(self: *LoopParameters, operand: *ValueId) void {
+        if (std.mem.indexOfScalar(ValueId, self.from, self.function.find(operand.*)) != null) self.found = true;
+    }
+
+    fn replace(self: *LoopParameters, operand: *ValueId) void {
+        if (std.mem.indexOfScalar(ValueId, self.from, self.function.find(operand.*))) |position| operand.* = self.to[position];
+    }
+};
+
+fn selectArm(function: *const Function, value: ValueId, condition: ValueId, taken: bool) ValueId {
+    const definition = function.definition(function.find(value)) orelse return value;
+    if (definition != .select or function.find(definition.select.condition) != condition) return value;
+    return if (taken) definition.select.then_value else definition.select.else_value;
+}
+
+fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
+    const header = function.blocks.items[loop.header];
+    if (header.instructions.items.len != 0) return false;
+    const test_result = exitTest(function, loop) orelse return false;
+    if (test_result.operation != .eqb or boolean(function, test_result.operands.rhs) != true) return false;
+    const flag = function.find(test_result.operands.lhs);
+    const flag_position = std.mem.indexOfScalar(ValueId, header.parameters.items, flag) orelse return false;
+    const body = test_result.stay;
+    if (function.blocks.items[body].parameters.items.len != 0) return false;
+    for (loop.blocks) |block| if (block != loop.header and !graph.dominates(body, block)) return false;
+    const latch = loop.latches[0];
+    const terminator = function.blocks.items[latch].terminator;
+    if (terminator != .branch or @backingInt(terminator.branch.target) != loop.header) return false;
+    const back = function.branchArguments(terminator.branch);
+    for (back) |argument| if (argument.coerce_to != null or argument.variant_tag_mapping != null) return false;
+    const carried = function.definition(function.find(back[flag_position].value)) orelse return false;
+    if (carried != .select or boolean(function, carried.select.then_value) != true or function.find(carried.select.else_value) != flag) return false;
+    const condition = function.find(carried.select.condition);
+    const taken = try canonicalize.addressTaken(function);
+    if (!function.plainValue(condition) or taken[@backingInt(condition)]) return false;
+    for (back) |argument| {
+        const definition = function.definition(function.find(argument.value)) orelse continue;
+        if (definition != .select or function.find(definition.select.condition) != condition) continue;
+        for ([_]ValueId{ definition.select.then_value, definition.select.else_value }) |arm| {
+            const value = function.find(arm);
+            if (!function.plainValue(value) or taken[@backingInt(value)]) return false;
+        }
+    }
+    for (header.parameters.items) |parameter| {
+        if (!function.valueType(parameter).isPrimitive() or taken[@backingInt(parameter)]) return false;
+    }
+    const edges = (try function.controlFlowEdges()).incoming[test_result.exit].items;
+    if (edges.len != 1 or edges[0].block != loop.header) return false;
+    for (function.blocks.items, 0..) |*block, index| {
+        if (index == loop.header or graph.dominates(body, @intCast(index)) or graph.dominates(test_result.exit, @intCast(index))) continue;
+        var uses: LoopParameters = .{ .function = function, .from = header.parameters.items };
+        for (block.instructions.items) |instruction| {
+            if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &uses, LoopParameters.check);
+        }
+        function_ir.terminatorAllOperands(function, &block.terminator, &uses, LoopParameters.check);
+        if (uses.found) return false;
+    }
+    const original = try function.scratch.dupe(ValueId, header.parameters.items);
+    const replacements = try function.scratch.alloc(ValueId, original.len);
+    const inactive = try function.insertInstruction(loop.header, 0, .{ .const_bool = false }, header.span, header.frame);
+    var initial: std.ArrayList(structures.FunctionValueUse) = .empty;
+    for (original, 0..) |parameter, position| {
+        if (position == flag_position) {
+            replacements[position] = inactive;
+            continue;
+        }
+        const argument = function.definitions.items[@backingInt(parameter)].argument.data;
+        replacements[position] = try function.addParameter(body, argument);
+        try initial.append(function.scratch, .{ .value = parameter });
+    }
+    var rewritten: LoopParameters = .{ .function = function, .from = original, .to = replacements };
+    for (function.blocks.items, 0..) |*block, index| {
+        if (!graph.dominates(body, @intCast(index))) continue;
+        for (block.instructions.items) |instruction| {
+            if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &rewritten, LoopParameters.replace);
+        }
+        function_ir.terminatorAllOperands(function, &block.terminator, &rewritten, LoopParameters.replace);
+    }
+    const active = test_result.operands.rhs;
+    var exiting: std.ArrayList(structures.FunctionValueUse) = .empty;
+    var repeating: std.ArrayList(structures.FunctionValueUse) = .empty;
+    const next_condition = if (std.mem.indexOfScalar(ValueId, original, condition)) |position| replacements[position] else condition;
+    for (function.branchArguments(terminator.branch), 0..) |argument, position| {
+        try exiting.append(function.scratch, .{ .value = if (position == flag_position) active else selectArm(function, argument.value, next_condition, true) });
+        if (position != flag_position) try repeating.append(function.scratch, .{ .value = selectArm(function, argument.value, next_condition, false) });
+    }
+    const initial_arguments = try function.appendBranchArguments(initial.items);
+    for (Function.edges(&function.blocks.items[loop.header].terminator)) |maybe_edge| if (maybe_edge) |edge| {
+        if (@backingInt(edge.target) == body) edge.arguments = initial_arguments;
+    };
+    function.blocks.items[latch].terminator = .{ .predicate_branch = .{
+        .operation = .eqb,
+        .operands = .{ .lhs = next_condition, .rhs = active },
+        .then_branch = .{ .target = @fromBackingInt(loop.header), .arguments = try function.appendBranchArguments(exiting.items) },
+        .else_branch = .{ .target = @fromBackingInt(body), .arguments = try function.appendBranchArguments(repeating.items) },
+    } };
+    return true;
+}
 
 fn constant(function: *const Function, value: ValueId) ?i32 {
     const definition = function.definition(function.find(value)) orelse return null;

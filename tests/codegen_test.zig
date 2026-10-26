@@ -14,6 +14,89 @@ test "machine encoding is available before native allocation" {
     try std.testing.expectEqualSlices(u8, &.{0xc3}, encoded.code.items);
 }
 
+test "machine pointer operands preserve register and spill width" {
+    for (0..3) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.store_rax, @fromBackingInt(0), 0);
+        try function.register(.load_rax, @fromBackingInt(0), 0);
+        var encoded = try function.encode(&.{switch (mode) {
+            0 => .rbx,
+            1 => .r12,
+            else => null,
+        }}, &.{256}, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const expected: []const u8 = switch (mode) {
+            0 => &.{ 0x48, 0x89, 0xc3, 0x48, 0x89, 0xd8 },
+            1 => &.{ 0x49, 0x89, 0xc4, 0x4c, 0x89, 0xe0 },
+            else => &.{ 0x48, 0x89, 0x84, 0x24, 0, 1, 0, 0, 0x48, 0x8b, 0x84, 0x24, 0, 1, 0, 0 },
+        };
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items);
+    }
+}
+
+test "machine indexed constant stores preserve base encoding and spill fallback" {
+    for (0..3) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.load_rax, @fromBackingInt(0), 0);
+        try function.emit(.lea_rax_rax_rcx_4);
+        try function.immediate(.mov_rax_i32, 1);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{switch (mode) {
+            0 => .rbx,
+            1 => .r13,
+            else => null,
+        }}, &.{256}, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const expected: []const u8 = switch (mode) {
+            0 => &.{ 0xc7, 0x04, 0x8b, 1, 0, 0, 0 },
+            1 => &.{ 0x41, 0xc7, 0x44, 0x8d, 0, 1, 0, 0, 0 },
+            else => &.{ 0x48, 0x8b, 0x84, 0x24, 0, 1, 0, 0, 0x48, 0x8d, 0x04, 0x88, 0xc7, 0, 1, 0, 0, 0 },
+        };
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items);
+    }
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    try function.register(.load_rax, @fromBackingInt(0), 0);
+    try function.emit(.lea_rax_rax_rcx_4);
+    try function.immediate(.mov_rax_i32, 1);
+    try function.emit(.mov_rdi_rax);
+    var encoded = try function.encode(&.{.rbx}, &.{0}, &.{});
+    defer encoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x89, 0xd8, 0x48, 0x8d, 0x04, 0x88, 0xc7, 0, 1, 0, 0, 0, 0x48, 0x89, 0xc7 }, encoded.code.items);
+}
+
+test "loop allocation bases preserve checked element reads and writes" {
+    try test_sources.SourceFixture.expectParity(
+        \\func run() int
+        \\    var values: List(int) = List(int).filled(0, 16) else return 0
+        \\    var index = 0
+        \\    loop
+        \\        if index == values.len() -> break
+        \\        values[index] = index + 1
+        \\        index += 1
+        \\    var count = 0
+        \\    for number in 0..values.len()
+        \\        if values[number] > 0 -> count += 1
+        \\    return count + values[15] + 10
+    , 42);
+}
+
+test "conditional counting preserves wrapping and both predicate outcomes" {
+    try test_sources.SourceFixture.expectParity(
+        \\func run() int
+        \\    var values: List(int) = [0, 1, -1]
+        \\    var wrapping = 2147483647
+        \\    var count = 40
+        \\    for number in 0..values.len()
+        \\        if values[number] == 0 -> wrapping += 1
+        \\        if values[number] <> 0 -> count += 1
+        \\    if wrapping <> -2147483648 -> return 0
+        \\    return count
+    , 42);
+}
+
 test "machine symbolic positions resolve after register and spill encoding" {
     var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
     defer function.deinit();

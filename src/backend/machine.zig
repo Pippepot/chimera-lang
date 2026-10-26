@@ -63,7 +63,7 @@ pub const Function = struct {
     pub fn register(self: *Function, operation: x86.RegisterOperation, value: ValueId, bits: u32) !void {
         std.debug.assert(bits == 0);
         switch (operation) {
-            .load_eax, .store_eax, .add_eax, .sub_eax, .imul_eax, .cmp_eax, .load_ecx => {},
+            .load_eax, .store_eax, .load_rax, .store_rax, .add_eax, .sub_eax, .imul_eax, .cmp_eax, .load_ecx => {},
             else => unreachable,
         }
         try self.instructions.append(self.gpa, .{ .register = .{ .operation = operation, .value = value } });
@@ -134,6 +134,10 @@ pub const Function = struct {
                 skip_until = index + 2;
                 continue;
             }
+            if (try self.encodeIndexedStore(&encoded.code, index, registers)) {
+                skip_until = index + 3;
+                continue;
+            }
             if (try self.encodeInPlace(&encoded.code, index, registers, spills)) {
                 skip_until = index + 3;
                 continue;
@@ -185,6 +189,17 @@ pub const Function = struct {
         return registers[@backingInt(instructions[1].register.value)] == source;
     }
 
+    fn encodeIndexedStore(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !bool {
+        const instructions = self.instructions.items[index..];
+        if (instructions.len < 4 or instructions[0] != .register or instructions[0].register.operation != .load_rax) return false;
+        if (instructions[1] != .fixed or instructions[1].fixed.operation != .lea_rax_rax_rcx_4) return false;
+        if (instructions[2] != .fixed or instructions[2].fixed.operation != .mov_rax_i32) return false;
+        if (instructions[3] != .scratch_dead) return false;
+        const base = registers[@backingInt(instructions[0].register.value)] orelse return false;
+        try x86.appendRegister(code, self.gpa, .store_indexed_i32, base, instructions[2].fixed.bits);
+        return true;
+    }
+
     fn encodeInPlace(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register, spills: []const u32) !bool {
         const instructions = self.instructions.items[index..];
         if (instructions.len < 4) return false;
@@ -229,6 +244,8 @@ pub const Function = struct {
         const spilled: x86.Operation = switch (operation.operation) {
             .load_eax => .mov_eax_rsp,
             .store_eax => .mov_rsp_eax,
+            .load_rax => .mov_rax_rsp,
+            .store_rax => .mov_rsp_rax,
             .add_eax => .add_eax_rsp,
             .sub_eax => .sub_eax_rsp,
             .imul_eax => .imul_eax_rsp,

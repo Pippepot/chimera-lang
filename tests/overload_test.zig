@@ -199,6 +199,18 @@ test "overload mismatches and overlapping generic alternatives are explicit erro
 }
 
 test "overload selected where failure is not candidate filtering" {
+    try Fixture.expectParity(
+        \\func integer(value: int) int -> value
+        \\func boolean(value: bool) int where false -> 0
+        \\overload choose(integer, boolean)
+        \\func run() int -> choose(42)
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func constrained(value: int) int where false -> value
+        \\func absent(value: none) int -> 0
+        \\overload choose(constrained, absent)
+        \\exit(choose(42))
+    , .where_condition_failed);
     try Fixture.expectSourceDiagnostic(
         \\func constrained(static T: type, value: T) T where T is bool -> value
         \\func absent(value: none) int -> 0
@@ -207,7 +219,7 @@ test "overload selected where failure is not candidate filtering" {
     , .where_condition_failed);
 }
 
-test "overload membership edits invalidate callers and recover from ambiguity" {
+test "overload membership and annotation edits invalidate callers and recover from ambiguity" {
     const prefix =
         \\func integer(value: int) int -> value
         \\func alternate(value: int) int -> value + 1
@@ -218,7 +230,13 @@ test "overload membership edits invalidate callers and recover from ambiguity" {
     try fixture.expectExit(0, 42);
     try fixture.db.setInput(queries.SourceText, 0, prefix ++ "\noverload choose(alternate, boolean)\nexit(choose(42))");
     try fixture.expectExit(0, 43);
-    try fixture.db.setInput(queries.SourceText, 0, prefix ++ "\noverload choose(integer, alternate)\nexit(choose(42))");
+    try fixture.db.setInput(queries.SourceText, 0,
+        \\func integer(value: int) int -> value
+        \\func alternate(value: int) int -> value + 1
+        \\func boolean(value: int) int -> 0
+        \\overload choose(alternate, boolean)
+        \\exit(choose(42))
+    );
     try fixture.expectDiagnostic(null, .ambiguous_overload);
     try fixture.db.setInput(queries.SourceText, 0, prefix ++ "\noverload choose(integer, boolean)\nexit(choose(42))");
     try fixture.expectExit(0, 42);

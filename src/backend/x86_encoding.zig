@@ -61,6 +61,7 @@ const instructions = .{
     .mov_rsp_rax = Encoding{ .prefix = &.{ 0x48, 0x89, 0x84, 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "mov [rsp+", .asm_suffix = "], rax" },
     .mov_edi = Encoding{ .prefix = &.{0xBF}, .operand = .i32, .asm_prefix = "mov edi, " },
     .mov_eax = Encoding{ .prefix = &.{0xB8}, .operand = .i32, .asm_prefix = "mov eax, " },
+    .mov_rax_i32 = Encoding{ .prefix = &.{ 0xC7, 0x00 }, .operand = .i32, .asm_prefix = "mov dword [rax], " },
     .mov_ecx = Encoding{ .prefix = &.{0xB9}, .operand = .i32, .asm_prefix = "mov ecx, " },
     .mov_edx = Encoding{ .prefix = &.{0xBA}, .operand = .i32, .asm_prefix = "mov edx, " },
     .mov_rax = Encoding{ .prefix = &.{ 0x48, 0xB8 }, .operand = .u64, .asm_prefix = "mov rax, " },
@@ -220,7 +221,7 @@ pub const Register = enum(u4) {
     }
 };
 
-pub const RegisterOperation = enum { load_eax, store_eax, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, add_immediate, sub_immediate, imul_immediate, add_from_eax, sub_from_eax, imul_from_eax, save, restore };
+pub const RegisterOperation = enum { load_eax, store_eax, load_rax, store_rax, store_indexed_i32, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, add_immediate, sub_immediate, imul_immediate, add_from_eax, sub_from_eax, imul_from_eax, save, restore };
 
 fn registerEncoding(comptime operation: RegisterOperation, comptime register: Register) Encoding {
     const r = register.low();
@@ -229,6 +230,13 @@ fn registerEncoding(comptime operation: RegisterOperation, comptime register: Re
     return switch (operation) {
         .load_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x89, 0xC0 | (r << 3) }, .asm_prefix = "mov eax, " ++ name },
         .store_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x89, 0xC0 | r }, .asm_prefix = "mov " ++ name ++ ", eax" },
+        .load_rax => .{ .prefix = &[_]u8{ if (extended) 0x4c else 0x48, 0x89, 0xC0 | (r << 3) }, .asm_prefix = "mov rax, " ++ @tagName(register) },
+        .store_rax => .{ .prefix = &[_]u8{ if (extended) 0x49 else 0x48, 0x89, 0xC0 | r }, .asm_prefix = "mov " ++ @tagName(register) ++ ", rax" },
+        .store_indexed_i32 => .{
+            .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0xC7, if (r == 5) 0x44 else 0x04, 0x88 | r } ++ (if (r == 5) &[_]u8{0} else &[_]u8{}),
+            .operand = .i32,
+            .asm_prefix = "mov dword [" ++ @tagName(register) ++ "+rcx*4], ",
+        },
         .add_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x01, 0xC0 | (r << 3) }, .asm_prefix = "add eax, " ++ name },
         .sub_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x29, 0xC0 | (r << 3) }, .asm_prefix = "sub eax, " ++ name },
         .imul_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x0F, 0xAF, 0xC0 | r }, .asm_prefix = "imul eax, " ++ name },

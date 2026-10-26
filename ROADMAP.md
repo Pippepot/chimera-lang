@@ -8,6 +8,29 @@ Settle missing semantics before implementation. Each milestone covers
 diagnostics, execution, ownership, and incremental/cache behavior. Legacy parity
 is not a goal.
 
+## Immediate engineering priority
+
+Reduce frontend compilation time before further runtime or machine-stage
+optimization. This takes precedence over the design investigations and feature
+milestones below; it does not change their relative order.
+
+1. Attribute cold compilation and fresh leaf edits with the existing phase
+  profiler, separating frontend work from optimization, code generation, and
+  dependency waits. Use serial measurements first, then correctly affined
+  eight-worker measurements to distinguish work from contention.
+2. Start with body construction and typing: repeated flow/reference-state work,
+  name and call resolution, and repeated type-fact queries. Choose the first
+  change from measured exclusive cost and a focused behavioral check, not file
+  size. Preserve diagnostics, ownership, and source evaluation order.
+3. Investigate scratch allocation, copying, and result publication within the
+  dominant frontend path. Reuse existing facts at their owning boundary before
+  introducing another cache. Prioritize parsing or invalidation changes only
+  when their measured contribution warrants them.
+
+Accept changes only with matched uninstrumented cold, leaf-edit, and generated
+runtime measurements under the [benchmark protocol](benchmarks/README.md#measurement-protocol).
+Keep backend and workload changes separate so frontend gains remain attributable.
+
 ## Immediate design priorities
 
 Investigate these before the remaining implementation milestones, in this order.
@@ -19,6 +42,8 @@ Investigate these before the remaining implementation milestones, in this order.
   `[x * 2 for x in values if x > 0]`. Preserve fixed-size Array literal
   semantics and favor List for potentially runtime-sized results; settle mixed
   static/runtime sizes, evaluation order, ownership, and partial failure cleanup.
+3. precompile-std build step is extremely slow - investigate.
+4. the codebase has grown substantially, it is time for a refactoring pass, reducing LOC and simplifying the compiler
 
 ## Ordered milestones
 

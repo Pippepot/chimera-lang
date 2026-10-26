@@ -52,14 +52,15 @@ not the saved measurements. The temporary point follows its parent without a
 status label. Incompatible environments remain separate. The dashboard plots
 separate zero-worker and eight-worker compilation curves per phase and matched
 environment, using the latest result per commit regardless of suite hash.
-Driver or generator edits do not hide
-history or add duplicate workload curves. Keep the benchmark input fixed for
+Driver, generator, or sampling-protocol edits do not hide
+history or add duplicate workload curves. Sampling details remain in tooltips
+and raw records. Keep the benchmark input fixed for
 comparable timings; raw records retain the original suite hashes for auditing.
 Debug and obsolete protocols remain in raw records without adding duplicate
 graphs. Runtime still uses its latest compatible workload.
 Compilation and runtime have separate identities: replacing compilation
 workloads does not discard unchanged runtime history or its cached C references.
-Protocol, Zig, machine, and kernel keep incompatible timing environments
+Zig, machine, and kernel keep incompatible timing environments
 separate. Affinity is retained in raw records but does not split the graphs;
 worker-count curves share the existing history axes.
 
@@ -142,7 +143,8 @@ measurement's total sample count and stability, so truncated or duplicate sample
 are rejected. Workload semantics and timer boundaries have separate versioned
 identities from the recorded sampling policy. Older raw records are preserved;
 compatible fixed-count C references remain reusable. Changed compilation
-sequences have separate graph identities rather than silently joining old data.
+sampling sequences retain their protocol identities in raw records without
+splitting the compilation graphs.
 
 For worker-scaling measurements, the compilation driver accepts
 `--workers=N` from 0 through 64 (default 0):
@@ -156,7 +158,10 @@ zero-worker and eight-worker lanes independently and plots both; other counts
 remain standalone probes. Both recorded lanes use the same adaptive policy.
 Compare worker counts on the same CPU affinity set, using physical
 cores where possible; do not pin a multiworker run to one CPU. `--cpu` restricts
-every lane to that one CPU. To record both lanes on an eight-core CPU set:
+every lane to that one CPU. The recorder warns when the worker count exceeds
+the allowed CPU count: those samples measure oversubscription, not multicore
+scaling. It preserves the requested affinity and all samples. To record both
+lanes on an eight-core CPU set, omit `--cpu`:
 
 ```sh
 taskset -c 4-11 .venv/bin/python benchmarks/history.py --worktree

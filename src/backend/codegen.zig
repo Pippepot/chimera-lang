@@ -211,9 +211,15 @@ const LocationPlan = struct {
     return_buffer_offset: ?u32,
     calls: CallLayouts,
     spills: []u32,
+    allocation_bases: []bool,
+    uses: []Usage,
     saved_register_offset: u32,
 
-    const Usage = enum { unused, used, returned };
+    const Usage = enum { unused, used, shared, returned };
+
+    fn markUsed(usage: *Usage) void {
+        usage.* = if (usage.* == .unused) .used else .shared;
+    }
 
     fn markBranchArguments(
         ssa: *const structures.FunctionBodyAnalysis,
@@ -225,7 +231,7 @@ const LocationPlan = struct {
         const target = ssa.blocks[@backingInt(branch.target)];
         for (arguments, ssa.block_arguments[target.argument_start..target.argument_end]) |argument, parameter| {
             const index = @backingInt(argument.value);
-            needed[index] = .used;
+            markUsed(&needed[index]);
             if (parameter.representation == .storage) addressable[index] = true;
         }
     }
@@ -233,7 +239,7 @@ const LocationPlan = struct {
     fn markCallArguments(ssa: *const structures.FunctionBodyAnalysis, call: structures.FunctionCall, needed: []Usage, addressable: []bool) void {
         for (ssa.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
             const index = @backingInt(argument.valueId());
-            needed[index] = .used;
+            markUsed(&needed[index]);
             if (argument == .deinit or argument == .borrowed) addressable[index] = true;
         }
     }
@@ -262,7 +268,7 @@ const LocationPlan = struct {
 
     fn init(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator) !LocationPlan {
         const needed = try gpa.alloc(Usage, ssa.valueCount());
-        defer gpa.free(needed);
+        errdefer gpa.free(needed);
         @memset(needed, .unused);
         const addressable = try gpa.alloc(bool, ssa.valueCount());
         defer gpa.free(addressable);
@@ -276,19 +282,19 @@ const LocationPlan = struct {
             const value_index = @backingInt(ssa.instructionValue(instruction_index));
             value_types[value_index] = instruction.resultType();
             for (instruction.operands()) |operand| if (operand) |value| {
-                needed[@backingInt(value.*)] = .used;
+                markUsed(&needed[@backingInt(value.*)]);
             };
             switch (instruction) {
                 .const_type, .const_int_literal, .static_conversion => unreachable,
                 .initializer_ref => |operation| {
                     for (ssa.initializer_captures[operation.captures.start..operation.captures.end]) |capture| {
-                        needed[@backingInt(capture)] = .used;
+                        markUsed(&needed[@backingInt(capture)]);
                         addressable[@backingInt(capture)] = true;
                     }
                 },
                 .local_storage => addressable[value_index] = true,
                 .initializer_capture_write => |operation| if (ssa.is_initializer_region) {
-                    needed[operation.parameter_index] = .used;
+                    markUsed(&needed[operation.parameter_index]);
                 },
                 .storage_projection => |operation| if (operation.projection != .box_element) {
                     addressable[@backingInt(operation.owner)] = true;
@@ -301,7 +307,7 @@ const LocationPlan = struct {
                 .borrow_write => |operation| addressable[@backingInt(operation.value)] = true,
                 .call => |call| markCallArguments(ssa, call, needed, addressable),
                 .aggregate => |aggregate| for (ssa.aggregate_fields[aggregate.fields.start..aggregate.fields.end]) |field| {
-                    needed[@backingInt(field)] = .used;
+                    markUsed(&needed[@backingInt(field)]);
                 },
                 .fill => |operation| addressable[@backingInt(operation.first)] = true,
                 .move => |operation| {
@@ -314,7 +320,7 @@ const LocationPlan = struct {
         for (ssa.blocks) |block| {
             var terminator = block.terminator;
             for (terminator.operands()) |operand| if (operand) |value| {
-                needed[@backingInt(value.*)] = .used;
+                markUsed(&needed[@backingInt(value.*)]);
             };
             for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
                 markBranchArguments(ssa, branch.*, needed, addressable);
@@ -417,6 +423,21 @@ const LocationPlan = struct {
         }
         const spills = try promoteRegisters(ssa, gpa, locations, value_types, addressable);
         errdefer gpa.free(spills);
+        var allocation_bases: []bool = &.{};
+        errdefer gpa.free(allocation_bases);
+        if (spills.len != 0) for (ssa.instructions) |instruction| {
+            if (instruction != .allocation_element) continue;
+            const index = @backingInt(instruction.allocation_element.allocation);
+            if (index < ssa.block_arguments.len or addressable[index] or locations[index] != .stack) continue;
+            const definition = ssa.instructions[index - ssa.block_arguments.len];
+            if (definition == .local_storage or definition == .storage_projection or definition == .initializer_ref) continue;
+            if (allocation_bases.len == 0) {
+                allocation_bases = try gpa.alloc(bool, locations.len);
+                @memset(allocation_bases, false);
+            }
+            allocation_bases[index] = true;
+            spills[index] = locations[index].stack;
+        };
         const saved_register_offset = local_end;
         if (spills.len != 0) for (std.enums.values(x86.Register)) |_| {
             _ = try reserveStack(&local_end, indirect_layout);
@@ -458,6 +479,8 @@ const LocationPlan = struct {
             .return_buffer_offset = return_buffer_offset,
             .calls = calls,
             .spills = spills,
+            .allocation_bases = allocation_bases,
+            .uses = needed,
             .saved_register_offset = saved_register_offset,
         };
     }
@@ -497,6 +520,8 @@ const LocationPlan = struct {
         gpa.free(self.value_types);
         deinitCallLayouts(&self.calls, gpa);
         gpa.free(self.spills);
+        gpa.free(self.allocation_bases);
+        gpa.free(self.uses);
         self.* = undefined;
     }
 };
@@ -603,16 +628,89 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             self.block_offsets[block_index] = try self.encoder.position();
             std.debug.assert(block.instruction_start <= block.instruction_end);
             std.debug.assert(block.instruction_end <= ssa.instructions.len);
-            for (block.instruction_start..block.instruction_end) |instruction_index| {
+            var instruction_index = block.instruction_start;
+            while (instruction_index < block.instruction_end) : (instruction_index += 1) {
                 self.current_span = if (ssa.instruction_spans.len == ssa.instructions.len) ssa.instruction_spans[instruction_index] else null;
                 self.current_frame = if (ssa.instruction_frames.len != 0) ssa.instruction_frames[instruction_index] else .root;
+                if (ssa.instructions[instruction_index] == .compare and try self.emitConditionalIncrement(instruction_index, block.instruction_end)) {
+                    instruction_index += 2;
+                    if (buffered) try self.encoder.stream.instructions.append(self.gpa, .scratch_dead);
+                    continue;
+                }
+                if (ssa.instructions[instruction_index] == .allocation_element and try self.emitElementCopy(instruction_index, block.instruction_end)) {
+                    instruction_index += 1;
+                    if (buffered) try self.encoder.stream.instructions.append(self.gpa, .scratch_dead);
+                    continue;
+                }
                 const destination = self.valueLocation(ssa.instructionValue(instruction_index));
                 try self.emitInstruction(ssa.instructions[instruction_index], destination);
+                const value_index = @backingInt(ssa.instructionValue(instruction_index));
+                if (self.plan.allocation_bases.len != 0 and self.plan.allocation_bases[value_index]) {
+                    try self.loadAddress(destination);
+                    try self.encoder.register(.store_rax, @fromBackingInt(@intCast(value_index)), 0);
+                }
                 if (buffered and destination != .eax) try self.encoder.stream.instructions.append(self.gpa, .scratch_dead);
             }
             self.current_span = if (ssa.terminator_spans.len == ssa.blocks.len) ssa.terminator_spans[block_index] else null;
             self.current_frame = if (ssa.terminator_frames.len != 0) ssa.terminator_frames[block_index] else .root;
             try self.emitTerminator(block.terminator, fallthrough);
+        }
+
+        fn emitElementCopy(self: *Self, index: usize, end: usize) !bool {
+            if (index + 1 >= end) return false;
+            const value = self.ssa.instructionValue(index);
+            if (self.plan.uses[@backingInt(value)] != .used) return false;
+            const next = self.ssa.instructions[index + 1];
+            if (next != .value_copy) return false;
+            const copy = next.value_copy;
+            const reading = copy.source == value;
+            if (!reading and copy.destination != value) return false;
+            const size = (try self.types.layout(copy.type_id)).byte_size;
+            if (size != 1 and size != 4) return false;
+            try self.emitAllocationElementAddress(self.ssa.instructions[index].allocation_element);
+            if (reading) {
+                try self.encoder.offset(if (size == 1) .movzx_eax_rax else .mov_eax_rax, 0);
+                const destination = self.resultLocation(copy.destination, self.valueLocation(self.ssa.instructionValue(index + 1)));
+                if (size == 1) {
+                    try self.storeComponent(u8, destination, 0);
+                } else try self.storeComponent(u32, destination, 0);
+            } else if (size == 4 and self.valueLocation(copy.source) == .immediate) {
+                try self.encoder.immediate(.mov_rax_i32, self.valueLocation(copy.source).immediate);
+            } else {
+                try self.encoder.emit(.mov_rdi_rax);
+                if (size == 1) {
+                    try self.loadComponent(u8, self.valueLocation(copy.source), 0);
+                } else try self.loadComponent(u32, self.valueLocation(copy.source), 0);
+                try self.encoder.offset(if (size == 1) .mov_rdi_al else .mov_rdi_eax, 0);
+            }
+            return true;
+        }
+
+        fn emitConditionalIncrement(self: *Self, index: usize, end: usize) !bool {
+            if (index + 2 >= end) return false;
+            const condition = self.ssa.instructionValue(index);
+            const increment = self.ssa.instructionValue(index + 1);
+            if (self.plan.uses[@backingInt(condition)] != .used or self.plan.uses[@backingInt(increment)] != .used) return false;
+            const addition = self.ssa.instructions[index + 1];
+            const selection = self.ssa.instructions[index + 2];
+            if (addition != .addi or selection != .select) return false;
+            const select = selection.select;
+            if (select.type_id != .int or select.condition != condition) return false;
+            const base = if (self.valueLocation(addition.addi.rhs) == .immediate and self.valueLocation(addition.addi.rhs).immediate == 1)
+                addition.addi.lhs
+            else if (self.valueLocation(addition.addi.lhs) == .immediate and self.valueLocation(addition.addi.lhs).immediate == 1)
+                addition.addi.rhs
+            else
+                return false;
+            var comparison = self.ssa.instructions[index].compare;
+            if (select.then_value != increment or select.else_value != base) {
+                if (select.else_value != increment or select.then_value != base) return false;
+                comparison.operation = comparison.operation.negated();
+            }
+            try self.emitCompare(comparison, .eax);
+            try self.encoder.integerBinary(.addi, self.valueLocation(base));
+            try self.storeResult(self.valueLocation(self.ssa.instructionValue(index + 2)));
+            return true;
         }
 
         fn emitInstruction(self: *Self, instruction: structures.FunctionInstruction, destination: ValueLocation) !void {
@@ -651,7 +749,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                 ),
                 .storage_projection => |operation| try self.emitStorageProjection(operation, destination),
                 .allocation_element => |operation| if (destination != .discarded) {
-                    try self.emitElementAddress(self.valueLocation(operation.allocation), false, operation.index, operation.type_id);
+                    try self.emitAllocationElementAddress(operation);
                     try self.bindIndirect(destination);
                 },
                 .array_element => |operation| if (destination != .discarded) {
@@ -1100,6 +1198,15 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             try self.storeAddress(destination);
         }
 
+        fn emitAllocationElementAddress(self: *Self, operation: structures.AllocationElement) !void {
+            const index = @backingInt(operation.allocation);
+            const base: ValueLocation = if (self.plan.allocation_bases.len != 0 and self.plan.allocation_bases[index])
+                .{ .register = @fromBackingInt(@intCast(index)) }
+            else
+                self.valueLocation(operation.allocation);
+            try self.emitElementAddress(base, false, operation.index, operation.type_id);
+        }
+
         /// Leaves the address of element `index` in rax. The elements start at
         /// the address `base` holds, or at `base` itself when `base_is_value`.
         fn emitElementAddress(self: *Self, base: ValueLocation, base_is_value: bool, index: structures.FunctionValueId, element_type: structures.TypeId) !void {
@@ -1140,11 +1247,12 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
         fn loadAddress(self: *Self, location: ValueLocation) !void {
             switch (location) {
                 .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(.mov_rax_rsp, offset),
+                .register => |register| try self.encoder.register(.load_rax, register, 0),
                 .indirect => |offset| {
                     try self.encoder.offset(.mov_rax_rsp, offset);
                     try self.encoder.emit(.mov_rax_rax);
                 },
-                .discarded, .immediate, .eax, .register => unreachable,
+                .discarded, .immediate, .eax => unreachable,
             }
         }
 

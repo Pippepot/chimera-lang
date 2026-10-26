@@ -50,6 +50,24 @@ test "bare panic and message panic report their source location" {
     try SourceFixture.expectSourceDiagnostic("panic 42", .call_argument_type_mismatch);
 }
 
+test "checked marking retains negative upper-bound and wrapping index panics" {
+    for ([_]i32{ -1, 16, std.math.maxInt(i32) }) |first| {
+        const source = try std.fmt.allocPrint(std.testing.allocator,
+            \\func mark(first: int)
+            \\    var values: List(int) = List(int).filled(0, 16) else return
+            \\    var index = first
+            \\    if first == 2147483647 -> index += 1
+            \\    loop
+            \\        if index > 16 -> break
+            \\        values[index] = 1
+            \\        index += 17
+            \\mark({d})
+        , .{first});
+        defer std.testing.allocator.free(source);
+        try expectPanic(source, "List index out of bounds", &.{"at mark "});
+    }
+}
+
 test "panic traces direct indirect recursive and zero-sized frames" {
     try expectPanic(
         \\func stop() never -> panic "stopped"

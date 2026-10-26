@@ -232,8 +232,9 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(cached[-1]["nanoseconds"], 999_999_999)
 
     def test_measure_reuses_c_samples_and_refresh_forces_remeasurement(self):
-        for saved, refresh in ((False, False), (True, False), (True, True)):
-            with self.subTest(saved=saved, refresh=refresh), tempfile.TemporaryDirectory() as directory:
+        for saved, refresh, affinity in ((False, False, [4]), (False, False, list(range(4, 12))),
+                                         (True, False, [4]), (True, True, [4])):
+            with self.subTest(saved=saved, refresh=refresh, affinity=affinity), tempfile.TemporaryDirectory() as directory:
                 snapshot = Path(directory)
                 (snapshot / "benchmarks").mkdir()
                 driver = snapshot / "benchmarks/history_benchmark.zig"
@@ -242,6 +243,7 @@ class HistoryTests(unittest.TestCase):
                 reference.write_text("C reference")
                 data = snapshot / "data"
                 previous = record()
+                previous["runner"]["affinity"] = affinity
                 previous["suite"] = history.suite_id()
                 previous["c_compiler"] = {"path": "/usr/bin/cc", "version": "cc 1.0"}
                 previous["benchmarks"][0]["samples"] = samples(include_c=True)
@@ -268,8 +270,11 @@ class HistoryTests(unittest.TestCase):
                     patch.object(history, "prepare", return_value=True), \
                         patch.object(history, "loc", return_value=previous["loc"]), \
                         patch.object(history, "runner", return_value=previous["runner"]), \
-                        patch.object(history.shutil, "which", return_value="/usr/bin/cc"):
+                        patch.object(history.shutil, "which", return_value="/usr/bin/cc"), \
+                        patch.object(history.sys, "stderr", new_callable=io.StringIO) as stderr:
                     measured = history.measure(snapshot, "abc", previous["commit_date"], "new-tree", True, False, data, refresh)
+                self.assertEqual("this measures oversubscription" in stderr.getvalue(), len(affinity) < 8)
+                self.assertEqual(measured["runner"]["affinity"], affinity)
                 expected = samples() + [dict(sample, lane="workers-8") for sample in samples()]
                 expected.extend(sample for sample in samples(include_c=True) if sample["case"] == history.RUNTIME_CASE)
                 self.assertEqual(measured["benchmarks"][0]["samples"], expected)
@@ -653,7 +658,7 @@ class HistoryTests(unittest.TestCase):
                 self.assertNotIn("previous suite", graph.read_text())
             self.assertEqual(history.read_records(data), records)
 
-    def test_report_keeps_previous_fixed_sampling_protocol_separate(self):
+    def test_report_joins_compilation_history_across_sampling_protocols(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             previous = record()
@@ -665,11 +670,22 @@ class HistoryTests(unittest.TestCase):
             current = record()
             current["commit"] = "new"
             current["recorded_at"] = "2026-10-23T12:00:00Z"
+            current["benchmarks"][0]["samples"].extend(
+                dict(sample, lane="workers-8") for sample in samples())
             for entry in (previous, current):
                 history.save(data, entry)
             content = history.render(data, [("abc", previous["commit_date"]), ("new", current["commit_date"])]).read_text()
-            self.assertEqual(content.count("<object"), 5)
-            self.assertEqual(len(list((data / "graphs").glob("*-cold.svg"))), 2)
+            self.assertEqual(content.count("<object"), 3)
+            self.assertEqual(content.count("<h2>ReleaseFast Compilation</h2>"), 1)
+            namespace = {"svg": "http://www.w3.org/2000/svg"}
+            for phase in ("cold", "leaf-edit"):
+                graph, = (data / "graphs").glob(f"*-{phase}.svg")
+                tree = ElementTree.parse(graph)
+                for point in ("point-0-0", "point-0-1", "point-1-0"):
+                    self.assertIsNotNone(tree.find(f".//*[@id='{point}']"))
+                tooltips = tree.findall(".//svg:title", namespace)
+                self.assertTrue(any("fixed-count" in tooltip.text for tooltip in tooltips))
+                self.assertTrue(any("stable (<=2% range)" in tooltip.text for tooltip in tooltips))
             self.assertEqual(history.read_records(data), [previous, current])
 
     def test_new_compilation_workload_preserves_only_unchanged_runtime_history(self):

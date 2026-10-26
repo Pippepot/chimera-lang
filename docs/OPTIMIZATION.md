@@ -424,16 +424,142 @@ executable grew from 133,702,505 to 134,113,669 bytes; the sieve executable shra
 from 19,155 to 19,102 bytes. Code size is not a runtime benchmark. Raw forward,
 reverse, and profiled samples and source hashes were preserved separately.
 
+### Worker Affinity
+
+The history point for `1c79b6c2568c` originally restricted both compilation
+lanes to CPU 4: `--cpu 4` applies to every worker, not just the serial lane.
+Cold compilation measured 34.776 s with zero workers and 41.378 s with eight
+workers sharing that one CPU. It measures oversubscription, not multicore
+scaling, and cannot be compared directly with preceding eight-worker points
+whose affinity was CPUs 4-11.
+
+Remeasuring the same committed source and benchmark suite on CPUs 4-11 produced
+32.680 s serial and 24.940 s with eight workers; both cold measurements met
+the 2% range criterion after two samples. Leaf edits were 341 ms and 453 ms
+respectively, both unstable at the three-sample cap. Correcting affinity
+restores the cold worker advantage, not a universal benefit for incremental
+work. The report uses the new point and retains the original raw record.
+The recorder warns about oversubscription without silently changing affinity
+or dropping samples.
+
+A separate control rebuilt an exact archive of the preceding `625baee` with
+the same current driver and CPUs 4-11, measuring only its eight-worker lane.
+It produced 25.638 s cold and 475 ms leaf edit, each stable after two samples;
+its older recorded cold median was 19.650 s. The old compiler also slows under
+current conditions, and these checks do not reproduce a new eight-worker
+source regression. The latest commit's 24.940 s versus the control's 25.638 s
+is a single-order comparison, not an established compiler speedup.
+
+### Sieve Runtime Attribution
+
+The 2026-10-26 attribution used the final 19,102-byte native sieve, with all four
+backend source hashes matching the workspace, and GCC 16.2.1 `-O3` on the same
+C workload. CPU-4-pinned runs used one warm-up and adaptive sampling. Diagnostic
+copies replaced only selected native loop instructions, leaving allocation,
+input, output, and the rest of the executable unchanged. Every copy passed 15
+probes, including SIMD tails and the full 88-million bound. These are causal
+experiments, not implemented compiler optimizations or general semantic proofs.
+
+| Same-Binary Experiment | Median | Saved Versus Native | Share of Measured Gap |
+| --- | ---: | ---: | ---: |
+| Unchanged Chimera | 1.694 s | - | - |
+| Unchanged C `-O3` | 1.347 s | - | - |
+| Compact scalar count only | 1.446 s | 247 ms | 71% |
+| SIMD count only | 1.429 s | 264 ms | 76% |
+| Compact marking, checks retained | 1.593 s | 100 ms | 29% |
+| SIMD count and compact checked marking | 1.358 s | 336 ms | 97% |
+
+All rows in this comparison reached the stability criterion after two measured
+runs, with measured order reversed between rounds. The baseline gap was 347 ms,
+or 25.8% relative to C. The combined experiment finished 0.8% behind C, within
+the observed timing uncertainty. Isolated savings overlap and must not be added
+as independent contributions. Separate earlier wall timings were faster for
+both programs; compare values within a matched batch, not across batches.
+
+- **Counting is the main avoidable loss, not simply missing SIMD.** Chimera
+  executes 58 instructions per element, retaining range-exhaustion state,
+  conditional selects, bounds checks, array-base reloads, an address temporary,
+  and register moves. A compact scalar count needs five instructions per
+  element. Its replacement alone removes about 4.66 billion retired
+  instructions. SIMD adds only another 17 ms in the matched native experiment;
+  it does not explain the bulk of the count-loop gap.
+- **Marking has unnecessary scalar work.** The hot loop executes 20 instructions
+  per store versus C's four. It reloads the invariant array base, stores and
+  reloads the element address, and shuttles values through scratch registers.
+  Keeping the base in a register and using a direct indexed store reduces the
+  loop to ten instructions while retaining both index bounds checks. This
+  removes about 2.13 billion retired instructions and saves 100 ms in isolation.
+- **Bounds-check removal is not a demonstrated prerequisite for parity.** The
+  combined experiment above retains marking checks. An unchecked marking
+  counterfactual saves another 22 ms, too small relative to timing uncertainty
+  to assign a precise contribution. It is not safe as a compiler transform
+  without a non-wrapping proof or guarded fallback.
+
+Cycle samples put about 82% of native execution in marking and 18% in counting;
+the hottest phase is not necessarily the largest avoidable difference from C.
+Hardware counters recorded about 9.36 billion retired instructions for native
+versus 1.00 billion for C, with fewer than 13,000 branch misses in either.
+Allocation, zeroing, cleanup, and the algorithm were unchanged in the ablations,
+so they do not explain the recovered 97% of the gap. Breakpoint-based phase
+timings were unstable and are not used for the attribution percentages.
+
+Raw samples, profiles, source hashes, phase probes, and assembly ablations are
+preserved under `/tmp/chimera-sieve-attribution-20261026`. No production compiler
+code changed during this investigation.
+
+### Checked Scalar Loop Simplification
+
+The production follow-up rotates a loop-carried exhaustion flag into a latch
+test. The original header remains the initial guard and final-value merge, so
+empty ranges and observed final iterator values retain their meaning. The
+rewrite requires one latch, an empty header, a dominating body, and immutable
+primitive carried values and select operands. It does not prove non-wrapping
+induction or remove checks.
+
+Native lowering fuses adjacent single-use compare/add-one/select sequences into
+boolean addition, preserving integer wrapping. Single-use allocation-element
+addresses fuse with adjacent scalar copies instead of passing through pointer
+stack slots. Immutable allocation bases can use 64-bit virtual register operands
+while whole descriptors retain their original storage. Constant integer stores
+use a direct indexed address when the base has a register and scratch `rax` is
+dead; spilled bases retain the ordinary address sequence. Both negative-index
+and upper-bound marking checks remain.
+
+An interleaved CPU-4 comparison of the final generated sieve measured 1.493 s
+before these changes, 1.219 s after them, and 1.157 s for GCC `-O3`. The candidate
+was stable after two measured runs; the baseline and C reached five samples
+without stability. This supports a substantial scalar improvement, not a precise
+remaining-gap estimate or a claim of C parity. All three executables passed
+14 small-input probes and the 88-million workload. The native executable shrank
+from 19,102 to 19,004 bytes. Frozen sources, hashes, executable copies, and raw
+samples are under `/tmp/chimera-scalar-loops-20261026`.
+
+### Assembly Dump Scope
+
+The earlier Chimera dump treated its flat ELF as raw x86 bytes, including
+read-only strings after the code. Those apparent instructions are not executed
+code. It also includes the entry point, allocator, syscall I/O, panic handling,
+cleanup, and source-trace data. The C dump showed only `main`; dynamically linked
+libc implementations were absent. Dump line counts therefore compare different
+things and exaggerate the native code-size difference. Compare function-scoped
+code and account for runtime/linkage separately. Redundant loop instructions
+and aggregate copies are real remaining costs, distinct from that dump artifact.
+
 ## Remaining Work
 
+- Frontend compilation time is the immediate engineering priority, ahead of the
+  runtime and machine-stage work below. Follow the attribution and acceptance
+  order in the [roadmap](../ROADMAP.md#immediate-engineering-priority); keep
+  optimizer and backend changes separate from frontend comparisons.
+- Close the remaining C runtime-performance gap through stronger loop bounds
+  proofs, register allocation, and machine copy/address selection. Carried
+  exhaustion state, adjacent conditional increments, and single-use element
+  address temporaries now have scalar simplifications. SIMD counting remains
+  an additional opportunity. General
+  bounds proofs or guarded fast paths remain useful, but unchecked marking is
+  not required by the measured near-parity experiment. Preserve wrapping
+  arithmetic and panic behavior; do not special-case the sieve or weaken checks.
 - Reduce machine-stage analysis and encoding cost where profiles justify it.
   Register classes, frame compaction, scheduling, and additional targets remain
-  follow-up work, not part of this first boundary.
-- Recover compilation throughput without reducing optimization, and investigate
-  the leaf-edit regression with matched profiles. Join simplification, repeated
-  operand facts, and executable publication remain candidates, not proven fixes.
-- Reduce the remaining C gap with general bounds proofs, allocation-base reuse,
-  instruction selection, or vectorization. C vectorizes final counting and uses
-  a tighter marking loop; Chimera still counts scalarly and retains bounds checks.
-  Preserve wrapping arithmetic and panic behavior; do not special-case the sieve
-  or weaken its checks.
+  follow-up work, not part of this first boundary. Compilation throughput and
+  leaf-edit times remain non-regression checks, not outstanding regressions.

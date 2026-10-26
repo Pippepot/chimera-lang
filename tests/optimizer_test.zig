@@ -39,6 +39,37 @@ fn hasConstant(body: structures.FunctionBodyAnalysis, value: i32) bool {
 
 const arithmetic = [_]Tag{ .addi, .subi, .muli, .divsi, .negi };
 
+test "carried exit rotation preserves empty and final range iterations" {
+    const program =
+        \\func calculate(first: int, limit: int) int
+        \\    var sum = 0
+        \\    for value in first..limit
+        \\        sum += value
+        \\    return sum
+        \\func run() int -> calculate(2, 6) * 3 + calculate(3, 3) + calculate(7, 3)
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "calculate")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{.select}));
+}
+
+test "carried exit rotation preserves observable cursor and finished state" {
+    try Fixture.expectParity(
+        \\func walk(limit: int) int
+        \\    var index = 0
+        \\    var sum = 0
+        \\    var finished = limit <= 0
+        \\    loop
+        \\        if finished -> break
+        \\        sum += index
+        \\        if index + 1 == limit -> finished = true else index += 1
+        \\    return sum + index * 10 + if finished -> 1 else 0
+        \\func run() int -> walk(4) + walk(0) + walk(-1) + 3
+    , 42);
+}
+
 test "unchanged nested aggregates leave loops while changing fields retain their values" {
     const program =
         \\pub struct Pair
