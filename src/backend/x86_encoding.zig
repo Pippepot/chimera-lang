@@ -220,7 +220,7 @@ pub const Register = enum(u4) {
     }
 };
 
-pub const RegisterOperation = enum { load_eax, store_eax, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, save, restore };
+pub const RegisterOperation = enum { load_eax, store_eax, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, add_immediate, sub_immediate, imul_immediate, add_from_eax, sub_from_eax, imul_from_eax, save, restore };
 
 fn registerEncoding(comptime operation: RegisterOperation, comptime register: Register) Encoding {
     const r = register.low();
@@ -234,6 +234,12 @@ fn registerEncoding(comptime operation: RegisterOperation, comptime register: Re
         .imul_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x0F, 0xAF, 0xC0 | r }, .asm_prefix = "imul eax, " ++ name },
         .cmp_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x39, 0xC0 | (r << 3) }, .asm_prefix = "cmp eax, " ++ name },
         .load_ecx => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x89, 0xC1 | (r << 3) }, .asm_prefix = "mov ecx, " ++ name },
+        .add_immediate => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x81, 0xC0 | r }, .operand = .i32, .compact = .{ .immediate = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x83, 0xC0 | r } }, .asm_prefix = "add " ++ name ++ ", " },
+        .sub_immediate => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x81, 0xE8 | r }, .operand = .i32, .compact = .{ .immediate = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x83, 0xE8 | r } }, .asm_prefix = "sub " ++ name ++ ", " },
+        .imul_immediate => .{ .prefix = (if (extended) &[_]u8{0x45} else &[_]u8{}) ++ &[_]u8{ 0x69, 0xC0 | (r << 3) | r }, .operand = .i32, .compact = .{ .immediate = (if (extended) &[_]u8{0x45} else &[_]u8{}) ++ &[_]u8{ 0x6B, 0xC0 | (r << 3) | r } }, .asm_prefix = "imul " ++ name ++ ", " ++ name ++ ", " },
+        .add_from_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x01, 0xC0 | r }, .asm_prefix = "add " ++ name ++ ", eax" },
+        .sub_from_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x29, 0xC0 | r }, .asm_prefix = "sub " ++ name ++ ", eax" },
+        .imul_from_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x0F, 0xAF, 0xC0 | (r << 3) }, .asm_prefix = "imul " ++ name ++ ", eax" },
         .save => .{ .prefix = &[_]u8{ if (extended) 0x4C else 0x48, 0x89, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "mov [rsp+", .asm_suffix = "], " ++ @tagName(register) },
         .restore => .{ .prefix = &[_]u8{ if (extended) 0x4C else 0x48, 0x8B, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "mov " ++ @tagName(register) ++ ", [rsp+", .asm_suffix = "]" },
     };
@@ -250,6 +256,8 @@ const register_forms = blk: {
         if (full.compact == .displacement) {
             result[operation_index][register_index].small = displacementEncoding(full, .u8);
             result[operation_index][register_index].zero = displacementEncoding(full, .none);
+        } else if (full.compact == .immediate) {
+            result[operation_index][register_index].small = .{ .prefix = full.compact.immediate, .operand = .i8, .asm_prefix = full.asm_prefix, .asm_suffix = full.asm_suffix };
         }
     };
     break :blk result;
@@ -265,6 +273,9 @@ pub fn registerSelectedEncoding(operation: RegisterOperation, register: Register
     if (form.full.compact == .displacement) {
         if (bits == 0) return form.zero.?;
         if (bits <= std.math.maxInt(i8)) return form.small.?;
+    } else if (form.full.compact == .immediate) {
+        const signed: i32 = @bitCast(@as(u32, @truncate(bits)));
+        if (std.math.cast(i8, signed) != null) return form.small.?;
     }
     return form.full;
 }

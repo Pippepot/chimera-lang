@@ -4206,6 +4206,16 @@ pub const OptimizeFunctionInstance = CompilerQuery("OptimizeFunctionInstance", .
 
 pub const PrepareFunctionInstance = CompilerQuery("PrepareFunctionInstance", .optimization, prepareFunctionInstance, .{});
 
+pub const InlineFunctionFacts = CompilerQuery("InlineFunctionFacts", .optimization_inline, inlineFunctionFacts, .{ .content_equality = true });
+
+fn inlineFunctionFacts(ctx: anytype, instance: structures.InstanceId) anyerror!?@import("optimizer/inline.zig").Facts {
+    const body = (try ctx.get(OptimizeFunctionInstance, instance)).* orelse return null;
+    var arena: std.heap.ArenaAllocator = .init(ctx.allocator());
+    defer arena.deinit();
+    const facts = try @import("optimizer/inline.zig").analyzeCallee(arena.allocator(), &body);
+    return try value_operations.Owned(@TypeOf(facts)).clone(ctx.allocator(), facts);
+}
+
 fn prepareFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?structures.FunctionBodyAnalysis {
     const body = (try ctx.get(AnalyzeFunctionInstance, instance)).* orelse return null;
     return try optimizer.prepare(ctx.allocator(), &body, TypeLayoutContext(@TypeOf(ctx)){ .ctx = ctx });
@@ -4237,6 +4247,10 @@ fn OptimizationContext(comptime Context: type) type {
             if (((try self.ctx.get(CallComponent, callee)).* orelse return null).members.len != 0) return null;
             if (!(try self.ctx.get(ValidateRuntimeFunction, callee)).*) return null;
             return if ((try self.ctx.get(OptimizeFunctionInstance, callee)).*) |*body| body else null;
+        }
+
+        pub fn inlineFacts(self: @This(), callee: structures.InstanceId) !?@import("optimizer/inline.zig").Facts {
+            return (try self.ctx.get(InlineFunctionFacts, callee)).*;
         }
 
         pub fn passesIndirectly(self: @This(), type_id: structures.TypeId) !bool {

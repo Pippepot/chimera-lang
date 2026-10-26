@@ -21,6 +21,7 @@ pub const Category = enum {
     optimization_canonicalize,
     optimization_numbering,
     optimization_dead_code,
+    optimization_joins,
     optimization_cleanup,
     optimization_hoist,
     optimization_idioms,

@@ -27,16 +27,21 @@ pub const Options = struct {
 pub const QueryOptions = struct {
     disk_boundary: bool = false,
     content_equality: bool = false,
+    /// Q.run allocates its structurally owned output with Context.resultAllocator.
+    result_arena: bool = false,
 };
 
 pub fn Query(comptime name: []const u8, comptime category: profiling.Category, comptime implementation: anytype, comptime options: QueryOptions) type {
     const function = @typeInfo(@TypeOf(implementation)).@"fn";
     const Result = @typeInfo(function.return_type.?).error_union.payload;
     if (!options.content_equality) validateObservableType(Result, name ++ ".Output");
+    if (options.result_arena and !canCompactOutput(Result, .{}))
+        @compileError("result_arena requires a structurally owned output");
     return struct {
         pub const cache_name = name;
         pub const profile_category = category;
         pub const disk_boundary = options.disk_boundary;
+        pub const result_arena = options.result_arena;
         pub const Input = function.param_types[1].?;
         pub const Output = Result;
         pub const run = implementation;
@@ -294,6 +299,7 @@ pub const Context = struct {
     current: *Entry,
     worker_index: ?usize,
     scratch_allocator: std.mem.Allocator,
+    result_allocator: ?std.mem.Allocator = null,
 
     pub fn input(ctx: *Context, comptime I: type, key: I.Key) anyerror!*const I.Value {
         validateInput(I);
@@ -327,6 +333,10 @@ pub const Context = struct {
 
     pub fn allocator(ctx: *Context) std.mem.Allocator {
         return ctx.scratch_allocator;
+    }
+
+    pub fn resultAllocator(ctx: *Context) std.mem.Allocator {
+        return ctx.result_allocator orelse unreachable;
     }
 
     pub fn hasParallelWorkers(ctx: *Context) bool {
@@ -1893,11 +1903,15 @@ fn computeFn(comptime Q: type) ComputeFn {
             var scratch = db.acquireScratchArena(worker_index);
             defer db.releaseScratchArena(worker_index, &scratch);
             var recycler: RecyclingAllocator = .{ .backing = scratch.allocator() };
+            var result_arena: std.heap.ArenaAllocator = .init(db.query_storage.arenaAllocator());
+            defer result_arena.deinit();
+            const direct_result = @hasDecl(Q, "result_arena") and Q.result_arena;
             var ctx: Context = .{
                 .db = db,
                 .current = entry,
                 .worker_index = worker_index,
                 .scratch_allocator = recycler.allocator(),
+                .result_allocator = if (direct_result) result_arena.allocator() else null,
             };
 
             // Every successful return transfers the output into entry storage.
@@ -1935,10 +1949,10 @@ fn computeFn(comptime Q: type) ComputeFn {
                 scratch = .init(db.query_storage.arenaAllocator());
                 return .{ .pointer = @ptrCast(output_box), .storage = .{ .arena = arena } };
             } else {
-                var arena = std.heap.ArenaAllocator.init(db.query_storage.arenaAllocator());
-                errdefer arena.deinit();
-                const output_box = try arena.allocator().create(Q.Output);
-                output_box.* = try value_operations.Owned(Q.Output).clone(arena.allocator(), output_value);
+                const output_box = try result_arena.allocator().create(Q.Output);
+                output_box.* = if (direct_result and !restored) output_value else try value_operations.Owned(Q.Output).clone(result_arena.allocator(), output_value);
+                const arena = result_arena;
+                result_arena = .init(db.query_storage.arenaAllocator());
                 return .{ .pointer = @ptrCast(output_box), .storage = .{ .arena = arena } };
             }
         }

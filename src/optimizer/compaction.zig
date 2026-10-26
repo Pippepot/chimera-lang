@@ -222,9 +222,16 @@ pub fn removeDead(function: *Function) !function_ir.Changes {
     const reachable = (try function.controlFlowEdges()).reachable;
     const live = try liveValues(function.scratch, function, reachable);
     var changes: function_ir.Changes = .{};
+    var uses: DeadUses = .{ .function = function };
+    const tables = function_ir.tableView(function);
     for (function.results.items, function.removed.items, function.instructions.items) |result, *removed, *instruction| {
         if (!removed.* and !live[@backingInt(result)]) {
             changes.storage = changes.storage or function_ir.usesStorage(function, instruction);
+            function_ir.visitInstructionReferences(tables, instruction, &uses, DeadUses.reference);
+            switch (instruction.*) {
+                .borrow_address, .storage_cursor, .initializer_ref => uses.changed = true,
+                else => {},
+            }
             removed.* = true;
             changes.changed = true;
         }
@@ -244,12 +251,23 @@ pub fn removeDead(function: *Function) !function_ir.Changes {
                 try function.removeParameter(@intCast(index), position, incoming[index].items);
                 changes.changed = true;
                 changes.storage = true;
+                uses.changed = true;
             }
         }
     }
+    changes.uses = uses.changed;
     if (changes.changed) function.invalidateOperands();
     return changes;
 }
+
+const DeadUses = struct {
+    function: *const Function,
+    changed: bool = false,
+
+    fn reference(self: *DeadUses, value: ValueId) void {
+        if (!self.function.valueType(value).isPrimitive()) self.changed = true;
+    }
+};
 
 fn remapTargets(terminator: *Terminator, block_map: []const ?u32) void {
     switch (terminator.*) {

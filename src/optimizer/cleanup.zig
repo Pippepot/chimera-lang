@@ -2,10 +2,31 @@ const std = @import("std");
 const structures = @import("../structures.zig");
 const function_ir = @import("function.zig");
 const canonicalize = @import("canonicalize.zig");
+const effects = @import("effects.zig");
 
 const ValueId = structures.FunctionValueId;
 const Function = function_ir.Function;
 const Incoming = @import("graph.zig").Incoming;
+
+pub fn simplifyParameters(function: *Function, variants: bool) !bool {
+    function.resolveReferences();
+    const graph = (try function.controlFlowEdges()).*;
+    var parameters: ParameterSimplifier = .{
+        .function = function,
+        .incoming = graph.incoming,
+    };
+    var changed = false;
+    if (variants) {
+        changed = try narrowParameters(&parameters);
+        if (changed) function.resolveReferences();
+        changed = try splitScalarVariants(&parameters) or changed;
+    }
+    for (graph.order) |block| if (try parameters.foldParameters(block)) {
+        changed = true;
+    };
+    if (changed) function.resolveReferences();
+    return changed;
+}
 
 pub fn simplify(function: *Function) !bool {
     for (function.blocks.items) |*block| {
@@ -24,6 +45,259 @@ pub fn simplify(function: *Function) !bool {
     if (changed) function.resolveReferences();
     return changed;
 }
+
+const scalar_types = [_]structures.TypeId{ .int, .bool, .byte };
+
+const VariantUses = struct {
+    references: u32 = 0,
+    accepted: u32 = 0,
+    payloads: [scalar_types.len]bool = @splat(false),
+
+    fn count(uses: []VariantUses, value: ValueId) void {
+        uses[@backingInt(value)].references += 1;
+    }
+};
+
+fn splitScalarVariants(parameters: *ParameterSimplifier) !bool {
+    const function = parameters.function;
+    const graph = (try function.controlFlowEdges()).*;
+    var uses: ?[]const VariantUses = null;
+    var changed = false;
+    for (graph.order) |block| {
+        if (block == function.entry) continue;
+        const edges = graph.incoming[block].items;
+        if (edges.len < 2) continue;
+        var position = function.blocks.items[block].parameters.items.len;
+        while (position > 0) {
+            position -= 1;
+            const parameter = function.blocks.items[block].parameters.items[position];
+            if (function.valueType(parameter).isPrimitive()) continue;
+            if (!function.plainValue(parameter)) continue;
+            for (edges) |edge| {
+                const use = function.branchArguments(edge.branch(function).*)[position];
+                const mapping = use.variant_tag_mapping orelse break;
+                if (use.coerce_to == null or mapping.end - mapping.start != 1) break;
+            } else {
+                const taken = try parameters.addressTaken();
+                if (taken[@backingInt(parameter)]) continue;
+                if (uses == null) uses = try scalarVariantUses(function, taken);
+                if (try splitScalarVariant(function, block, position, parameter, edges, uses.?[@backingInt(parameter)])) changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+fn scalarVariantUses(function: *Function, taken: []const bool) ![]const VariantUses {
+    const uses = try function.scratch.alloc(VariantUses, function.valueCount());
+    @memset(uses, .{});
+    const tables = function_ir.tableView(function);
+    for (function.blocks.items) |*body| {
+        for (body.instructions.items) |index| {
+            if (function.removed.items[index]) continue;
+            const instruction = &function.instructions.items[index];
+            function_ir.visitInstructionReferences(tables, instruction, uses, VariantUses.count);
+            const result = function.results.items[index];
+            if (@backingInt(result) < taken.len and taken[@backingInt(result)]) continue;
+            switch (instruction.*) {
+                .variant_tag => |operand| {
+                    uses[@backingInt(operand)].accepted += 1;
+                },
+                .variant_extract => |extraction| if (extraction.destination == null) {
+                    const scalar = std.mem.indexOfScalar(structures.TypeId, &scalar_types, extraction.target_type) orelse continue;
+                    const use = &uses[@backingInt(extraction.operand)];
+                    use.payloads[scalar] = true;
+                    use.accepted += 1;
+                },
+                else => {},
+            }
+        }
+        function_ir.visitTerminatorReferences(tables, &body.terminator, uses, VariantUses.count);
+    }
+    return uses;
+}
+
+fn splitScalarVariant(function: *Function, block: u32, position: usize, parameter: ValueId, edges: []const Incoming, uses: VariantUses) !bool {
+    if (uses.accepted == 0 or uses.references != uses.accepted) return false;
+    const tag = try function.addParameter(block, .{ .type_id = .int });
+    var parameters: [scalar_types.len]?ValueId = @splat(null);
+    for (uses.payloads, scalar_types, &parameters) |needed, type_id, *value| {
+        if (needed) value.* = try function.addParameter(block, .{ .type_id = type_id });
+    }
+    for (edges) |edge| {
+        const branch = edge.branch(function);
+        const old = function.branchArguments(branch.*);
+        const use = old[position];
+        var arguments: std.ArrayList(structures.FunctionValueUse) = .empty;
+        try arguments.appendSlice(function.scratch, old);
+        const source = function.blocks.items[edge.block];
+        const mapping = use.variant_tag_mapping.?;
+        const discriminator: i32 = @bitCast(function.variant_coercion_tags.items[mapping.start]);
+        const constant = try function.insertInstruction(edge.block, source.instructions.items.len, .{ .const_int = discriminator }, source.span, source.frame);
+        try arguments.append(function.scratch, .{ .value = constant });
+        for (parameters, scalar_types) |payload, type_id| if (payload != null) {
+            var value = use.value;
+            if (function.valueType(value) != type_id) {
+                const zero: structures.FunctionInstruction = switch (type_id) {
+                    .int => .{ .const_int = 0 },
+                    .bool => .{ .const_bool = false },
+                    .byte => .{ .const_byte = 0 },
+                    else => unreachable,
+                };
+                value = try function.insertInstruction(edge.block, function.blocks.items[edge.block].instructions.items.len, zero, source.span, source.frame);
+            }
+            try arguments.append(function.scratch, .{ .value = value });
+        };
+        branch.arguments = try function.appendBranchArguments(arguments.items);
+    }
+    for (function.blocks.items) |body| for (body.instructions.items) |index| {
+        if (function.removed.items[index]) continue;
+        const instruction = function.instructions.items[index];
+        const result = function.results.items[index];
+        const replacement: ValueId = switch (instruction) {
+            .variant_tag => |operand| if (operand == parameter) tag else continue,
+            .variant_extract => |extraction| if (extraction.operand == parameter) parameters[std.mem.indexOfScalar(structures.TypeId, &scalar_types, extraction.target_type).?].? else continue,
+            else => continue,
+        };
+        function.replace(result, replacement);
+        function.removed.items[index] = true;
+    };
+    try function.removeParameter(block, position, edges);
+    function.resolveReferences();
+    return true;
+}
+
+// A merge of injections of one alternative can carry its payload directly.
+// Rebuild the variant only for consumers that still need the complete value.
+fn narrowParameters(parameters: *ParameterSimplifier) !bool {
+    const function = parameters.function;
+    const graph = (try function.controlFlowEdges()).*;
+    var changed = false;
+    for (graph.order) |block| {
+        if (block == function.entry or graph.incoming[block].items.len == 0) continue;
+        var position = function.blocks.items[block].parameters.items.len;
+        while (position > 0) {
+            position -= 1;
+            const parameter = function.blocks.items[block].parameters.items[position];
+            const data = function.definitions.items[@backingInt(parameter)].argument.data;
+            if (data.type_id.isPrimitive()) continue;
+            if (data.representation != .value or !function.direct(data.type_id)) continue;
+            const edges = graph.incoming[block].items;
+            const first = function.branchArguments(edges[0].branch(function).*)[position];
+            const mapping = first.variant_tag_mapping orelse continue;
+            if (first.coerce_to == null or mapping.end - mapping.start != 1) continue;
+            const type_id = function.valueType(first.value);
+            if (!function.direct(type_id)) continue;
+            const tag = function.variant_coercion_tags.items[mapping.start];
+            const taken = try parameters.addressTaken();
+            if (taken[@backingInt(parameter)]) continue;
+            for (edges) |edge| {
+                const argument = function.branchArguments(edge.branch(function).*)[position];
+                const tags = argument.variant_tag_mapping orelse break;
+                if (argument.coerce_to != first.coerce_to or tags.end - tags.start != 1 or function.valueType(argument.value) != type_id) break;
+                if (function.variant_coercion_tags.items[tags.start] != tag) break;
+            } else {
+                const payload = try function.addParameter(block, .{ .type_id = type_id });
+                const rebuilt = try function.insertInstruction(block, 0, .{ .variant_coerce = .{
+                    .operand = payload,
+                    .target_type = data.type_id,
+                    .tag_mapping = mapping,
+                } }, function.blocks.items[block].span, function.blocks.items[block].frame);
+                for (edges) |edge| {
+                    const branch = edge.branch(function);
+                    const old = function.branchArguments(branch.*);
+                    const arguments = try function.scratch.alloc(structures.FunctionValueUse, old.len + 1);
+                    @memcpy(arguments[0..old.len], old);
+                    arguments[old.len] = .{ .value = old[position].value };
+                    branch.arguments = try function.appendBranchArguments(arguments);
+                }
+                function.replace(parameter, rebuilt);
+                try function.removeParameter(block, position, edges);
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
+const ParameterSimplifier = struct {
+    function: *Function,
+    incoming: []const std.ArrayList(Incoming),
+    address_taken: ?[]const bool = null,
+    stable_values: ?[]const bool = null,
+
+    fn addressTaken(self: *ParameterSimplifier) ![]const bool {
+        if (self.address_taken == null) self.address_taken = try canonicalize.addressTaken(self.function);
+        const taken = self.address_taken.?;
+        if (taken.len < self.function.valueCount()) {
+            const extended = try self.function.scratch.alloc(bool, self.function.valueCount());
+            @memcpy(extended[0..taken.len], taken);
+            @memset(extended[taken.len..], false);
+            self.address_taken = extended;
+        }
+        return self.address_taken.?;
+    }
+
+    fn stable(self: *ParameterSimplifier, value: ValueId) !bool {
+        if (!self.function.plainValue(value)) return false;
+        const taken = try self.addressTaken();
+        const index = @backingInt(value);
+        if (!taken[index]) return true;
+        if (self.stable_values == null) self.stable_values = try effects.stableValues(self.function);
+        return self.stable_values.?[index];
+    }
+
+    fn foldParameters(self: *ParameterSimplifier, block: u32) !bool {
+        const function = self.function;
+        if (block == function.entry) return false;
+        var changed = false;
+        var position = function.blocks.items[block].parameters.items.len;
+        while (position > 0) {
+            position -= 1;
+            const parameter = function.blocks.items[block].parameters.items[position];
+            const data = function.definitions.items[@backingInt(parameter)].argument.data;
+            if (data.representation != .value or !function.direct(data.type_id)) continue;
+            var common: ?ValueId = null;
+            for (self.incoming[block].items) |edge| {
+                const argument = function.branchArguments(edge.branch(function).*)[position];
+                if (argument.coerce_to != null) break;
+                const value = function.find(argument.value);
+                if (value == parameter) continue;
+                if (!function.plainValue(value)) break;
+                if (common) |previous| {
+                    if (previous != value) break;
+                } else common = value;
+            } else {
+                if (common) |value| {
+                    if (!try self.stable(parameter) or !try self.stable(value)) continue;
+                    function.replace(parameter, value);
+                    changed = true;
+                }
+            }
+        }
+        if (changed) {
+            const parameters = function.blocks.items[block].parameters.items;
+            for (self.incoming[block].items) |edge| {
+                const branch = edge.branch(function);
+                try function.branch_arguments.ensureUnusedCapacity(function.scratch, parameters.len);
+                const arguments = function.branchArguments(branch.*);
+                const start: u32 = @intCast(function.branch_arguments.items.len);
+                for (parameters, arguments) |parameter, argument| {
+                    if (function.find(parameter) == parameter) function.branch_arguments.appendAssumeCapacity(argument);
+                }
+                branch.arguments = .{ .start = start, .end = @intCast(function.branch_arguments.items.len) };
+            }
+            var kept: usize = 0;
+            for (parameters) |parameter| {
+                if (function.find(parameter) != parameter) continue;
+                parameters[kept] = parameter;
+                kept += 1;
+            }
+            function.blocks.items[block].parameters.shrinkRetainingCapacity(kept);
+        }
+        return changed;
+    }
+};
 
 const Sweep = struct {
     function: *Function,
@@ -52,6 +326,48 @@ const Sweep = struct {
         terminator.* = .{ .branch = predicate.then_branch };
         self.touch(block);
         return true;
+    }
+
+    fn threadExit(self: *Sweep, block: u32) bool {
+        const function = self.function;
+        for (Function.edges(&function.blocks.items[block].terminator)) |maybe_edge| {
+            const edge = maybe_edge orelse continue;
+            const target = @backingInt(edge.target);
+            if (target == block or self.dirty[target]) continue;
+            const join = function.blocks.items[target];
+            if (join.instructions.items.len != 0 or join.terminator != .predicate_branch) continue;
+            const predicate = join.terminator.predicate_branch;
+            if (predicate.operation == .eqt or predicate.operation == .net) continue;
+            const lhs = self.incomingValue(join, edge.*, predicate.operands.lhs) orelse continue;
+            const rhs = self.incomingValue(join, edge.*, predicate.operands.rhs) orelse continue;
+            const order = if (lhs == rhs) .eq else std.math.order(scalarConstant(function, lhs) orelse continue, scalarConstant(function, rhs) orelse continue);
+            const selected = if (predicate.operation.holds(order)) predicate.then_branch else predicate.else_branch;
+            if (selected.arguments.start != selected.arguments.end) continue;
+            const exit = function.blocks.items[@backingInt(selected.target)];
+            switch (exit.terminator) {
+                .return_unit, .return_value, .diverge => {},
+                else => continue,
+            }
+            if (self.dirty[@backingInt(selected.target)]) continue;
+            var uses: ParameterUses = .{ .function = function, .parameters = join.parameters.items };
+            const tables = function_ir.tableView(function);
+            for (exit.instructions.items) |index| {
+                if (!function.removed.items[index]) function_ir.visitInstructionReferences(tables, &function.instructions.items[index], &uses, ParameterUses.reference);
+            }
+            function_ir.visitTerminatorReferences(tables, &exit.terminator, &uses, ParameterUses.reference);
+            if (uses.found) continue;
+            edge.* = selected;
+            self.touch(block);
+            return true;
+        }
+        return false;
+    }
+
+    fn incomingValue(self: *Sweep, join: function_ir.Block, edge: structures.FunctionBranch, operand: ValueId) ?ValueId {
+        const position = std.mem.indexOfScalar(ValueId, join.parameters.items, operand) orelse return operand;
+        const argument = self.function.branchArguments(edge)[position];
+        if (argument.coerce_to != null) return null;
+        return self.function.find(argument.value);
     }
 
     fn arm(self: *Sweep, block: u32, branch: structures.FunctionBranch) ?structures.FunctionBranch {
@@ -173,6 +489,26 @@ const Sweep = struct {
     }
 };
 
+const ParameterUses = struct {
+    function: *const Function,
+    parameters: []const ValueId,
+    found: bool = false,
+
+    fn reference(self: *ParameterUses, value: ValueId) void {
+        if (std.mem.indexOfScalar(ValueId, self.parameters, self.function.find(value)) != null) self.found = true;
+    }
+};
+
+fn scalarConstant(function: *const Function, value: ValueId) ?i32 {
+    const definition = function.definition(value) orelse return null;
+    return switch (definition) {
+        .const_int => |integer| integer,
+        .const_bool => |flag| @intFromBool(flag),
+        .const_byte => |byte| byte,
+        else => null,
+    };
+}
+
 fn speculatable(instruction: structures.FunctionInstruction) bool {
     return switch (instruction) {
         .const_int, .const_bool, .const_byte, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select => true,
@@ -210,7 +546,7 @@ fn sweep(function: *Function) !bool {
     var changed = false;
     for (function.order.items) |block| {
         if (!reachable[block] or state.dirty[block]) continue;
-        if (state.foldSameTarget(block) or try state.formSelect(block) or try state.merge(block) or try state.forward(block)) changed = true;
+        if (state.foldSameTarget(block) or state.threadExit(block) or try state.formSelect(block) or try state.merge(block) or try state.forward(block)) changed = true;
     }
     return changed;
 }

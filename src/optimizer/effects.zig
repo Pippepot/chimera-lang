@@ -15,6 +15,26 @@ pub const Resource = union(enum) {
     unknown,
 };
 
+/// Addressable snapshots may still be immutable when their addresses remain
+/// private and no instruction writes their storage. Heap contents are separate.
+pub fn stableValues(function: *Function) ![]const bool {
+    function.resolveReferences();
+    const memory = try Memory.init(function);
+    var writes: Writes = .{};
+    for (function.blocks.items) |block| for (block.instructions.items) |index| {
+        if (!function.removed.items[index]) try writes.instruction(function.scratch, &memory, function.instructions.items[index]);
+    };
+    const stable = try function.scratch.alloc(bool, function.valueCount());
+    for (stable, 0..) |*value, index| {
+        const id: ValueId = @fromBackingInt(@intCast(index));
+        value.* = function.plainValue(id) and !memory.roots.address_taken[index];
+        if (value.* or !function.plainValue(id)) continue;
+        const root = memory.roots.root(id);
+        value.* = root == .slot and !memory.slotExposed(root.slot) and !writes.slots.contains(root.slot);
+    }
+    return stable;
+}
+
 pub const Roots = struct {
     function: *Function,
     address_taken: []const bool,

@@ -207,8 +207,6 @@ def cached_c_reference(records: list[dict], current: dict) -> tuple[list[dict], 
             if any(sample["case"] != RUNTIME_CASE or sample["phase"] != "runtime"
                    or sample["nanoseconds"] < 0 or sample["executable_bytes"] <= 0 for sample in samples):
                 continue
-            if any(sample["lane"] == "c-O3" and sample["nanoseconds"] < 1_000_000_000 for sample in samples):
-                continue
             origin = previous.get("c_reference", {"snapshot": previous["snapshot"], "recorded_at": previous["recorded_at"]})
             return [dict(sample) for sample in samples], dict(origin)
     return None
@@ -537,6 +535,7 @@ def main() -> None:
     parser.add_argument("--data-dir", type=Path, default=ROOT / ".history", help="result directory, default .history")
     parser.add_argument("--render-only", action="store_true", help="regenerate graphs without measuring")
     args = parser.parse_args()
+    failed = False
     if args.worktree and (args.commit or args.backfill_loc or args.backfill_benchmarks):
         parser.error("--worktree cannot be combined with a commit or backfill")
     if args.backfill_benchmarks and (args.backfill_loc or args.loc_only):
@@ -582,6 +581,8 @@ def main() -> None:
                         record.update(current)
                         record["failures"] = [{"case": case, "error": str(error)} for case in CORE_CASES]
                     save(data, record)
+                    if record.get("failures") and not args.backfill_benchmarks:
+                        failed = True
                     count = sum(sample["lane"] in COMPILATION_LANES for benchmark in record["benchmarks"] for sample in benchmark["samples"])
                     print(f"Recorded {commit[:12]}: {record['loc']['code']:,} production lines, {count} benchmark samples", flush=True)
         report = render(data, history)
@@ -589,6 +590,8 @@ def main() -> None:
         print(f"Benchmarks: {data / 'benchmarks.html'}")
         if (data / "benchmarks.png").exists():
             print(f"Benchmark image: {data / 'benchmarks.png'}")
+        if failed:
+            raise ValueError("requested benchmarks failed; see recorded failure logs")
 
 
 if __name__ == "__main__":

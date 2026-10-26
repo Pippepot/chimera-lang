@@ -119,7 +119,7 @@ const work_rows = [_]WorkRow{
     } },
     .{ .label = "type facts", .categories = &.{.type_facts} },
     .{ .label = "comptime", .categories = &.{.comptime_execution} },
-    .{ .label = "optimization", .categories = &.{ .optimization, .optimization_setup, .optimization_graph, .optimization_inline, .optimization_sroa, .optimization_promotion, .optimization_canonicalize, .optimization_numbering, .optimization_dead_code, .optimization_cleanup, .optimization_hoist, .optimization_idioms, .optimization_compaction, .optimization_clone }, .unit = .function, .parts = &.{
+    .{ .label = "optimization", .categories = &.{ .optimization, .optimization_setup, .optimization_graph, .optimization_inline, .optimization_sroa, .optimization_promotion, .optimization_canonicalize, .optimization_numbering, .optimization_dead_code, .optimization_joins, .optimization_cleanup, .optimization_hoist, .optimization_idioms, .optimization_compaction, .optimization_clone }, .unit = .function, .parts = &.{
         .{ .label = "setup / type layout", .categories = &.{.optimization_setup}, .unit = .phase },
         .{ .label = "dominance", .categories = &.{.optimization_graph}, .unit = .phase },
         .{ .label = "inlining", .categories = &.{.optimization_inline}, .unit = .phase },
@@ -128,6 +128,7 @@ const work_rows = [_]WorkRow{
         .{ .label = "canonicalization", .categories = &.{.optimization_canonicalize}, .unit = .phase },
         .{ .label = "value numbering", .categories = &.{.optimization_numbering}, .unit = .phase },
         .{ .label = "dead code", .categories = &.{.optimization_dead_code}, .unit = .phase },
+        .{ .label = "join simplification", .categories = &.{.optimization_joins}, .unit = .phase },
         .{ .label = "CFG cleanup", .categories = &.{.optimization_cleanup}, .unit = .phase },
         .{ .label = "loop hoisting", .categories = &.{.optimization_hoist}, .unit = .phase },
         .{ .label = "loop idioms", .categories = &.{.optimization_idioms}, .unit = .phase },

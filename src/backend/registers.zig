@@ -54,6 +54,7 @@ const References = struct {
 };
 
 const Scan = struct {
+    mapping: []const ?u32,
     defined: *BitSet,
     uses: *BitSet,
     intervals: []Interval,
@@ -62,16 +63,16 @@ const Scan = struct {
     weight: u64 = 1,
 
     fn use(self: *Scan, value: ValueId) void {
-        const index = @backingInt(value);
+        const index = self.mapping[@backingInt(value)] orelse return;
         if (!self.defined.isSet(index)) self.uses.set(index);
-        self.extend(value);
+        self.extend(index);
         self.weights[index] +|= self.weight;
     }
 
-    fn extend(self: *Scan, value: ValueId) void {
-        const interval = &self.intervals[@backingInt(value)];
-        interval.start = @min(interval.start, self.position);
-        interval.end = @max(interval.end, self.position);
+    fn extend(self: *Scan, value: u32) void {
+        const interval = &self.intervals[value];
+        interval.start = @min(interval.start, self.position * 2);
+        interval.end = @max(interval.end, self.position * 2);
     }
 };
 
@@ -81,6 +82,16 @@ pub fn allocate(gpa: std.mem.Allocator, body: *const Body, candidate: []const bo
     const scratch = arena.allocator();
     const block_count = body.blocks.len;
     const value_count = body.valueCount();
+    const mapping = try scratch.alloc(?u32, value_count);
+    @memset(mapping, null);
+    const candidate_count = std.mem.count(bool, candidate, &.{true});
+    const values = try scratch.alloc(u32, candidate_count);
+    var next_value: u32 = 0;
+    for (candidate, 0..) |allowed, index| if (allowed) {
+        mapping[index] = next_value;
+        values[next_value] = @intCast(index);
+        next_value += 1;
+    };
     const references: References = .{ .body = body };
 
     const starts = try scratch.alloc(u32, block_count);
@@ -96,6 +107,7 @@ pub fn allocate(gpa: std.mem.Allocator, body: *const Body, candidate: []const bo
         position += 1;
     }
 
+    if (position > std.math.maxInt(u32) / 2) return error.FunctionTooLarge;
     const depth = try scratch.alloc(u32, position + 1);
     @memset(depth, 0);
     for (body.blocks, 0..) |block, index| {
@@ -107,41 +119,47 @@ pub fn allocate(gpa: std.mem.Allocator, body: *const Body, candidate: []const bo
         };
     }
 
-    const intervals = try scratch.alloc(Interval, value_count);
+    const intervals = try scratch.alloc(Interval, candidate_count);
     @memset(intervals, .{});
-    const weights = try scratch.alloc(u64, value_count);
+    const weights = try scratch.alloc(u64, candidate_count);
     @memset(weights, 0);
     const uses = try scratch.alloc(BitSet, block_count);
     const defines = try scratch.alloc(BitSet, block_count);
     for (body.blocks, uses, defines, 0..) |block, *used, *defined, index| {
-        used.* = try BitSet.initEmpty(scratch, value_count);
-        defined.* = try BitSet.initEmpty(scratch, value_count);
-        var scan: Scan = .{ .defined = defined, .uses = used, .intervals = intervals, .weights = weights, .position = starts[index] };
+        used.* = try BitSet.initEmpty(scratch, candidate_count);
+        defined.* = try BitSet.initEmpty(scratch, candidate_count);
+        var scan: Scan = .{ .mapping = mapping, .defined = defined, .uses = used, .intervals = intervals, .weights = weights, .position = starts[index] };
         for (block.argument_start..block.argument_end) |argument| {
-            defined.set(argument);
-            scan.extend(@fromBackingInt(@intCast(argument)));
+            if (mapping[argument]) |value| {
+                defined.set(value);
+                scan.extend(value);
+            }
         }
         for (block.instruction_start..block.instruction_end) |instruction| {
             scan.position += 1;
-            scan.weight = std.math.pow(u64, 8, @min(depth[scan.position], 6));
+            scan.weight = loopWeight(depth[scan.position]);
             references.instruction(instruction, &scan, Scan.use);
             const result = body.instructionValue(instruction);
-            defined.set(@backingInt(result));
-            scan.extend(result);
-            weights[@backingInt(result)] +|= scan.weight;
+            if (mapping[@backingInt(result)]) |value| {
+                defined.set(value);
+                // Read operands before defining the result, allowing last-use reuse.
+                extendTo(&intervals[value], scan.position * 2 + 1);
+                weights[value] +|= scan.weight;
+            }
         }
         scan.position = ends[index];
-        scan.weight = std.math.pow(u64, 8, @min(depth[scan.position], 6));
+        scan.weight = loopWeight(depth[scan.position]);
         references.terminator(index, &scan, Scan.use);
     }
 
     const live_in = try scratch.alloc(BitSet, block_count);
     const live_out = try scratch.alloc(BitSet, block_count);
     for (live_in, live_out) |*input, *output| {
-        input.* = try BitSet.initEmpty(scratch, value_count);
-        output.* = try BitSet.initEmpty(scratch, value_count);
+        input.* = try BitSet.initEmpty(scratch, candidate_count);
+        output.* = try BitSet.initEmpty(scratch, candidate_count);
     }
-    var next = try BitSet.initEmpty(scratch, value_count);
+    var next = try BitSet.initEmpty(scratch, candidate_count);
+    var incoming = try BitSet.initEmpty(scratch, candidate_count);
     var changed = true;
     while (changed) {
         changed = false;
@@ -152,8 +170,11 @@ pub fn allocate(gpa: std.mem.Allocator, body: *const Body, candidate: []const bo
             var terminator = body.blocks[block].terminator;
             for (terminator.successors()) |maybe_successor| if (maybe_successor) |successor| {
                 const target = @backingInt(successor.*);
-                var incoming = try live_in[target].clone(scratch);
-                for (body.blocks[target].argument_start..body.blocks[target].argument_end) |argument| incoming.unset(argument);
+                incoming.unsetAll();
+                incoming.setUnion(live_in[target]);
+                for (body.blocks[target].argument_start..body.blocks[target].argument_end) |argument| {
+                    if (mapping[argument]) |value| incoming.unset(value);
+                }
                 live_out[block].setUnion(incoming);
             };
             next.unsetAll();
@@ -170,13 +191,13 @@ pub fn allocate(gpa: std.mem.Allocator, body: *const Body, candidate: []const bo
     }
     for (0..block_count) |block| {
         var inputs = live_in[block].iterator(.{});
-        while (inputs.next()) |value| extendTo(&intervals[value], starts[block]);
+        while (inputs.next()) |value| extendTo(&intervals[value], starts[block] * 2);
         var outputs = live_out[block].iterator(.{});
-        while (outputs.next()) |value| extendTo(&intervals[value], ends[block]);
+        while (outputs.next()) |value| extendTo(&intervals[value], ends[block] * 2);
     }
 
     var order: std.ArrayList(u32) = .empty;
-    for (candidate, 0..) |allowed, value| if (allowed and intervals[value].start <= intervals[value].end) try order.append(scratch, @intCast(value));
+    for (intervals, 0..) |interval, value| if (interval.start <= interval.end) try order.append(scratch, @intCast(value));
     std.mem.sort(u32, order.items, weights, heavierFirst);
     const available = std.enums.values(Register);
     const assigned = try scratch.alloc(std.ArrayList(Interval), available.len);
@@ -189,7 +210,7 @@ pub fn allocate(gpa: std.mem.Allocator, body: *const Body, candidate: []const bo
         choice: for (available, assigned) |register, *taken| {
             for (taken.items) |other| if (interval.start <= other.end and other.start <= interval.end) continue :choice;
             try taken.append(scratch, interval);
-            registers[value] = register;
+            registers[values[value]] = register;
             break;
         }
     }
@@ -197,6 +218,11 @@ pub fn allocate(gpa: std.mem.Allocator, body: *const Body, candidate: []const bo
     defer used.deinit(gpa);
     for (available, assigned) |register, taken| if (taken.items.len != 0) try used.append(gpa, register);
     return .{ .registers = registers, .used = try used.toOwnedSlice(gpa) };
+}
+
+fn loopWeight(depth: u32) u64 {
+    const exponent: u6 = @intCast(@min(depth, 6));
+    return @as(u64, 1) << (exponent * 3);
 }
 
 fn extendTo(interval: *Interval, position: u32) void {

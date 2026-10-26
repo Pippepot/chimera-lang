@@ -19,6 +19,7 @@ pub const Changes = struct {
     changed: bool = false,
     storage: bool = false,
     control_flow: bool = false,
+    uses: bool = false,
 };
 
 pub const Block = struct {
@@ -206,8 +207,9 @@ pub const Function = struct {
     }
 
     pub fn replace(self: *Function, value: ValueId, target: ValueId) void {
-        std.debug.assert(self.find(target) != value);
-        self.replacement.items[@backingInt(value)] = target;
+        const canonical = self.find(target);
+        std.debug.assert(canonical != value);
+        self.replacement.items[@backingInt(value)] = canonical;
         self.invalidateOperands();
     }
 
@@ -338,20 +340,17 @@ pub const Function = struct {
     pub fn resolveReferences(self: *Function) void {
         if (!self.operands_dirty) return;
         self.address_taken = null;
-        for (self.instructions.items, self.removed.items) |*instruction, removed| {
-            if (removed) continue;
-            for (instruction.operands()) |operand| if (operand) |value| {
-                value.* = self.find(value.*);
-            };
+        for (self.blocks.items) |*block| {
+            for (block.instructions.items) |index| {
+                if (!self.removed.items[index]) allOperands(self, &self.instructions.items[index], self, resolveOperand);
+            }
+            terminatorAllOperands(self, &block.terminator, self, resolveOperand);
         }
-        for (self.blocks.items) |*block| for (block.terminator.operands()) |operand| if (operand) |value| {
-            value.* = self.find(value.*);
-        };
-        for (self.call_arguments.items) |*argument| argument.operand().* = self.find(argument.valueId());
-        for (self.branch_arguments.items) |*argument| argument.value = self.find(argument.value);
-        for (self.initializer_captures.items) |*capture| capture.* = self.find(capture.*);
-        for (self.aggregate_fields.items) |*field| field.* = self.find(field.*);
         self.operands_dirty = false;
+    }
+
+    fn resolveOperand(self: *Function, value: *ValueId) void {
+        value.* = self.find(value.*);
     }
 };
 
@@ -386,9 +385,21 @@ test "optimizer operand normalization invalidates after replacement and appended
     try testing.expect(function.operands_dirty);
     function.resolveReferences();
     try testing.expectEqual(third, function.definition(appended).?.value_copy.source);
+    const detached = try function.newInstruction(.{ .value_copy = .{ .source = first, .type_id = .int } }, span, .root);
+    const obsolete = try function.appendBranchArguments(&.{.{ .value = first }});
+    try function.aggregate_fields.append(function.scratch, first);
+    try function.initializer_captures.append(function.scratch, first);
     const arguments = try function.appendBranchArguments(&.{.{ .value = first }});
+    const destination = try function.addBlock(.return_unit, span, .root);
+    _ = try function.addParameter(destination, .{ .type_id = .int });
+    function.blocks.items[0].terminator = .{ .branch = .{ .target = @fromBackingInt(destination), .arguments = arguments } };
+    function.invalidateControlFlow();
     function.resolveReferences();
     try testing.expectEqual(third, function.branch_arguments.items[arguments.start].value);
+    try testing.expectEqual(first, function.instructions.items[detached].value_copy.source);
+    try testing.expectEqual(first, function.branch_arguments.items[obsolete.start].value);
+    try testing.expectEqual(first, function.aggregate_fields.items[0]);
+    try testing.expectEqual(first, function.initializer_captures.items[0]);
     try testing.expect(!function.operands_dirty);
     try testing.expect(!function.hasStorage());
     const canonicalize = @import("canonicalize.zig");

@@ -177,7 +177,9 @@ revision immediately. It skips matching prior attempts, including recorded
 failures, when resumed. Each workload runs separately: an unsupported runtime
 case does not erase valid compilation results. Source, host-toolchain, build,
 and correctness failures produce no timing; details live in raw records and
-`.history/failures/`. Revisions predating the harness's module/query API are
+`.history/failures/`. Single-snapshot recording exits nonzero if a requested
+workload fails, after saving its record and rendering the report. Backfill
+continues through unavailable revisions. Revisions predating the harness's module/query API are
 marked unavailable; this does not prove their compiler cannot compile the source.
 Backfill attempts older revisions too, rather than assuming
 one failure proves every ancestor incompatible. Normal single-commit recording
@@ -201,12 +203,11 @@ JSON retains all samples and executable sizes; graphs show separate workload
 medians, not one aggregate score. Code size is not a runtime benchmark.
 Compilation and runtime graphs use seconds.
 
-The fixed limit is calibrated on CPU 4 for a C `-O3` baseline close to, but above,
-one second. There are no sleeps, repeated subprocess padding, or optimization
-barriers. Fresh and cached baselines require every measured `-O3` sample to be
-at least one second; a faster machine can reject this limit and require an
-explicitly versioned larger workload. Frequency and system-load variation mean
-the baseline cannot be exactly one second. The old one-million-element timings
+The fixed limit was calibrated on CPU 4 for a C `-O3` baseline close to one second.
+There are no sleeps, repeated subprocess padding, or optimization barriers.
+Faster machines can produce subsecond samples; fresh and cached baselines accept
+these timings with the same correctness checks. The workload stays fixed across
+machines, and incompatible environments remain separate. The old one-million-element timings
 remain in raw records and are not joined to the new runtime curve.
 
 The equivalent [C sieve](history_runtime.c) uses the same algorithm, signed 32-bit
@@ -236,9 +237,13 @@ Optimization levels are not guaranteed to improve monotonically.
 Assembly inspection confirms that optimized C still executes the factor and
 multiple-marking loops. GCC replaces elementwise zeroing with `memset` and
 vectorizes the final count; it does not substitute a precomputed prime count.
-The generated Chi marking loop retains List assignment/get calls, bounds
-checks, and stack loads/stores; filling still calls an element initializer per
-slot. These are concrete code-generation/library differences, not evidence
+The generated Chi code inlines List indexing, fills with `rep stosd`, and keeps
+unchanged List descriptors outside the marking and counting loops. Scalar
+iterator results use separate tag and payload values, and eligible loop scalars
+use preserved registers with in-place arithmetic at last-use operand reuse.
+Constant incoming predicates can bypass independent terminal exits instead of
+materializing exhausted iterator joins. Bounds checks and scalar counting remain
+in the hot loops. These are concrete code-generation/library differences, not evidence
 of C skipping the requested computation. ReleaseFast optimizes the Zig compiler
 itself, not the generated Chi program through LLVM.
 

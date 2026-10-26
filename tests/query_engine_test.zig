@@ -618,6 +618,80 @@ test "query storage releases scratch before retaining published bytes" {
     try testing.expect(tracking.allocated_bytes - tracking.freed_bytes - initial_live < 1024 * 1024);
 }
 
+test "direct result arenas transfer ownership and release scratch on success and failure" {
+    const Implementation = struct {
+        var published: [*]u8 = undefined;
+
+        fn run(ctx: *Context, key: u32) !OwnedOutput {
+            const value = (try ctx.input(NumberInput, key)).*;
+            const temporary = try ctx.allocator().alloc(u8, 4 * 1024 * 1024);
+            @memset(temporary, 42);
+            const bytes = try ctx.resultAllocator().alloc(u8, 1);
+            bytes[0] = @intCast(value % 2);
+            if (value == 4) return error.TestInfrastructureFailure;
+            published = bytes.ptr;
+            return .{ .bytes = bytes };
+        }
+    };
+    const Direct = query.Query("direct-result", .query_other, Implementation.run, .{ .result_arena = true });
+    var tracking = testing.FailingAllocator.init(testing.allocator, .{});
+    const db = try Database.init(tracking.allocator(), .{ .worker_count = 1 });
+    var live = true;
+    defer if (live) db.deinit();
+    OwnedOutput.deinits.reset();
+    try db.addInput(NumberInput, 0, 2);
+    const initial_live = tracking.allocated_bytes - tracking.freed_bytes;
+    const first = try db.get(Direct, 0);
+    try testing.expectEqual(Implementation.published, first.bytes.ptr);
+    try testing.expectEqual(@as(u8, 0), first.bytes[0]);
+    try testing.expect(tracking.allocated_bytes - tracking.freed_bytes - initial_live < 1024 * 1024);
+
+    try db.setInput(NumberInput, 0, 4);
+    try testing.expectError(error.TestInfrastructureFailure, db.get(Direct, 0));
+    try OwnedOutput.deinits.expect(0);
+    try testing.expectEqual(@as(u8, 0), first.bytes[0]);
+    try testing.expect(tracking.allocated_bytes - tracking.freed_bytes - initial_live < 1024 * 1024);
+
+    try db.setInput(NumberInput, 0, 6);
+    try testing.expectEqual(first, try db.get(Direct, 0));
+    try OwnedOutput.deinits.expect(1);
+    try db.setInput(NumberInput, 0, 7);
+    const changed = try db.get(Direct, 0);
+    try testing.expectEqual(Implementation.published, changed.bytes.ptr);
+    try testing.expectEqual(@as(u8, 1), changed.bytes[0]);
+    try OwnedOutput.deinits.expect(2);
+    db.deinit();
+    live = false;
+    try OwnedOutput.deinits.expect(3);
+}
+
+test "direct result queries copy memo provider outputs into persistent storage" {
+    const Implementation = struct {
+        fn run(_: *Context, _: u32) !OwnedOutput {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const Direct = query.Query("direct-restored-result", .query_other, Implementation.run, .{ .result_arena = true });
+    const Provider = struct {
+        pub const query_types = .{Direct};
+
+        pub fn load(_: *@This(), comptime Q: type, ctx: *Context, key: Q.Input) !?Q.Output {
+            const value = (try ctx.input(NumberInput, key)).*;
+            return .{ .bytes = try ctx.allocator().dupe(u8, if (value == 0) "restored" else "updated") };
+        }
+
+        pub fn deinit(_: *@This()) void {}
+    };
+    var provider: Provider = .{};
+    const db = try testDatabase(1);
+    defer db.deinit();
+    try db.installMemoProvider(Provider, &provider);
+    try db.addInput(NumberInput, 0, 0);
+    try testing.expectEqualStrings("restored", (try db.get(Direct, 0)).bytes);
+    try db.setInput(NumberInput, 0, 1);
+    try testing.expectEqualStrings("updated", (try db.get(Direct, 0)).bytes);
+}
+
 test "query storage preserves large aligned identities during recomputation" {
     const AlignedQuery = struct {
         pub const Input = struct {

@@ -163,11 +163,12 @@ class HistoryTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertIsNone(history.cached_c_reference([previous], previous))
 
-    def test_c_reference_cache_rejects_an_under_one_second_o3_sample(self):
+    def test_c_reference_cache_accepts_valid_subsecond_samples(self):
         previous = record()
         previous["benchmarks"][0]["samples"] = samples(include_c=True)
         previous["benchmarks"][0]["samples"][-1]["nanoseconds"] = 999_999_999
-        self.assertIsNone(history.cached_c_reference([previous], previous))
+        cached, _ = history.cached_c_reference([previous], previous)
+        self.assertEqual(cached[-1]["nanoseconds"], 999_999_999)
 
     def test_measure_reuses_c_samples_and_refresh_forces_remeasurement(self):
         for saved, refresh in ((False, False), (True, False), (True, True)):
@@ -617,6 +618,30 @@ class HistoryTests(unittest.TestCase):
             graph, = (data / "graphs").glob(f"*-{history.RUNTIME_CASE}-runtime.svg")
             self.assertEqual(len(ElementTree.parse(graph).findall(".//svg:title", namespace)), 4)
             self.assertEqual(len(history.read_records(data)), 2)
+
+    def test_requested_failures_raise_after_saving_and_rendering_but_backfill_continues(self):
+        for failed, backfill in ((False, False), (True, False), (True, True)):
+            with self.subTest(failed=failed, backfill=backfill), tempfile.TemporaryDirectory() as directory:
+                data = Path(directory)
+                current = record()
+                current["failures"] = [{"case": history.RUNTIME_CASE, "error": "unsupported"}] if failed else []
+                arguments = ["history.py", "--data-dir", directory]
+                if backfill:
+                    arguments.append("--backfill-benchmarks")
+                with patch.object(history.sys, "argv", arguments), \
+                        patch.object(history, "command", return_value="abc"), \
+                        patch.object(history, "commits", return_value=[("abc", current["commit_date"])]), \
+                        patch.object(history, "environment", return_value={}), \
+                        patch.object(history, "unpack"), \
+                        patch.object(history, "measure", return_value=current), \
+                        patch.object(history, "render", return_value=data / "index.html") as render:
+                    if failed and not backfill:
+                        with self.assertRaisesRegex(ValueError, "requested benchmarks failed"):
+                            history.main()
+                    else:
+                        history.main()
+                    render.assert_called_once()
+                self.assertEqual(history.read_records(data), [current])
 
     def test_backfill_resumes_matching_attempts_including_failures(self):
         with tempfile.TemporaryDirectory() as directory:

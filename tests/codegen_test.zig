@@ -5,6 +5,67 @@ const runtime = test_sources.runtime;
 const structures = test_sources.structures;
 const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 
+test "in-place loop arithmetic preserves wrapping and operand order" {
+    try test_sources.SourceFixture.expectParity(
+        \\func calculate(seed: int) int
+        \\    var value = seed
+        \\    var index = 0
+        \\    loop
+        \\        if index == 3 -> break
+        \\        value *= 3
+        \\        value += 1000
+        \\        value -= 1000
+        \\        value = index + value
+        \\        value -= index
+        \\        index += 1
+        \\    return value
+        \\func run() int -> calculate(1) + calculate(2147483647) - calculate(2147483647) + 15
+    , 42);
+}
+
+test "loop registers preserve parallel copies spills and values across calls" {
+    const source =
+        \\func called(number: int) int
+        \\    var value = number
+        \\    var index = 0
+        \\    loop
+        \\        if index == 3 -> break
+        \\        value += 1
+        \\        index += 1
+        \\    return value
+        \\func run() int
+        \\    var a = 1
+        \\    var b = 2
+        \\    var c = 3
+        \\    var d = 4
+        \\    var e = 5
+        \\    var f = 6
+        \\    var g = 7
+        \\    var h = 8
+        \\    var index = 0
+        \\    var sum = 0
+        \\    loop
+        \\        if index == 6 -> break
+        \\        const previous = a
+        \\        a = b
+        \\        b = c
+        \\        c = d
+        \\        d = e
+        \\        e = f
+        \\        f = g
+        \\        g = h
+        \\        h = previous
+        \\        sum += called(index)
+        \\        index += 1
+        \\    return sum + a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f + 7 * g + 8 * h - 147
+    ;
+    try test_sources.SourceFixture.expectParity(source, 42);
+    const fixture = try test_sources.SourceFixture.init(source ++ "\nexit(run())");
+    defer fixture.deinit();
+    try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+}
+
 const small_variant = structures.TypeId.fromInterned(@fromBackingInt(@intCast(0)));
 const wide_variant = structures.TypeId.fromInterned(@fromBackingInt(@intCast(1)));
 const seven_byte_payload = structures.TypeId.fromInterned(@fromBackingInt(@intCast(2)));
@@ -216,9 +277,120 @@ fn expectArtifactExitCode(artifact: structures.CompiledFunction, expected: u8) !
         .{ .instance = entry, .artifact = artifact },
         .{ .instance = exit_function, .artifact = exit_artifact },
     };
-    var executable = try codegen.buildExecutable(entry, &functions, allocator);
+    var executable = executable: {
+        var scratch: std.heap.ArenaAllocator = .init(allocator);
+        defer scratch.deinit();
+        break :executable try codegen.buildExecutableWithResultAllocator(entry, &functions, scratch.allocator(), allocator);
+    };
     defer executable.deinit(allocator);
     try test_sources.expectProgramExit(executable.bytes, expected);
+}
+
+test "native comparisons and selections preserve signed and boolean predicates" {
+    for ([_]structures.PredicateOperation{ .lti, .gti, .lei, .gei, .eqi, .nei, .eqb, .neb }) |predicate| {
+        for ([_]i32{ -1, 0, 1 }) |left| {
+            if ((predicate == .eqb or predicate == .neb) and left < 0) continue;
+            const expected = switch (predicate) {
+                .lti => left < 0,
+                .gti => left > 0,
+                .lei => left <= 0,
+                .gei => left >= 0,
+                .eqi, .eqb => left == 0,
+                .nei, .neb => left != 0,
+                .eqt, .net => unreachable,
+            };
+            const boolean = predicate == .eqb or predicate == .neb;
+            var instructions = [_]structures.FunctionInstruction{
+                if (boolean) .{ .const_bool = left != 0 } else .{ .const_int = left },
+                if (boolean) .{ .const_bool = false } else .{ .const_int = 0 },
+                .{ .compare = .{ .operation = predicate, .operands = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1) } } },
+                .{ .const_bool = true },
+                .{ .const_bool = false },
+                .{ .select = .{ .condition = @fromBackingInt(2), .then_value = @fromBackingInt(3), .else_value = @fromBackingInt(4), .type_id = .bool } },
+                .{ .compare = .{ .operation = .eqb, .operands = .{ .lhs = @fromBackingInt(5), .rhs = @fromBackingInt(3) } } },
+                .{ .const_int = 42 },
+                .{ .const_int = 91 },
+                .{ .select = .{ .condition = @fromBackingInt(6), .then_value = @fromBackingInt(7), .else_value = @fromBackingInt(8), .type_id = .int } },
+                directCall(.{ .item = @fromBackingInt(1) }),
+            };
+            instructions[10].call.arguments = .{ .start = 0, .end = 1 };
+            instructions[10].call.return_type = .never;
+            var blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = instructions.len, .terminator = .diverge }};
+            var body = functionSsa(&instructions, &blocks);
+            body.call_arguments = &.{.{ .prepared = .{ .value = @fromBackingInt(9) } }};
+            var artifact = try codegen.compileFunction(&body, TestTypes{}, std.testing.allocator);
+            defer artifact.deinit(std.testing.allocator);
+            try expectArtifactExitCode(artifact, if (expected) 42 else 91);
+        }
+    }
+}
+
+test "native bulk operations preserve overlapping move direction and clear the direction flag" {
+    for ([_]bool{ false, true }) |backward| {
+        for ([_]bool{ false, true }) |empty| {
+            var types: ArrayCopyTypes = .{ .array_length = 6 };
+            var instructions = [_]structures.FunctionInstruction{
+                .{ .local_storage = array_copy_type },
+                .{ .const_int = 0 },
+                .{ .const_int = 1 },
+                .{ .const_int = 2 },
+                .{ .const_int = 3 },
+                .{ .const_int = 4 },
+                .{ .const_int = 6 },
+                .{ .const_int = 10 },
+                .{ .const_int = 20 },
+                .{ .const_int = 30 },
+                .{ .array_element = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(1), .type_id = .int } },
+                .{ .array_element = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(2), .type_id = .int } },
+                .{ .array_element = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(3), .type_id = .int } },
+                .{ .array_element = .{ .array = @fromBackingInt(0), .index = @fromBackingInt(5), .type_id = .int } },
+                .{ .fill = .{ .first = @fromBackingInt(10), .count = @fromBackingInt(6), .value = @fromBackingInt(3), .type_id = .int } },
+                .{ .value_copy = .{ .source = @fromBackingInt(7), .destination = @fromBackingInt(10), .type_id = .int } },
+                .{ .value_copy = .{ .source = @fromBackingInt(8), .destination = @fromBackingInt(11), .type_id = .int } },
+                .{ .value_copy = .{ .source = @fromBackingInt(9), .destination = @fromBackingInt(12), .type_id = .int } },
+                .{ .move = .{ .destination = @fromBackingInt(if (backward) 11 else 10), .source = @fromBackingInt(if (backward) 10 else 11), .count = @fromBackingInt(if (empty) 1 else 4), .type_id = .int, .backward = backward } },
+                .{ .fill = .{ .first = @fromBackingInt(13), .count = @fromBackingInt(3), .value = @fromBackingInt(3), .type_id = .int } },
+                .{ .value_copy = .{ .source = @fromBackingInt(11), .type_id = .int } },
+                .{ .value_copy = .{ .source = @fromBackingInt(12), .type_id = .int } },
+                .{ .value_copy = .{ .source = @fromBackingInt(13), .type_id = .int } },
+                .{ .addi = .{ .lhs = @fromBackingInt(20), .rhs = @fromBackingInt(21) } },
+                .{ .addi = .{ .lhs = @fromBackingInt(23), .rhs = @fromBackingInt(22) } },
+                .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
+            };
+            var blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = instructions.len, .terminator = .diverge }};
+            var body = functionSsa(&instructions, &blocks);
+            body.call_arguments = &.{.{ .prepared = .{ .value = @fromBackingInt(24) } }};
+            var artifact = try codegen.compileFunction(&body, &types, std.testing.allocator);
+            defer artifact.deinit(std.testing.allocator);
+            try expectArtifactExitCode(artifact, if (empty) 52 else if (backward) 32 else 34);
+        }
+    }
+}
+
+test "native byte fills and directed moves preserve exact byte storage" {
+    for ([_]bool{ false, true }) |backward| {
+        for ([_]bool{ false, true }) |empty| {
+            var instructions = [_]structures.FunctionInstruction{
+                .{ .local_storage = .byte },
+                .{ .local_storage = .byte },
+                .{ .const_byte = 42 },
+                .{ .const_byte = 13 },
+                .{ .const_int = 1 },
+                .{ .const_int = 0 },
+                .{ .fill = .{ .first = @fromBackingInt(0), .count = @fromBackingInt(4), .value = @fromBackingInt(2), .type_id = .byte } },
+                .{ .fill = .{ .first = @fromBackingInt(1), .count = @fromBackingInt(4), .value = @fromBackingInt(3), .type_id = .byte } },
+                .{ .move = .{ .destination = @fromBackingInt(1), .source = @fromBackingInt(0), .count = @fromBackingInt(if (empty) 5 else 4), .type_id = .byte, .backward = backward } },
+                .{ .byte_to_int = @fromBackingInt(1) },
+                .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
+            };
+            var blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = instructions.len, .terminator = .diverge }};
+            var body = functionSsa(&instructions, &blocks);
+            body.call_arguments = &.{.{ .prepared = .{ .value = @fromBackingInt(9) } }};
+            var artifact = try codegen.compileFunction(&body, TestTypes{}, std.testing.allocator);
+            defer artifact.deinit(std.testing.allocator);
+            try expectArtifactExitCode(artifact, if (empty) 13 else 42);
+        }
+    }
 }
 
 test "native array projections scale runtime indices and large copies remain bounded" {

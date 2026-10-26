@@ -405,10 +405,10 @@ fn boundsChecks(function: *Function, graph: Graph, loop: Loop, preheader: u32) !
             const predicate = terminator.predicate_branch;
             const left = function.find(predicate.operands.lhs);
             const right = function.find(predicate.operands.rhs);
-            const holds: ?bool = if (left == parameter and constant(function, right) != null and constant(function, right).? <= start and predicate.operation == .gei)
-                true
-            else if (left == parameter and right == limit and predicate.operation == .lti)
-                true
+            const holds: ?bool = if (left == parameter and constant(function, right) != null and constant(function, right).? <= start and (predicate.operation == .gei or predicate.operation == .lti))
+                predicate.operation == .gei
+            else if (left == parameter and right == limit and (predicate.operation == .lti or predicate.operation == .gei))
+                predicate.operation == .lti
             else
                 null;
             if (holds) |taken| {

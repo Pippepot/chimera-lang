@@ -20,7 +20,7 @@ pub const Callee = struct {
     entry_taken: []const bool = &.{},
 };
 
-const Facts = struct {
+pub const Facts = struct {
     eligible: bool,
     entry_taken: []const bool = &.{},
 };
@@ -43,7 +43,7 @@ const Cache = struct {
     }
 };
 
-fn analyzeCallee(scratch: std.mem.Allocator, body: *const Body) !Facts {
+pub fn analyzeCallee(scratch: std.mem.Allocator, body: *const Body) !Facts {
     var function = try Function.init(scratch, body, &.{});
     if (!try @import("graph.zig").dominatesUses(&function)) return .{ .eligible = false };
     const entry = @backingInt(body.entry);
@@ -74,6 +74,7 @@ pub fn inlineCalls(function: *Function, context: anytype) !bool {
             const instruction = function.instructions.items[index];
             if (instruction != .call) continue;
             const callee = (try candidate(function, context, &cache, instruction.call)) orelse continue;
+            if (callee.body.instructions.len > budget -| size) continue;
             try inlineInstruction(function, context, block, position, index, callee);
             size += callee.body.instructions.len;
             changed = true;
@@ -90,7 +91,14 @@ fn liveInstructions(function: *const Function) usize {
 }
 
 pub fn cost(body: *const Body) usize {
-    return body.instructions.len + body.blocks.len;
+    var total = body.blocks.len;
+    for (body.instructions) |instruction| {
+        total += switch (instruction) {
+            .const_int, .const_bool, .const_byte, .const_unit, .const_none => 0,
+            else => @as(usize, 1),
+        };
+    }
+    return total;
 }
 
 fn candidate(function: *Function, context: anytype, cache: *Cache, call: structures.FunctionCall) !?Callee {
@@ -112,8 +120,18 @@ fn candidate(function: *Function, context: anytype, cache: *Cache, call: structu
     };
     const body = callee.body;
     if (cache.limit == null) cache.limit = try context.inlineLimit();
-    if (cost(body) > cache.limit.?) return null;
-    const facts = try cache.analyze(function.scratch, body);
+    if (body.instructions.len + body.blocks.len > cache.limit.?) {
+        for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
+            if (argument != .prepared) continue;
+            const type_id = function.valueType(function.find(argument.valueId()));
+            if (!type_id.isPrimitive() and function.direct(type_id)) break;
+        } else return null;
+        if (cost(body) > cache.limit.?) return null;
+    }
+    const facts = if (@hasDecl(@TypeOf(context), "inlineFacts") and !callee.region)
+        (try context.inlineFacts(callee.instance)) orelse return null
+    else
+        try cache.analyze(function.scratch, body);
     if (!facts.eligible) return null;
     callee.entry_taken = facts.entry_taken;
     return callee;

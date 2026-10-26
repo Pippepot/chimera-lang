@@ -39,6 +39,160 @@ fn hasConstant(body: structures.FunctionBodyAnalysis, value: i32) bool {
 
 const arithmetic = [_]Tag{ .addi, .subi, .muli, .divsi, .negi };
 
+test "unchanged nested aggregates leave loops while changing fields retain their values" {
+    const program =
+        \\pub struct Pair
+        \\    copy = trivial
+        \\    pub first: int
+        \\    pub second: int
+        \\struct Nested
+        \\    copy = trivial
+        \\    pub pair: Pair
+        \\    pub extra: int
+        \\func rebuild(value: Nested) Nested
+        \\    return Nested{pair = Pair{first = value.pair.first, second = value.pair.second}, extra = value.extra}
+        \\func steady(value: Nested, limit: int) int
+        \\    var saved = value
+        \\    var index = 0
+        \\    var sum = 0
+        \\    loop
+        \\        if index >= limit -> break
+        \\        saved = rebuild(saved)
+        \\        sum += saved.pair.first
+        \\        index += 1
+        \\    return sum + saved.pair.second + saved.extra
+        \\func changing(value: Pair, limit: int) int
+        \\    var saved = value
+        \\    var index = 0
+        \\    loop
+        \\        if index >= limit -> break
+        \\        saved = Pair{first = saved.second, second = saved.first + 1}
+        \\        index += 1
+        \\    return saved.first + saved.second
+        \\func run() int
+        \\    const pair = Pair{first = 3, second = 5}
+        \\    const nested = Nested{pair = pair, extra = 4}
+        \\    return steady(nested, 5) + changing(pair, 2) + steady(nested, 0) - 1
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const rebuilt = (try optimizedBody(fixture, "rebuild")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(rebuilt, &.{.aggregate}));
+    const steady = (try optimizedBody(fixture, "steady")).*.?;
+    for (steady.blocks, 0..) |block, index| {
+        if (index == @backingInt(steady.entry)) continue;
+        for (steady.block_arguments[block.argument_start..block.argument_end]) |argument|
+            try testing.expect(argument.type_id.isPrimitive());
+    }
+}
+
+test "ordinary user cursor construction and polling simplify across loop joins" {
+    const program =
+        \\struct Cursor
+        \\    position: int
+        \\    last: int
+        \\    descending: bool
+        \\    func next(mut self: Cursor) int | End
+        \\        if self.position == self.last -> return End{}
+        \\        const result = self.position
+        \\        if self.descending -> self.position -= 1
+        \\        else self.position += 1
+        \\        return result
+        \\struct Source
+        \\    first: int
+        \\    last: int
+        \\    func iter(self: Source) Cursor
+        \\        return Cursor{position = self.first, last = self.last, descending = false}
+        \\func sum(first: int, last: int) int
+        \\    var result = 0
+        \\    for item in Source{first = first, last = last} -> result += item
+        \\    return result
+        \\func run() int -> sum(2, 10) - sum(2, 2) - 2
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "sum")).*.?;
+    try testing.expectEqual(@as(usize, 0), countCalls(body));
+    try testing.expectEqual(@as(usize, 0), count(body, &.{ .aggregate, .subi, .variant_coerce, .variant_extract, .variant_tag, .select }));
+}
+
+test "constant incoming predicates bypass only exits independent of join parameters" {
+    try Fixture.expectParity(
+        \\func pick(flag: bool, number: int) int | none
+        \\    if flag -> return number
+        \\    return none
+        \\func calculate(flag: bool, number: int) int
+        \\    const value = pick(flag, number)
+        \\    if const integer: int = value -> return integer
+        \\    return 11
+        \\func run() int -> calculate(true, 31) + calculate(false, 90)
+    , 42);
+}
+
+test "joins retain known variant alternatives and constant aggregate fields" {
+    const program =
+        \\struct Value
+        \\    copy = trivial
+        \\    pub number: int
+        \\    pub subtract: bool
+        \\func choose(flag: bool, number: int) Value | none
+        \\    if flag -> return Value{number = number, subtract = false}
+        \\    return Value{number = number + 1, subtract = false}
+        \\func calculate(flag: bool, number: int) int
+        \\    const value: Value = choose(flag, number) else return 90
+        \\    if value.subtract -> return value.number - 10
+        \\    return value.number + 10
+        \\func constant(number: int) int
+        \\    const value: Value = choose(true, number) else return 90
+        \\    return value.number
+        \\func run() int -> calculate(true, 10) + calculate(false, 11) + constant(0)
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "calculate")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{ .variant_tag, .subi }));
+}
+
+test "aggregate reconstruction keeps snapshots separate from later mutations" {
+    try Fixture.expectParity(
+        \\struct Pair
+        \\    copy = trivial
+        \\    pub first: int
+        \\    pub second: int
+        \\func change(mut value: Pair) -> value.first += 10
+        \\func run() int
+        \\    var value = Pair{first = 3, second = 7}
+        \\    const saved = Pair{first = value.first, second = value.second}
+        \\    change(value)
+        \\    return saved.first * 10 + value.first - saved.second + 6
+    , 42);
+}
+
+test "scalar variant joins preserve distinct tags and inactive payloads" {
+    const program =
+        \\func pick(mode: int, number: int) int | bool | none
+        \\    if mode == 0 -> return number
+        \\    if mode == 1 -> return true
+        \\    return none
+        \\func calculate(mode: int, number: int) int
+        \\    const value = pick(mode, number)
+        \\    if const integer: int = value -> return integer
+        \\    if const flag: bool = value
+        \\        if flag -> return 22
+        \\        return 90
+        \\    return 0
+        \\func run() int -> calculate(0, 20) + calculate(1, 99) + calculate(2, 99)
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "calculate")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{ .variant_tag, .variant_extract }));
+}
+
 test "value numbering eliminates repeated expressions" {
     const program =
         \\func repeated(a: int, b: int) int -> (a + b) * (a + b)
@@ -58,11 +212,11 @@ test "value numbering respects branch dominance and shares aggregates" {
         \\    pub first: int
         \\    pub second: int
         \\func separate(flag: bool, a: int, b: int) int
-        \\    if flag? -> return (a + b) * (a + b)
+        \\    if flag -> return (a + b) * (a + b)
         \\    return (a + b) * (a + b) * 2
         \\func dominated(flag: bool, a: int, b: int) int
         \\    const sum = a + b
-        \\    if flag? -> return sum * (a + b)
+        \\    if flag -> return sum * (a + b)
         \\    return sum * (a + b) * 2
         \\func alternatives(branch: int, a: int, b: int) int
         \\    if branch == 0 -> return (a + b) * (a + b)
@@ -72,7 +226,7 @@ test "value numbering respects branch dominance and shares aggregates" {
         \\func aggregate(flag: bool, a: int, b: int) Pair
         \\    const first = Pair{first = a, second = b}
         \\    const second = Pair{first = a, second = b}
-        \\    if flag? -> return first
+        \\    if flag -> return first
         \\    return second
         \\func run() int
         \\    if separate(true, 2, 3) <> 25 -> return 90
@@ -227,6 +381,7 @@ test "promotion turns non-escaping scalar locals into SSA values" {
     try fixture.expectExit(0, 42);
     for ([_][]const u8{ "sum", "merge", "checked", "reopened" }) |name| {
         const body = (try optimizedBody(fixture, name)).*.?;
+        errdefer std.debug.print("promotion failed for {s}\n", .{name});
         try testing.expectEqual(@as(usize, 0), countLocalStorage(body, .int) + countLocalStorage(body, .bool));
         try testing.expectEqual(@as(usize, 0), count(body, &.{.value_copy}));
     }

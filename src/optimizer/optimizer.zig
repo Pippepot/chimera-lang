@@ -59,32 +59,41 @@ fn optimizeInto(scratch: std.mem.Allocator, body: *const Body, context: anytype)
 
 fn simplify(function: *Function, context: anytype, numbering_workspace: *numbering.Workspace, field_layouts: *sroa.Layouts) !void {
     var storage_dirty = true;
-    for (0..2) |_| {
-        var changed = false;
+    while (true) {
         if (storage_dirty) try measured(.optimization_setup, Function.classifyTypes, .{ function, context });
         if (storage_dirty and function.hasStorage()) {
             if (try measured(.optimization_sroa, sroa.split, .{ function, context, field_layouts })) {
-                changed = true;
                 try measured(.optimization_setup, Function.classifyTypes, .{ function, context });
             }
             try check(function);
-            if (try measured(.optimization_promotion, promotion.promote, .{function})) changed = true;
+            // Their consumers run below; storage passes need another round only
+            // when those consumers change storage uses or control flow.
+            _ = try measured(.optimization_promotion, promotion.promote, .{function});
             try check(function);
         }
-        const folded = try measured(.optimization_canonicalize, canonicalize.canonicalize, .{function});
-        changed = changed or folded.changed;
+        const parameters_changed = try measured(.optimization_joins, cleanup.simplifyParameters, .{ function, true });
+        try check(function);
+        var folded = try measured(.optimization_canonicalize, canonicalize.canonicalize, .{function});
+        if (parameters_changed or folded.changed) {
+            var variants_dirty = folded.control_flow;
+            while (try measured(.optimization_joins, cleanup.simplifyParameters, .{ function, variants_dirty })) {
+                const more = try measured(.optimization_canonicalize, canonicalize.canonicalize, .{function});
+                variants_dirty = more.control_flow;
+                folded.changed = folded.changed or more.changed;
+                folded.storage = folded.storage or more.storage;
+                folded.control_flow = folded.control_flow or more.control_flow;
+                try check(function);
+            }
+        }
         try check(function);
         const numbered = try measured(.optimization_numbering, numbering.number, .{ function, numbering_workspace });
-        changed = changed or numbered.changed;
         try check(function);
         const dead = try measured(.optimization_dead_code, compaction.removeDead, .{function});
-        changed = changed or dead.changed;
         try check(function);
         const cleaned = try measured(.optimization_cleanup, cleanup.simplify, .{function});
-        changed = changed or cleaned;
         try check(function);
         storage_dirty = folded.storage or folded.control_flow or numbered.storage or dead.storage or cleaned;
-        if (!changed) break;
+        if (!numbered.changed and !dead.uses and !cleaned and !(storage_dirty and function.hasStorage())) break;
     }
 }
 

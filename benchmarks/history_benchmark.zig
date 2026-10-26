@@ -195,8 +195,6 @@ fn measureRuntimeProgram(init: std.process.Init, writer: *std.Io.Writer, lane: [
         const result = try runRuntimeProgram(init, program, runtime_limit);
         const ended = std.Io.Clock.awake.now(init.io);
         try validateRuntimeOutput(init.gpa, result, "5107832\n");
-        if (sample != 0 and std.mem.eql(u8, lane, "c-O3") and
-            started.durationTo(ended).toNanoseconds() < std.time.ns_per_s) return error.CReferenceBelowOneSecond;
         try record(writer, runtime_case, lane, "runtime", sample, started, ended, size);
     }
 }

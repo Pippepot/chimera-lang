@@ -60,7 +60,6 @@ pub struct RangeSequence
             last = self.last,
             stride = self.stride,
             descending = self.descending,
-            started = false,
             finished = self.empty,
         }
 
@@ -96,20 +95,16 @@ pub struct RangeIterator
     last: int
     stride: int
     descending: bool
-    started: bool
     finished: bool
 
     pub func next(mut self: RangeIterator) int | End
         if self.finished -> return End{}
-        if self.started
-            if self.value == self.last
-                self.finished = true
-                return End{}
-            if self.stride == 0 -> self.value = self.last
-            else if self.descending -> self.value -= self.stride
-            else self.value += self.stride
-        self.started = true
-        return self.value
+        const value = self.value
+        if value == self.last -> self.finished = true
+        else if self.stride == 0 -> self.value = self.last
+        else if self.descending -> self.value -= self.stride
+        else self.value += self.stride
+        return value
 
 pub func exclusive(first: int | FromEnd | none, limit: int | FromEnd | none) Range
     return Range{first = first, limit = limit, inclusive = false}

@@ -68,13 +68,18 @@ be proven, for example from an exit test that bounds an induction variable.
 Per instance, callees first:
 
 ```
-prepare:  sroa -> promote -> canonicalize -> number -> dead -> cleanup  (twice)
+prepare:  sroa -> promote -> (joins -> canonicalize)* -> number -> dead -> cleanup
 optimize: inline -> prepare passes again -> hoist -> loop idioms -> prepare passes
 ```
 
-The second local round repeats storage passes only when storage uses or control
-flow changed. Value-only simplification still repeats canonicalization, numbering,
-dead-value removal, and cleanup. Scalar replacement reaches its own fixed point;
+Joins and canonicalization converge together before numbering and dead-value
+removal. A later pass changing the facts an earlier pass consumed triggers
+another local round; changes already consumed within the round do not. Storage
+uses and address exposure removed by dead-code elimination can trigger another
+round; deleting only unread scalar computations cannot. Join profiling is
+reported separately from CFG cleanup.
+Storage passes repeat only when downstream storage uses or control flow changed and
+local storage remains. Scalar replacement reaches its own fixed point;
 new field types are classified before promotion. Type classification visits only
 newly added values. Storage-free bodies skip scalar replacement and promotion;
 the absence of live local slots is cached until a new slot is introduced.
@@ -90,8 +95,10 @@ on producer exit and consumer entry. Canonicalization resolves replacements
 before collecting address-taken facts. An editable function reuses normalized
 operands and address-taken facts until mutation invalidates them. Replacements,
 new values, operand-table edits, and changing passes invalidate operand facts;
-control-flow edits invalidate them alongside the graph. These facts are local
-to the scratch function and never change query dependencies.
+control-flow edits invalidate them alongside the graph. Normalization follows
+attached instructions and their owned side-table ranges; obsolete argument,
+capture, and field entries are inert. These facts are local to the scratch
+function and never change query dependencies.
 
 | Pass | Owner | Driven by |
 | --- | --- | --- |
@@ -132,10 +139,17 @@ never a member of its own component, so the queries stay acyclic.
 With parallel workers, component discovery schedules sibling `DirectCallees`
 dependencies ahead of traversal so their body analysis and local preparation can
 overlap. Component queries remain demand-driven to preserve cycle handling.
+When an argument is an aggregate passed directly by value, primitive constants
+cost zero because its fields expose scalar-replacement opportunities and codegen uses immediates. Other
+calls retain the ordinary instruction cost. The caller's growth budget still
+counts every inserted instruction, including constants. This exposes small
+aggregate factories without speculative specialization or standard-library identities.
 
 Within an inline pass, repeated calls reuse callee resolution and per-body
-eligibility, failure-exit, and entry-address facts. The cache is scratch-owned and
-never survives the optimization invocation or changes query invalidation.
+eligibility and entry-address facts. `InlineFunctionFacts` shares immutable
+callee analysis between callers and depends on `OptimizeFunctionInstance`, so
+callee changes invalidate it normally. Initializer-region facts stay local to
+the inline pass.
 
 Std precompilation retains prepared bodies, call components, and optimized
 bodies alongside typed bodies and native code. The lazy bundle supplies these
@@ -177,6 +191,29 @@ dominator-tree traversal with sparse save/restore state.
 Promotion collects eligibility counts and indexed use sites in one traversal;
 counts live per candidate slot rather than in separate value-sized arrays.
 
+Canonicalization folds reconstruction from a value's original fields back to
+that value. Cleanup removes merge parameters whose incoming values agree,
+including unchanged loop backedges. An addressable snapshot can participate
+only when its address remains private and no instruction writes its storage;
+changing allocation contents does not change the descriptor snapshot.
+Variant merges whose incoming edges all inject the same alternative carry its
+payload directly and reconstruct the variant only for remaining consumers.
+Field reads through immutable struct merges preserve common values and primitive
+constants, including invariant fields of otherwise changing loop state.
+Mixed variant merges used only by tag reads and primitive payload extraction
+carry their tag and scalar payloads independently. Inactive scalar payloads use
+valid zero values; aggregate and reference payloads retain their ordinary
+representation. Ownership operations and addressable projections prevent this
+rewrite, so it introduces no fabricated owning values or references.
+Scalar-variant use facts are indexed once per join pass. Redundant parameters
+are removed together so each incoming argument list is rebuilt once per block.
+Join rewrites share conservative address-taking facts; newly created parameters
+and scalar instructions cannot introduce address exposure.
+
+An incoming edge with a known predicate can bypass an empty join directly to a
+terminal exit when that exit uses none of the join parameters. This removes
+exhausted iterator paths without inventing payload values or skipping cleanup.
+
 ### Loops
 
 Loops come from back edges in the dominator tree and are canonicalized with a
@@ -195,10 +232,23 @@ introducing a redundant parameter that would hide an induction start constant.
 
 ### Backend
 
-Codegen allocates `int` and `bool` values to `rbx`, `rbp`, and `r12`–`r15`,
-which every compiled function preserves. Liveness is computed over the
-emission order; values are colored greedily by use count weighted by loop
-depth. Unallocated values keep their stack slots.
+Codegen uses immediates for constants and computes scalar results in `eax`.
+In functions containing loops, the existing weighted live-interval allocator
+keeps eligible integer and boolean values in six preserved registers. Addressed
+values, incoming parameters, and initializer environments retain stack storage.
+Liveness bitsets index only eligible values and reuse their edge scratch buffer.
+Operand reads precede result definitions in the interval order, allowing a result
+to reuse a register at its operand's last use.
+Arithmetic updates that register directly when the result shares a legal
+operand location; commutative operations may reuse either operand, subtraction
+only its left operand. Immediate updates use compact signed-byte encodings
+when possible. Division retains its fixed-register sequence.
+Each function saves and restores the registers it uses. Independent scalar edge
+copies bypass scratch storage; dependent copies still stage all sources before
+writing any destination. Comparisons produce canonical boolean values;
+scalar selections use conditional moves. Fills use `rep stosb` or `rep stosd`,
+and directed copies use `rep movsb`, clearing the direction flag after a
+descending copy. Aggregate construction copies each field to its layout offset.
 
 ## IR facts passes rely on
 
@@ -206,8 +256,9 @@ depth. Unallocated values keep their stack slots.
   control-flow edge is a branch with explicit argument payloads; there are no
   hidden call-result edges.
 - Values are immutable except through addresses. A value is address-taken when
-  any use is not a known read; address-taken values are never aliased or
-  promoted.
+  any use is not a known read. Promotion excludes address-taken values; snapshot
+  reconstruction and redundant-parameter elimination additionally prove private,
+  unwritten storage before aliasing an addressable value.
 - Typed bodies may keep unreferenced side-table entries; passes visit
   references through users, never by scanning tables.
 - A slot read before any store on a path is unreachable by typing's definite
@@ -225,3 +276,33 @@ depth. Unallocated values keep their stack slots.
   body or an inlined callee changes, and not when an out-of-line callee does.
 - `InlineLimit` set to zero keeps calls out of line for tests about call
   structure and native artifact reuse.
+
+## Remaining Work
+
+- Recover the remaining compilation regression without reducing optimization.
+  The CPU-4 matched million-line probe measured 18.89 s cold / 136.7 ms leaf edit
+  for the saved pre-refactor compiler and 21.76 s / 141.3 ms after join and backend
+  changes. Executable size fell from 177.8 MB to 135.0 MB. These are single
+  measured cold/edit pairs after warm-up, not full benchmark medians.
+  Subsequent shared inline-fact caching reduced the small probe's inlining work
+  from about 13.8 ms to 8.2 ms; repeat the million-line comparison for that state,
+  including eight-worker compilation. Join simplification remains a major cost.
+- Continue the C assembly comparison. The latest paired sieve medians were
+  2.264 s before the refactor, 1.036 s after terminal jump threading, and 0.570 s
+  for C `-O3`, with one warm-up and nine samples on CPU 4. The later direct-register
+  arithmetic change passed backend tests but has not been runtime-benchmarked.
+  C vectorizes final counting and uses a tighter marking loop. Chimera still
+  counts scalarly, retains bounds checks, reloads allocation bases, and stages
+  dependent edge copies. Preserve wrapping arithmetic and panic behavior when
+  pursuing bounds proofs, instruction selection, or vectorization; do not
+  special-case the sieve or weaken its checks.
+- Complete the routine safe test suite. Focused optimizer and backend suites
+  pass, including incremental inlining, scalar variants, wrapping arithmetic,
+  parallel copies, spills, and call preservation. The attempted full run did not
+  produce a completion summary, so cross-suite verification remains outstanding.
+  Use `zig build test --seed=0 -Doptimize=safe -j1` without allocation-failure sweeps.
+
+Local measurement artifacts are under `.history/loop-optimization/`, including
+`paired-before-compile.csv`, `paired-current-compile.csv`, `runtime.json`, probe
+profiles, generated assembly, and `full-tests-current.txt`. They are ignored
+experiment artifacts, not committed benchmark history.
