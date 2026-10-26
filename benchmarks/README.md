@@ -78,8 +78,15 @@ The history driver uses ReleaseFast with LLVM and each revision's ordinary std
 configuration: its own precompiled bundle where supported, otherwise its own
 embedded std sources. Compilation is measured separately with zero and eight
 workers, using fresh databases without disk caching or profiling. Each worker
-count has one warm-up followed by three measured cold/edit pairs; runtime has
-one warm-up and nine samples and keeps its zero-worker compilation setup. The cold timer
+count has one discarded warm-up per measurement, then adaptive sampling. Two
+measured runs suffice when their full range is at most 2% of their median;
+otherwise sampling continues up to three runs for compilation and five for
+runtime. Thus noisy cold compilation never exceeds the previous three-run
+budget. All measured samples are retained.
+Results still outside that range at the cap are explicitly marked unstable in
+raw records and graph tooltips, not silently accepted as stable. This is an
+observed-repeatability heuristic, not a confidence interval or proof of no
+regression. Runtime keeps its zero-worker compilation setup. The cold timer
 includes database creation, module/source registration, analysis, native
 code generation, and linking. It excludes source generation, compiler builds,
 database teardown, file writes, and generated-program execution. Cold means
@@ -99,13 +106,17 @@ conversion/comparison, structs and methods, generic types/functions, tuples and
 destructuring, variants/match, overload selection, custom converters, indirect
 calls, explicit optional result handling, explicit ownership transfer, and
 compile-time evaluation. The full executable must exit 42; changing the leaf's
-returned value must produce 43 while preserving all feature checks.
+returned value first produces 43 while preserving all feature checks.
 
 Cold means a fresh database for the whole million-line program. Leaf edit changes
 only the one-line leaf source input in that existing database, then measures
 incremental recomputation, code generation, and relinking. The module catalog and
-other source inputs are unchanged. Each measured edit follows its paired cold
-build; it is not a fresh build disguised as an incremental measurement.
+other source inputs are unchanged. Cold and edit sampling stop independently.
+An edit normally follows a measured cold build; if more edit samples are needed,
+they use the last database and a new leaf value each time. They never toggle
+between already-cached leaf bodies or force extra cold builds. Every resulting
+exit status is checked. The compilation protocol versions this changed edit
+sequence separately from the earlier fixed cold/edit pairs.
 
 This is a broad synthetic throughput/reuse workload, not a claim to represent
 every application or every language feature. Repeated shapes and shared generic
@@ -119,12 +130,19 @@ Small generator/semantic checks, without recording misleading million-line point
 ```sh
 zig test benchmarks/history_workload.zig --test-no-exec -femit-bin=/tmp/chimera-history-workload-test
 /tmp/chimera-history-workload-test --seed=0
+zig test benchmarks/history_sampling.zig --test-no-exec -femit-bin=/tmp/chimera-history-sampling-test
+/tmp/chimera-history-sampling-test --seed=0
 zig build history-benchmark --seed=0 -j1 -Doptimize=fast -- --case=core-1000000 --lines=1000 --samples=1
 ```
 
 Nondefault line counts are labelled `probe-core-N` and rejected by the recorder.
-Workload semantics, sample counts, and timer boundaries are versioned; changing
-them starts a new compilation identity.
+`--samples=N` overrides adaptive stopping for standalone probes in either case;
+one-sample probes are not accepted as history measurements. The CSV declares each
+measurement's total sample count and stability, so truncated or duplicate samples
+are rejected. Workload semantics and timer boundaries have separate versioned
+identities from the recorded sampling policy. Older raw records are preserved;
+compatible fixed-count C references remain reusable. Changed compilation
+sequences have separate graph identities rather than silently joining old data.
 
 For worker-scaling measurements, the compilation driver accepts
 `--workers=N` from 0 through 64 (default 0):
@@ -135,8 +153,8 @@ zig build history-benchmark --seed=0 -j1 -Doptimize=fast -- --case=core-1000000 
 
 Nonzero-worker samples use a `workers-N` lane. The history recorder runs the
 zero-worker and eight-worker lanes independently and plots both; other counts
-remain standalone probes. The serial protocol and its historical measurements
-are unchanged. Compare worker counts on the same CPU affinity set, using physical
+remain standalone probes. Both recorded lanes use the same adaptive policy.
+Compare worker counts on the same CPU affinity set, using physical
 cores where possible; do not pin a multiworker run to one CPU. `--cpu` restricts
 every lane to that one CPU. To record both lanes on an eight-core CPU set:
 
@@ -169,7 +187,7 @@ Historical measurements use the current fixed driver and standalone
 build target. A small import bridge exposes the revision's compiler. Compiler and
 standard-library sources are never replaced or patched to accept a workload.
 LOC and source identity are captured before harness insertion; the suite hash
-separately includes the driver, workload generator, C reference, build harness,
+separately includes the driver, sampler, workload generator, C reference, build harness,
 and import bridge.
 
 `--backfill-benchmarks` attempts first-parent commits newest first and saves each
@@ -196,7 +214,7 @@ dead-code elimination, while permitting legitimate algorithm optimizations;
 there are no volatile operations or inner-loop barriers.
 
 The executable builds and writes once outside the timer, then runs once
-unmeasured and nine times measured. Process wall time includes stdin/stdout,
+unmeasured and then adaptively sampled under the rule above. Process wall time includes stdin/stdout,
 startup, allocation, computation, and cleanup, not just a kernel.
 Older snapshots without runtime coverage still contribute compiler measurements.
 JSON retains all samples and executable sizes; graphs show separate workload
@@ -214,7 +232,8 @@ The equivalent [C sieve](history_runtime.c) uses the same algorithm, signed 32-b
 integer array, input, output, correctness probes, warm-up, and process timer.
 This matches Chimera's `int`; the old C reference used a wider 64-bit array.
 The system `cc` builds it at `-O0` and `-O3`, outside the timer;
-these snapshots require a C11 compiler on `PATH`. Each level gets nine samples.
+these snapshots require a C11 compiler on `PATH`. Each level gets one warm-up
+and its own adaptive measurement sequence.
 The latest matching run's C medians appear as two labelled horizontal runtime
 reference lines in the report and SVG/PNG exports. They share the runtime
 curve's color, with dotted `-O0` and dashed `-O3` lines. Render-only never reruns C.

@@ -1984,6 +1984,8 @@ const maybe: int | unit = if 1 < 2 -> 1
 
 
 # Match
+# Patterns compose recursively: every tuple position accepts any pattern below,
+# including nested tuples, ranges, type tests, captures, and wildcards.
 # Literal: match an equal value. '_': match anything without binding.
 # A bare name resolving to a type tests the active alternative against that type.
 # Type names include aliases, qualified names, and specialized types; unions
@@ -2023,9 +2025,22 @@ const maybe: int | unit = if 1 < 2 -> 1
 # selects one compatible logical type; int wins over byte as in construction.
 # Other multiple compatible types are ambiguous. Text compares decoded UTF-8
 # bytes including NUL, without copying the subject. Byte literals require 0..255.
+# Range: a..b excludes b; a..=b includes b. Omitted bounds extend to the ends
+# of the selected numeric domain; inclusive syntax requires an upper bound.
+# Bounds are compile-time integer expressions (int, byte, or int_literal),
+# including static names and calls. Runtime captures and relative bounds are
+# errors. Matching uses built-in integer comparisons and invokes no converters
+# or membership hooks. A range selects one compatible numeric logical type,
+# preferring int over byte and int_literal as integer literals do. Its interval
+# intersects that type's domain: 0..256 covers every byte. Empty or reversed
+# ranges are errors; a range disjoint from every compatible alternative is an
+# incompatible pattern. Explicit none endpoints denote omitted bounds, as in
+# ordinary range construction. Range syntax here is a pattern, not a Range value.
 # Coverage uses the typed domain and prior patterns, independently of constant
 # folding. Bool, byte, unit, and none have finite domains. Integer and text
 # literal lists require a catch-all or type pattern for the remaining values.
+# Integer ranges and literals combine by interval coverage; adjacent ranges may
+# jointly cover the complete domain, including at any depth in a tuple pattern.
 # Every match must be exhaustive; a fully covered arm is an error.
 # Arm values join like conditional branches. Pattern bindings do not refine
 # the original value's binding.
@@ -2037,10 +2052,13 @@ const maybe: int | unit = if 1 < 2 -> 1
 # remain visible in its condition and selected body. Conditions short-circuit
 # as bool expressions. A false guard cleans attempt-local captures and tries
 # the next arm. A selected body never retries. Completed side effects persist.
-# A guarded arm does not establish exhaustive coverage. An unconstrained,
-# unguarded tuple pattern covers its compatible tuple alternatives; partial
-# element patterns require an unconditional remainder unless existing scalar
-# coverage already proves the domain complete.
+# A guarded arm does not establish exhaustive coverage, even if its condition
+# is constant true. Tuple coverage combines unguarded element patterns across
+# arms, preserving correlations between positions and nested alternatives.
+# For (bool, int), (true, _) and (false, _) together are exhaustive; for
+# (bool, bool), (true, true) and (false, false) leave the mixed pairs uncovered.
+# Earlier unguarded arms may jointly make a later pattern fully redundant,
+# including a guarded pattern. Partial overlap is allowed if new values remain.
 # Captures from borrowed places make their actual copies after structural
 # success and before conditions, including custom copy hooks. Conditions and
 # body inspect the same copied object. Rejected conditions clean those copies

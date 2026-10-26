@@ -5,6 +5,108 @@ const runtime = test_sources.runtime;
 const structures = test_sources.structures;
 const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 
+test "machine encoding is available before native allocation" {
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    try function.emit(.ret);
+    var encoded = try function.encode(&.{}, &.{}, &.{});
+    defer encoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &.{0xc3}, encoded.code.items);
+}
+
+test "machine symbolic positions resolve after register and spill encoding" {
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    const value: test_sources.machine.ValueId = @fromBackingInt(0);
+    try function.immediate(.mov_eax, 42);
+    try function.register(.store_eax, value, 0);
+    const jump = try function.patchable(.jmp);
+    try function.register(.load_eax, value, 0);
+    try function.patchHere(jump);
+    const returned = try function.position();
+    try function.emit(.ret);
+    for (0..2) |index| {
+        var encoded = try function.encode(&.{if (index == 0) .rbx else null}, &.{256}, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const field = encoded.fields[jump];
+        const displacement = std.mem.readInt(i32, encoded.code.items[field..][0..4], .little);
+        try std.testing.expectEqual(@as(i64, encoded.positions[returned]), @as(i64, field) + 4 + displacement);
+        try std.testing.expectEqual(@as(u8, 0xc3), encoded.code.items[encoded.positions[returned]]);
+    }
+}
+
+test "machine in-place arithmetic requires dead scratch and respects labels" {
+    for (0..3) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        if (mode == 2) _ = try function.position();
+        try function.immediate(.sub_eax, 7);
+        try function.register(.store_eax, @fromBackingInt(1), 0);
+        if (mode != 1) try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{ .rbx, .rbx }, &.{ 0, 4 }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const expected: []const u8 = if (mode == 0) &.{ 0x83, 0xeb, 7 } else &.{ 0x89, 0xd8, 0x83, 0xe8, 7, 0x89, 0xc3 };
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items);
+    }
+}
+
+test "machine liveness retains expanded branch uses under register pressure" {
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    for (0..8) |index| {
+        try function.immediate(.mov_eax, @intCast(index));
+        try function.register(.store_eax, @fromBackingInt(@intCast(index)), 0);
+    }
+    try function.emit(.test_eax);
+    const skip = try function.patchable(.je);
+    try function.register(.load_eax, @fromBackingInt(7), 0);
+    try function.patchHere(skip);
+    for (0..8) |index| try function.register(.load_eax, @fromBackingInt(@intCast(index)), 0);
+    try function.emit(.ret);
+    function.verify(8);
+    var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 8);
+    defer allocation.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 6), allocation.used.len);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(@TypeOf(allocation.registers[0]), allocation.registers, &.{null}));
+    for (allocation.registers, 0..) |selected, index| {
+        if (selected == null) continue;
+        for (allocation.registers[index + 1 ..]) |other| if (other) |register| {
+            try std.testing.expect(selected.? != register);
+        };
+    }
+}
+
+test "machine live ranges reuse registers between separate definitions" {
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    try function.register(.store_eax, @fromBackingInt(0), 0);
+    try function.register(.load_eax, @fromBackingInt(0), 0);
+    try function.register(.store_eax, @fromBackingInt(1), 0);
+    try function.register(.load_eax, @fromBackingInt(1), 0);
+    try function.register(.store_eax, @fromBackingInt(0), 0);
+    try function.register(.load_eax, @fromBackingInt(0), 0);
+    try function.emit(.ret);
+    var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 2);
+    defer allocation.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), allocation.used.len);
+    try std.testing.expectEqual(allocation.registers[0], allocation.registers[1]);
+}
+
+test "machine division branches preserve live loop values and signed overflow" {
+    try test_sources.SourceFixture.expectParity(
+        \\func calculate(divisor: int) int
+        \\    var value = -2147483648
+        \\    var index = 0
+        \\    loop
+        \\        if index == 3 -> break
+        \\        value /= divisor
+        \\        index += 1
+        \\    return value
+        \\func run() int -> calculate(-1) - calculate(1) + 42
+    , 42);
+}
+
 test "in-place loop arithmetic preserves wrapping and operand order" {
     try test_sources.SourceFixture.expectParity(
         \\func calculate(seed: int) int

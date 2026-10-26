@@ -16,17 +16,20 @@ def samples(include_runtime=False, include_c=False):
     for phase in ("cold", "leaf-edit"):
         for index in range(3):
             result.append({"case": history.COMPILATION_CASE, "lane": "normal", "phase": phase, "sample": index,
-                           "nanoseconds": (index + 1) * 1_000_000, "executable_bytes": 100})
+                           "nanoseconds": (index + 199) * 10_000, "executable_bytes": 100,
+                           "sample_count": 3, "stable": True})
     if include_runtime or include_c:
-        for index in range(9):
+        for index in range(5):
             result.append({"case": history.RUNTIME_CASE, "lane": "normal", "phase": "runtime", "sample": index,
-                           "nanoseconds": (96 + index) * 1_000_000, "executable_bytes": 200})
+                           "nanoseconds": (98 + index) * 1_000_000, "executable_bytes": 200,
+                           "sample_count": 5, "stable": False})
     if include_c:
         for lane in history.C_LANES:
             level = int(lane.removeprefix("c-O"))
-            for index in range(9):
+            for index in range(5):
                 result.append({"case": history.RUNTIME_CASE, "lane": lane, "phase": "runtime", "sample": index,
-                               "nanoseconds": (1600 + index - level) * 1_000_000, "executable_bytes": 300})
+                               "nanoseconds": (1602 + index - level) * 1_000_000, "executable_bytes": 300,
+                               "sample_count": 5, "stable": True})
     return result
 
 
@@ -34,7 +37,8 @@ def encode(rows):
     output = io.StringIO()
     writer = csv.DictWriter(output, fieldnames=list(samples()[0]))
     writer.writeheader()
-    writer.writerows(rows)
+    writer.writerows({key: str(value).lower() if isinstance(value, bool) else value
+                     for key, value in row.items()} for row in rows)
     return output.getvalue()
 
 
@@ -52,6 +56,60 @@ def record():
 class HistoryTests(unittest.TestCase):
     def test_csv_round_trip(self):
         self.assertEqual(history.parse_samples(encode(samples())), samples())
+
+    def test_adaptive_counts_and_independent_phases(self):
+        rows = [row for row in samples() if row["phase"] == "leaf-edit" or row["sample"] < 2]
+        for row in rows:
+            if row["phase"] == "cold":
+                row["sample_count"] = 2
+        self.assertEqual(history.parse_samples(encode(rows)), rows)
+
+    def test_rejects_premature_or_falsely_stable_measurements(self):
+        for count, stable, noisy in ((1, False, False), (2, False, True), (2, True, True), (5, False, False)):
+            rows = [{"case": history.RUNTIME_CASE, "lane": "normal", "phase": "runtime", "sample": index,
+                     "nanoseconds": 100_000 + (10_000 if noisy and index == 0 else 0),
+                     "executable_bytes": 42, "sample_count": count, "stable": stable}
+                    for index in range(count)]
+            with self.subTest(count=count, stable=stable, noisy=noisy), self.assertRaises(ValueError):
+                history.parse_samples(encode(rows), history.RUNTIME_CASE)
+
+    def test_rejects_inconsistent_count_and_stability_metadata(self):
+        for field, value in (("sample_count", 2), ("stable", False)):
+            rows = samples()
+            rows[0][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                history.parse_samples(encode(rows))
+
+    def test_rejects_truncated_csv_fields(self):
+        with self.assertRaises(ValueError):
+            history.parse_samples(encode(samples()).rsplit(",", 2)[0])
+
+    def test_sampling_notes_distinguish_stable_capped_and_legacy_results(self):
+        self.assertIn("stable (<=2% range)", history.sampling_note({"stable": True}))
+        self.assertIn("unstable at 5-sample cap", history.sampling_note({"stable": False}))
+        self.assertIn("unstable at 3-sample cap", history.sampling_note({"case": history.COMPILATION_CASE, "stable": False}))
+        self.assertIn("fixed-count", history.sampling_note({}))
+
+    def test_c_reference_accepts_complete_adaptive_and_legacy_samples(self):
+        for legacy in (False, True):
+            previous = record()
+            previous["benchmarks"][0]["samples"] = samples(include_c=True)
+            if legacy:
+                for lane in history.C_LANES:
+                    template = next(sample for sample in previous["benchmarks"][0]["samples"] if sample["lane"] == lane)
+                    previous["benchmarks"][0]["samples"].extend(dict(template, sample=index) for index in range(5, 9))
+                for sample in previous["benchmarks"][0]["samples"]:
+                    del sample["sample_count"]
+                    del sample["stable"]
+            else:
+                previous["benchmarks"][0]["samples"] = [sample for sample in previous["benchmarks"][0]["samples"]
+                                                          if sample["lane"] not in history.C_LANES or sample["sample"] < 2]
+                for sample in previous["benchmarks"][0]["samples"]:
+                    if sample["lane"] in history.C_LANES:
+                        sample["sample_count"] = 2
+            with self.subTest(legacy=legacy):
+                cached, _ = history.cached_c_reference([previous], previous)
+                self.assertEqual(len(cached), 18 if legacy else 4)
 
     def test_eight_worker_compilation_samples(self):
         parallel = [dict(sample, lane="workers-8") for sample in samples()]
@@ -167,6 +225,9 @@ class HistoryTests(unittest.TestCase):
         previous = record()
         previous["benchmarks"][0]["samples"] = samples(include_c=True)
         previous["benchmarks"][0]["samples"][-1]["nanoseconds"] = 999_999_999
+        for sample in previous["benchmarks"][0]["samples"]:
+            if sample["lane"] == history.C_LANES[-1]:
+                sample["stable"] = False
         cached, _ = history.cached_c_reference([previous], previous)
         self.assertEqual(cached[-1]["nanoseconds"], 999_999_999)
 
@@ -591,6 +652,25 @@ class HistoryTests(unittest.TestCase):
                 self.assertNotIn("Workload", graph.read_text())
                 self.assertNotIn("previous suite", graph.read_text())
             self.assertEqual(history.read_records(data), records)
+
+    def test_report_keeps_previous_fixed_sampling_protocol_separate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            previous = record()
+            previous["protocol"] = "core-million-zero-workers-v5"
+            previous["compilation_protocol"] = "core-million-modules-one-line-leaf-v1"
+            for sample in previous["benchmarks"][0]["samples"]:
+                del sample["sample_count"]
+                del sample["stable"]
+            current = record()
+            current["commit"] = "new"
+            current["recorded_at"] = "2026-10-23T12:00:00Z"
+            for entry in (previous, current):
+                history.save(data, entry)
+            content = history.render(data, [("abc", previous["commit_date"]), ("new", current["commit_date"])]).read_text()
+            self.assertEqual(content.count("<object"), 5)
+            self.assertEqual(len(list((data / "graphs").glob("*-cold.svg"))), 2)
+            self.assertEqual(history.read_records(data), [previous, current])
 
     def test_new_compilation_workload_preserves_only_unchanged_runtime_history(self):
         with tempfile.TemporaryDirectory() as directory:

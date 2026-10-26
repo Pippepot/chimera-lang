@@ -326,7 +326,7 @@ pub fn append(code: *std.ArrayList(u8), allocator: std.mem.Allocator, operation:
     try appendPattern(code, allocator, selectedEncoding(operation, bits), bits);
 }
 
-fn appendPattern(code: *std.ArrayList(u8), allocator: std.mem.Allocator, pattern: Encoding, bits: u64) !void {
+pub fn appendPattern(code: *std.ArrayList(u8), allocator: std.mem.Allocator, pattern: Encoding, bits: u64) !void {
     const destination = try code.addManyAsSlice(allocator, pattern.length());
     @memcpy(destination[0..pattern.prefix.len], pattern.prefix);
     const operand = destination[pattern.prefix.len..];

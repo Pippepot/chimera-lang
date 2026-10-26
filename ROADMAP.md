@@ -36,15 +36,6 @@ Investigate these before the remaining implementation milestones, in this order.
   ownership, including `const (x, y) = point`. Resolve grouping/singletons;
   support multiple results and Map items.
 
-### 6. Match
-
-- Single subject evaluation; literal, wildcard, binding, and typed `name: Type`
-  patterns. Diagnose redundancy and non-exhaustiveness.
-- Define when subject and pattern bindings copy, borrow, or consume, including
-  noncopyable payloads and cleanup of unmatched alternatives and arm exits.
-- Check whether existing expression semantics cover value-producing `if` and
-  `match`; align any missing rules with value-producing blocks.
-
 ### 7. Basic collection algorithms
 
 - `swap`, `reverse`, and `sort` need not wait for Map/Set. Define support for

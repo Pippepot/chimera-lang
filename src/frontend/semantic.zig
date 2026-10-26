@@ -676,8 +676,9 @@ pub const UnresolvedBody = struct {
         pub const Sequence = struct { children: structures.FunctionValueRange, storage: LocalId, storage_read: ValueId };
     };
     pub const PatternBinding = struct { pattern: u32, value: ValueId, span: structures.SourceSpan };
+    pub const MatchInterval = struct { first: i64, last: i64 };
     pub const MatchPattern = struct {
-        shape: union(enum) { any, type: structures.TypeId, literal: ValueUse, tuple: structures.FunctionValueRange },
+        shape: union(enum) { any, type: structures.TypeId, literal: ValueUse, range: MatchInterval, tuple: structures.FunctionValueRange },
         binding: ?ConditionBinding = null,
         carrier: LocalId,
         read: ValueId,
@@ -2039,12 +2040,45 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                     }
                 },
                 .field_access, .call, .type_variant, .type_func => pattern.shape = .{ .type = try self.bindingType(index) },
+                .range, .range_inclusive => pattern.shape = .{ .range = try self.buildMatchRange(index) },
                 .match_tuple => pattern.shape = .{ .tuple = try self.buildMatchTuple(index) },
                 else => pattern.shape = .{ .literal = try self.appendUse(index, false) },
             }
             const result: u32 = @intCast(self.match_patterns.items.len);
             try self.match_patterns.append(self.gpa, pattern);
             return result;
+        }
+
+        fn buildMatchRange(self: *Self, index: structures.Node.Index) !UnresolvedBody.MatchInterval {
+            const node = self.ast.nodes[index.index()];
+            const first = (try self.matchRangeBound(node.data.node_node.a)) orelse std.math.minInt(i64);
+            const limit = try self.matchRangeBound(node.data.node_node.b);
+            var last = limit orelse std.math.maxInt(i64);
+            if (node.tag == .range and limit != null) {
+                if (last == std.math.minInt(i64)) return self.reject(index, .match_range_empty);
+                last -= 1;
+            }
+            if (first > last) return self.reject(index, .match_range_empty);
+            return .{ .first = first, .last = last };
+        }
+
+        fn matchRangeBound(self: *Self, index: structures.Node.Index) !?i64 {
+            if (self.ast.nodes[index.index()].tag == .none_literal) return null;
+            if (integerLiteralValue(self.ast, self.source, index)) |integer| return integer;
+            try self.rejectRuntimeCapture(index);
+            const value_id = self.analysis_context.executeComptime(index) catch |err| switch (err) {
+                error.QueryCycle => return self.reject(index, .declaration_cycle),
+                else => return err,
+            } orelse return error.Unavailable;
+            const constant = try self.analysis_context.lookupCompileTimeValue(value_id);
+            if (constant == .runtime) switch (constant.runtime.value) {
+                .int => |integer| return integer,
+                .int_literal => |integer| return integer,
+                .byte => |byte| return byte,
+                .none => return null,
+                else => {},
+            };
+            return self.reject(index, .match_range_bound_not_integer);
         }
 
         fn matchNameIsType(self: *Self, index: structures.Node.Index) !bool {

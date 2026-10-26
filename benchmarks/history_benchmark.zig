@@ -1,6 +1,7 @@
 const std = @import("std");
 const compiler = @import("compiler");
 const workload_generator = @import("history_workload.zig");
+const sampling = @import("history_sampling.zig");
 const queries = compiler.queries;
 const has_standard_bundle = @hasDecl(compiler, "standard_bundle");
 const standard_bundle = if (has_standard_bundle) @embedFile("standard_bundle") else "";
@@ -10,8 +11,6 @@ comptime {
         @compileError("benchmark driver and compiler must use the same optimization mode");
 }
 
-const sample_count = 9;
-const compilation_samples = 3;
 const compilation_case = "core-1000000";
 const runtime_case = "sieve-88000000";
 const runtime_limit = 88_000_000;
@@ -80,15 +79,7 @@ fn validateRuntimeOutput(allocator: std.mem.Allocator, result: std.process.RunRe
     if (result.stderr.len != 0) return error.UnexpectedProgramOutput;
 }
 
-fn record(writer: *std.Io.Writer, case_name: []const u8, lane: []const u8, phase: []const u8, sample: usize, started: std.Io.Timestamp, ended: std.Io.Timestamp, size: usize) !void {
-    if (sample == 0) return;
-    try writer.print("{s},{s},{s},{d},{d},{d}\n", .{
-        case_name,                                 lane, phase, sample - 1,
-        started.durationTo(ended).toNanoseconds(), size,
-    });
-}
-
-fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usize, samples: usize, workers: usize) !void {
+fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usize, samples: ?usize, workers: usize) !void {
     var workload = try workload_generator.generate(init.gpa, lines);
     defer workload.deinit();
     const allocator = init.arena.allocator();
@@ -100,29 +91,52 @@ fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usi
     std.debug.print("history: {s}: {d} code lines, {d} modules, {d} mixed-feature units, {d} workers\n", .{
         name, workload.lines, workload.files.len, workload.units, workers,
     });
-    for (0..samples + 1) |sample| {
-        var started = std.Io.Clock.awake.now(init.io);
-        const db = try compiler.query.Database.init(init.gpa, .{ .worker_count = workers });
-        defer db.deinit();
-        var registry: compiler.modules.SourceRegistry = .{};
-        defer registry.deinit(init.gpa);
-        try registry.update(db, init.gpa, workload.entry, files, &.{});
-        if (has_standard_bundle) _ = try compiler.standard_bundle.install(db, standard_bundle);
-        var bytes = try executable(db, init.gpa);
-        var ended = std.Io.Clock.awake.now(init.io);
-        try record(writer, name, lane, "cold", sample, started, ended, bytes.len);
-        try validate(init, bytes, 42);
-        started = std.Io.Clock.awake.now(init.io);
-        try db.setInput(queries.SourceText, registry.fileId(files[files.len - 1].path).?, workload.edited_leaf);
-        bytes = try executable(db, init.gpa);
-        ended = std.Io.Clock.awake.now(init.io);
-        try record(writer, name, lane, "leaf-edit", sample, started, ended, bytes.len);
-        try validate(init, bytes, 43);
-        try writer.flush();
+    var cold: sampling.Sampling = .{ .fixed_count = samples, .limit = sampling.compilation_maximum_samples };
+    var edit: sampling.Sampling = .{ .fixed_count = samples, .limit = sampling.compilation_maximum_samples };
+    var database: ?*compiler.query.Database = null;
+    defer if (database) |db| db.deinit();
+    var registry: compiler.modules.SourceRegistry = .{};
+    defer registry.deinit(init.gpa);
+    var leaf_value: u8 = 41;
+    var warmup = true;
+    while (true) {
+        if (warmup or !cold.complete()) {
+            if (database) |db| db.deinit();
+            database = null;
+            registry.deinit(init.gpa);
+            registry = .{};
+            const started = std.Io.Clock.awake.now(init.io);
+            const db = try compiler.query.Database.init(init.gpa, .{ .worker_count = workers });
+            database = db;
+            try registry.update(db, init.gpa, workload.entry, files, &.{});
+            if (has_standard_bundle) _ = try compiler.standard_bundle.install(db, standard_bundle);
+            const bytes = try executable(db, init.gpa);
+            const ended = std.Io.Clock.awake.now(init.io);
+            if (!warmup) try cold.add(started.durationTo(ended).toNanoseconds(), bytes.len);
+            try validate(init, bytes, 42);
+            leaf_value = 41;
+        }
+        if (warmup or !edit.complete()) {
+            const db = database.?;
+            leaf_value += 1;
+            const source = try std.fmt.allocPrint(init.gpa, "pub func value() int -> {d}\n", .{leaf_value});
+            defer init.gpa.free(source);
+            const started = std.Io.Clock.awake.now(init.io);
+            try db.setInput(queries.SourceText, registry.fileId(files[files.len - 1].path).?, source);
+            const bytes = try executable(db, init.gpa);
+            const ended = std.Io.Clock.awake.now(init.io);
+            if (!warmup) try edit.add(started.durationTo(ended).toNanoseconds(), bytes.len);
+            try validate(init, bytes, leaf_value + 1);
+        }
+        warmup = false;
+        if (cold.complete() and edit.complete()) break;
     }
+    try cold.write(writer, name, lane, "cold");
+    try edit.write(writer, name, lane, "leaf-edit");
+    try writer.flush();
 }
 
-fn measureRuntime(init: std.process.Init, writer: *std.Io.Writer, skip_c: bool) !void {
+fn measureRuntime(init: std.process.Init, writer: *std.Io.Writer, skip_c: bool, samples: ?usize) !void {
     const source =
         \\import std.io.{stdin, read_bytes}
         \\func run() unit | none
@@ -161,7 +175,7 @@ fn measureRuntime(init: std.process.Init, writer: *std.Io.Writer, skip_c: bool) 
     const bytes = try executable(db, init.gpa);
     defer std.Io.Dir.cwd().deleteFile(init.io, "history-program") catch {};
     try writeProgram(init, bytes);
-    try measureRuntimeProgram(init, writer, "normal", "./history-program", bytes.len);
+    try measureRuntimeProgram(init, writer, "normal", "./history-program", bytes.len, samples);
     if (skip_c) return;
     defer std.Io.Dir.cwd().deleteFile(init.io, "history-c-program") catch {};
     for ([_][]const u8{ "-O0", "-O3" }) |optimization| {
@@ -174,11 +188,11 @@ fn measureRuntime(init: std.process.Init, writer: *std.Io.Writer, skip_c: bool) 
         const size = (try file.stat(init.io)).size;
         file.close(init.io);
         const lane = try std.fmt.allocPrint(init.arena.allocator(), "c{s}", .{optimization});
-        try measureRuntimeProgram(init, writer, lane, "./history-c-program", size);
+        try measureRuntimeProgram(init, writer, lane, "./history-c-program", size, samples);
     }
 }
 
-fn measureRuntimeProgram(init: std.process.Init, writer: *std.Io.Writer, lane: []const u8, program: []const u8, size: usize) !void {
+fn measureRuntimeProgram(init: std.process.Init, writer: *std.Io.Writer, lane: []const u8, program: []const u8, size: usize, samples: ?usize) !void {
     std.debug.print("history: {s} (runtime, {s})\n", .{ runtime_case, lane });
     const probes = [_]struct { limit: u32, expected: []const u8 }{
         .{ .limit = 2, .expected = "1\n" },
@@ -190,13 +204,17 @@ fn measureRuntimeProgram(init: std.process.Init, writer: *std.Io.Writer, lane: [
         const result = try runRuntimeProgram(init, program, probe.limit);
         try validateRuntimeOutput(init.gpa, result, probe.expected);
     }
-    for (0..sample_count + 1) |sample| {
+    var measured: sampling.Sampling = .{ .fixed_count = samples };
+    for (0..sampling.maximum_samples + 1) |sample| {
         const started = std.Io.Clock.awake.now(init.io);
         const result = try runRuntimeProgram(init, program, runtime_limit);
         const ended = std.Io.Clock.awake.now(init.io);
         try validateRuntimeOutput(init.gpa, result, "5107832\n");
-        try record(writer, runtime_case, lane, "runtime", sample, started, ended, size);
+        if (sample == 0) continue;
+        try measured.add(started.durationTo(ended).toNanoseconds(), size);
+        if (measured.complete()) break;
     }
+    try measured.write(writer, runtime_case, lane, "runtime");
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -205,7 +223,7 @@ pub fn main(init: std.process.Init) !void {
     var skip_c = false;
     var selected: ?[]const u8 = null;
     var lines: usize = 1_000_000;
-    var samples: usize = compilation_samples;
+    var samples: ?usize = null;
     var workers: usize = 0;
     for (args[1..]) |argument| {
         if (std.mem.eql(u8, argument, "--skip-c")) {
@@ -220,7 +238,7 @@ pub fn main(init: std.process.Init) !void {
             workers = try std.fmt.parseInt(usize, argument["--workers=".len..], 10);
         } else return error.InvalidArgument;
     }
-    if (samples == 0 or samples > sample_count) return error.InvalidArgument;
+    if (samples) |count| if (count == 0 or count > sampling.maximum_samples) return error.InvalidArgument;
     if (workers > 64) return error.InvalidArgument;
     if (selected) |name| {
         if (!std.mem.eql(u8, name, compilation_case) and
@@ -229,10 +247,10 @@ pub fn main(init: std.process.Init) !void {
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);
     const writer = &output.interface;
-    try writer.writeAll("case,lane,phase,sample,nanoseconds,executable_bytes\n");
+    try writer.writeAll("case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable\n");
     if (selected == null or std.mem.eql(u8, selected.?, compilation_case))
         try measureCompilation(init, writer, lines, samples, workers);
     if (selected == null or std.mem.eql(u8, selected.?, runtime_case))
-        try measureRuntime(init, writer, skip_c);
+        try measureRuntime(init, writer, skip_c, samples);
     try writer.flush();
 }

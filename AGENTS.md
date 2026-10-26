@@ -26,3 +26,4 @@ Build clear, correct code with the least total machinery.
 - Exhaustive allocation-failure sweeps are opt-in backup checks. Do not enable `-Dallocation-failures=true` unless explicitly requested; ordinary failure-path tests remain part of routine verification.
 - Use default caches and fixed `--seed=0`. Repeat passing checks only for relevant changes or unresolved concerns. Collaborating agents share results for the same source state; one agent owns the final full-suite run.
 - Update the document that owns a changed fact; replace obsolete roadmap details rather than accumulating history.
+- If there are remaining tasks, work on those while waiting for the test or benchmark to finish

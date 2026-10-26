@@ -27,6 +27,67 @@ existing IR need no optimizer change. Unknown means conservative: a use the
 optimizer does not recognize marks the value address-taken, and an
 unclassified instruction is never removed, moved, or numbered.
 
+## Staged IR Plan
+
+Keep a small set of deliberate semantic levels, not an extensible dialect
+framework. Share SSA mechanics where their invariants agree; introduce a new
+representation when a consumer needs facts that the previous level cannot
+express directly.
+
+1. **Typed semantics.** Keep compile-time execution, reference contracts,
+  diagnostics, and source cleanup attached to typed bodies. Runtime
+  optimization must not become a prerequisite for interpretation. Share
+  operation semantics, not machine instructions, with the interpreter.
+2. **Semantic optimization.** Retain logical values, storage projections,
+  aggregates, variants, and explicit effects. Keep mutable analyses local to
+  the optimizer, reuse them until mutation invalidates their facts, and publish
+  immutable bodies. Introduce stronger operations only when transformations
+  benefit from their semantics; ordinary induction facts need not become IR.
+  A non-wrapping loop rewrite must prove its preconditions or retain a guarded
+  fast path and the original fallback, including final-increment behavior.
+3. **Native machine instructions.** Lower semantic operations before machine
+  register allocation, making instruction operands, temporary values, fixed
+  registers, clobbers, branches, and copies explicit. The machine stage owns
+  physical locations and encoding; it does not repeat language validation.
+  Verify machine constraints and preserve call-site provenance through lowering.
+4. **Additional targets.** Separate logical types, representation domains,
+  physical calling conventions, and execution capabilities. Layout facts belong
+  to a type and representation domain; address spaces qualify reference access
+  paths, not the logical referent type. Prefer explicit target observations in
+  new compile-time APIs. Implicit observations require context-scoped semantic
+  queries and coherent generated-type identities. Native cache and std-bundle
+  compatibility must include the target facts they depend on.
+5. **Explicit kernels.** Define execution, synchronization, failure, and numeric
+  policies before device lowering. Retain parallel domains, workgroup storage,
+  and collective participation until scheduling has consumed them. Structured
+  kernel regions or explicit convergence information may share SSA machinery;
+  do not maintain a second authoritative CFG. CPU barrier execution requires
+  cooperating participants or phased/resumable lowering, not serial completion
+  of individual work items. Begin with synchronous transfers and host-managed
+  allocation; future asynchronous completion must retain resources and enforce
+  access obligations, not merely keep owners alive.
+
+Implement the current native foundation first. Additional targets and kernel
+representations follow concrete use cases; use an established device backend
+where practical rather than requiring a custom GPU allocator and scheduler.
+General rewrite DSLs, dialect registries, tensor scheduling, and persisted
+per-pass analyses remain deferred until they remove demonstrated complexity.
+
+Preserve wrapping arithmetic, eager effect order, conditional initialization,
+ownership hooks, storage identity, and panic behavior at every level. Mutable
+references do not imply universal non-aliasing. Floating-point reassociation and
+parallel reduction require an explicit language policy. Validate new boundaries
+with native/interpreter parity, machine constraint tests, and incremental cache
+tests; measure compilation time, memory, and generated execution rather than
+using IR size as a performance claim.
+
+Each implementation slice must pass matched compilation and generated-runtime
+benchmarks before acceptance. Compare snapshots with the same frontend,
+workloads, compiler mode, std configuration, affinity, and worker counts using
+the [benchmark protocol](../benchmarks/README.md#measurement-protocol). Preserve
+raw samples; investigate noise with matched repeats rather than accepting a
+repeatable cold, incremental, or runtime regression in exchange for another gain.
+
 ## IR shape
 
 Typing publishes memory form: every local is a `local_storage` slot accessed
@@ -235,20 +296,49 @@ introducing a redundant parameter that would hide an induction start constant.
 
 ### Backend
 
-Codegen uses immediates for constants and computes scalar results in `eax`.
-In functions containing loops, the existing weighted live-interval allocator
-keeps eligible integer and boolean values in six preserved registers. Addressed
-values, incoming parameters, and initializer environments retain stack storage.
-Liveness bitsets index only eligible values and reuse their edge scratch buffer.
-Operand reads precede result definitions in the interval order, allowing a result
-to reuse a register at its operand's last use.
-Arithmetic updates that register directly when the result shares a legal
-operand location; commutative operations may reuse either operand, subtraction
-only its left operand. Immediate updates use compact signed-byte encodings
-when possible. Division retains its fixed-register sequence.
-Each function saves and restores the registers it uses. Scalar edge copies bypass
-scratch storage when forward or reverse order preserves every source. Cycles and
-unsupported copy shapes still stage all sources before writing any destination.
+Functions with allocatable scalar values lower to the query-local x86 instruction
+stream in `src/backend/machine.zig` before allocation or byte encoding. Fixed-only
+functions stream operations directly to encoding, avoiding a buffered stage with
+no allocation work. The buffered stream contains
+fixed-register operations, virtual scalar reads and writes, symbolic branches,
+labels, preservation operations, and explicit scratch-dead boundaries. Constants
+remain immediates; scalar computation initially uses `eax`, with fixed scratch
+registers for division, addressing, calls, and bulk copies. These registers are
+outside the six preserved registers available to virtual values. External
+runtime helpers retain the same direct encoding path and calling convention.
+Local targets are nonzero positions after labels; zero represents no local
+target, keeping fixed operands compact without optional-target padding.
+
+In functions containing loops, eligible integer and boolean values become
+virtual registers with stack spill homes. Addressed values, incoming parameters,
+and initializer environments retain storage. The weighted live-range allocator
+derives its CFG and eligible-value liveness from the expanded machine stream,
+including division branches and the actual edge-copy reads and writes. This CFG
+is a temporary analysis, not a second authoritative graph. Separate definitions
+retain separate live ranges rather than extending one interval across dead gaps.
+Operand reads precede definitions, allowing last-use reuse. Frames currently reserve preservation
+capacity for all six registers before allocation; emitted saves and restores
+include only registers actually used.
+
+After allocation, arithmetic updates a register directly when it can reuse a
+legal operand location and scratch results are dead; subtraction only reuses its
+left operand. Label boundaries prevent such combining across jump targets.
+Encoding retains compact immediates and store-to-load forwarding. Scalar edge
+copies bypass scratch storage when forward or reverse order preserves every
+virtual source. Cycles and unsupported copy shapes stage every source before
+writing destinations; machine liveness prevents allocation from introducing new
+copy hazards. Coalesced register copies disappear only where scratch results are
+dead.
+
+Encoding resolves symbolic branch targets and maps relocation fields, call return
+positions, and initializer references to byte offsets. Outlined initializer
+artifacts are appended only after their parent's encoding. Artifacts retain the
+existing owned code and metadata format; the machine stream is not published,
+cached, or interpreted. Its owning boundary asserts virtual-value ranges and
+relative-target labels; encoding reports displacement and function-size limits.
+The encoder reuses its selected encoding for operand offsets and byte emission,
+and collects branch patches during emission instead of rescanning every
+instruction afterwards.
 Comparisons produce canonical boolean values;
 scalar selections use conditional moves. Fills use `rep stosb` or `rep stosd`,
 and directed copies use `rep movsb`, clearing the direction flag after a
@@ -280,42 +370,65 @@ descending copy. Aggregate construction copies each field to its layout offset.
   body or an inlined callee changes, and not when an out-of-line callee does.
 - `InlineLimit` set to zero keeps calls out of line for tests about call
   structure and native artifact reuse.
+- Machine tests cover symbolic byte offsets with register and spilled operands,
+  scratch-dead combining boundaries, expanded-branch register pressure, and
+  signed division inside loops. Existing execution tests cover edge-copy cycles,
+  calls, initializer regions, relocations, and panic provenance.
 
-The 2026-10-26 full run of `zig build test --seed=0 -Doptimize=safe -j1`
-completed all 50 build steps: 2,091 tests passed and 24 skipped, without
+The 2026-10-26 machine-stage run of `zig build test --seed=0 -Doptimize=safe -j1`
+completed all 50 build steps: 2,112 tests passed and 24 skipped, without
 allocation-failure sweeps. Formatting checks and `git diff --check` also passed.
 
 ## Measurements
 
-The 2026-10-26 follow-up compared the saved `30446e6` compiler with batched
-scalar-variant replacement, reduced scalar-replacement traversal, fused
-canonicalization normalization, and ordered scalar edge copies. ReleaseFast
-measurements used the unchanged [benchmark protocol](../benchmarks/README.md#measurement-protocol),
-without profiling or concurrent builds: one warm-up and three compilation
-samples per lane, and one warm-up and nine runtime samples. Serial compilation
-and runtime used CPU 4; eight workers used CPUs 4-11. All exit statuses and sieve
-outputs were checked.
+The 2026-10-26 machine-boundary comparison used frozen identical frontend and std
+sources with only backend changes between snapshots. ReleaseFast measurements
+used the adaptive [benchmark protocol](../benchmarks/README.md#measurement-protocol):
+one warm-up, at least two measured runs, and caps of three compilation or five
+runtime samples. A full sample range within 2% of the median is marked stable;
+capped noisy results remain explicitly
+unstable. Compilation phases stop independently, and extra leaf edits use fresh
+leaf values rather than cycling through cached bodies. These changed incremental
+sequences retain a separate compilation identity from the fixed-count results.
 
-| Measurement | Before | After |
+Full-scale cycle profiles identified added machine-stage work rather than a
+generated-runtime slowdown. Before the final encoding changes, the new
+allocation/encoding function accounted for 1.89% of candidate cycles and
+instruction appends another 0.32%; the old combined location/register planning
+path accounted for 0.87% of baseline cycles, versus 0.39% for new location
+planning. These are different scopes, not additive wall-time estimates. Source
+attribution exposed repeated instruction scans, repeated encoding selection,
+and fixed-instruction encoding. Compact target metadata, reuse of selected
+encodings, and a branch-only patch list remove avoidable work. The stage still
+performs allocation and encoding; an IR boundary is not intrinsically free.
+
+Uninstrumented acceptance runs used CPU 4 for serial compilation and runtime,
+and CPUs 4-11 for eight workers, without concurrent builds. Both baseline-first
+and candidate-first orders were measured. All generated exit statuses and sieve
+outputs were checked. Changes below compare candidate medians with baseline
+medians in the same order:
+
+| Measurement | Baseline First | Candidate First |
 | --- | ---: | ---: |
-| Million-line cold, zero workers | 31.226 s | 31.017 s |
-| Million-line leaf edit, zero workers | 216.6 ms | 222.7 ms |
-| Million-line cold, eight workers | 20.856 s | 20.287 s |
-| Million-line leaf edit, eight workers | 259.5 ms | 287.2 ms |
-| Million-line executable | 134.96 MB | 133.70 MB |
-| Sieve runtime | 1.375 s | 1.332 s |
-| Paired C `-O3` runtime | 1.033 s | 1.048 s |
+| Million-line cold, zero workers | -7.11% | +0.77% |
+| Million-line leaf edit, zero workers | +3.75% | -2.50% |
+| Million-line cold, eight workers | -0.31% | -0.12% |
+| Million-line leaf edit, eight workers | -3.42% | +1.82% |
+| Sieve runtime | +0.80% | -2.05% |
 
-Sieve runtime improved about 3.1%; Chimera still takes about 27% longer than the
-current C `-O3` executable. Cold compilation gains are modest
-and leaf-edit medians regressed; this does not establish recovery of the older
-pre-refactor compilation regression. CPU sampling identified normalization and
-address-taking scans as substantial costs. A separate instrumented 10,000-line
-probe reduced canonicalization work from about 24 ms to 18 ms; that pass timing
-is not an end-to-end acceptance measurement.
+No repeatable end-to-end regression was detected in these checks. Leaf-edit and
+baseline-runtime samples often reached their caps and remained unstable; sign
+changes across order reversals do not establish a speedup or exact equality.
+The observed timing uncertainty remains a few percent. The million-line
+executable grew from 133,702,505 to 134,113,669 bytes; the sieve executable shrank
+from 19,155 to 19,102 bytes. Code size is not a runtime benchmark. Raw forward,
+reverse, and profiled samples and source hashes were preserved separately.
 
 ## Remaining Work
 
+- Reduce machine-stage analysis and encoding cost where profiles justify it.
+  Register classes, frame compaction, scheduling, and additional targets remain
+  follow-up work, not part of this first boundary.
 - Recover compilation throughput without reducing optimization, and investigate
   the leaf-edit regression with matched profiles. Join simplification, repeated
   operand facts, and executable publication remain candidates, not proven fixes.

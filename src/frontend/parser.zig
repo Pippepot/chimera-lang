@@ -687,6 +687,10 @@ fn parseMatchCapture(parser: *ParserState) ParseError!Node.Index {
 }
 
 fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
+    if (matchRangeAhead(parser)) {
+        const first = if (parser.current().tag == .ellipsis2) null else try parseExpressionPrecedence(parser, 5);
+        return parseRange(parser, first);
+    }
     const token_index = parser.index;
     const pattern = if (parser.current().tag == .identifier and parser.tokens[parser.index + 1].tag == .colon)
         try parseMatchCapture(parser)
@@ -711,6 +715,23 @@ fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
     if (parser.current().tag != .pipe) return pattern;
     try matchPatternAsType(parser, pattern);
     return parseVariantMembers(parser, token_index, pattern, true);
+}
+
+fn matchRangeAhead(parser: *ParserState) bool {
+    var depth: usize = 0;
+    for (parser.tokens[parser.index..]) |token| {
+        switch (token.tag) {
+            .ellipsis2 => if (depth == 0) return true,
+            .l_paren, .l_bracket, .l_brace => depth += 1,
+            .r_paren, .r_bracket, .r_brace => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .comma, .colon, .arrow, .keyword_and, .pipe, .dedent, .eof => if (depth == 0) return false,
+            else => {},
+        }
+    }
+    return false;
 }
 
 fn matchPatternAsType(parser: *ParserState, index: Node.Index) ParseError!void {

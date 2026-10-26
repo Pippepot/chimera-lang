@@ -425,6 +425,424 @@ test "tuple match nested variant products retain explicit remainder coverage" {
     , 42);
 }
 
+test "tuple match combines finite and nested type partitions exhaustively" {
+    try Fixture.expectParity(
+        \\func choose(value: (bool, int)) int
+        \\    return match value
+        \\        (true, number) -> number
+        \\        (false, number) -> number + 1
+        \\func nested(value: ((int | bool, bool), int) | none) int
+        \\    return match value
+        \\        ((int, true), number) -> number
+        \\        ((int, false), number) -> number + 1
+        \\        ((bool, _), number) -> number + 2
+        \\        none -> 3
+        \\func run() int
+        \\    return choose((true, 5)) + choose((false, 6)) + nested(((1, true), 7)) + nested(((1, false), 8)) + nested(((false, true), 9)) + nested(none)
+    , 42);
+    try Fixture.expectParity(
+        \\func choose(value: (bool, int) | (bool,)) int
+        \\    return match value
+        \\        (true, number) -> number
+        \\        (false, number) -> number + 1
+        \\        (true,) -> 10
+        \\        (false,) -> 20
+        \\func run() int
+        \\    const first: (bool, int) = (true, 5)
+        \\    const second: (bool, int) = (false, 6)
+        \\    const third: (bool,) = (true,)
+        \\    const fourth: (bool,) = (false,)
+        \\    return choose(first) + choose(second) + choose(third) + choose(fourth)
+    , 42);
+}
+
+test "tuple match finite partitions distinguish unit none and reference fields" {
+    try Fixture.expectParity(
+        \\func choose(value: (unit | none, bool)) int
+        \\    return match value
+        \\        ((), true) -> 5
+        \\        ((), false) -> 7
+        \\        (none, _) -> 15
+        \\func run() int -> choose(((), true)) + choose(((), false)) + choose((none, true)) + choose((none, false))
+    , 42);
+    try Fixture.expectParity(
+        \\func choose(value: (ref bool, int) | (bool, int)) int
+        \\    return match value
+        \\        (true, number) -> number
+        \\        (false, number) -> number + 1
+        \\func run() int
+        \\    var flag = true
+        \\    const borrowed: (ref bool, int) = (flag, 19)
+        \\    const owned: (bool, int) = (false, 22)
+        \\    return choose(borrowed) + choose(owned)
+    , 42);
+}
+
+test "tuple match preserves product correlations through overlapping arms" {
+    try Fixture.expectParity(
+        \\func choose(value: (bool, bool)) int
+        \\    return match value
+        \\        (true, _) -> 10
+        \\        (_, true) -> 20
+        \\        (false, false) -> 2
+        \\func run() int -> choose((true, true)) + choose((true, false)) + choose((false, true)) + choose((false, false))
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func choose(value: (bool, bool)) int
+        \\    return match value
+        \\        (true, true) -> 1
+        \\        (false, false) -> 2
+        \\exit(choose((true, true)))
+    , .match_not_exhaustive);
+    try Fixture.expectSourceDiagnostic(
+        \\func choose(value: (int, int)) int
+        \\    return match value
+        \\        (0, _) -> 1
+        \\        (_, 0) -> 2
+        \\exit(choose((0, 0)))
+    , .match_not_exhaustive);
+}
+
+test "tuple match rejects duplicate subsumed and collectively covered arms" {
+    const patterns = [_][]const u8{
+        "(true, _) -> 1\n        (true, _) -> 2",
+        "(true, _) -> 1\n        (true, false) -> 2",
+        "(true, _) -> 1\n        (_, true) -> 2\n        (true, true) -> 3",
+        "(true, true) -> 1\n        (false, true) -> 2\n        (_, true) -> 3",
+        "(true, _) -> 1\n        (false, _) -> 2\n        (bool, bool) -> 3",
+        "(true, _) -> 1\n        (true, _) and false -> 2",
+    };
+    for (patterns) |arms| {
+        const source = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "func choose(value: (bool, bool)) int\n    return match value\n        {s}\n        _ -> 4\nexit(choose((true, true)))",
+            .{arms},
+        );
+        defer std.testing.allocator.free(source);
+        try Fixture.expectSourceDiagnostic(source, .match_redundant_arm);
+    }
+    try Fixture.expectSourceDiagnostic(
+        \\func choose(value: ((int, int), bool)) int
+        \\    return match value
+        \\        ((0, _), _) -> 1
+        \\        ((0, 42), true) -> 2
+        \\        _ -> 3
+        \\exit(choose(((0, 42), true)))
+    , .match_redundant_arm);
+    try Fixture.expectSourceDiagnostic(
+        \\func choose(value: (StaticString, int)) int
+        \\    return match value
+        \\        ("a\0b", _) -> 1
+        \\        ("a\u{0}b", 42) -> 2
+        \\        _ -> 3
+        \\exit(choose(("a\0b", 42)))
+    , .match_redundant_arm);
+}
+
+test "tuple match guards preserve uncovered products and retry effects" {
+    try Fixture.expectParity(
+        \\func reject(ref attempts: int) bool
+        \\    attempts += 1
+        \\    return false
+        \\func choose(value: (bool, int), ref attempts: int) int
+        \\    return match value
+        \\        (true, number) and reject(attempts) -> 90
+        \\        (true, number) -> number
+        \\        (false, number) -> number + 1
+        \\func run() int
+        \\    var attempts = 0
+        \\    const result = choose((true, 19), attempts) + choose((false, 21), attempts)
+        \\    return result + attempts
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func choose(value: (bool, int)) int
+        \\    return match value
+        \\        (true, number) and true -> number
+        \\        (false, number) -> number
+        \\exit(choose((true, 42)))
+    , .match_not_exhaustive);
+}
+
+test "tuple match finite partitions preserve noncopyable ownership and references" {
+    try Fixture.expectParity(
+        \\struct Token
+        \\    copy = none
+        \\    move = none
+        \\    drop = explicit
+        \\    value: int
+        \\func dispose(deinit token: Token) int -> token.value
+        \\func choose(flag: bool) int
+        \\    return match (flag, Token{value = 19})
+        \\        (true, token) and false -> dispose(token)
+        \\        (true, token) -> dispose(token)
+        \\        (false, token) -> dispose(token) + 4
+        \\func run() int -> choose(true) + choose(false)
+    , 42);
+    try Fixture.expectParity(
+        \\func update(ref pair: (bool, int)) unit
+        \\    match pair
+        \\        (true, ref number) -> number += 19
+        \\        (false, ref number) -> number += 23
+        \\func run() int
+        \\    var first = (true, 0)
+        \\    var second = (false, 0)
+        \\    update(first)
+        \\    update(second)
+        \\    return first.1 + second.1
+    , 42);
+}
+
+test "tuple match byte partitions cover the complete finite domain" {
+    var source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    try source.writer.writeAll("func choose(value: (byte, int)) int\n    return match value\n");
+    for (0..256) |index| try source.writer.print("        ({d}, number) -> number + {d}\n", .{ index, if (index == 255) @as(usize, 19) else 0 });
+    try source.writer.writeAll("func run() int\n    const last: byte = 255\n    return choose((last, 23))\n");
+    try Fixture.expectParity(source.written(), 42);
+    const missing = try std.mem.replaceOwned(u8, std.testing.allocator, source.written(), "        (255, number) -> number + 19\n", "");
+    defer std.testing.allocator.free(missing);
+    const rejected = try std.fmt.allocPrint(std.testing.allocator, "{s}\nexit(run())", .{missing});
+    defer std.testing.allocator.free(rejected);
+    try Fixture.expectSourceDiagnostic(rejected, .match_not_exhaustive);
+}
+
+test "tuple match incremental edits recompute product coverage" {
+    const fixture = try Fixture.init(
+        \\func choose(value: (bool, int)) int
+        \\    return match value
+        \\        (true, number) -> number
+        \\        (false, number) -> number + 1
+        \\exit(choose((false, 41)))
+    );
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0,
+        \\func choose(value: (bool, int)) int
+        \\    return match value
+        \\        (true, number) -> number
+        \\        (false, number) and true -> number + 1
+        \\exit(choose((false, 41)))
+    );
+    try fixture.expectDiagnostic(0, .match_not_exhaustive);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0,
+        \\func choose(value: (bool, int)) int
+        \\    return match value
+        \\        (true, number) -> number
+        \\        (true, number) -> number + 1
+        \\        _ -> 42
+        \\exit(choose((false, 41)))
+    );
+    try fixture.expectDiagnostic(0, .match_redundant_arm);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0,
+        \\func choose(value: (bool, int)) int
+        \\    return match value
+        \\        (true, number) -> number
+        \\        (false, number) -> number + 1
+        \\exit(choose((false, 41)))
+    );
+    try fixture.expectExit(0, 42);
+}
+
+test "range patterns compose recursively with tuple type and literal patterns" {
+    try Fixture.expectParity(
+        \\func choose(value: ((int | bool, int), bool)) int
+        \\    return match value
+        \\        ((0..10, number), false) -> number
+        \\        ((10..=20, number), false) -> number + 1
+        \\        ((bool, number), _) -> number + 2
+        \\        _ -> 0
+        \\func run() int
+        \\    return choose(((0, 5), false)) + choose(((9, 6), false)) + choose(((10, 7), false)) + choose(((20, 8), false)) + choose(((true, 12), true)) + choose(((21, 99), false)) + choose(((-1, 99), false))
+    , 42);
+    try Fixture.expectParity(
+        \\func choose(value: (int,)) int
+        \\    return match value
+        \\        ((0..10),) -> 19
+        \\        _ -> 23
+        \\func run() int -> choose((9,)) + choose((10,))
+    , 42);
+}
+
+test "range patterns combine open partitions and full integer boundaries" {
+    try Fixture.expectParity(
+        \\func choose(value: int) int
+        \\    return match value
+        \\        ..0 -> 5
+        \\        0 -> 7
+        \\        1..2147483647 -> 10
+        \\        2147483647.. -> 20
+        \\func run() int -> choose(-2147483648) + choose(0) + choose(2147483646) + choose(2147483647)
+    , 42);
+    try Fixture.expectParity(
+        \\func choose(value: (int, bool)) int
+        \\    return match value
+        \\        (..=0, true) -> 19
+        \\        (1.., true) -> 23
+        \\        (.., false) -> 0
+        \\func run() int -> choose((-2147483648, true)) + choose((2147483647, true)) + choose((0, false))
+    , 42);
+    try Fixture.expectParity(
+        \\func choose(value: int) int
+        \\    return match value
+        \\        -9223372036854775808..=9223372036854775807 -> 21
+        \\func run() int -> choose(-2147483648) + choose(2147483647)
+    , 42);
+}
+
+test "range patterns use byte domains and preserve integer preference" {
+    try Fixture.expectParity(
+        \\func choose(value: (byte, bool)) int
+        \\    return match value
+        \\        (0..128, true) -> 5
+        \\        (128..256, true) -> 7
+        \\        (..=255, false) -> 15
+        \\func run() int
+        \\    const low: byte = 0
+        \\    const high: byte = 255
+        \\    return choose((low, true)) + choose((high, true)) + choose((low, false)) + choose((high, false))
+    , 42);
+    try Fixture.expectParity(
+        \\func choose(value: int | byte | bool) int
+        \\    return match value
+        \\        0..10 -> 19
+        \\        int -> 0
+        \\        byte -> 23
+        \\        bool -> 0
+        \\func run() int
+        \\    const byte_value: byte = 5
+        \\    return choose(5) + choose(byte_value)
+    , 42);
+}
+
+test "range patterns evaluate static bounds and permit ordinary guards" {
+    try Fixture.expectParity(
+        \\static Low = -2
+        \\func upper() int -> 10
+        \\func choose(static limit: int, value: (int, int)) int
+        \\    return match value
+        \\        (Low + 2..upper(), number) and number > limit -> number
+        \\        (0..10, number) -> number + 1
+        \\        _ -> 0
+        \\func run() int -> choose(10, (0, 19)) + choose(30, (9, 22))
+    , 42);
+    try Fixture.expectParity(
+        \\static NoLimit = none
+        \\func choose(value: int) int
+        \\    return match value
+        \\        NoLimit..0 -> 19
+        \\        0..NoLimit -> 23
+        \\func run() int -> choose(-2147483648) + choose(2147483647)
+    , 42);
+}
+
+test "range patterns retain owners until selection and protect projected references" {
+    try Fixture.expectParity(
+        \\struct Token
+        \\    copy = none
+        \\    move = none
+        \\    drop = explicit
+        \\    value: int
+        \\func dispose(deinit token: Token) int -> token.value
+        \\func choose(number: int) int
+        \\    return match (number, Token{value = 19})
+        \\        (..5, token) -> dispose(token)
+        \\        (5..10, token) and false -> dispose(token)
+        \\        (5..10, token) -> dispose(token)
+        \\        (10.., token) -> dispose(token) + 4
+        \\func run() int -> choose(5) + choose(10)
+    , 42);
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var pair = (5, 19)
+        \\    match pair
+        \\        (0..10, ref number) -> number += 23
+        \\        _ -> ()
+        \\    return pair.1
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func change(ref number: int) bool
+        \\    number += 1
+        \\    return false
+        \\var number = 5
+        \\const pair: (ref int, int) = (number, 0)
+        \\match pair
+        \\    (0..10, _) and change(number) -> ()
+        \\    _ -> ()
+    , .match_guard_invalidates_subject);
+}
+
+test "range coverage rejects gaps redundancy empty bounds and runtime captures" {
+    try Fixture.expectSourceDiagnostic(
+        \\func choose(value: (int, bool)) int
+        \\    return match value
+        \\        (..0, _) -> 1
+        \\        (1.., _) -> 2
+        \\exit(choose((1, true)))
+    , .match_not_exhaustive);
+    try Fixture.expectSourceDiagnostic(
+        \\func choose(value: (int, bool)) int
+        \\    return match value
+        \\        (..0, _) -> 1
+        \\        (0..10, _) -> 2
+        \\        (-5..5, true) -> 3
+        \\        _ -> 4
+        \\exit(choose((1, true)))
+    , .match_redundant_arm);
+    try Fixture.expectSourceDiagnostic(
+        \\match (5, true)
+        \\    (0..10, _) -> 1
+        \\    (5, _) -> 2
+        \\    _ -> 3
+    , .match_redundant_arm);
+    try Fixture.expectSourceDiagnostic(
+        \\func choose(value: int) int
+        \\    return match value
+        \\        ..0 and true -> 1
+        \\        0.. -> 2
+        \\exit(choose(1))
+    , .match_not_exhaustive);
+    for ([_][]const u8{ "0..0", "10..=0", "..-9223372036854775808" }) |pattern| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "match 0\n    {s} -> 1\n    _ -> 2", .{pattern});
+        defer std.testing.allocator.free(source);
+        try Fixture.expectSourceDiagnostic(source, .match_range_empty);
+    }
+    try Fixture.expectSourceDiagnostic(
+        \\static Low = false
+        \\match 5
+        \\    Low..10 -> 1
+        \\    _ -> 2
+    , .match_range_bound_not_integer);
+    try Fixture.expectSourceDiagnostic(
+        \\const low = 0
+        \\match 5
+        \\    low..10 -> 1
+        \\    _ -> 2
+    , .comptime_runtime_capture);
+    try Fixture.expectSourceDiagnostic(
+        \\const value: byte = 0
+        \\match value
+        \\    256..300 -> 1
+        \\    _ -> 2
+    , .match_pattern_incompatible);
+}
+
+test "range pattern edits recompute nested coverage and static dependencies" {
+    const fixture = try Fixture.initFiles(
+        \\import bounds
+        \\func choose(value: (int, bool)) int
+        \\    return match value
+        \\        (..bounds.Split, _) -> 19
+        \\        (10.., _) -> 42
+        \\exit(choose((10, true)))
+    , &.{.{ .path = "bounds/limits.chi", .module_path = "bounds", .source = "pub static Split = 10" }});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(test_sources.queries.SourceText, 1, "pub static Split = 9");
+    try fixture.expectDiagnostic(0, .match_not_exhaustive);
+    try fixture.db.setInput(test_sources.queries.SourceText, 1, "pub static Split = 11");
+    try fixture.expectExit(0, 19);
+}
+
 test "guarded match catch all copies retain feasible cleanup without changing their type" {
     try Fixture.expectParity(
         \\struct Token

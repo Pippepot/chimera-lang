@@ -9256,13 +9256,25 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 any,
                 type: structures.TypeId,
                 literal: MatchLiteral,
+                range: semantic.UnresolvedBody.MatchInterval,
                 tuple: []const MatchPattern,
             },
         };
         const MatchDomain = struct {
             member: structures.TypeId,
-            whole: bool = false,
-            literals: std.ArrayList(@FieldType(MatchLiteral, "value")) = .empty,
+            remaining: []const MatchSpace,
+        };
+        // A disjoint part of the typed domain. Tuples retain correlations between
+        // fields; scalar complements avoid enumerating integer and text values.
+        const MatchSpace = struct {
+            type_id: structures.TypeId,
+            shape: union(enum) {
+                any,
+                integer: semantic.UnresolvedBody.MatchInterval,
+                literal: @FieldType(MatchLiteral, "value"),
+                excluding: []const @FieldType(MatchLiteral, "value"),
+                tuple: []const MatchSpace,
+            } = .any,
         };
         const ResolvedMatchArm = struct {
             source: semantic.UnresolvedBody.MatchArm,
@@ -9362,9 +9374,43 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                             try patterns.append(self.gpa, .{ .source = id, .input_type = type_id, .member = member, .shape = .{ .literal = literal } });
                     }
                 },
+                .range => |interval| try self.resolveRangeMatchPatterns(&patterns, id, type_id, members, interval),
                 .tuple => |range| try self.resolveTupleMatchPatterns(&patterns, id, type_id, members, range),
             }
             return patterns.toOwnedSlice(self.gpa);
+        }
+
+        fn matchIntegerDomain(type_id: structures.TypeId) semantic.UnresolvedBody.MatchInterval {
+            switch (type_id) {
+                .int => return .{ .first = std.math.minInt(i32), .last = std.math.maxInt(i32) },
+                .byte => return .{ .first = 0, .last = std.math.maxInt(u8) },
+                .int_literal => return .{ .first = std.math.minInt(i64), .last = std.math.maxInt(i64) },
+                else => unreachable,
+            }
+        }
+
+        fn resolveRangeMatchPatterns(self: *Self, patterns: *std.ArrayList(MatchPattern), id: u32, type_id: structures.TypeId, members: []const structures.TypeId, interval: semantic.UnresolvedBody.MatchInterval) !void {
+            var selected: ?structures.TypeId = null;
+            var ambiguous = false;
+            for (members) |member| {
+                const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
+                if (logical != .int and logical != .byte and logical != .int_literal) continue;
+                if (logical == .int) {
+                    selected = .int;
+                    ambiguous = false;
+                    continue;
+                }
+                if (selected == .int or selected == logical) continue;
+                if (selected != null) ambiguous = true;
+                selected = logical;
+            }
+            if (ambiguous) return self.reject(self.unresolved.match_patterns[id].span, .{ .match_range_ambiguous = type_id });
+            const logical = selected orelse return;
+            const domain = matchIntegerDomain(logical);
+            const intersection: semantic.UnresolvedBody.MatchInterval = .{ .first = @max(domain.first, interval.first), .last = @min(domain.last, interval.last) };
+            if (intersection.first > intersection.last) return;
+            for (members) |member| if ((try self.analysis_context.facts().memberSpec(member)).type_id == logical)
+                try patterns.append(self.gpa, .{ .source = id, .input_type = type_id, .member = member, .shape = .{ .range = intersection } });
         }
 
         fn resolveTupleMatchPatterns(self: *Self, patterns: *std.ArrayList(MatchPattern), id: u32, type_id: structures.TypeId, members: []const structures.TypeId, range: structures.FunctionValueRange) anyerror!void {
@@ -9391,40 +9437,105 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             }
         }
 
-        fn matchPatternSelects(self: *Self, pattern: MatchPattern, member: structures.TypeId) !bool {
+        fn matchPatternSelects(pattern: MatchPattern, member: structures.TypeId) bool {
             if (pattern.member) |selected| return selected == member;
-            const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
-            return switch (pattern.shape) {
-                .any => true,
-                .type => |target| includesType(target, try self.analysis_context.facts().variantMembers(target), logical),
-                .literal => |literal| logical == literal.type_id,
-                .tuple => unreachable,
-            };
-        }
-
-        fn matchPatternCoversType(self: *Self, id: u32, type_id: structures.TypeId) anyerror!bool {
-            const pattern = self.unresolved.match_patterns[id];
-            switch (pattern.shape) {
-                .any => return true,
-                .type => |target| {
-                    const members = try self.matchInputMembers(type_id);
-                    return try self.countMembers(members, target, try self.analysis_context.facts().variantMembers(target)) == members.len;
-                },
-                .literal => return type_id == .unit or type_id == .none,
-                .tuple => |range| return self.tupleMatchCoversType(range, type_id),
-            }
-        }
-
-        fn tupleMatchCoversType(self: *Self, range: structures.FunctionValueRange, type_id: structures.TypeId) anyerror!bool {
-            const children = self.unresolved.match_pattern_children[range.start..range.end];
-            for (try self.matchInputMembers(type_id)) |member| {
-                const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
-                const fields = (try self.analysis_context.facts().tupleMembers(logical)) orelse return false;
-                if (fields.len != children.len) return false;
-                for (fields, children) |field, child|
-                    if (!try self.matchPatternCoversType(child, field.type_id)) return false;
-            }
+            std.debug.assert(pattern.shape == .any);
             return true;
+        }
+
+        // Return the intersection and append the disjoint remainder. Resolved
+        // patterns select at most one member at each node, so the intersection
+        // of a space and a pattern is itself a single space.
+        fn partitionMatchSpace(self: *Self, space: MatchSpace, pattern: MatchPattern, remainder: *std.ArrayList(MatchSpace)) anyerror!?MatchSpace {
+            if (pattern.shape == .any) return space;
+            const member = pattern.member.?;
+            const members = try self.matchInputMembers(space.type_id);
+            if (members.len > 1) std.debug.assert(space.shape == .any);
+            var selected: ?MatchSpace = null;
+            for (members) |candidate| {
+                const part: MatchSpace = .{ .type_id = candidate, .shape = space.shape };
+                if (candidate == member) {
+                    std.debug.assert(selected == null);
+                    selected = part;
+                } else try remainder.append(self.gpa, part);
+            }
+            const intersection = selected orelse return null;
+            switch (pattern.shape) {
+                .any => unreachable,
+                .type => return intersection,
+                .literal => |literal| return self.partitionMatchLiteral(intersection, literal, remainder),
+                .range => |interval| return self.partitionMatchInteger(intersection, interval, remainder),
+                .tuple => |children| return self.partitionMatchTuple(intersection, children, remainder),
+            }
+        }
+
+        fn partitionMatchLiteral(self: *Self, space: MatchSpace, literal: MatchLiteral, remainder: *std.ArrayList(MatchSpace)) !?MatchSpace {
+            if (literal.value == .integer)
+                return self.partitionMatchInteger(space, .{ .first = literal.value.integer, .last = literal.value.integer }, remainder);
+            if (space.shape == .literal) {
+                if (std.meta.eql(space.shape.literal, literal.value)) return space;
+                try remainder.append(self.gpa, space);
+                return null;
+            }
+            std.debug.assert(space.shape == .any or space.shape == .excluding);
+            const excluded = if (space.shape == .excluding) space.shape.excluding else &.{};
+            for (excluded) |excluded_literal| if (std.meta.eql(excluded_literal, literal.value)) {
+                try remainder.append(self.gpa, space);
+                return null;
+            };
+            const values = try self.gpa.alloc(@FieldType(MatchLiteral, "value"), excluded.len + 1);
+            @memcpy(values[0..excluded.len], excluded);
+            values[excluded.len] = literal.value;
+            const finite: ?usize = switch (literal.type_id) {
+                .bool => 2,
+                .unit, .none => 1,
+                else => null,
+            };
+            if (finite == null or values.len != finite.?)
+                try remainder.append(self.gpa, .{ .type_id = space.type_id, .shape = .{ .excluding = values } });
+            return .{ .type_id = space.type_id, .shape = .{ .literal = literal.value } };
+        }
+
+        fn partitionMatchInteger(self: *Self, space: MatchSpace, interval: semantic.UnresolvedBody.MatchInterval, remainder: *std.ArrayList(MatchSpace)) !?MatchSpace {
+            std.debug.assert(space.shape == .any or space.shape == .integer);
+            const domain = if (space.shape == .integer) space.shape.integer else matchIntegerDomain((try self.analysis_context.facts().memberSpec(space.type_id)).type_id);
+            const intersection: semantic.UnresolvedBody.MatchInterval = .{ .first = @max(domain.first, interval.first), .last = @min(domain.last, interval.last) };
+            if (intersection.first > intersection.last) {
+                try remainder.append(self.gpa, space);
+                return null;
+            }
+            if (domain.first < intersection.first)
+                try remainder.append(self.gpa, .{ .type_id = space.type_id, .shape = .{ .integer = .{ .first = domain.first, .last = intersection.first - 1 } } });
+            if (intersection.last < domain.last)
+                try remainder.append(self.gpa, .{ .type_id = space.type_id, .shape = .{ .integer = .{ .first = intersection.last + 1, .last = domain.last } } });
+            return .{ .type_id = space.type_id, .shape = .{ .integer = intersection } };
+        }
+
+        fn partitionMatchTuple(self: *Self, space: MatchSpace, patterns: []const MatchPattern, remainder: *std.ArrayList(MatchSpace)) anyerror!?MatchSpace {
+            std.debug.assert(space.shape == .any or space.shape == .tuple);
+            const children = if (space.shape == .tuple)
+                try self.gpa.dupe(MatchSpace, space.shape.tuple)
+            else children: {
+                const logical = (try self.analysis_context.facts().memberSpec(space.type_id)).type_id;
+                const fields = (try self.analysis_context.facts().tupleMembers(logical)).?;
+                const result = try self.gpa.alloc(MatchSpace, fields.len);
+                for (fields, result) |field, *child| child.* = .{ .type_id = field.type_id };
+                break :children result;
+            };
+            std.debug.assert(children.len == patterns.len);
+            for (children, patterns, 0..) |*child, pattern, index| {
+                var rejected: std.ArrayList(MatchSpace) = .empty;
+                const matched = try self.partitionMatchSpace(child.*, pattern, &rejected);
+                for (rejected.items) |part| {
+                    // Earlier fields matched; this field did not. Later fields
+                    // retain their original domains, preserving the product.
+                    const product = try self.gpa.dupe(MatchSpace, children);
+                    product[index] = part;
+                    try remainder.append(self.gpa, .{ .type_id = space.type_id, .shape = .{ .tuple = product } });
+                }
+                child.* = matched orelse return null;
+            }
+            return .{ .type_id = space.type_id, .shape = .{ .tuple = children } };
         }
 
         fn validateMatchCaptureTypes(self: *Self, pattern: MatchPattern, types: []?structures.TypeId) anyerror!void {
@@ -9442,7 +9553,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn resolveMatchArms(self: *Self, source: @FieldType(Expression.Operation, "match"), type_id: structures.TypeId, members: []const structures.TypeId) ![]const ResolvedMatchArm {
             const domains = try self.gpa.alloc(MatchDomain, members.len);
-            for (members, domains) |member, *domain| domain.* = .{ .member = member };
+            for (members, domains) |member, *domain| {
+                const remaining = try self.gpa.alloc(MatchSpace, 1);
+                remaining[0] = .{ .type_id = member };
+                domain.* = .{ .member = member, .remaining = remaining };
+            }
             const capture_types = try self.gpa.alloc(?structures.TypeId, self.unresolved.local_count);
             @memset(capture_types, null);
             var resolved: std.ArrayList(ResolvedMatchArm) = .empty;
@@ -9452,55 +9567,34 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     const raw = self.unresolved.match_patterns[arm.pattern];
                     if (raw.shape == .literal) _ = try self.matchLiteral(raw.shape.literal, members, type_id);
                     if (raw.shape == .type) return self.reject(arm.span, .{ .match_pattern_incompatible = self.typeMismatch(type_id, raw.shape.type) });
+                    if (raw.shape == .range) return self.reject(arm.span, .{ .match_pattern_incompatible = self.typeMismatch(type_id, .int) });
                     return self.reject(arm.span, .match_tuple_pattern_incompatible);
                 }
                 var before: std.ArrayList(structures.TypeId) = .empty;
-                for (domains) |domain| if (!domain.whole) try before.append(self.gpa, domain.member);
+                for (domains) |domain| if (domain.remaining.len != 0) try before.append(self.gpa, domain.member);
                 const first = resolved.items.len;
                 for (patterns) |pattern| {
                     try self.validateMatchCaptureTypes(pattern, capture_types);
                     var selected: std.ArrayList(structures.TypeId) = .empty;
-                    for (domains) |domain| {
-                        if (domain.whole or !try self.matchPatternSelects(pattern, domain.member)) continue;
-                        if (pattern.shape == .literal) {
-                            var covered = false;
-                            for (domain.literals.items) |literal| if (std.meta.eql(literal, pattern.shape.literal.value)) {
-                                covered = true;
-                                break;
-                            };
-                            if (!covered) try selected.append(self.gpa, domain.member);
-                        } else try selected.append(self.gpa, domain.member);
+                    for (domains) |*domain| {
+                        if (domain.remaining.len == 0 or !matchPatternSelects(pattern, domain.member)) continue;
+                        var remainder: std.ArrayList(MatchSpace) = .empty;
+                        var useful = false;
+                        for (domain.remaining) |space| {
+                            if (try self.partitionMatchSpace(space, pattern, &remainder) != null) useful = true;
+                        }
+                        if (useful) try selected.append(self.gpa, domain.member);
+                        if (arm.condition == null) domain.remaining = try remainder.toOwnedSlice(self.gpa);
                     }
                     if (selected.items.len == 0) continue;
                     try resolved.append(self.gpa, .{ .source = arm, .pattern = pattern, .members = try selected.toOwnedSlice(self.gpa), .remaining = before.items });
                 }
                 if (resolved.items.len == first) return self.reject(arm.span, .match_redundant_arm);
-                if (arm.condition == null) for (domains) |*domain| {
-                    if (domain.whole) continue;
-                    var compatible = false;
-                    for (patterns) |pattern| if (try self.matchPatternSelects(pattern, domain.member)) {
-                        compatible = true;
-                        break;
-                    };
-                    if (!compatible) continue;
-                    const first_pattern = patterns[0];
-                    if (first_pattern.shape == .literal) {
-                        const literal = first_pattern.shape.literal;
-                        try domain.literals.append(self.gpa, literal.value);
-                        const size: ?usize = switch (literal.type_id) {
-                            .bool => 2,
-                            .byte => 256,
-                            .unit, .none => 1,
-                            else => null,
-                        };
-                        if (size) |finite| domain.whole = domain.literals.items.len == finite;
-                    } else if (try self.matchPatternCoversType(arm.pattern, (try self.analysis_context.facts().memberSpec(domain.member)).type_id)) domain.whole = true;
-                };
                 var remaining: std.ArrayList(structures.TypeId) = .empty;
-                for (domains) |domain| if (!domain.whole) try remaining.append(self.gpa, domain.member);
+                for (domains) |domain| if (domain.remaining.len != 0) try remaining.append(self.gpa, domain.member);
                 resolved.items[resolved.items.len - 1].remaining = try remaining.toOwnedSlice(self.gpa);
             }
-            for (domains) |domain| if (!domain.whole)
+            for (domains) |domain| if (domain.remaining.len != 0)
                 return self.reject(self.valueSpan(source.subject.value), .{ .match_not_exhaustive = (try self.analysis_context.facts().memberSpec(domain.member)).type_id });
             return resolved.toOwnedSlice(self.gpa);
         }
@@ -9549,20 +9643,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             try self.recordUse(value_to_test);
             switch (literal.value) {
                 .integer => |integer| {
-                    var operand = value_to_test;
-                    if (literal.type_id == .byte) {
-                        const function = try self.analysis_context.byteIntFunction();
-                        _ = (try self.analysis_context.functionSignature(function)) orelse return error.Unavailable;
-                        operand = try self.appendInstruction(.{ .call = .{
-                            .target = .{ .direct = function },
-                            .arguments = try self.publishRange(&self.call_arguments, &[_]structures.FunctionCallArgument{.{ .prepared = .{ .value = operand.id } }}),
-                            .return_type = .int,
-                        } });
-                    }
-                    const expected = if (literal.type_id == .int_literal)
-                        try self.appendInstruction(.{ .const_int_literal = integer })
-                    else
-                        try self.appendInstruction(.{ .const_int = @intCast(integer) });
+                    const operand = try self.matchIntegerOperand(value_to_test);
+                    const expected = try self.matchIntegerConstant(literal.type_id, integer);
                     try self.moveCurrentBoundaryEffectsToTerminator();
                     self.branchOn(.eqi, operand.id, expected.id, matched, unmatched);
                 },
@@ -9591,6 +9673,43 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     try self.moveCurrentBoundaryEffectsToTerminator();
                     self.branchOn(.eqb, comparison.id, truth.id, matched, unmatched);
                 },
+            }
+        }
+
+        fn matchIntegerOperand(self: *Self, operand: Value) !Value {
+            if (operand.type_id != .byte) return operand;
+            const function = try self.analysis_context.byteIntFunction();
+            _ = (try self.analysis_context.functionSignature(function)) orelse return error.Unavailable;
+            return self.appendInstruction(.{ .call = .{
+                .target = .{ .direct = function },
+                .arguments = try self.publishRange(&self.call_arguments, &[_]structures.FunctionCallArgument{.{ .prepared = .{ .value = operand.id } }}),
+                .return_type = .int,
+            } });
+        }
+
+        fn matchIntegerConstant(self: *Self, type_id: structures.TypeId, integer: i64) !Value {
+            if (type_id == .int_literal) return self.appendInstruction(.{ .const_int_literal = integer });
+            return self.appendInstruction(.{ .const_int = @intCast(integer) });
+        }
+
+        fn matchRangeTest(self: *Self, value_to_test: Value, interval: semantic.UnresolvedBody.MatchInterval, matched: structures.FunctionBlockId, unmatched: structures.FunctionBlockId) !void {
+            try self.recordUse(value_to_test);
+            const operand = try self.matchIntegerOperand(value_to_test);
+            const domain = matchIntegerDomain(value_to_test.type_id);
+            if (interval.first > domain.first) {
+                const lower = try self.matchIntegerConstant(value_to_test.type_id, interval.first);
+                const inside = try self.newEmptyBlock();
+                try self.moveCurrentBoundaryEffectsToTerminator();
+                self.branchOn(.gei, operand.id, lower.id, inside, unmatched);
+                self.enterBlock(inside);
+            }
+            if (interval.last < domain.last) {
+                const upper = try self.matchIntegerConstant(value_to_test.type_id, interval.last);
+                try self.moveCurrentBoundaryEffectsToTerminator();
+                self.branchOn(.lei, operand.id, upper.id, matched, unmatched);
+            } else {
+                try self.moveCurrentBoundaryEffectsToTerminator();
+                self.terminate(.{ .branch = self.emptyBranch(matched) });
             }
         }
 
@@ -9698,6 +9817,14 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (unmatched) |rejected| {
                     const matched = try self.newEmptyBlock();
                     try self.matchLiteralTest(selected, pattern.shape.literal, matched, rejected, source.span);
+                    self.enterBlock(matched);
+                }
+                return prepared;
+            }
+            if (pattern.shape == .range) {
+                if (unmatched) |rejected| {
+                    const matched = try self.newEmptyBlock();
+                    try self.matchRangeTest(selected, pattern.shape.range, matched, rejected);
                     self.enterBlock(matched);
                 }
                 return prepared;

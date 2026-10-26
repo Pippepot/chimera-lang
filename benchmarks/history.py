@@ -26,8 +26,13 @@ from xml.etree import ElementTree
 
 
 ROOT = Path(__file__).resolve().parent.parent
-PROTOCOL = "core-million-zero-workers-v5"
-COMPILATION_PROTOCOL = "core-million-modules-one-line-leaf-v1"
+PROTOCOL = "core-million-zero-workers-v6"
+SAMPLING_PROTOCOL = "one-warmup-range-2pct-min2-compile3-runtime5-v1"
+MINIMUM_SAMPLES = 2
+MAXIMUM_SAMPLES = 5
+COMPILATION_MAXIMUM_SAMPLES = 3
+RELATIVE_RANGE_PERCENT = 2
+COMPILATION_PROTOCOL = "core-million-modules-one-line-leaf-v2"
 RUNTIME_PROTOCOL = "sieve-88000000-i32-wall-v1"
 LEGACY_RUNTIME = {
     "suite": "4820879fd6e6ae15a0d1e71b4a070054600c5ea7caecbea87971a75f41f4e509",
@@ -55,7 +60,7 @@ def prepare(snapshot: Path) -> bool:
         raise FileNotFoundError("revision predates the fixed harness's compiler/module API")
     bundled = (snapshot / "src/standard_bundle.zig").exists()
     (snapshot / "benchmarks").mkdir(exist_ok=True)
-    for name in ("history_benchmark.zig", "history_workload.zig", "history_runtime.c"):
+    for name in ("history_benchmark.zig", "history_sampling.zig", "history_workload.zig", "history_runtime.c"):
         shutil.copy2(ROOT / "benchmarks" / name, snapshot / "benchmarks" / name)
     shutil.copy2(ROOT / "benchmarks/history_build.zig", snapshot / ".history.build.zig")
     bridge = COMPILER_BRIDGE
@@ -67,7 +72,7 @@ def prepare(snapshot: Path) -> bool:
 
 def suite_id() -> str:
     digest = hashlib.sha256(COMPILER_BRIDGE.encode())
-    for name in ("history_benchmark.zig", "history_workload.zig", "history_runtime.c", "history_build.zig"):
+    for name in ("history_benchmark.zig", "history_sampling.zig", "history_workload.zig", "history_runtime.c", "history_build.zig"):
         digest.update(b"\0" + (ROOT / "benchmarks" / name).read_bytes())
     return digest.hexdigest()
 
@@ -131,21 +136,50 @@ def loc_policy() -> str:
     return hashlib.sha256(b"root-or-src-layout-v2\0" + (ROOT / "loc.sh").read_bytes()).hexdigest()
 
 
+def validate_measurement(samples: list[dict], *, legacy: bool = False) -> None:
+    count = samples[0].get("sample_count")
+    maximum = COMPILATION_MAXIMUM_SAMPLES if samples[0]["case"] == COMPILATION_CASE else MAXIMUM_SAMPLES
+    if count is None and legacy:
+        count = 9
+        if any("sample_count" in sample or "stable" in sample for sample in samples):
+            raise ValueError("mixed sampling protocols")
+    else:
+        if not isinstance(count, int) or not MINIMUM_SAMPLES <= count <= maximum:
+            raise ValueError("invalid declared sample count")
+        if any(sample.get("sample_count") != count for sample in samples):
+            raise ValueError("inconsistent declared sample count")
+        values = sorted(sample["nanoseconds"] for sample in samples)
+        middle = len(values) // 2
+        median = (values[middle - 1] + (values[middle] - values[middle - 1]) // 2
+                  if len(values) % 2 == 0 else values[middle])
+        stable = median > 0 and (values[-1] - values[0]) * 100 <= median * RELATIVE_RANGE_PERCENT
+        if any(sample.get("stable") is not stable for sample in samples):
+            raise ValueError("incorrect stability declaration")
+        if not stable and count != maximum:
+            raise ValueError("unstable measurement ended before the sample cap")
+    if sorted(sample["sample"] for sample in samples) != list(range(count)):
+        raise ValueError("incomplete or duplicate benchmark samples")
+    if any(sample["nanoseconds"] < 0 or sample["executable_bytes"] <= 0 for sample in samples):
+        raise ValueError("invalid benchmark measurement")
+
+
 def parse_samples(text: str, case: str | None = None) -> list[dict]:
     samples = list(csv.DictReader(io.StringIO(text)))
     if not samples:
         raise ValueError("benchmark produced no samples")
     groups = defaultdict(list)
     for sample in samples:
-        for field in ("sample", "nanoseconds", "executable_bytes"):
-            sample[field] = int(sample[field])
-        if sample["nanoseconds"] < 0 or sample["executable_bytes"] <= 0:
-            raise ValueError("invalid benchmark measurement")
-        groups[(sample["case"], sample["lane"], sample["phase"])].append(sample["sample"])
-    for (name, lane, phase), indices in groups.items():
-        count = 3 if name == COMPILATION_CASE and lane in COMPILATION_LANES and phase in CORE_CASES[COMPILATION_CASE] else 9
-        if sorted(indices) != list(range(count)):
-            raise ValueError(f"benchmark must supply exactly {count} samples per measurement")
+        try:
+            for field in ("sample", "nanoseconds", "executable_bytes", "sample_count"):
+                sample[field] = int(sample[field])
+            if sample["stable"] not in ("true", "false"):
+                raise ValueError("invalid stability declaration")
+            sample["stable"] = sample["stable"] == "true"
+            groups[(sample["case"], sample["lane"], sample["phase"])].append(sample)
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError("invalid benchmark sample") from error
+    for measurement in groups.values():
+        validate_measurement(measurement)
     compilation = [{(COMPILATION_CASE, lane, phase) for phase in CORE_CASES[COMPILATION_CASE]}
                    for lane in COMPILATION_LANES]
     compilation.append(set.union(*compilation))
@@ -160,6 +194,13 @@ def parse_samples(text: str, case: str | None = None) -> list[dict]:
     if set(groups) not in allowed:
         raise ValueError("benchmark workload set changed; update the recording protocol")
     return samples
+
+
+def sampling_note(sample: dict) -> str:
+    if "stable" not in sample:
+        return "; fixed-count sampling"
+    maximum = COMPILATION_MAXIMUM_SAMPLES if sample.get("case") == COMPILATION_CASE else MAXIMUM_SAMPLES
+    return "; stable (<=2% range)" if sample["stable"] else f"; unstable at {maximum}-sample cap"
 
 
 def runner() -> dict:
@@ -192,7 +233,6 @@ def runtime_identity(record: dict) -> dict | None:
 
 def cached_c_reference(records: list[dict], current: dict) -> tuple[list[dict], dict] | None:
     keys = ("zig", "runner", "c_compiler")
-    expected = {(lane, index) for lane in C_LANES for index in range(9)}
     for previous in sorted(records, key=lambda record: record["recorded_at"], reverse=True):
         if any(previous.get(key) != current.get(key) for key in keys):
             continue
@@ -202,10 +242,14 @@ def cached_c_reference(records: list[dict], current: dict) -> tuple[list[dict], 
             if benchmark["mode"] != "fast":
                 continue
             samples = [sample for sample in benchmark["samples"] if sample["lane"] in C_LANES]
-            if len(samples) != len(expected) or {(sample["lane"], sample["sample"]) for sample in samples} != expected:
+            if {sample["lane"] for sample in samples} != set(C_LANES):
                 continue
-            if any(sample["case"] != RUNTIME_CASE or sample["phase"] != "runtime"
-                   or sample["nanoseconds"] < 0 or sample["executable_bytes"] <= 0 for sample in samples):
+            if any(sample["case"] != RUNTIME_CASE or sample["phase"] != "runtime" for sample in samples):
+                continue
+            try:
+                for lane in C_LANES:
+                    validate_measurement([sample for sample in samples if sample["lane"] == lane], legacy=True)
+            except (KeyError, TypeError, ValueError):
                 continue
             origin = previous.get("c_reference", {"snapshot": previous["snapshot"], "recorded_at": previous["recorded_at"]})
             return [dict(sample) for sample in samples], dict(origin)
@@ -214,6 +258,7 @@ def cached_c_reference(records: list[dict], current: dict) -> tuple[list[dict], 
 
 def environment() -> dict:
     return {"suite": suite_id(), "protocol": PROTOCOL, "compilation_protocol": COMPILATION_PROTOCOL,
+            "sampling_protocol": SAMPLING_PROTOCOL,
             "runtime_suite": {"protocol": RUNTIME_PROTOCOL,
                               "source": hashlib.sha256((ROOT / "benchmarks/history_runtime.c").read_bytes()).hexdigest()},
             "zig": command(["zig", "version"]),
@@ -438,7 +483,7 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
     groups = defaultdict(dict)
     runtime_suite = next((runtime_identity(record) for record in reversed(records) if runtime_identity(record) is not None), None)
     for record in records:
-        current = record.get("protocol") == PROTOCOL
+        current = record.get("protocol") in (PROTOCOL, "core-million-zero-workers-v5")
         runtime_compatible = runtime_identity(record) is not None and runtime_identity(record) == runtime_suite
         if not current and not runtime_compatible:
             continue
@@ -461,7 +506,7 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
                     if "c_compiler" in record:
                         provenance["c_compiler"] = record["c_compiler"]
                 else:
-                    provenance["compilation_protocol"] = record.get("compilation_protocol", COMPILATION_PROTOCOL)
+                    provenance["compilation_protocol"] = record.get("compilation_protocol", "core-million-modules-one-line-leaf-v1")
                 configuration = json.dumps(provenance, sort_keys=True)
                 key = (configuration, benchmark["mode"])
                 point = (record["commit"], "worktree" if record["worktree"] else "commit")
@@ -478,6 +523,9 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
         references = defaultdict(dict)
         for (case, lane), values in sorted(reference_samples.items()):
             spread = f"median of {len(values)}; min {min(values):.3f}, max {max(values):.3f} s"
+            metadata = next(sample for sample in reference_benchmark["samples"]
+                            if sample["case"] == case and sample["lane"] == lane and sample["phase"] == "runtime")
+            spread += sampling_note(metadata)
             reference_date = reference_record.get("c_reference", reference_record)["recorded_at"][:10]
             references[case][f"C {lane[1:]}"] = (statistics.median(values), reference_date + "\n" + spread)
         for record, benchmark in entries.values():
@@ -491,6 +539,9 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
             for key, values in samples.items():
                 unit = "s" if key[2] == "runtime" or key[0] == COMPILATION_CASE else "ms"
                 spread = f"median of {len(values)}; min {min(values):.3f}, max {max(values):.3f} {unit}"
+                metadata = next(sample for sample in benchmark["samples"]
+                                if (sample["case"], sample["lane"], sample["phase"]) == key)
+                spread += sampling_note(metadata)
                 measurements[key].append((positions[record["commit"]] + (0.35 if record["worktree"] else 0),
                                           statistics.median(values), description(record) + "\n" + spread))
         plots = defaultdict(dict)

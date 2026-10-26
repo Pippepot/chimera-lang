@@ -655,6 +655,10 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writer.writeAll("literal pattern has more than one matching type in ");
             try writeType(types, writer, type_id);
         },
+        .match_range_ambiguous => |type_id| {
+            try writer.writeAll("range pattern has more than one matching type in ");
+            try writeType(types, writer, type_id);
+        },
         .compile_time_panic => |message| {
             try writer.writeAll("panic during compile-time execution");
             const bytes = try types.byteString(message);
