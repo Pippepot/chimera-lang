@@ -9,7 +9,7 @@ const structures = @import("structures.zig");
 const value_operations = @import("value.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHISTD05";
+const format = "CHIMERASTD05";
 const Files = [standard_library.paths.len]structures.FileId;
 
 const Table = struct {

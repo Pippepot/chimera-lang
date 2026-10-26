@@ -928,6 +928,41 @@ test "native parallel backedge copies preserve cycles while falling through to e
     }
 }
 
+test "native acyclic backedge copies preserve both dependency directions" {
+    for ([_]bool{ false, true }) |backward| {
+        for ([_]i32{ 0, 1, 2, 3 }) |iterations| {
+            var arguments = [_]structures.FunctionBlockArgument{ .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int } };
+            var uses = [_]structures.FunctionValueUse{
+                .{ .value = @fromBackingInt(5) },  .{ .value = @fromBackingInt(6) },                       .{ .value = @fromBackingInt(7) },
+                .{ .value = @fromBackingInt(11) }, .{ .value = @fromBackingInt(if (backward) 2 else 10) }, .{ .value = @fromBackingInt(if (backward) 10 else 1) },
+                .{ .value = @fromBackingInt(1) },  .{ .value = @fromBackingInt(2) },
+            };
+            var instructions = [_]structures.FunctionInstruction{
+                integerConstant(iterations),    integerConstant(11),            integerConstant(31),                                                                                                                       integerConstant(0), integerConstant(1), integerConstant(7),
+                integerBinary(.subtract, 0, 9), integerBinary(.subtract, 3, 4), .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
+            };
+            var calls = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(12) } }};
+            var blocks = [_]structures.FunctionBlock{
+                .{ .instruction_start = 0, .instruction_end = 6, .terminator = .{ .branch = .{ .target = @fromBackingInt(1), .arguments = .{ .start = 0, .end = 3 } } } },
+                .{ .argument_end = 3, .instruction_start = 6, .instruction_end = 7, .terminator = .{ .predicate_branch = .{
+                    .operation = .gti,
+                    .operands = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(8) },
+                    .then_branch = .{ .target = @fromBackingInt(1), .arguments = .{ .start = 3, .end = 6 } },
+                    .else_branch = .{ .target = @fromBackingInt(2), .arguments = .{ .start = 6, .end = 8 } },
+                } } },
+                .{ .argument_start = 3, .argument_end = 5, .instruction_start = 7, .instruction_end = 9, .terminator = .diverge },
+            };
+            var body = functionSsa(&instructions, &blocks);
+            body.block_arguments = &arguments;
+            body.branch_arguments = &uses;
+            body.call_arguments = &calls;
+            var artifact = try codegen.compileFunction(&body, TestTypes{}, std.testing.allocator);
+            defer artifact.deinit(std.testing.allocator);
+            try expectArtifactExitCode(artifact, if (iterations == 0) 236 else if (iterations > 1) 0 else if (backward) 24 else 252);
+        }
+    }
+}
+
 test "native copies preserve byte tails and adjacent guards across the bulk threshold" {
     const allocator = std.testing.allocator;
     for ([_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 255, 256, 257 }) |count| {

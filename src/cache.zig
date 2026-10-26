@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const magic = "CHICACHE";
+const magic = "CHIMERACACHE";
 const format_version: u64 = 1;
 const header_len = magic.len + 32 + 8 + 32;
 const max_artifact_size = 512 * 1024 * 1024;
@@ -34,7 +34,7 @@ fn buildIdDigest() ?Key {
                 std.mem.eql(u8, bytes[name_start..name_end], "GNU\x00") and desc_size == 20)
             {
                 var hasher = Sha256.init(.{});
-                hasher.update("chi compiler build ID");
+                hasher.update("Chimera compiler build ID");
                 hasher.update(bytes[desc_start..desc_end]);
                 return hasher.finalResult();
             }

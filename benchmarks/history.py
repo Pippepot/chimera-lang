@@ -564,7 +564,7 @@ def main() -> None:
                     continue
                 if args.backfill_benchmarks and commit in attempted and not args.refresh_c:
                     continue
-                with tempfile.TemporaryDirectory(prefix="chi-history-") as directory:
+                with tempfile.TemporaryDirectory(prefix="chimera-history-") as directory:
                     snapshot = Path(directory)
                     if args.worktree:
                         identity = copy_worktree(snapshot, data)

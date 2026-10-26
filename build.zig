@@ -23,11 +23,11 @@ pub fn build(b: *std.Build) void {
     precompiler_module.addImport("standard_library", standard_library);
     const precompiler = b.addExecutable(.{ .name = "precompile-std", .root_module = precompiler_module });
     const precompile = b.addRunArtifact(precompiler);
-    const standard_bundle = precompile.addOutputFileArg("std.chi-artifact");
+    const standard_bundle = precompile.addOutputFileArg("std.chimera-artifact");
     root_module.addAnonymousImport("standard_bundle", .{ .root_source_file = standard_bundle });
 
     const compiler = b.addExecutable(.{
-        .name = "chi",
+        .name = "chimera",
         .root_module = root_module,
         .use_llvm = use_llvm,
     });
@@ -37,7 +37,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(compiler);
     run.addPassthruArgs();
-    const run_step = b.step("run", "Compile and run a Chi program");
+    const run_step = b.step("run", "Compile and run a Chimera program");
     run_step.dependOn(&run.step);
 
     const benchmark_compiler = b.createModule(.{

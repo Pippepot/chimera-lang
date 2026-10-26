@@ -8,7 +8,7 @@ explicitly, and run ordinary functions at compile time.
 
 ## A first look
 
-```chi
+```chimera
 func double(value: int) int
   return value * 2
 
@@ -29,7 +29,7 @@ ends the program with an exit code: this program exits with `42`.
 Sometimes a value has more than one possible type. A setting, for example, can
 hold an integer or be absent:
 
-```chi
+```chimera
 const limit: int | none = 42
 
 if const value: int = limit
@@ -54,7 +54,7 @@ the alternatives your program needs, including your own structs.
 Functions return ordinary values. An operation that may have no result can
 return an optional variant:
 
-```chi
+```chimera
 func divide(numerator: int, denominator: int) int | none
   if denominator == 0 -> return none
   return numerator / denominator
@@ -68,7 +68,7 @@ else
 Try `divide(84, 0)` to take the second branch. To keep the binding in the current
 scope, give it a mismatch handler that exits:
 
-```chi
+```chimera
 const quotient: int = divide(84, 2) else panic "division by zero"
 ```
 
@@ -82,7 +82,7 @@ selects a present `false` just as it selects a present `true`.
 
 Allocation APIs also return explicit optionals:
 
-```chi
+```chimera
 var numbers: List(int) = List(int).new(4) else panic "allocation refused"
 const _: unit = numbers.append(10) else panic "allocation refused"
 const _: unit = numbers.append(20) else panic "allocation refused"
@@ -94,7 +94,7 @@ checks bounds and panics; `get` returns an optional reference for explicit handl
 
 ## Compile-time code is still code
 
-```chi
+```chimera
 func square(value: int) int
   return value * value
 
@@ -112,7 +112,7 @@ version. Types can be built by compile-time functions too.
 Collection construction can expand a static shape while evaluating its elements
 at runtime:
 
-```chi
+```chimera
 const evens = [i * 2 static for i in 0..4]
 const combined = [0, ..evens, 8]
 const positives = [x for x in evens if x > 0]
@@ -125,7 +125,7 @@ a List. `List(int).collect([x for x in evens if x > 0])` instead returns
 Ranges use `..` for an exclusive end and `..=` for an inclusive end. Prefix `^n`
 counts back from the collection's initialized length:
 
-```chi
+```chimera
 const values = [10, 20, 30, 40]
 const last = values[^1]
 const tail = values[^2..]
@@ -139,7 +139,7 @@ they never wrap or clamp. Postfix `value^` still transfers ownership.
 
 ## Make change visible
 
-```chi
+```chimera
 func increment(mut value: int)
   value += 1
 
@@ -158,7 +158,7 @@ be used. Owned resources are cleaned up automatically.
 
 A `ref` binding aliases existing storage and inherits its permission:
 
-```chi
+```chimera
 var scores = [20, 21]
 if ref item: int = scores.get(1)
   item += 1

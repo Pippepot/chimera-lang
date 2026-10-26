@@ -9,6 +9,7 @@ Specification examples can describe planned features, not current support.
 
 ```sh
 zig build
+./zig-out/bin/chimera --help
 zig build run -- program.chi
 zig build run -- --help
 zig build run -- --workers=2 --disk-cache program.chi
@@ -61,7 +62,7 @@ runs load these results and native functions lazily, so inlining a bundled std
 function reuses its optimized body. Absent specializations compile normally.
 No adjacent std files or disk-cache flag are required.
 
-`--disk-cache` enables `.chi-cache/` beside the entry. A whole-program hit skips
+`--disk-cache` enables `.chimera-cache/` beside the entry. A whole-program hit skips
 analysis and linking; a changed program may reuse validated body and code
 snapshots. Keys include all loaded sources, module directories, and compiler
 identity. Damage and relevant edits fall back to compilation. Without the flag,

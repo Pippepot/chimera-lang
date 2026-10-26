@@ -43,7 +43,7 @@ pub const SourceFixture = struct {
 
     pub fn printDiagnostics(self: SourceFixture, entry: structures.FileId) !void {
         const source = (try self.db.input(queries.SourceText, entry)).*;
-        std.debug.print("Chi entry source:\n{s}\n", .{source});
+        std.debug.print("Chimera entry source:\n{s}\n", .{source});
         const diagnostics = try self.db.transitiveAccumulatorValues(queries.BuildExecutable, entry, structures.Diagnostic, std.testing.allocator);
         defer std.testing.allocator.free(diagnostics);
         for (diagnostics) |diagnostic| std.debug.print("file {d}: {any} at {any}\n", .{ diagnostic.file_id, diagnostic.kind, diagnostic.span });

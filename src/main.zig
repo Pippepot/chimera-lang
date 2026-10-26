@@ -345,7 +345,7 @@ pub fn main(init: std.process.Init) !void {
     const source_files = modules.readSources(io, arena, entry_dir, catalog.files) catch |read_error|
         try exitWithError(errors, "failed to read sources under '{s}': {s}", .{ entry_dir_path, @errorName(read_error) });
     const cache_directory = if (command_line.disk_cache_enabled)
-        try std.fs.path.join(arena, &.{ entry_dir_path, ".chi-cache" })
+        try std.fs.path.join(arena, &.{ entry_dir_path, ".chimera-cache" })
     else
         null;
 

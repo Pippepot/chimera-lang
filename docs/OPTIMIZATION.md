@@ -92,7 +92,9 @@ the same editable function.
 
 Instruction replacements are normalized at consuming pass boundaries, not both
 on producer exit and consumer entry. Canonicalization resolves replacements
-before collecting address-taken facts. An editable function reuses normalized
+before collecting address-taken facts, then normalizes consumers in its existing
+fixed-point traversal rather than rescanning the body between rounds.
+An editable function reuses normalized
 operands and address-taken facts until mutation invalidates them. Replacements,
 new values, operand-table edits, and changing passes invalidate operand facts;
 control-flow edits invalidate them alongside the graph. Normalization follows
@@ -207,6 +209,7 @@ representation. Ownership operations and addressable projections prevent this
 rewrite, so it introduces no fabricated owning values or references.
 Scalar-variant use facts are indexed once per join pass. Redundant parameters
 are removed together so each incoming argument list is rebuilt once per block.
+Scalar-variant consumer replacements share one body traversal and normalization.
 Join rewrites share conservative address-taking facts; newly created parameters
 and scalar instructions cannot introduce address exposure.
 
@@ -243,9 +246,10 @@ Arithmetic updates that register directly when the result shares a legal
 operand location; commutative operations may reuse either operand, subtraction
 only its left operand. Immediate updates use compact signed-byte encodings
 when possible. Division retains its fixed-register sequence.
-Each function saves and restores the registers it uses. Independent scalar edge
-copies bypass scratch storage; dependent copies still stage all sources before
-writing any destination. Comparisons produce canonical boolean values;
+Each function saves and restores the registers it uses. Scalar edge copies bypass
+scratch storage when forward or reverse order preserves every source. Cycles and
+unsupported copy shapes still stage all sources before writing any destination.
+Comparisons produce canonical boolean values;
 scalar selections use conditional moves. Fills use `rep stosb` or `rep stosd`,
 and directed copies use `rep movsb`, clearing the direction flag after a
 descending copy. Aggregate construction copies each field to its layout offset.
@@ -277,32 +281,46 @@ descending copy. Aggregate construction copies each field to its layout offset.
 - `InlineLimit` set to zero keeps calls out of line for tests about call
   structure and native artifact reuse.
 
+The 2026-10-26 full run of `zig build test --seed=0 -Doptimize=safe -j1`
+completed all 50 build steps: 2,091 tests passed and 24 skipped, without
+allocation-failure sweeps. Formatting checks and `git diff --check` also passed.
+
+## Measurements
+
+The 2026-10-26 follow-up compared the saved `30446e6` compiler with batched
+scalar-variant replacement, reduced scalar-replacement traversal, fused
+canonicalization normalization, and ordered scalar edge copies. ReleaseFast
+measurements used the unchanged [benchmark protocol](../benchmarks/README.md#measurement-protocol),
+without profiling or concurrent builds: one warm-up and three compilation
+samples per lane, and one warm-up and nine runtime samples. Serial compilation
+and runtime used CPU 4; eight workers used CPUs 4-11. All exit statuses and sieve
+outputs were checked.
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Million-line cold, zero workers | 31.226 s | 31.017 s |
+| Million-line leaf edit, zero workers | 216.6 ms | 222.7 ms |
+| Million-line cold, eight workers | 20.856 s | 20.287 s |
+| Million-line leaf edit, eight workers | 259.5 ms | 287.2 ms |
+| Million-line executable | 134.96 MB | 133.70 MB |
+| Sieve runtime | 1.375 s | 1.332 s |
+| Paired C `-O3` runtime | 1.033 s | 1.048 s |
+
+Sieve runtime improved about 3.1%; Chimera still takes about 27% longer than the
+current C `-O3` executable. Cold compilation gains are modest
+and leaf-edit medians regressed; this does not establish recovery of the older
+pre-refactor compilation regression. CPU sampling identified normalization and
+address-taking scans as substantial costs. A separate instrumented 10,000-line
+probe reduced canonicalization work from about 24 ms to 18 ms; that pass timing
+is not an end-to-end acceptance measurement.
+
 ## Remaining Work
 
-- Recover the remaining compilation regression without reducing optimization.
-  The CPU-4 matched million-line probe measured 18.89 s cold / 136.7 ms leaf edit
-  for the saved pre-refactor compiler and 21.76 s / 141.3 ms after join and backend
-  changes. Executable size fell from 177.8 MB to 135.0 MB. These are single
-  measured cold/edit pairs after warm-up, not full benchmark medians.
-  Subsequent shared inline-fact caching reduced the small probe's inlining work
-  from about 13.8 ms to 8.2 ms; repeat the million-line comparison for that state,
-  including eight-worker compilation. Join simplification remains a major cost.
-- Continue the C assembly comparison. The latest paired sieve medians were
-  2.264 s before the refactor, 1.036 s after terminal jump threading, and 0.570 s
-  for C `-O3`, with one warm-up and nine samples on CPU 4. The later direct-register
-  arithmetic change passed backend tests but has not been runtime-benchmarked.
-  C vectorizes final counting and uses a tighter marking loop. Chimera still
-  counts scalarly, retains bounds checks, reloads allocation bases, and stages
-  dependent edge copies. Preserve wrapping arithmetic and panic behavior when
-  pursuing bounds proofs, instruction selection, or vectorization; do not
-  special-case the sieve or weaken its checks.
-- Complete the routine safe test suite. Focused optimizer and backend suites
-  pass, including incremental inlining, scalar variants, wrapping arithmetic,
-  parallel copies, spills, and call preservation. The attempted full run did not
-  produce a completion summary, so cross-suite verification remains outstanding.
-  Use `zig build test --seed=0 -Doptimize=safe -j1` without allocation-failure sweeps.
-
-Local measurement artifacts are under `.history/loop-optimization/`, including
-`paired-before-compile.csv`, `paired-current-compile.csv`, `runtime.json`, probe
-profiles, generated assembly, and `full-tests-current.txt`. They are ignored
-experiment artifacts, not committed benchmark history.
+- Recover compilation throughput without reducing optimization, and investigate
+  the leaf-edit regression with matched profiles. Join simplification, repeated
+  operand facts, and executable publication remain candidates, not proven fixes.
+- Reduce the remaining C gap with general bounds proofs, allocation-base reuse,
+  instruction selection, or vectorization. C vectorizes final counting and uses
+  a tighter marking loop; Chimera still counts scalarly and retains bounds checks.
+  Preserve wrapping arithmetic and panic behavior; do not special-case the sieve
+  or weaken its checks.

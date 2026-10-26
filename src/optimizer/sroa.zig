@@ -180,7 +180,7 @@ const Rewriter = struct {
         if (self.lookupSlot(operand.*)) |slot| operand.* = slot.whole.?;
     }
 
-    fn prepare(self: *Rewriter, instruction: ?u32, block: u32) !void {
+    fn prepare(self: *Rewriter, instruction: ?u32, block: u32) !bool {
         self.epoch += 1;
         self.needed.clearRetainingCapacity();
         if (instruction) |index| {
@@ -188,6 +188,7 @@ const Rewriter = struct {
         } else function_ir.terminatorReadOperands(self.function, &self.function.blocks.items[block].terminator, self, observe);
         if (self.failed) return error.OutOfMemory;
         for (self.needed.items) |index| try self.assemble(&self.slots[index]);
+        return self.needed.items.len != 0;
     }
 };
 
@@ -223,7 +224,7 @@ fn replace(function: *Function, order: []const u32, mapping: []const ?u32, slots
                 },
                 .value_copy => |copy| if (copy.destination) |destination| {
                     if (rewriter.lookupSlot(destination)) |slot| {
-                        try rewriter.prepare(index, block_index);
+                        _ = try rewriter.prepare(index, block_index);
                         var source = copy.source;
                         rewriter.substitute(&source);
                         for (slot.parts, slot.fields, 0..) |part, field, field_index| {
@@ -236,14 +237,14 @@ fn replace(function: *Function, order: []const u32, mapping: []const ?u32, slots
                 },
                 else => {},
             }
-            try rewriter.prepare(index, block_index);
-            function_ir.readOperands(function, &function.instructions.items[index], &rewriter, Rewriter.substitute);
+            if (try rewriter.prepare(index, block_index))
+                function_ir.readOperands(function, &function.instructions.items[index], &rewriter, Rewriter.substitute);
             try rebuilt.append(scratch, index);
         }
         rewriter.span = function.blocks.items[block_index].span;
         rewriter.frame = function.blocks.items[block_index].frame;
-        try rewriter.prepare(null, block_index);
-        function_ir.terminatorReadOperands(function, &function.blocks.items[block_index].terminator, &rewriter, Rewriter.substitute);
+        if (try rewriter.prepare(null, block_index))
+            function_ir.terminatorReadOperands(function, &function.blocks.items[block_index].terminator, &rewriter, Rewriter.substitute);
         function.blocks.items[block_index].instructions = rebuilt;
     }
 }

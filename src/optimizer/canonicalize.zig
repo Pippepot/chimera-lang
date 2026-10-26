@@ -19,6 +19,7 @@ pub fn canonicalize(function: *Function) !function_ir.Changes {
         for (function.blocks.items) |block| for (block.instructions.items) |index| {
             if (function.removed.items[index]) continue;
             const instruction = &function.instructions.items[index];
+            function_ir.allOperands(function, instruction, function, Function.resolveOperand);
             const result = function.results.items[index];
             const original = instruction.*;
             if (try rules.simplify(instruction, result)) {
@@ -30,14 +31,13 @@ pub fn canonicalize(function: *Function) !function_ir.Changes {
             }
         };
         for (function.blocks.items) |*block| {
+            function_ir.terminatorAllOperands(function, &block.terminator, function, Function.resolveOperand);
             if (rules.simplifyTerminator(&block.terminator)) changed = true;
         }
         changes.changed = changes.changed or changed;
-        if (changed) {
-            function.invalidateOperands();
-            function.resolveReferences();
-        }
+        if (changed) function.invalidateOperands();
     }
+    function.operands_dirty = false;
     changes.control_flow = rules.graph_changed;
     return changes;
 }

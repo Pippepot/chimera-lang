@@ -830,9 +830,11 @@ fn FunctionEmitter(comptime Types: type) type {
             const destinations = self.plan.locations[target.argument_start..target.argument_end];
             std.debug.assert(arguments.len == parameters.len);
             if (arguments.len == 1) return self.emitBranchArgument(arguments[0], parameters[0].type_id, destinations[0], null);
-            if (self.independentBranchCopies(arguments, parameters, destinations)) {
-                for (arguments, parameters, destinations) |argument, parameter, destination|
-                    try self.emitBranchArgument(argument, parameter.type_id, destination, null);
+            if (self.branchCopyDirection(arguments, parameters, destinations)) |backward| {
+                for (0..arguments.len) |position| {
+                    const index = if (backward) arguments.len - position - 1 else position;
+                    try self.emitBranchArgument(arguments[index], parameters[index].type_id, destinations[index], null);
+                }
                 return;
             }
             // Several arguments may read each other's parameters, so all of them
@@ -852,19 +854,25 @@ fn FunctionEmitter(comptime Types: type) type {
             }
         }
 
-        fn independentBranchCopies(self: *Self, arguments: []const structures.FunctionValueUse, parameters: []const structures.FunctionBlockArgument, destinations: []const ValueLocation) bool {
-            for (arguments, parameters, destinations) |argument, parameter, destination| {
+        fn branchCopyDirection(self: *Self, arguments: []const structures.FunctionValueUse, parameters: []const structures.FunctionBlockArgument, destinations: []const ValueLocation) ?bool {
+            var forward = true;
+            var backward = true;
+            for (arguments, parameters, destinations, 0..) |argument, parameter, destination, index| {
                 if (destination == .discarded) continue;
-                if (argument.coerce_to != null or destination == .indirect) return false;
-                if (parameter.type_id != .int and parameter.type_id != .bool and parameter.type_id != .byte) return false;
+                if (argument.coerce_to != null or destination == .indirect) return null;
+                if (parameter.type_id != .int and parameter.type_id != .bool and parameter.type_id != .byte) return null;
                 const source = self.valueLocation(argument.value);
-                if (source == .indirect) return false;
+                if (source == .indirect) return null;
                 if (std.meta.eql(source, destination)) continue;
-                for (destinations) |other| {
-                    if (std.meta.eql(source, other)) return false;
+                for (destinations, 0..) |other, other_index| {
+                    if (!std.meta.eql(source, other)) continue;
+                    forward = forward and other_index > index;
+                    backward = backward and other_index < index;
                 }
             }
-            return true;
+            if (forward) return false;
+            if (backward) return true;
+            return null;
         }
 
         /// Writes one branch argument to its parameter, or to `scratch` when given.

@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIQRY45";
+const format = "CHIMERAQRY45";
 const max_records = 1_000_000;
 // Snapshot records name their interner, input, or query boundary by type name.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
@@ -700,7 +700,7 @@ test "query restore rejects obsolete IR formats" {
     const allocator = std.testing.allocator;
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
     defer db.deinit();
-    for ([_][]const u8{ "CHIQRY12", "CHIQRY18", "CHIQRY20" }) |obsolete|
+    for ([_][]const u8{ "CHIMERAQRY12", "CHIMERAQRY18", "CHIMERAQRY20" }) |obsolete|
         try std.testing.expectError(error.InvalidCache, restoreInterns(db, allocator, obsolete));
 }
 
@@ -1706,7 +1706,7 @@ test "cached storage joins reject mismatched types and coercion metadata" {
 test "snapshots reject the previous IR format" {
     const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
     defer db.deinit();
-    try std.testing.expectError(error.InvalidCache, restoreInterns(db, std.testing.allocator, "CHIQRY16"));
+    try std.testing.expectError(error.InvalidCache, restoreInterns(db, std.testing.allocator, "CHIMERAQRY16"));
 }
 
 test "array snapshot interns reject unavailable elements unsupported storage and oversized counts" {

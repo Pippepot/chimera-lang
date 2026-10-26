@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) void {
         precompiler_module.addImport("standard_library", standard_library);
         const precompiler = b.addExecutable(.{ .name = "history-precompile-std", .root_module = precompiler_module });
         const precompile = b.addRunArtifact(precompiler);
-        const bundle = precompile.addOutputFileArg("std.chi-artifact");
+        const bundle = precompile.addOutputFileArg("std.chimera-artifact");
         driver.addAnonymousImport("standard_bundle", .{ .root_source_file = bundle });
     }
     const executable = b.addExecutable(.{ .name = "history_benchmark", .root_module = driver, .use_llvm = true });

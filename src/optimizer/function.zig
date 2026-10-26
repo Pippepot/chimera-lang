@@ -349,7 +349,7 @@ pub const Function = struct {
         self.operands_dirty = false;
     }
 
-    fn resolveOperand(self: *Function, value: *ValueId) void {
+    pub fn resolveOperand(self: *Function, value: *ValueId) void {
         value.* = self.find(value.*);
     }
 };

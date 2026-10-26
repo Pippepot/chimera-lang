@@ -32,18 +32,18 @@ def run(
 
 
 def clear_query_snapshot(project: pathlib.Path) -> None:
-    for path in (project / ".chi-cache").iterdir():
+    for path in (project / ".chimera-cache").iterdir():
         if not path.is_file():
             continue
         with path.open("rb") as cached:
-            cached.seek(80)  # CHICACHE header
-            if cached.read(6) == b"CHIQRY":
+            cached.seek(len(b"CHIMERACACHE") + 32 + 8 + 32)
+            if cached.read(len(b"CHIMERAQRY")) == b"CHIMERAQRY":
                 path.unlink()
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("compiler", type=pathlib.Path, help="path to a chi binary built with -Doptimize=fast")
+    parser.add_argument("compiler", type=pathlib.Path, help="path to a Chimera binary built with -Doptimize=fast")
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--temp-dir", type=pathlib.Path, help="filesystem on which to create the benchmark fixture")
     args = parser.parse_args()
@@ -51,7 +51,7 @@ def main() -> None:
     if args.samples < 1:
         parser.error("--samples must be positive")
 
-    with tempfile.TemporaryDirectory(prefix="chi-parallel-", dir=args.temp_dir) as dirname:
+    with tempfile.TemporaryDirectory(prefix="chimera-parallel-", dir=args.temp_dir) as dirname:
         fixture_root = pathlib.Path(dirname)
         project = fixture_root / "big"
         project.mkdir()
@@ -62,7 +62,7 @@ def main() -> None:
         small_warm = []
         small_uncached = []
         for _ in range(args.samples):
-            shutil.rmtree(small / ".chi-cache", ignore_errors=True)
+            shutil.rmtree(small / ".chimera-cache", ignore_errors=True)
             small_cold.append(run(compiler, small, 2, expected_exit=0))
             small_warm.append(run(compiler, small, 2, expected_exit=0))
             small_uncached.append(run(compiler, small, 2, expected_exit=0, cache_enabled=False))
@@ -90,7 +90,7 @@ def main() -> None:
             warm = []
             uncached = []
             for _ in range(args.samples):
-                shutil.rmtree(project / ".chi-cache", ignore_errors=True)
+                shutil.rmtree(project / ".chimera-cache", ignore_errors=True)
                 cold.append(run(compiler, project, workers))
                 warm.append(run(compiler, project, workers))
                 uncached.append(run(compiler, project, workers, cache_enabled=False))
@@ -105,7 +105,7 @@ def main() -> None:
             (False, True),
             (False, False),
         ):
-            shutil.rmtree(project / ".chi-cache", ignore_errors=True)
+            shutil.rmtree(project / ".chimera-cache", ignore_errors=True)
             (project / "main.chi").write_text(entry)
             if cache_enabled:
                 run(compiler, project, 2)
@@ -115,7 +115,7 @@ def main() -> None:
                 if cache_enabled and not use_queries:
                     clear_query_snapshot(project)
                 edited.append(run(compiler, project, 2, (55 + value) % 256, cache_enabled=cache_enabled))
-            if not cache_enabled and (project / ".chi-cache").exists():
+            if not cache_enabled and (project / ".chimera-cache").exists():
                 raise RuntimeError("default run created a disk cache")
             print(
                 f"edited_cache={cache_enabled} queries={use_queries} "

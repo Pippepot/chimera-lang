@@ -87,6 +87,32 @@ test "unchanged nested aggregates leave loops while changing fields retain their
     }
 }
 
+test "scalar replacement copies split slots without aliasing their fields" {
+    const program =
+        \\struct Pair
+        \\    copy = trivial
+        \\    pub first: int
+        \\    pub second: int
+        \\func calculate(limit: int) int
+        \\    var source = Pair{first = 1, second = 2}
+        \\    var saved = Pair{first = 0, second = 0}
+        \\    var index = 0
+        \\    loop
+        \\        if index == limit -> break
+        \\        saved = source
+        \\        source.first += 1
+        \\        source.second += 2
+        \\        index += 1
+        \\    return saved.first * 10 + saved.second
+        \\func run() int -> calculate(4) + calculate(0) - 6
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "calculate")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{ .aggregate, .field_access, .local_storage }));
+}
+
 test "ordinary user cursor construction and polling simplify across loop joins" {
     const program =
         \\struct Cursor
@@ -185,6 +211,34 @@ test "scalar variant joins preserve distinct tags and inactive payloads" {
         \\        return 90
         \\    return 0
         \\func run() int -> calculate(0, 20) + calculate(1, 99) + calculate(2, 99)
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "calculate")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{ .variant_tag, .variant_extract }));
+}
+
+test "scalar variant joins batch independent and dependent consumers" {
+    const program =
+        \\func pick(mode: int, number: int) int | bool | none
+        \\    if mode == 0 -> return number
+        \\    if mode == 1 -> return true
+        \\    return none
+        \\func calculate(mode: int, number: int) int
+        \\    const first = pick(mode, number)
+        \\    const second = pick(2 - mode, number + 1)
+        \\    var result = 0
+        \\    if const integer: int = first -> result += integer
+        \\    if const flag: bool = first
+        \\        if flag -> result += 10
+        \\    if const integer: int = second -> result += integer
+        \\    if const flag: bool = second
+        \\        if flag -> result += 10
+        \\    const third = pick(mode, result)
+        \\    if const integer: int = third -> return integer
+        \\    return result
+        \\func run() int -> calculate(0, 10) + calculate(1, 99) + calculate(2, 11)
     ;
     try Fixture.expectParity(program, 42);
     const fixture = try Fixture.init(program);

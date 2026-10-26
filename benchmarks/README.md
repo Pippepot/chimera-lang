@@ -117,8 +117,8 @@ records, not on the new compilation curves. Their timings are not comparable.
 Small generator/semantic checks, without recording misleading million-line points:
 
 ```sh
-zig test benchmarks/history_workload.zig --test-no-exec -femit-bin=/tmp/chi-history-workload-test
-/tmp/chi-history-workload-test --seed=0
+zig test benchmarks/history_workload.zig --test-no-exec -femit-bin=/tmp/chimera-history-workload-test
+/tmp/chimera-history-workload-test --seed=0
 zig build history-benchmark --seed=0 -j1 -Doptimize=fast -- --case=core-1000000 --lines=1000 --samples=1
 ```
 
@@ -212,7 +212,7 @@ remain in raw records and are not joined to the new runtime curve.
 
 The equivalent [C sieve](history_runtime.c) uses the same algorithm, signed 32-bit
 integer array, input, output, correctness probes, warm-up, and process timer.
-This matches Chi's `int`; the old C reference used a wider 64-bit array.
+This matches Chimera's `int`; the old C reference used a wider 64-bit array.
 The system `cc` builds it at `-O0` and `-O3`, outside the timer;
 these snapshots require a C11 compiler on `PATH`. Each level gets nine samples.
 The latest matching run's C medians appear as two labelled horizontal runtime
@@ -237,15 +237,17 @@ Optimization levels are not guaranteed to improve monotonically.
 Assembly inspection confirms that optimized C still executes the factor and
 multiple-marking loops. GCC replaces elementwise zeroing with `memset` and
 vectorizes the final count; it does not substitute a precomputed prime count.
-The generated Chi code inlines List indexing, fills with `rep stosd`, and keeps
+The generated Chimera code inlines List indexing, fills with `rep stosd`, and keeps
 unchanged List descriptors outside the marking and counting loops. Scalar
 iterator results use separate tag and payload values, and eligible loop scalars
 use preserved registers with in-place arithmetic at last-use operand reuse.
+Scalar edge copies run without staging when forward or reverse order preserves
+their sources; cycles and unsupported shapes retain scratch storage.
 Constant incoming predicates can bypass independent terminal exits instead of
 materializing exhausted iterator joins. Bounds checks and scalar counting remain
 in the hot loops. These are concrete code-generation/library differences, not evidence
 of C skipping the requested computation. ReleaseFast optimizes the Zig compiler
-itself, not the generated Chi program through LLVM.
+itself, not the generated Chimera program through LLVM.
 
 The suite does not measure CLI file discovery/startup, multi-worker scaling,
 peak RSS, or broad application runtime. Those need separate versioned workloads.
@@ -298,8 +300,8 @@ For CLI worker scaling and warm/edited disk reuse:
 
 ```sh
 zig build -Doptimize=fast
-python3 benchmarks/parallel.py zig-out/bin/chi
-python3 benchmarks/parallel.py zig-out/bin/chi --temp-dir .
+python3 benchmarks/parallel.py zig-out/bin/chimera
+python3 benchmarks/parallel.py zig-out/bin/chimera --temp-dir .
 ```
 
 The linker build ID identifies stripped Fast compiler binaries cheaply. Measure

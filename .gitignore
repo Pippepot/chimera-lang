@@ -4,8 +4,8 @@ chimera.asm
 chimera.o
 zig-out/
 .zig-cache/
-.chi-cache/
-.chi-run-*
+.chimera-cache/
+.chimera-run-*
 .history/
 __pycache__/
 *.qcache

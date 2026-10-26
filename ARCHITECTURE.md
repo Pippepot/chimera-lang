@@ -731,7 +731,7 @@ Allocation-backed cursors compare the allocation's logical identity and frozen
 contents across copied descriptors; inline backing retains its original cell identity.
 Literal-backed readonly byte cursors and references instead publish symbolic
 interner IDs and checked offsets. Copying and permission attenuation retain the
-typed destination's cursor identity before publication. Snapshot format CHIQRY45
+typed destination's cursor identity before publication. Snapshot format CHIMERAQRY45
 validates their nominal standard identity, permission, bounds, and operation types, including source-free
 intern restoration; transient storage addresses are never persisted.
 

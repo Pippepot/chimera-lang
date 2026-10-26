@@ -62,6 +62,7 @@ fn splitScalarVariants(parameters: *ParameterSimplifier) !bool {
     const function = parameters.function;
     const graph = (try function.controlFlowEdges()).*;
     var uses: ?[]const VariantUses = null;
+    var replacements: ?[]?ScalarVariant = null;
     var changed = false;
     for (graph.order) |block| {
         if (block == function.entry) continue;
@@ -80,10 +81,20 @@ fn splitScalarVariants(parameters: *ParameterSimplifier) !bool {
             } else {
                 const taken = try parameters.addressTaken();
                 if (taken[@backingInt(parameter)]) continue;
-                if (uses == null) uses = try scalarVariantUses(function, taken);
-                if (try splitScalarVariant(function, block, position, parameter, edges, uses.?[@backingInt(parameter)])) changed = true;
+                if (uses == null) {
+                    uses = try scalarVariantUses(function, taken);
+                    replacements = try function.scratch.alloc(?ScalarVariant, function.valueCount());
+                    @memset(replacements.?, null);
+                }
+                const replacement = try splitScalarVariant(function, block, position, edges, uses.?[@backingInt(parameter)]) orelse continue;
+                replacements.?[@backingInt(parameter)] = replacement;
+                changed = true;
             }
         }
+    }
+    if (changed) {
+        replaceScalarVariants(function, replacements.?);
+        function.resolveReferences();
     }
     return changed;
 }
@@ -117,8 +128,13 @@ fn scalarVariantUses(function: *Function, taken: []const bool) ![]const VariantU
     return uses;
 }
 
-fn splitScalarVariant(function: *Function, block: u32, position: usize, parameter: ValueId, edges: []const Incoming, uses: VariantUses) !bool {
-    if (uses.accepted == 0 or uses.references != uses.accepted) return false;
+const ScalarVariant = struct {
+    tag: ValueId,
+    payloads: [scalar_types.len]?ValueId,
+};
+
+fn splitScalarVariant(function: *Function, block: u32, position: usize, edges: []const Incoming, uses: VariantUses) !?ScalarVariant {
+    if (uses.accepted == 0 or uses.references != uses.accepted) return null;
     const tag = try function.addParameter(block, .{ .type_id = .int });
     var parameters: [scalar_types.len]?ValueId = @splat(null);
     for (uses.payloads, scalar_types, &parameters) |needed, type_id, *value| {
@@ -150,21 +166,29 @@ fn splitScalarVariant(function: *Function, block: u32, position: usize, paramete
         };
         branch.arguments = try function.appendBranchArguments(arguments.items);
     }
+    try function.removeParameter(block, position, edges);
+    return .{ .tag = tag, .payloads = parameters };
+}
+
+fn replaceScalarVariants(function: *Function, replacements: []const ?ScalarVariant) void {
     for (function.blocks.items) |body| for (body.instructions.items) |index| {
         if (function.removed.items[index]) continue;
         const instruction = function.instructions.items[index];
         const result = function.results.items[index];
-        const replacement: ValueId = switch (instruction) {
-            .variant_tag => |operand| if (operand == parameter) tag else continue,
-            .variant_extract => |extraction| if (extraction.operand == parameter) parameters[std.mem.indexOfScalar(structures.TypeId, &scalar_types, extraction.target_type).?].? else continue,
+        const operand = switch (instruction) {
+            .variant_tag => |operand| operand,
+            .variant_extract => |extraction| extraction.operand,
             else => continue,
+        };
+        const split = replacements[@backingInt(operand)] orelse continue;
+        const replacement: ValueId = switch (instruction) {
+            .variant_tag => split.tag,
+            .variant_extract => |extraction| split.payloads[std.mem.indexOfScalar(structures.TypeId, &scalar_types, extraction.target_type).?].?,
+            else => unreachable,
         };
         function.replace(result, replacement);
         function.removed.items[index] = true;
     };
-    try function.removeParameter(block, position, edges);
-    function.resolveReferences();
-    return true;
 }
 
 // A merge of injections of one alternative can carry its payload directly.
