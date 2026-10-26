@@ -8,6 +8,14 @@ Settle missing semantics before implementation. Each milestone covers
 diagnostics, execution, ownership, and incremental/cache behavior. Legacy parity
 is not a goal.
 
+## Deferred flow typing integration
+
+Complete the unfinished flow typing implementation and source migration before
+considering it accepted. Ownership/lifetime invariants, failing suites, diagnostics,
+cache verification, and performance comparisons remain open. See the
+[handoff and failure inventory](docs/FLOW_TYPING_HANDOFF.md) for the concrete work.
+Fixes are deferred at the user's request.
+
 ## Immediate engineering priority
 
 Reduce frontend compilation time before further runtime or machine-stage
@@ -105,8 +113,7 @@ not gate collections or basic algorithms.
 - Result-correlated mutation provenance: preserve per-alternative output effects
   through forwarding, saved results, later writes, loop joins, and cached contracts.
   Until then, caller-visible output dependencies merge all ordinary return paths.
-- Contextual enum shorthand (`.Red`) and smart casts after variant checks;
-  define name resolution, narrowing, and invalidation by mutation.
+- Contextual enum shorthand (`.Red`); define name resolution and inference.
 - Generator suspension/yield syntax only if ordinary cursor composition proves
   insufficient; preserve item ownership, lending lifetimes, and failure effects.
 - Publication of compile-time allocations into static/runtime storage: define

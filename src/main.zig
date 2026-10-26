@@ -733,9 +733,12 @@ test "CLI supports compile-time allocation with scalar publication" {
         .source_path = "allocation.chi",
         .source =
         \\func compute() int | none
-        \\  const owner: Box(int) = Box.new(42) else return none
+        \\  const owner = Box.new(42)
+        \\  if not (owner is Box(int)) -> return none
         \\  return owner.borrow()
-        \\static answer = (if const _selected_result_0: int = compute() -> _selected_result_0 else panic "unexpected none")
+        \\static answer = ((match compute()
+        \\    _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\    _ -> panic "unexpected none"))
         \\exit(answer)
         ,
         .program_args = &.{},

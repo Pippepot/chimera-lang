@@ -6,6 +6,9 @@ Chimera brings native code and checked ownership to a small, expressive syntax.
 Describe optional values and errors with variants, bind their alternatives
 explicitly, and run ordinary functions at compile time.
 
+Flow typing is unfinished; see the [implementation handoff](docs/FLOW_TYPING_HANDOFF.md)
+for known failures and remaining work.
+
 ## A first look
 
 ```chimera
@@ -59,33 +62,35 @@ func divide(numerator: int, denominator: int) int | none
   if denominator == 0 -> return none
   return numerator / denominator
 
-if const quotient: int = divide(84, 2)
+const quotient = divide(84, 2)
+if quotient is int
   exit(quotient)
 else
   exit(1)
 ```
 
-Try `divide(84, 0)` to take the second branch. To keep the binding in the current
-scope, give it a mismatch handler that exits:
+Try `divide(84, 0)` to take the second branch. A negative guard also refines
+later reads when its failure branch exits:
 
 ```chimera
-const quotient: int = divide(84, 2) else panic "division by zero"
+const quotient = divide(84, 2)
+if not (quotient is int) -> panic "division by zero"
+print(quotient)
 ```
 
-A plain `const result = divide(84, 2)` stores the complete `int | none` value.
-Use `T | Error` or `T | none | Error` when you need informative error alternatives.
-The same typed patterns work in match arms, for example `error: Error -> ...`.
-
-Comparisons and logical `and`, `or`, and `not` produce `bool`. A plain `if` tests
-that Boolean; optionals have no truthiness. A typed binding of `bool | none`
-selects a present `false` just as it selects a present `true`.
+The declaration stores `int | none`; the successful branch reads its `int`
+payload. Assignment still accepts the declared type. `is` returns a normal
+Boolean and introduces no names. Type patterns in `match` refine the matched
+place in the same way. Use `T | Error` for informative error alternatives.
+Comparisons and `and`, `or`, and `not` produce `bool`; optionals have no truthiness.
 
 Allocation APIs also return explicit optionals:
 
 ```chimera
-var numbers: List(int) = List(int).new(4) else panic "allocation refused"
-const _: unit = numbers.append(10) else panic "allocation refused"
-const _: unit = numbers.append(20) else panic "allocation refused"
+var numbers = List(int).new(4)
+if not (numbers is List(int)) -> panic "allocation refused"
+if not (numbers.append(10) is unit) -> panic "allocation refused"
+if not (numbers.append(20) is unit) -> panic "allocation refused"
 print(numbers[0])
 ```
 

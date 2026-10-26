@@ -43,7 +43,9 @@ test "patterns copy existing owners and preserve independent reference authority
         \\    const [ref x, var y] = values
         \\    x += 1
         \\    y -= 1
-        \\    if const first: int = values.get(0) -> return first + y
+        \\    match values.get(0)
+        \\        first and first is int -> return first + y
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -124,7 +126,9 @@ test "fresh and explicitly transferred Lists destructure noncopyable elements" {
     , 42);
     try Fixture.expectParity(
         \\func run() int
-        \\    if const [a, b] = (if const _selected_result_0: List(int) = List(int).from([19, 23]) -> _selected_result_0^ else panic "unexpected none") -> return a + b
+        \\    if const [a, b] = ((match List(int).from([19, 23])
+        \\        _selected_result_0 and _selected_result_0 is List(int) -> _selected_result_0^
+        \\        _ -> panic "unexpected none")) -> return a + b
         \\    return 90
     , 42);
 }
@@ -151,7 +155,11 @@ test "patterns drop ignored and extracted owners exactly once" {
         \\func run() int
         \\    var trace = 0
         \\    if true
-        \\        const (a, _) = (Item{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), value = 19}, Item{trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else panic "unexpected none"), value = 23})
+        \\        const (a, _) = (Item{trace = ((match Ref.from(trace)
+        \\            _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\            _ -> panic "unexpected none")), value = 19}, Item{trace = ((match Ref.from(trace)
+        \\                _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
+        \\                _ -> panic "unexpected none")), value = 23})
         \\    return trace
     , 42);
     try Fixture.expectParity(
@@ -163,7 +171,11 @@ test "patterns drop ignored and extracted owners exactly once" {
         \\func run() int
         \\    var trace = 0
         \\    if true
-        \\        const [a, _] = [Item{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), value = 19}, Item{trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else panic "unexpected none"), value = 23}]
+        \\        const [a, _] = [Item{trace = ((match Ref.from(trace)
+        \\            _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\            _ -> panic "unexpected none")), value = 19}, Item{trace = ((match Ref.from(trace)
+        \\                _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
+        \\                _ -> panic "unexpected none")), value = 23}]
         \\    return trace
     , 42);
 }
@@ -172,8 +184,12 @@ test "runtime and static comprehensions destructure nested item shapes" {
     try Fixture.expectParity(
         \\func run() int
         \\    const values = [x + y for (x, y) in [(19, 1), (20, 2)]]
-        \\    if const a: int = values.get(0)
-        \\        if const b: int = values.get(1) -> return a + b
+        \\    match values.get(0)
+        \\        a and a is int ->
+        \\            match values.get(1)
+        \\                b and b is int -> return a + b
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
     , 42);
     try Fixture.expectParity(
@@ -265,7 +281,9 @@ test "nested pattern failure cleans all owners and preserves borrowed sources" {
         \\    return (Item{trace = trace, value = 10}, [Item{trace = trace, value = 12}, Item{trace = trace, value = 20}])
         \\func run() int
         \\    var trace = 0
-        \\    if const (first, [second]) = produce((if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")) -> return 90
+        \\    if const (first, [second]) = produce(((match Ref.from(trace)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none"))) -> return 90
         \\    return trace
     , 42);
     try Fixture.expectParity(
@@ -306,7 +324,9 @@ test "loop pattern carriers keep immovable payloads in place and clean early exi
         \\        return (Item{trace = self.trace, value = 19}, Item{trace = self.trace, value = 23})
         \\func run() int
         \\    var trace = 0
-        \\    for (ref a, ref b) in Cursor{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")}
+        \\    for (ref a, ref b) in Cursor{trace = ((match Ref.from(trace)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none"))}
         \\        if a.value + b.value <> 42 -> return 90
         \\        break
         \\    return trace
@@ -323,7 +343,11 @@ test "counted List transfer keeps captured references and drops each moved eleme
         \\func run() int
         \\    var trace = 0
         \\    if true
-        \\        const values: List(Item) = [Item{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), value = 19}, Item{trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else panic "unexpected none"), value = 23}]
+        \\        const values: List(Item) = [Item{trace = ((match Ref.from(trace)
+        \\            _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\            _ -> panic "unexpected none")), value = 19}, Item{trace = ((match Ref.from(trace)
+        \\                _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
+        \\                _ -> panic "unexpected none")), value = 23}]
         \\        if const [first, _] = values^
         \\            ()
         \\        else

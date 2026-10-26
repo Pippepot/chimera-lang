@@ -1,0 +1,15 @@
+Later focused match run (after part of fixture cleanup):
+38/66 match_test.test.guarded match catch all copies retain feasible cleanup without changing their type...
+thread 453707 panic: reached unreachable code
+Unwind error at address `/tmp/chimera-flow-tests:0x11693ed` (unwind info unavailable), remaining frames may be incorrect
+/home/pippe/.local/share/mise/installs/zig/0.17.0/lib/std/debug.zig:442:14: 0x125a559 in assert (std.zig)
+src/frontend/lifetime.zig:538:33: 0x162d87e in applyEndings (test_sources.zig)
+src/frontend/lifetime.zig:523:57: 0x16301e2 in scanOpenBlock (test_sources.zig)
+src/frontend/lifetime.zig:501:31: 0x162bb98 in validateEndingApplications (test_sources.zig)
+src/frontend/lifetime.zig:490:40: 0x162b546 in validatePathComplete (test_sources.zig)
+src/frontend/lifetime.zig:144:34: 0x159f533 in solve (test_sources.zig)
+src/frontend/typing.zig:10714:29: 0x159f890 in analyzeLifetimes (test_sources.zig)
+src/frontend/typing.zig:739:42: 0x15b0514 in prepareAnalysis (test_sources.zig)
+src/frontend/typing.zig:719:37: 0x15b9295 in finishAnalysis (test_sources.zig)
+
+This run preceded the last scalar-projection and binding-version edits.

@@ -43,12 +43,16 @@ test "indexed remainder assignment uses checked getter and owned replacement" {
         \\func calculate() int | none
         \\    var values = [17, 23]
         \\    values[0] %= 5
-        \\    if ref value: int = values.get(9)
-        \\        value %= 5
-        \\        return 90
+        \\    match values.get(9)
+        \\        ref value and value is int ->
+        \\            value %= 5
+        \\            return 90
+        \\        _ -> ()
         \\    return values[0] + 40
         \\func run() int
-        \\    if const answer: int = calculate() -> return answer
+        \\    match calculate()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -69,22 +73,30 @@ test "end relative indexing preserves eager setters and bounds first compound as
         \\    var calls = 0
         \\    const index = ^distance(calls)
         \\    const next = replacement(calls)
-        \\    if ref value: int = values.get(index)
-        \\        value = next
-        \\        return 90
+        \\    match values.get(index)
+        \\        ref value and value is int ->
+        \\            value = next
+        \\            return 90
+        \\        _ -> ()
         \\    if not (calls == 11) -> return none
-        \\    if ref value: int = values.get(^distance(calls))
-        \\        value += replacement(calls)
-        \\        return 91
+        \\    match values.get(^distance(calls))
+        \\        ref value and value is int ->
+        \\            value += replacement(calls)
+        \\            return 91
+        \\        _ -> ()
         \\    if not (calls == 12) -> return none
-        \\    if const selected_index: int = missing(calls)
-        \\        values[^selected_index] = replacement(calls)
-        \\        return 92
+        \\    match missing(calls)
+        \\        selected_index and selected_index is int ->
+        \\            values[^selected_index] = replacement(calls)
+        \\            return 92
+        \\        _ -> ()
         \\    if not (calls == 112) -> return none
         \\    values[^1] += 2
         \\    return values[^1]
         \\func run() int
-        \\    if const result: int = inspect() -> return result
+        \\    match inspect()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 93
     , 42);
 }
@@ -106,7 +118,9 @@ test "end relative setters preserve contextual byte conversion" {
         \\    items[^1] = 22
         \\    return byte_int(items[0]) + byte_int(items[^1])
         \\func run() int
-        \\    if const result: int = inspect() -> return result
+        \\    match inspect()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -440,15 +454,22 @@ test "operation functions user indexers and qualified explicit bracket calls hav
         \\    return ()
         \\func calculate() int | none
         \\    var value = Value{value = 19}
-        \\    const initial: int = value[0] else return none
+        \\    const initial = value[0]
+        \\    if not (initial is int) -> return none
         \\    value[0] = initial + 2
         \\    Value.[]=(value, 0, 21)
-        \\    if const invalid: int = value[1] -> return 91
-        \\    const first: int = Value.[](value, 0) else return none
-        \\    const second: int = value[0] else return none
+        \\    match value[1]
+        \\        invalid and invalid is int -> return 91
+        \\        _ -> ()
+        \\    const first = Value.[](value, 0)
+        \\    if not (first is int) -> return none
+        \\    const second = value[0]
+        \\    if not (second is int) -> return none
         \\    return first + second
         \\func run() int
-        \\    if const calculated: int = calculate() -> return calculated
+        \\    match calculate()
+        \\        calculated and calculated is int -> return calculated
+        \\        _ -> ()
         \\    return 90
     , 42);
 }

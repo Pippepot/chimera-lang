@@ -103,8 +103,10 @@ test "panic snapshots borrowed sliced and heap-backed text" {
     const source =
         \\func stop() never | none
         \\    var message = "prefix: hé"
-        \\    const _: unit = message.append("\0suffix") else return none
-        \\    const view: StringView = message.view().slice(8..message.byte_length()) else return none
+        \\    const checked_value_1 = message.append("\0suffix")
+        \\    if not (checked_value_1 is unit) -> return none
+        \\    const view = message.view().slice(8..message.byte_length())
+        \\    if not (view is StringView) -> return none
         \\    panic view
         \\stop()
     ;
@@ -112,8 +114,10 @@ test "panic snapshots borrowed sliced and heap-backed text" {
     const fixture = try SourceFixture.init(
         \\func stop() never | none
         \\    var message = "prefix: hé"
-        \\    const _: unit = message.append("\0suffix") else return none
-        \\    const view: StringView = message.view().slice(8..message.byte_length()) else return none
+        \\    const checked_value_1 = message.append("\0suffix")
+        \\    if not (checked_value_1 is unit) -> return none
+        \\    const view = message.view().slice(8..message.byte_length())
+        \\    if not (view is StringView) -> return none
         \\    panic view
         \\static result = stop()
         \\exit(result)
@@ -168,7 +172,9 @@ test "panic ignores prelude exclusions and lexical names and remains execution l
 test "panic traces outlined initializers and imported functions" {
     try expectPanic(
         \\func accept(init value: int) int | none -> value
-        \\if const value: int = accept(panic "initializer") -> exit(value) else exit(91)
+        \\match accept(panic "initializer")
+        \\    value and value is int -> exit(value)
+        \\    _ -> exit(91)
     , "initializer", &.{ "at <entry> ", "at accept ", "at <entry> " });
     const fixture = try SourceFixture.initFiles("import lib\nlib.stop()", &.{.{
         .path = "lib/stop.chi",
@@ -214,7 +220,8 @@ test "panic snapshots inline byte-array backing" {
     const declarations =
         \\func stop() never | none
         \\    const bytes: Array(byte, 3) = [65, 0, 66]
-        \\    const message: StringView = BytesView.from_array(3, bytes).validate_utf8() else return none
+        \\    const message = BytesView.from_array(3, bytes).validate_utf8()
+        \\    if not (message is StringView) -> return none
         \\    panic message
     ;
     const native_source = try std.testing.allocator.print("{s}\nstop()", .{declarations});
@@ -230,7 +237,9 @@ test "panic snapshots inline byte-array backing" {
 test "ordinary failure while evaluating a panic message precedes panic" {
     try SourceFixture.expectParity(
         \\func message() StringView | none -> return none
-        \\func stop() int | none -> panic (if const _selected_result_0: StringView = message() -> _selected_result_0 else return none)
+        \\func stop() int | none -> panic ((match message()
+        \\    _selected_result_0 and _selected_result_0 is StringView -> _selected_result_0
+        \\    _ -> return none))
         \\func run() int
         \\    if (stop() is int) -> return 90
         \\    return 42

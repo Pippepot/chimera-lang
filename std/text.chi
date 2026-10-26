@@ -11,7 +11,8 @@ pub struct BytesView
     data: Span(byte)
     pub func from_array(static N: int, ref value: Array(byte, N)) BytesView -> BytesView{data = Span(byte).from_array(N, value).as_imm()}
     pub func unsafe_from_allocation(ref value: Allocation(byte), initialized: int) BytesView | none
-        const view: Span(byte) = Span(byte).unsafe_from_allocation(value, initialized) else return none
+        const view = Span(byte).unsafe_from_allocation(value, initialized)
+        if not (view is Span(byte)) -> return none
         return BytesView{data = view.as_imm()}
     pub func from_span(imm span: Span(byte)) BytesView -> BytesView{data = span.as_imm()}
     pub func as_span(imm self: BytesView) Span(byte) -> self.data.as_imm()
@@ -21,17 +22,23 @@ pub struct BytesView
     func get_from_end(imm self: BytesView, index: FromEnd) ref byte | none -> self.data.get(index)
     pub overload get(get_at, get_from_end)
     func at(imm self: BytesView, index: int) ref byte
-        ref item: byte = self.get(index) else panic "BytesView index out of bounds"
+        const selected_item_2 = self.get(index)
+        if not (selected_item_2 is byte) -> panic "BytesView index out of bounds"
+        ref item = selected_item_2
         return item
     func at_from_end(imm self: BytesView, index: FromEnd) ref byte
-        ref item: byte = self.get(index) else panic "BytesView index out of bounds"
+        const selected_item_3 = self.get(index)
+        if not (selected_item_3 is byte) -> panic "BytesView index out of bounds"
+        ref item = selected_item_3
         return item
     func slice_at(imm self: BytesView, bounds: Range) BytesView
-        const view: BytesView = self.slice(bounds) else panic "BytesView slice out of bounds"
+        const view = self.slice(bounds)
+        if not (view is BytesView) -> panic "BytesView slice out of bounds"
         return view
     pub overload [](at, at_from_end, slice_at)
     pub func slice(imm self: BytesView, bounds: Range) BytesView | none
-        const view: Span(byte) = self.data.slice(bounds) else return none
+        const view = self.data.slice(bounds)
+        if not (view is Span(byte)) -> return none
         return BytesView{data = view}
     pub func validate_utf8(imm self: BytesView) StringView | none
         var index = 0
@@ -74,11 +81,13 @@ pub struct StringView
     pub func byte_length(imm self: StringView) int -> self.bytes.byte_length()
     pub func as_bytes(imm self: StringView) BytesView -> self.bytes
     func slice_at(imm self: StringView, bounds: Range) StringView
-        const view: StringView = self.slice(bounds) else panic "StringView slice out of bounds"
+        const view = self.slice(bounds)
+        if not (view is StringView) -> panic "StringView slice out of bounds"
         return view
     pub overload [](slice_at)
     pub func slice(imm self: StringView, bounds: Range) StringView | none
-        const offsets: (int, int) = bounds.resolve(self.byte_length()) else return none
+        const offsets = bounds.resolve(self.byte_length())
+        if not (offsets is (int, int)) -> return none
         const start = offsets.0
         const end = offsets.1
         if start < self.byte_length()
@@ -87,7 +96,8 @@ pub struct StringView
         if end < self.byte_length()
             const last = byte_int(self.bytes[end])
             if last >= 128 and last < 192 -> return none
-        const view: BytesView = self.bytes.slice(bounds) else return none
+        const view = self.bytes.slice(bounds)
+        if not (view is BytesView) -> return none
         return StringView{bytes = view}
 
 pub struct StaticString
@@ -109,23 +119,27 @@ pub struct String
     pub func ==(imm left: String, imm right: StringView) bool -> equal_bytes(left.as_bytes(), right.as_bytes())
     pub func <>(imm left: String, imm right: StringView) bool -> not equal_bytes(left.as_bytes(), right.as_bytes())
     pub func from_utf8(imm bytes: BytesView) String | none
-        const text: StringView = bytes.validate_utf8() else return none
+        const text = bytes.validate_utf8()
+        if not (text is StringView) -> return none
         var result = String.empty()
-        const _: unit = result.append(text) else return none
+        const selected_result_10 = result.append(text)
+        if not (selected_result_10 is unit) -> return none
         return result^
     pub func empty() String -> String{storage = ""}
     pub func byte_length(imm self: String) int
-        if const literal: StaticString = self.storage -> return literal.byte_length()
-        if ref owned: OwnedBytes = self.storage -> return owned.size
+        if self.storage is StaticString -> return self.storage.byte_length()
+        if self.storage is OwnedBytes -> return self.storage.size
         panic "invalid String storage"
     pub func capacity(imm self: String) int
-        if const literal: StaticString = self.storage -> return literal.byte_length()
-        if ref owned: OwnedBytes = self.storage -> return owned.allocation.capacity()
+        if self.storage is StaticString -> return self.storage.byte_length()
+        if self.storage is OwnedBytes -> return self.storage.allocation.capacity()
         panic "invalid String storage"
     pub func as_bytes(imm self: String) BytesView
-        if const literal: StaticString = self.storage -> return literal.as_bytes()
-        if ref owned: OwnedBytes = self.storage
-            const bytes: BytesView = BytesView.unsafe_from_allocation(owned.allocation, owned.size) else panic "invalid String byte view"
+        if self.storage is StaticString -> return self.storage.as_bytes()
+        if self.storage is OwnedBytes
+            ref owned = self.storage
+            const bytes = BytesView.unsafe_from_allocation(owned.allocation, owned.size)
+            if not (bytes is BytesView) -> panic "invalid String byte view"
             return bytes
         panic "invalid String storage"
     pub func view(imm self: String) StringView -> StringView{bytes = self.as_bytes()}
@@ -135,7 +149,8 @@ pub struct String
         const size = self.byte_length()
         var capacity = minimum_capacity
         if capacity < size -> capacity = size
-        const storage: Allocation(byte) = allocate(byte, capacity) else return none
+        const storage = allocate(byte, capacity)
+        if not (storage is Allocation(byte)) -> return none
         var replacement = OwnedBytes{allocation = storage^, size = 0}
         const bytes = self.as_bytes()
         var index = 0
@@ -157,9 +172,11 @@ pub struct String
             if capacity <= 1073741823 -> capacity *= 2
             else capacity = 2147483647
             if capacity < required -> capacity = required
-        const _: unit = self.reserve(capacity) else return none
+        const selected_result_13 = self.reserve(capacity)
+        if not (selected_result_13 is unit) -> return none
         const bytes = text.as_bytes()
-        if ref owned: OwnedBytes = self.storage
+        if self.storage is OwnedBytes
+            ref owned = self.storage
             var index = 0
             loop
                 if index == count -> break
@@ -170,7 +187,8 @@ pub struct String
         panic "invalid String storage during append"
     pub func clone(imm self: String) String | none
         var result = String.empty()
-        const _: unit = result.append(self.view()) else return none
+        const selected_result_14 = result.append(self.view())
+        if not (selected_result_14 is unit) -> return none
         return result^
 
 func equal_bytes(imm left: BytesView, imm right: BytesView) bool
@@ -190,10 +208,12 @@ pub converter(imm value: String) StringView -> value.view()
 pub converter(imm value: String) BytesView -> value.as_bytes()
 pub converter(imm value: StringView) String
     var result = String.empty()
-    const _: unit = result.append(value) else panic "string conversion allocation failed"
+    const selected_result_15 = result.append(value)
+    if not (selected_result_15 is unit) -> panic "string conversion allocation failed"
     return result^
 pub converter(value: int) String
-    const result: String = format_integer(value) else panic "string conversion allocation failed"
+    const result = format_integer(value)
+    if not (result is String) -> panic "string conversion allocation failed"
     return result^
 pub converter(value: byte) String -> String(byte_int(value))
 pub converter(value: bool) String -> if value -> "true" else "false"
@@ -203,24 +223,30 @@ pub converter(static T: type, static N: int, init value: collection_literal(T, N
     const values: Array(T, N) = value
     return String(values)
 pub converter(static T: type, static N: int, imm value: Array(T, N)) String
-    const result: String = format_span(value.span()) else panic "string conversion allocation failed"
+    const result = format_span(value.span())
+    if not (result is String) -> panic "string conversion allocation failed"
     return result^
 pub converter(static T: type, imm value: List(T)) String
-    const result: String = format_span(value.span()) else panic "string conversion allocation failed"
+    const result = format_span(value.span())
+    if not (result is String) -> panic "string conversion allocation failed"
     return result^
 pub converter(static T: type, imm value: Span(T)) String
-    const result: String = format_span(value) else panic "string conversion allocation failed"
+    const result = format_span(value)
+    if not (result is String) -> panic "string conversion allocation failed"
     return result^
 pub converter(imm value: BytesView) String -> String(value.as_span())
 pub converter(static T: type, imm value: Box(T)) String
-    const result: String = format_wrapped("Box(", value.borrow()) else panic "string conversion allocation failed"
+    const result = format_wrapped("Box(", value.borrow())
+    if not (result is String) -> panic "string conversion allocation failed"
     return result^
 pub converter(static T: type, imm value: Ref(T)) String
-    const result: String = format_wrapped("Ref(", value.value) else panic "string conversion allocation failed"
+    const result = format_wrapped("Ref(", value.value)
+    if not (result is String) -> panic "string conversion allocation failed"
     return result^
 
 func format_integer(value: int) String | none
-    const storage: Allocation(byte) = allocate(byte, 11) else return none
+    const storage = allocate(byte, 11)
+    if not (storage is Allocation(byte)) -> return none
     var result = OwnedBytes{allocation = storage^, size = 0}
     const digits: BytesView = "0123456789-"
     var remaining = value
@@ -244,14 +270,20 @@ func format_span(static T: type, imm values: Span(T)) String | none
     var result = "["
     var separator: StringView = ""
     for value in values
-        const _: unit = result.append(separator) else return none
-        const _: unit = result.append(String(value)) else return none
+        const selected_result_23 = result.append(separator)
+        if not (selected_result_23 is unit) -> return none
+        const selected_result_24 = result.append(String(value))
+        if not (selected_result_24 is unit) -> return none
         separator = ", "
-    const _: unit = result.append("]") else return none
+    const selected_result_25 = result.append("]")
+    if not (selected_result_25 is unit) -> return none
     return result^
 func format_wrapped(static T: type, imm prefix: StringView, imm value: T) String | none
     var result = String.empty()
-    const _: unit = result.append(prefix) else return none
-    const _: unit = result.append(String(value)) else return none
-    const _: unit = result.append(")") else return none
+    const selected_result_26 = result.append(prefix)
+    if not (selected_result_26 is unit) -> return none
+    const selected_result_27 = result.append(String(value))
+    if not (selected_result_27 is unit) -> return none
+    const selected_result_28 = result.append(")")
+    if not (selected_result_28 is unit) -> return none
     return result^

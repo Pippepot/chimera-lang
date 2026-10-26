@@ -20,8 +20,12 @@ test "bounded integer membership respects inclusivity emptiness and integer limi
         \\    var low = 19
         \\    var high = 23
         \\    if not (low in low..high) -> return 99
-        \\    if const first: int = accepted(19)
-        \\        if const second: int = accepted(23) -> return first + second
+        \\    match accepted(19)
+        \\        first and first is int ->
+        \\            match accepted(23)
+        \\                second and second is int -> return first + second
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 100
     , 42);
 }
@@ -106,7 +110,9 @@ test "membership evaluates source operands once from left to right" {
         \\    return 19
         \\func choices(ref trace: int) Choices
         \\    trace = trace * 10 + 2
-        \\    return Choices{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")}
+        \\    return Choices{trace = ((match Ref.from(trace)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none"))}
         \\func run() int
         \\    var trace = 0
         \\    if produce_value(trace) in choices(trace)
@@ -137,7 +143,9 @@ test "membership prepares scalar reads and conversions before the collection" {
         \\    if not (number in 0..change(number)) -> return 90
         \\    if number <> 23 -> return 91
         \\    var trace = 0
-        \\    const source = Source{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")}
+        \\    const source = Source{trace = ((match Ref.from(trace)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none"))}
         \\    if source in choices(trace)
         \\        if trace == 12 -> return 42
         \\    return 92
@@ -163,14 +171,18 @@ test "explicit optional selection short circuits membership and preserves cleanu
         \\    return none
         \\func checked_membership(ref trace: int) bool | none
         \\    const item = Item{trace = Ref.from(trace)}
-        \\    const selected: Choices = absent(trace) else return none
+        \\    const selected = absent(trace)
+        \\    if not (selected is Choices) -> return none
         \\    return item in selected
         \\func run() int
         \\    var trace = 0
-        \\    if const item: Item = missing(trace)
-        \\        if item in choices(trace) -> return 90
+        \\    match missing(trace)
+        \\        item and item is Item -> if item in choices(trace) -> return 90
+        \\        _ -> ()
         \\    if trace <> 1 -> return 91
-        \\    if const result: bool = checked_membership(trace) -> return 92
+        \\    match checked_membership(trace)
+        \\        result and result is bool -> return 92
+        \\        _ -> ()
         \\    if trace <> 12 -> return 93
         \\    if Item{trace = Ref.from(trace)} in Choices{} -> return 94
         \\    return trace + 20
@@ -188,8 +200,12 @@ test "membership composes with loops comprehensions and match guards" {
         \\        value and value in 9..=9 -> 28
         \\        _ -> 90
         \\    if not (1 + 2 in 1..4 and not (4 in 1..4) or 99 in 0..1) -> return 91
-        \\    if const first: int = values.get(0)
-        \\        if const second: int = values.get(1) -> return total + first + second + chosen
+        \\    match values.get(0)
+        \\        first and first is int ->
+        \\            match values.get(1)
+        \\                second and second is int -> return total + first + second + chosen
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 92
     , 42);
     try Fixture.expectSourceDiagnostic(

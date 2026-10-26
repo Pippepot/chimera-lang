@@ -385,12 +385,20 @@ test "portable artifacts recompute conditional and match tags when canonical mem
         \\    copy = trivial
         \\    pub value: int
         \\pub func answer(choice: A | B) int
-        \\    if const selected: A = choice -> return selected.value
+        \\    match choice
+        \\        A ->
+        \\            const selected = choice
+        \\            return selected.value
+        \\        _ -> ()
         \\    return 0
         \\pub func match_answer(choice: A | B) int
         \\    return match choice
         \\        B ->
-        \\            if const selected: B = choice -> return selected.value
+        \\            match choice
+        \\                B ->
+        \\                    const selected = choice
+        \\                    return selected.value
+        \\                _ -> ()
         \\            return 91
         \\        A -> 0
     };

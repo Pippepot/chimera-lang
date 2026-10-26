@@ -23,13 +23,23 @@ test "operation indexing Array reads replacements and bounds have parity" {
         \\func run() int
         \\    var values = [19, 23]
         \\    values[0] = 20
-        \\    if const first: int = values.get(0)
-        \\        if const second: int = values.get(1)
-        \\            if const invalid: int = values.get(-1) -> return 91
-        \\            if const invalid: int = values.get(2) -> return 92
-        \\            const empty: Array(int, 0) = []
-        \\            if const invalid: int = empty.get(0) -> return 93
-        \\            return first + second - 1
+        \\    match values.get(0)
+        \\        first and first is int ->
+        \\            match values.get(1)
+        \\                second and second is int ->
+        \\                    match values.get(-1)
+        \\                        invalid and invalid is int -> return 91
+        \\                        _ -> ()
+        \\                    match values.get(2)
+        \\                        invalid and invalid is int -> return 92
+        \\                        _ -> ()
+        \\                    const empty: Array(int, 0) = []
+        \\                    match empty.get(0)
+        \\                        invalid and invalid is int -> return 93
+        \\                        _ -> ()
+        \\                    return first + second - 1
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -58,14 +68,18 @@ test "operation indexing compound assignments and reference assignments have par
         \\    values[0] *= 2
         \\    values[0] -= 2
         \\    values[0] /= 2
-        \\    if ref reference: int = values.get(1)
-        \\        reference += 1
-        \\        reference *= 2
-        \\        reference -= 2
-        \\        reference /= 2
+        \\    match values.get(1)
+        \\        ref reference and reference is int ->
+        \\            reference += 1
+        \\            reference *= 2
+        \\            reference -= 2
+        \\            reference /= 2
+        \\        _ -> ()
         \\    return values[0] + values[1] + 11
         \\func run() int
-        \\    if const calculated: int = calculate() -> return calculated
+        \\    match calculate()
+        \\        calculated and calculated is int -> return calculated
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -75,10 +89,14 @@ test "operation indexing List reads replacements and bounds use ordinary calls" 
         \\func calculate() int | none
         \\    var values: List(int) = [19, 23]
         \\    values[0] += 1
-        \\    if const invalid: int = values.get(2) -> return 91
+        \\    match values.get(2)
+        \\        invalid and invalid is int -> return 91
+        \\        _ -> ()
         \\    return values[0] + values[1] - 1
         \\func run() int
-        \\    if const calculated: int = calculate() -> return calculated
+        \\    match calculate()
+        \\        calculated and calculated is int -> return calculated
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     , 42);
@@ -100,7 +118,9 @@ test "operation indexing evaluates owned replacements once and freezes the index
         \\    calls = 0
         \\    values[offset(calls)] += replacement(calls)
         \\    if calls <> 11 -> return 93
-        \\    if const stored: int = values.get(0) -> return stored
+        \\    match values.get(0)
+        \\        stored and stored is int -> return stored
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -118,7 +138,8 @@ test "indexed replacements and compound updates read the same owner across conta
             \\    values[1] += values[0]
             \\    return values[1] * 2
             \\func run() int
-            \\    if const result = calculate() -> return result
+            \\    match calculate()
+            \\        result -> return result
             \\    return 90
         , .{ .binding = binding });
         defer testing.allocator.free(source);
@@ -133,7 +154,9 @@ test "indexed nested array replacements finish conversion before mutable access"
         \\    values[1] = [values[0][0] + 1, values[0][1] + 11]
         \\    return values[1][0] + values[1][1]
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -149,10 +172,14 @@ test "optional replacement cleans its prepared owned value on mismatch" {
         \\    pub func replace(mut self: Sink, index: int, var item: Item) unit | none -> return none
         \\func run() int
         \\    var trace = [0]
-        \\    if ref handle: int = trace.get(0)
-        \\        var sink = Sink{}
-        \\        if const _: unit = sink.replace(99, Item{trace = Ref.from(handle), value = 42}) -> return 90
-        \\        return handle
+        \\    match trace.get(0)
+        \\        ref handle and handle is int ->
+        \\            var sink = Sink{}
+        \\            match sink.replace(99, Item{trace = Ref.from(handle), value = 42})
+        \\                filtered_value_81 and filtered_value_81 is unit -> return 90
+        \\                _ -> ()
+        \\            return handle
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -165,9 +192,12 @@ test "explicit checked reference acquisition skips the replacement on bounds fai
         \\func run() int
         \\    var values = [20]
         \\    var calls = 0
-        \\    if ref target: int = values.get(99)
-        \\        target = replacement(calls)
-        \\    if const first: int = values.get(0) -> return first + calls + 22
+        \\    match values.get(99)
+        \\        ref target and target is int -> target = replacement(calls)
+        \\        _ -> ()
+        \\    match values.get(0)
+        \\        first and first is int -> return first + calls + 22
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -196,7 +226,9 @@ test "operation indexing reads invoke ordinary copy hooks" {
         \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
         \\func run() int
         \\    const values = [Item{value = 41}]
-        \\    if const selected: Item = values.get(0) -> return selected.value
+        \\    match values.get(0)
+        \\        selected and selected is Item -> return selected.value
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -219,15 +251,23 @@ test "operation indexing replacement retains stored reference origins" {
     try Fixture.expectParity(
         \\func calculate() int | none
         \\    var original = [17]
-        \\    if ref item: int = original.get(0)
-        \\        var values = [(if const _selected_result_0: Ref(int) = Ref.from(item) -> _selected_result_0 else return none)]
-        \\        values[0] = (if const _selected_result_1: Ref(int) = Ref.from(item) -> _selected_result_1 else return none)
-        \\        ref stored = values[0]
-        \\        stored.value = 42
-        \\        return item
+        \\    match original.get(0)
+        \\        ref item and item is int ->
+        \\            var values = [((match Ref.from(item)
+        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\                _ -> return none))]
+        \\            values[0] = ((match Ref.from(item)
+        \\                _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
+        \\                _ -> return none))
+        \\            ref stored = values[0]
+        \\            stored.value = 42
+        \\            return item
+        \\        _ -> ()
         \\    return 90
         \\func run() int
-        \\    if const answer: int = calculate() -> return answer
+        \\    match calculate()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -236,14 +276,20 @@ test "operation indexing List and views use the same operator contract" {
     try Fixture.expectSourceExit(
         \\import std.memory.{List}
         \\func calculate() int | none
-        \\    var values: List(int) = List(int).new(2) else return none
-        \\    const _: unit = values.append(19) else return none
-        \\    const _: unit = values.append(23) else return none
+        \\    var values = List(int).new(2)
+        \\    if not (values is List(int)) -> return none
+        \\    const checked_value_2 = values.append(19)
+        \\    if not (checked_value_2 is unit) -> return none
+        \\    const checked_value_3 = values.append(23)
+        \\    if not (checked_value_3 is unit) -> return none
         \\    values[0] += 1
-        \\    const view: Span(int) = values.slice(0..2) else return none
+        \\    const view = values.slice(0..2)
+        \\    if not (view is Span(int)) -> return none
         \\    return view[0] + view[1] - 1
         \\func run() int
-        \\    if const calculated: int = calculate() -> return calculated
+        \\    match calculate()
+        \\        calculated and calculated is int -> return calculated
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     , 42);
@@ -255,11 +301,15 @@ test "List literal constructs contextual empty and byte lists in heap storage" {
         \\    var values: List(int) = [19, 23]
         \\    const empty: List(int) = []
         \\    const bytes: List(byte) = [1, 2]
-        \\    if ref first: int = values.get(0)
-        \\        first = 20
-        \\    if ref first: int = values.get(0)
-        \\        if ref second: int = values.get(1)
-        \\            return first + second + empty.len() + bytes.len() - 3
+        \\    match values.get(0)
+        \\        ref first and first is int -> first = 20
+        \\        _ -> ()
+        \\    match values.get(0)
+        \\        ref first and first is int ->
+        \\            match values.get(1)
+        \\                ref second and second is int -> return first + second + empty.len() + bytes.len() - 3
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     , 42);
@@ -270,15 +320,21 @@ test "List growth retains zero-sized logical elements and their destruction" {
         \\struct Item
         \\    drop = func(deinit self: Item) -> exit(42)
         \\func exercise() int | none
-        \\    var values: List(Item) = List(Item).new(0) else return none
-        \\    const _: unit = values.append(Item{}) else return none
-        \\    const _: unit = values.append(Item{}) else return none
-        \\    const _: unit = values.append(Item{}) else return none
+        \\    var values = List(Item).new(0)
+        \\    if not (values is List(Item)) -> return none
+        \\    const checked_value_2 = values.append(Item{})
+        \\    if not (checked_value_2 is unit) -> return none
+        \\    const checked_value_3 = values.append(Item{})
+        \\    if not (checked_value_3 is unit) -> return none
+        \\    const checked_value_4 = values.append(Item{})
+        \\    if not (checked_value_4 is unit) -> return none
         \\    if values.len() <> 3 -> exit(91)
         \\    if values.capacity() <> 4 -> exit(92)
         \\    return 93
         \\func run() int
-        \\    if const result: int = exercise() -> return result
+        \\    match exercise()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 94
     , 42);
 }
@@ -298,15 +354,22 @@ test "List prefix cleanup on explicit mismatch is reversed and skips later work"
         \\func construct(var trace: Ref(int)) unit | none
         \\    const prefix: List(Item) = [Item{trace = trace, value = 2}, Item{trace = trace, value = 4}]
         \\    prefix.len()
-        \\    const _: Item = missing(trace) else return none
+        \\    const checked_value_1 = missing(trace)
+        \\    if not (checked_value_1 is Item) -> return none
         \\    skipped(trace)
         \\    return unit
         \\func run() int
-        \\    var trace: Array(int, 1) = Array(int, 1).filled(0) else panic "unexpected none"
-        \\    if ref target: int = trace.get(0)
-        \\        if const _: unit = construct(Ref.from(target))
-        \\            return 92
-        \\    if ref result: int = trace.get(0) -> return result
+        \\    var trace = Array(int, 1).filled(0)
+        \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
+        \\    match trace.get(0)
+        \\        ref target and target is int ->
+        \\            match construct(Ref.from(target))
+        \\                filtered_value_153 and filtered_value_153 is unit -> return 92
+        \\                _ -> ()
+        \\        _ -> ()
+        \\    match trace.get(0)
+        \\        ref result and result is int -> return result
+        \\        _ -> ()
         \\    return 93
         \\exit(run())
     , 42);
@@ -316,12 +379,21 @@ test "List explicit factory infers length and optional elements remain ordinary 
     try Fixture.expectSourceExit(
         \\func missing() int | none -> return none
         \\func run() int
-        \\    if const values: List(int) = List(int).from([19, 23])
-        \\        if ref first: int = values.get(0)
-        \\            if ref second: int = values.get(1)
-        \\                const optional: List(int | none) = List(int | none).from([missing()]) else return 91
-        \\                if const _: none = optional[0] -> return first + second
-        \\                return 92
+        \\    match List(int).from([19, 23])
+        \\        values and values is List(int) ->
+        \\            match values.get(0)
+        \\                ref first and first is int ->
+        \\                    match values.get(1)
+        \\                        ref second and second is int ->
+        \\                            const optional = List(int | none).from([missing()])
+        \\                            if not (optional is List(int | none)) -> return 91
+        \\                            match optional[0]
+        \\                                filtered_value_75 and filtered_value_75 is none -> return first + second
+        \\                                _ -> ()
+        \\                            return 92
+        \\                        _ -> ()
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     , 42);
@@ -343,8 +415,9 @@ test "List explicit allocation failure is recoverable and skips element evaluati
         \\func skipped() Array(int, 262144)
         \\    exit(91)
         \\func run() int
-        \\    if const values: List(Array(int, 262144)) = List(Array(int, 262144)).from([skipped()])
-        \\        return 92
+        \\    match List(Array(int, 262144)).from([skipped()])
+        \\        values and values is List(Array(int, 262144)) -> return 92
+        \\        _ -> ()
         \\    return 42
         \\exit(run())
     , 42);
@@ -363,25 +436,36 @@ test "List cleanup releases failed allocations and destroys completed lists in r
         \\func construct(var trace: Ref(int)) unit | none
         \\    const prefix: List(Item) = [Item{trace = trace, value = 2}, Item{trace = trace, value = 4}]
         \\    prefix.len()
-        \\    const _: Item = missing(trace) else return none
+        \\    const checked_value_1 = missing(trace)
+        \\    if not (checked_value_1 is Item) -> return none
         \\    return unit
         \\func run() int
-        \\    var trace: Array(int, 1) = Array(int, 1).filled(0) else panic "unexpected none"
-        \\    if ref target: int = trace.get(0)
-        \\        var iteration = 0
-        \\        loop
-        \\            if iteration == 384 -> break
+        \\    var trace = Array(int, 1).filled(0)
+        \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
+        \\    match trace.get(0)
+        \\        ref target and target is int ->
+        \\            var iteration = 0
+        \\            loop
+        \\                if iteration == 384 -> break
+        \\                target = 0
+        \\                match construct(Ref.from(target))
+        \\                    filtered_value_145 and filtered_value_145 is unit -> return 91
+        \\                    _ -> ()
+        \\                if target == 42
+        \\                    iteration += 1
+        \\                else
+        \\                    return 92
         \\            target = 0
-        \\            if const _: unit = construct(Ref.from(target))
-        \\                return 91
-        \\            if target == 42
-        \\                iteration += 1
-        \\            else
-        \\                return 92
-        \\        target = 0
-        \\        const complete: List(Item) = [Item{trace = (if const _selected_result_4: Ref(int) = Ref.from(target) -> _selected_result_4 else panic "unexpected none"), value = 2}, Item{trace = (if const _selected_result_5: Ref(int) = Ref.from(target) -> _selected_result_5 else panic "unexpected none"), value = 4}]
-        \\        complete.len()
-        \\    if ref result: int = trace.get(0) -> return result
+        \\            const complete: List(Item) = [Item{trace = ((match Ref.from(target)
+        \\                _selected_result_4 and _selected_result_4 is Ref(int) -> _selected_result_4
+        \\                _ -> panic "unexpected none")), value = 2}, Item{trace = ((match Ref.from(target)
+        \\                    _selected_result_5 and _selected_result_5 is Ref(int) -> _selected_result_5
+        \\                    _ -> panic "unexpected none")), value = 4}]
+        \\            complete.len()
+        \\        _ -> ()
+        \\    match trace.get(0)
+        \\        ref result and result is int -> return result
+        \\        _ -> ()
         \\    return 93
         \\exit(run())
     , 42);
@@ -391,12 +475,19 @@ test "List construction and borrowing preserve stored external reference origins
     try Fixture.expectSourceExit(
         \\func make(imm value: Ref(int)) List(Ref(int)) -> [value]
         \\func run() int
-        \\    const original: Array(int, 1) = Array(int, 1).filled(42) else panic "unexpected none"
-        \\    if ref reference: int = original.get(0)
-        \\        const values = make((if const _selected_result_0: Ref(int) = Ref.from(reference) -> _selected_result_0 else panic "unexpected none"))
-        \\        if ref stored: Ref(int) = values.get(0)
-        \\            const result = stored
-        \\            return result.value
+        \\    const original = Array(int, 1).filled(42)
+        \\    if not (original is Array(int, 1)) -> panic "unexpected none"
+        \\    match original.get(0)
+        \\        ref reference and reference is int ->
+        \\            const values = make(((match Ref.from(reference)
+        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\                _ -> panic "unexpected none")))
+        \\            match values.get(0)
+        \\                ref stored and stored is Ref(int) ->
+        \\                    const result = stored
+        \\                    return result.value
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     , 42);
@@ -416,10 +507,19 @@ test "collection initializer consumers infer the pending shape and construct eac
         \\    trace.value = trace.value + 1
         \\    return 19
         \\func run() int
-        \\    var trace: Array(int, 1) = Array(int, 1).filled(0) else panic "unexpected none"
-        \\    if ref target: int = trace.get(0)
-        \\        if const size: int = count([element((if const _selected_result_0: Ref(int) = Ref.from(target) -> _selected_result_0 else panic "unexpected none")), element((if const _selected_result_1: Ref(int) = Ref.from(target) -> _selected_result_1 else panic "unexpected none"))])
-        \\            return target + size + 38
+        \\    var trace = Array(int, 1).filled(0)
+        \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
+        \\    match trace.get(0)
+        \\        ref target and target is int ->
+        \\            match count([element(((match Ref.from(target)
+        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\                _ -> panic "unexpected none"))), element(((match Ref.from(target)
+        \\                    _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
+        \\                    _ -> panic "unexpected none")))
+        \\            ])
+        \\                size and size is int -> return target + size + 38
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -431,10 +531,15 @@ test "collection literals default contextual empty nested and byte arrays have p
         \\    const empty: Array(int, 0) = []
         \\    const bytes: Array(byte, 2) = [1, 2]
         \\    const nested: Array(Array(int, 2), 1) = [[19, 23]]
-        \\    if ref first: int = values.get(0)
-        \\        if ref last: Array(int, 2) = nested.get(0)
-        \\            if ref second: int = last.get(1)
-        \\                return first + second + empty.len() + bytes.len() - 2
+        \\    match values.get(0)
+        \\        ref first and first is int ->
+        \\            match nested.get(0)
+        \\                ref last and last is Array(int, 2) ->
+        \\                    match last.get(1)
+        \\                        ref second and second is int -> return first + second + empty.len() + bytes.len() - 2
+        \\                        _ -> ()
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -454,15 +559,22 @@ test "Array prefix cleanup on explicit mismatch is reversed and skips later work
         \\func construct(var trace: Ref(int)) unit | none
         \\    const prefix: Array(Item, 2) = [Item{trace = trace, value = 2}, Item{trace = trace, value = 4}]
         \\    prefix.len()
-        \\    const _: Item = missing(trace) else return none
+        \\    const checked_value_1 = missing(trace)
+        \\    if not (checked_value_1 is Item) -> return none
         \\    skipped(trace)
         \\    return unit
         \\func run() int
-        \\    var trace: Array(int, 1) = Array(int, 1).filled(0) else panic "unexpected none"
-        \\    if ref target: int = trace.get(0)
-        \\        if const _: unit = construct(Ref.from(target))
-        \\            return 92
-        \\    if ref result: int = trace.get(0) -> return result
+        \\    var trace = Array(int, 1).filled(0)
+        \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
+        \\    match trace.get(0)
+        \\        ref target and target is int ->
+        \\            match construct(Ref.from(target))
+        \\                filtered_value_154 and filtered_value_154 is unit -> return 92
+        \\                _ -> ()
+        \\        _ -> ()
+        \\    match trace.get(0)
+        \\        ref result and result is int -> return result
+        \\        _ -> ()
         \\    return 93
     , 42);
 }
@@ -471,11 +583,17 @@ test "Array integer fill get and get_mut have native and comptime parity" {
     try Fixture.expectParity(
         \\import std.array.{Array}
         \\func run() int
-        \\    var values: Array(int, 3) = Array(int, 3).filled(20) else panic "unexpected none"
-        \\    if ref middle: int = values.get(1) -> middle = 22
-        \\    else return 90
-        \\    if ref first: int = values.get(0)
-        \\        if ref middle: int = values.get(1) -> return first + middle
+        \\    var values = Array(int, 3).filled(20)
+        \\    if not (values is Array(int, 3)) -> panic "unexpected none"
+        \\    match values.get(1)
+        \\        ref middle and middle is int -> middle = 22
+        \\        _ -> return 90
+        \\    match values.get(0)
+        \\        ref first and first is int ->
+        \\            match values.get(1)
+        \\                ref middle and middle is int -> return first + middle
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -488,8 +606,11 @@ test "Array filled evaluates its source once" {
         \\    return 41
         \\func run() int
         \\    var calls = 0
-        \\    const values: Array(int, 4) = Array(int, 4).filled(next(calls)) else panic "unexpected none"
-        \\    if ref last: int = values.get(3) -> return last + calls
+        \\    const values = Array(int, 4).filled(next(calls))
+        \\    if not (values is Array(int, 4)) -> panic "unexpected none"
+        \\    match values.get(3)
+        \\        ref last and last is int -> return last + calls
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -502,7 +623,8 @@ test "Array empty fill evaluates once and all bounds fail" {
         \\    return 41
         \\func run() int
         \\    var calls = 0
-        \\    var empty: Array(int, 0) = Array(int, 0).filled(next(calls)) else panic "unexpected none"
+        \\    var empty = Array(int, 0).filled(next(calls))
+        \\    if not (empty is Array(int, 0)) -> panic "unexpected none"
         \\    if (empty.get(-1) is int) -> return 90
         \\    if (empty.get(0) is int) -> return 91
         \\    if (empty.get(0) is int) -> return 92
@@ -515,12 +637,15 @@ test "Array populated bounds reject negative and past end indices" {
     try Fixture.expectParity(
         \\import std.array.{Array}
         \\func run() int
-        \\    var values: Array(int, 2) = Array(int, 2).filled(42) else panic "unexpected none"
+        \\    var values = Array(int, 2).filled(42)
+        \\    if not (values is Array(int, 2)) -> panic "unexpected none"
         \\    if (values.get(-1) is int) -> return 90
         \\    if (values.get(2) is int) -> return 91
         \\    if (values.get(-1) is int) -> return 92
         \\    if (values.get(2) is int) -> return 93
-        \\    if ref last: int = values.get(1) -> return last
+        \\    match values.get(1)
+        \\        ref last and last is int -> return last
+        \\        _ -> ()
         \\    return 94
     , 42);
 }
@@ -529,10 +654,16 @@ test "Array nested fill and element borrows retain shape" {
     try Fixture.expectParity(
         \\import std.array.{Array}
         \\func run() int
-        \\    const row: Array(int, 3) = Array(int, 3).filled(42) else panic "unexpected none"
-        \\    const matrix: Array(Array(int, 3), 2) = Array(Array(int, 3), 2).filled(row) else panic "unexpected none"
-        \\    if ref selected: Array(int, 3) = matrix.get(1)
-        \\        if ref cell: int = selected.get(2) -> return cell
+        \\    const row = Array(int, 3).filled(42)
+        \\    if not (row is Array(int, 3)) -> panic "unexpected none"
+        \\    const matrix = Array(Array(int, 3), 2).filled(row)
+        \\    if not (matrix is Array(Array(int, 3), 2)) -> panic "unexpected none"
+        \\    match matrix.get(1)
+        \\        ref selected and selected is Array(int, 3) ->
+        \\            match selected.get(2)
+        \\                ref cell and cell is int -> return cell
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -546,10 +677,13 @@ test "Array fill and whole copy invoke immovable element custom copies" {
         \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
         \\func run() int
         \\    const original = Item{value = 40}
-        \\    const values: Array(Item, 3) = Array(Item, 3).filled(original) else panic "unexpected none"
+        \\    const values = Array(Item, 3).filled(original)
+        \\    if not (values is Array(Item, 3)) -> panic "unexpected none"
         \\    const copied = values.copy()
         \\    if original.value <> 40 -> return 90
-        \\    if ref selected: Item = copied.get(2) -> return selected.value
+        \\    match copied.get(2)
+        \\        ref selected and selected is Item -> return selected.value
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -563,9 +697,12 @@ test "Array whole move invokes element custom moves" {
         \\    move = func(deinit self: Item) Item -> Item{value = self.value + 1}
         \\func run() int
         \\    const original = Item{value = 41}
-        \\    const values: Array(Item, 3) = Array(Item, 3).filled(original) else panic "unexpected none"
+        \\    const values = Array(Item, 3).filled(original)
+        \\    if not (values is Array(Item, 3)) -> panic "unexpected none"
         \\    const moved = values.move()
-        \\    if ref selected: Item = moved.get(2) -> return selected.value
+        \\    match moved.get(2)
+        \\        ref selected and selected is Item -> return selected.value
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -578,11 +715,17 @@ test "Array nested whole copies invoke every element custom copy" {
         \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
         \\func run() int
         \\    const original = Item{value = 39}
-        \\    const row: Array(Item, 3) = Array(Item, 3).filled(original) else panic "unexpected none"
-        \\    const matrix: Array(Array(Item, 3), 2) = Array(Array(Item, 3), 2).filled(row) else panic "unexpected none"
+        \\    const row = Array(Item, 3).filled(original)
+        \\    if not (row is Array(Item, 3)) -> panic "unexpected none"
+        \\    const matrix = Array(Array(Item, 3), 2).filled(row)
+        \\    if not (matrix is Array(Array(Item, 3), 2)) -> panic "unexpected none"
         \\    const copied = matrix.copy()
-        \\    if ref selected: Array(Item, 3) = copied.get(1)
-        \\        if ref cell: Item = selected.get(2) -> return cell.value
+        \\    match copied.get(1)
+        \\        ref selected and selected is Array(Item, 3) ->
+        \\            match selected.get(2)
+        \\                ref cell and cell is Item -> return cell.value
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -597,12 +740,20 @@ test "Array automatic cleanup drops elements in reverse index order" {
         \\        if self.value == 41 -> exit(41)
         \\        if self.value == 42 -> exit(42)
         \\func run()
-        \\    var values: Array(Item, 2) = Array(Item, 2).filled(Item{value = 0}) else panic "unexpected none"
-        \\    if ref first: Item = values.get(0) -> first = Item{value = 41}
-        \\    if ref last: Item = values.get(1) -> last = Item{value = 42}
-        \\    if ref first: Item = values.get(0)
-        \\        if ref last: Item = values.get(1)
-        \\            if first.value + last.value <> 83 -> exit(90)
+        \\    var values = Array(Item, 2).filled(Item{value = 0})
+        \\    if not (values is Array(Item, 2)) -> panic "unexpected none"
+        \\    match values.get(0)
+        \\        ref first and first is Item -> first = Item{value = 41}
+        \\        _ -> ()
+        \\    match values.get(1)
+        \\        ref last and last is Item -> last = Item{value = 42}
+        \\        _ -> ()
+        \\    match values.get(0)
+        \\        ref first and first is Item ->
+        \\            match values.get(1)
+        \\                ref last and last is Item -> if first.value + last.value <> 83 -> exit(90)
+        \\                _ -> ()
+        \\        _ -> ()
         \\run()
         \\exit(91)
     , 42);
@@ -615,7 +766,8 @@ test "Array empty cleanup does not call element destructors" {
         \\    copy = trivial
         \\    drop = func(deinit self: Item) -> exit(90)
         \\func run(deinit original: Item) int
-        \\    const empty: Array(Item, 0) = Array(Item, 0).filled(original) else panic "unexpected none"
+        \\    const empty = Array(Item, 0).filled(original)
+        \\    if not (empty is Array(Item, 0)) -> panic "unexpected none"
         \\    return empty.len() + 42
         \\exit(run(Item{}))
     , 42);
@@ -643,7 +795,8 @@ test "Array owning elements retain explicit drop obligations" {
         \\    copy = trivial
         \\    drop = explicit
         \\func run(imm original: Item) int
-        \\    const values: Array(Item, 2) = Array(Item, 2).filled(original) else panic "unexpected none"
+        \\    const values = Array(Item, 2).filled(original)
+        \\    if not (values is Array(Item, 2)) -> panic "unexpected none"
         \\    return values.len()
         \\exit(run(Item{}))
     , .value_requires_explicit_drop);
@@ -654,8 +807,11 @@ test "Array borrowed element cannot escape its local array" {
         \\import std.array.{Array}
         \\import std.memory.{Ref}
         \\func bad() Ref(int)
-        \\    const values: Array(int, 2) = Array(int, 2).filled(42) else panic "unexpected none"
-        \\    if ref selected: int = values.get(1) -> return Ref.from(selected)
+        \\    const values = Array(int, 2).filled(42)
+        \\    if not (values is Array(int, 2)) -> panic "unexpected none"
+        \\    match values.get(1)
+        \\        ref selected and selected is int -> return Ref.from(selected)
+        \\        _ -> ()
         \\    return bad()
         \\const reference = bad()
         \\exit(reference.value)
@@ -668,7 +824,9 @@ test "Array fill cannot return references to a local source" {
         \\import std.memory.{Ref}
         \\func bad() Array(Ref(int), 2)
         \\    const value = 42
-        \\    return (if const _selected_result_0: Array(Ref(int), 2) = Array(Ref(int), 2).filled(Ref.from(value)) -> _selected_result_0^ else panic "unexpected none")
+        \\    return ((match Array(Ref(int), 2).filled(Ref.from(value))
+        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 2) -> _selected_result_0^
+        \\        _ -> panic "unexpected none"))
         \\const values = bad()
         \\exit(values.len())
     , .borrow_outlives_source);
@@ -679,11 +837,17 @@ test "Array fill and nested reference reads preserve runtime source dependencies
         \\import std.array.{Array}
         \\import std.memory.{Ref}
         \\func fill(imm source: Ref(int)) Array(Ref(int), 2)
-        \\    return (if const _selected_result_0: Array(Ref(int), 2) = Array(Ref(int), 2).filled(source) -> _selected_result_0^ else panic "unexpected none")
+        \\    return ((match Array(Ref(int), 2).filled(source)
+        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 2) -> _selected_result_0^
+        \\        _ -> panic "unexpected none"))
         \\func run() int
         \\    const value = 42
-        \\    const values = fill((if const _selected_result_1: Ref(int) = Ref.from(value) -> _selected_result_1 else panic "unexpected none"))
-        \\    if ref selected: Ref(int) = values.get(1) -> return selected.value
+        \\    const values = fill(((match Ref.from(value)
+        \\        _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
+        \\        _ -> panic "unexpected none")))
+        \\    match values.get(1)
+        \\        ref selected and selected is Ref(int) -> return selected.value
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -691,8 +855,11 @@ test "Array fill and nested reference reads preserve runtime source dependencies
 test "Array get_mut requires mutable source storage" {
     try Fixture.expectRejected(
         \\import std.array.{Array}
-        \\const values: Array(int, 2) = Array(int, 2).filled(42) else panic "unexpected none"
-        \\if ref selected: int = values.get(0) -> selected = 1
+        \\const values = Array(int, 2).filled(42)
+        \\if not (values is Array(int, 2)) -> panic "unexpected none"
+        \\match values.get(0)
+        \\    ref selected and selected is int -> selected = 1
+        \\    _ -> ()
         \\exit(42)
     );
 }
@@ -704,26 +871,42 @@ test "Array copy hooks cannot invalidate pending borrows" {
         \\struct Handle
         \\    target: Ref(Box(int))
         \\    copy = func(imm self: Handle) Handle
-        \\        if const replacement: Box(int) = Box.new(17) -> self.target.value = replacement^
+        \\        match Box.new(17)
+        \\            replacement and replacement is Box(int) -> self.target.value = replacement^
+        \\            _ -> ()
         \\        return Handle{target = self.target}
         \\func inspect(imm earlier: Ref(int), imm values: Array(Handle, 2)) int -> earlier.value + values.len()
         \\func run() int | none
-        \\    var owner: Box(Box(int)) = Box.new((if const _selected_result_0: Box(int) = Box.new(42) -> _selected_result_0^ else panic "unexpected none")) else return none
+        \\    var owner = Box.new(((match Box.new(42)
+        \\        _selected_result_0 and _selected_result_0 is Box(int) -> _selected_result_0^
+        \\        _ -> panic "unexpected none")))
+        \\    if not (owner is Box(Box(int))) -> return none
         \\    var source = Handle{target = Ref.from(owner.borrow())}
-        \\    const values: Array(Handle, 2) = Array(Handle, 2).filled(source) else return none
+        \\    const values = Array(Handle, 2).filled(source)
+        \\    if not (values is Array(Handle, 2)) -> return none
         \\    return inspect(Ref.from(owner.borrow().borrow()), values.copy())
-        \\if const result: int = run() -> exit(result) else exit(90)
+        \\match run()
+        \\    result and result is int -> exit(result)
+        \\    _ -> exit(90)
     , .borrow_outlives_source);
 }
 
 test "Array static nested values publish into runtime storage" {
     try Fixture.expectSourceExit(
-        \\static row = (if const _selected_result_0: Array(int, 2) = Array(int, 2).filled(20) -> _selected_result_0^ else panic "unexpected none")
-        \\static matrix = (if const _selected_result_1: Array(Array(int, 2), 2) = Array(Array(int, 2), 2).filled(row) -> _selected_result_1^ else panic "unexpected none")
+        \\static row = ((match Array(int, 2).filled(20)
+        \\    _selected_result_0 and _selected_result_0 is Array(int, 2) -> _selected_result_0^
+        \\    _ -> panic "unexpected none"))
+        \\static matrix = ((match Array(Array(int, 2), 2).filled(row)
+        \\    _selected_result_1 and _selected_result_1 is Array(Array(int, 2), 2) -> _selected_result_1^
+        \\    _ -> panic "unexpected none"))
         \\func run() int
         \\    const values = matrix
-        \\    if ref selected: Array(int, 2) = values.get(1)
-        \\        if ref value: int = selected.get(0) -> return value + row.len() + 20
+        \\    match values.get(1)
+        \\        ref selected and selected is Array(int, 2) ->
+        \\            match selected.get(0)
+        \\                ref value and value is int -> return value + row.len() + 20
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     , 42);
@@ -734,7 +917,8 @@ test "Array zero-sized fill does not skip custom copy" {
         \\struct Empty
         \\    copy = func(imm self: Empty) Empty -> exit(42)
         \\func run() int
-        \\    const values: Array(Empty, 3) = Array(Empty, 3).filled(Empty{}) else panic "unexpected none"
+        \\    const values = Array(Empty, 3).filled(Empty{})
+        \\    if not (values is Array(Empty, 3)) -> panic "unexpected none"
         \\    return values.len()
         \\exit(run())
     , 42);
@@ -746,11 +930,16 @@ test "Array embedded storage supports checked mutable access" {
         \\    values: Array(int, 3)
         \\    copy = fieldwise
         \\func run() int
-        \\    var holder = Holder{values = (if const _selected_result_0: Array(int, 3) = Array(int, 3).filled(20) -> _selected_result_0^ else panic "unexpected none")}
-        \\    if ref selected: int = holder.values.get(1) -> selected = 22
-        \\    else return 90
+        \\    var holder = Holder{values = ((match Array(int, 3).filled(20)
+        \\        _selected_result_0 and _selected_result_0 is Array(int, 3) -> _selected_result_0^
+        \\        _ -> panic "unexpected none"))}
+        \\    match holder.values.get(1)
+        \\        ref selected and selected is int -> selected = 22
+        \\        _ -> return 90
         \\    const copied = holder.copy()
-        \\    if ref selected: int = copied.values.get(1) -> return selected + 20
+        \\    match copied.values.get(1)
+        \\        ref selected and selected is int -> return selected + 20
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -759,14 +948,23 @@ test "Array boxed inline storage retains mutable element references" {
     try Fixture.expectParity(
         \\import std.memory
         \\func calculate() int | none
-        \\    var owner: Box(Array(int, 3)) = Box.new((if const _selected_result_0: Array(int, 3) = Array(int, 3).filled(20) -> _selected_result_0^ else panic "unexpected none")) else return none
-        \\    var values: Ref(Array(int, 3)) = Ref.from(owner.borrow()) else return none
-        \\    if ref selected: int = values.value.get(1) -> selected = 22
-        \\    else return 90
-        \\    if ref selected: int = values.value.get(1) -> return selected + 20
+        \\    var owner = Box.new(((match Array(int, 3).filled(20)
+        \\        _selected_result_0 and _selected_result_0 is Array(int, 3) -> _selected_result_0^
+        \\        _ -> panic "unexpected none")))
+        \\    if not (owner is Box(Array(int, 3))) -> return none
+        \\    var values = Ref.from(owner.borrow())
+        \\    if not (values is Ref(Array(int, 3))) -> return none
+        \\    match values.value.get(1)
+        \\        ref selected and selected is int -> selected = 22
+        \\        _ -> return 90
+        \\    match values.value.get(1)
+        \\        ref selected and selected is int -> return selected + 20
+        \\        _ -> ()
         \\    return 91
         \\func run() int
-        \\    if const answer: int = calculate() -> return answer
+        \\    match calculate()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 92
     , 42);
 }
@@ -779,10 +977,16 @@ test "Array variant payload copies immovable nested elements in place" {
         \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
         \\func widen(imm values: Array(Item, 2)) Array(Item, 2) | none -> values
         \\func run() int
-        \\    const values: Array(Item, 2) = Array(Item, 2).filled(Item{value = 39}) else panic "unexpected none"
+        \\    const values = Array(Item, 2).filled(Item{value = 39})
+        \\    if not (values is Array(Item, 2)) -> panic "unexpected none"
         \\    const possible = widen(values)
-        \\    if const selected: Array(Item, 2) = possible
-        \\        if ref element: Item = selected.get(1) -> return element.value
+        \\    match possible
+        \\        Array(Item, 2) ->
+        \\            const selected = possible
+        \\            match selected.get(1)
+        \\                ref element and element is Item -> return element.value
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -793,7 +997,8 @@ test "Array zero-sized logical elements retain custom destruction" {
         \\    copy = trivial
         \\    drop = func(deinit self: Empty) -> exit(42)
         \\func run(deinit source: Empty)
-        \\    const values: Array(Empty, 3) = Array(Empty, 3).filled(source) else panic "unexpected none"
+        \\    const values = Array(Empty, 3).filled(source)
+        \\    if not (values is Array(Empty, 3)) -> panic "unexpected none"
         \\    _ = values.len()
         \\run(Empty{})
         \\exit(90)
@@ -807,16 +1012,22 @@ test "Array whole copies retain contained reference origins" {
         \\    return values.copy()
         \\func run() int
         \\    const source = 42
-        \\    const original: Array(Ref(int), 2) = Array(Ref(int), 2).filled((if const _selected_result_0: Ref(int) = Ref.from(source) -> _selected_result_0 else panic "unexpected none")) else panic "unexpected none"
+        \\    const original = Array(Ref(int), 2).filled(((match Ref.from(source)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none")))
+        \\    if not (original is Array(Ref(int), 2)) -> panic "unexpected none"
         \\    const values = duplicate(original)
-        \\    if ref selected: Ref(int) = values.get(1) -> return selected.value
+        \\    match values.get(1)
+        \\        ref selected and selected is Ref(int) -> return selected.value
+        \\        _ -> ()
         \\    return 90
     , 42);
     try Fixture.expectAnySourceDiagnostic(
         \\import std.memory.{Ref}
         \\func bad() Array(Ref(int), 2)
         \\    const source = 42
-        \\    const values: Array(Ref(int), 2) = Array(Ref(int), 2).filled(Ref.from(source)) else panic "unexpected none"
+        \\    const values = Array(Ref(int), 2).filled(Ref.from(source))
+        \\    if not (values is Array(Ref(int), 2)) -> panic "unexpected none"
         \\    return values.copy()
         \\const values = bad()
         \\exit(values.len())
@@ -826,10 +1037,15 @@ test "Array whole copies retain contained reference origins" {
 test "Array element references observe whole storage replacement" {
     try Fixture.expectParity(
         \\func run() int
-        \\    var values: Array(int, 2) = Array(int, 2).filled(42) else panic "unexpected none"
-        \\    if ref selected: int = values.get(1)
-        \\        values = (if const _selected_result_0: Array(int, 2) = Array(int, 2).filled(17) -> _selected_result_0^ else panic "unexpected none")
-        \\        return selected
+        \\    var values = Array(int, 2).filled(42)
+        \\    if not (values is Array(int, 2)) -> panic "unexpected none"
+        \\    match values.get(1)
+        \\        ref selected and selected is int ->
+        \\            values = ((match Array(int, 2).filled(17)
+        \\                _selected_result_0 and _selected_result_0 is Array(int, 2) -> _selected_result_0^
+        \\                _ -> panic "unexpected none"))
+        \\            return selected
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     , 17);
@@ -842,12 +1058,19 @@ test "Array fill invokes an ordinary copy for each initialized element" {
         \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
         \\func calculate() int | none
         \\    const source = Item{value = 20}
-        \\    const values: Array(Item, 2) = Array(Item, 2).filled(source) else return none
-        \\    ref first: Item = values.get(0) else return none
-        \\    ref second: Item = values.get(1) else return none
+        \\    const values = Array(Item, 2).filled(source)
+        \\    if not (values is Array(Item, 2)) -> return none
+        \\    const checked_value_2 = values.get(0)
+        \\    if not (checked_value_2 is Item) -> return none
+        \\    ref first = checked_value_2
+        \\    const checked_value_3 = values.get(1)
+        \\    if not (checked_value_3 is Item) -> return none
+        \\    ref second = checked_value_3
         \\    return first.value + second.value
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -859,7 +1082,8 @@ test "mutable alias call arguments write direct values back to their referents" 
         \\    value += 2
         \\func run() int
         \\    var source = 40
-        \\    var selected: Ref(int) = Ref.from(source) else panic "unexpected none"
+        \\    var selected = Ref.from(source)
+        \\    if not (selected is Ref(int)) -> panic "unexpected none"
         \\    advance(selected.value)
         \\    return source
     , 42);
@@ -870,15 +1094,20 @@ test "Array mutable alias calls retain newly stored reference origins" {
         \\import std.memory
         \\import std.memory.{Ref}
         \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
-        \\    values = (if const _selected_result_0: Array(Ref(int), 1) = Array(Ref(int), 1).filled(reference) -> _selected_result_0^ else panic "unexpected none")
+        \\    values = ((match Array(Ref(int), 1).filled(reference)
+        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 1) -> _selected_result_0^
+        \\        _ -> panic "unexpected none"))
         \\func run() int
         \\    const original = 42
-        \\    var values: Array(Ref(int), 1) = Array(Ref(int), 1).filled(Ref.from(original)) else panic "unexpected none"
+        \\    var values = Array(Ref(int), 1).filled(Ref.from(original))
+        \\    if not (values is Array(Ref(int), 1)) -> panic "unexpected none"
         \\    if 1 == 1
         \\        const temporary = 17
         \\        ref selected = values
         \\        overwrite(selected, Ref.from(temporary))
-        \\    if ref selected: Ref(int) = values.get(0) -> return selected.value
+        \\    match values.get(0)
+        \\        ref selected and selected is Ref(int) -> return selected.value
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     , .borrow_outlives_source);
@@ -889,18 +1118,27 @@ test "Array dereferenced mutable aliases cannot retain short-lived references" {
         \\import std.memory
         \\import std.memory.{Ref}
         \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
-        \\    values = (if const _selected_result_0: Array(Ref(int), 1) = Array(Ref(int), 1).filled(reference) -> _selected_result_0^ else panic "unexpected none")
+        \\    values = ((match Array(Ref(int), 1).filled(reference)
+        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 1) -> _selected_result_0^
+        \\        _ -> panic "unexpected none"))
         \\func run() int | none
         \\    const original = 42
-        \\    var owner: Box(Array(Ref(int), 1)) = Box.new((if const _selected_result_1: Array(Ref(int), 1) = Array(Ref(int), 1).filled(Ref.from(original)) -> _selected_result_1^ else panic "unexpected none")) else return none
+        \\    var owner = Box.new(((match Array(Ref(int), 1).filled(Ref.from(original))
+        \\        _selected_result_1 and _selected_result_1 is Array(Ref(int), 1) -> _selected_result_1^
+        \\        _ -> panic "unexpected none")))
+        \\    if not (owner is Box(Array(Ref(int), 1))) -> return none
         \\    if 1 == 1
         \\        const temporary = 17
         \\        var selected = Ref.from(owner.borrow())
         \\        overwrite(selected.value, Ref.from(temporary))
         \\    var selected = Ref.from(owner.borrow())
-        \\    if ref element: Ref(int) = selected.value.get(0) -> return element.value
+        \\    match selected.value.get(0)
+        \\        ref element and element is Ref(int) -> return element.value
+        \\        _ -> ()
         \\    return 90
-        \\if const answer: int = run() -> exit(answer) else exit(91)
+        \\match run()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> exit(91)
     , .borrow_outlives_source);
 }
 
@@ -909,18 +1147,27 @@ test "Array boxed mutable aliases retain long-lived reference origins" {
         \\import std.memory
         \\import std.memory.{Ref}
         \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
-        \\    values = (if const _selected_result_0: Array(Ref(int), 1) = Array(Ref(int), 1).filled(reference) -> _selected_result_0^ else panic "unexpected none")
+        \\    values = ((match Array(Ref(int), 1).filled(reference)
+        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 1) -> _selected_result_0^
+        \\        _ -> panic "unexpected none"))
         \\func run() int | none
         \\    const original = 17
         \\    const replacement = 42
-        \\    var owner: Box(Array(Ref(int), 1)) = Box.new((if const _selected_result_1: Array(Ref(int), 1) = Array(Ref(int), 1).filled(Ref.from(original)) -> _selected_result_1^ else panic "unexpected none")) else return none
+        \\    var owner = Box.new(((match Array(Ref(int), 1).filled(Ref.from(original))
+        \\        _selected_result_1 and _selected_result_1 is Array(Ref(int), 1) -> _selected_result_1^
+        \\        _ -> panic "unexpected none")))
+        \\    if not (owner is Box(Array(Ref(int), 1))) -> return none
         \\    if 1 == 1
         \\        var selected = Ref.from(owner.borrow())
         \\        overwrite(selected.value, Ref.from(replacement))
         \\    var selected = Ref.from(owner.borrow())
-        \\    if ref element: Ref(int) = selected.value.get(0) -> return element.value
+        \\    match selected.value.get(0)
+        \\        ref element and element is Ref(int) -> return element.value
+        \\        _ -> ()
         \\    return 90
-        \\if const answer: int = run() -> exit(answer) else exit(91)
+        \\match run()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> exit(91)
     , 42);
 }
 
@@ -929,16 +1176,23 @@ test "Array reference parameters retain caller origins when storing other inputs
         \\import std.memory
         \\import std.memory.{Ref}
         \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
-        \\    values = (if const _selected_result_0: Array(Ref(int), 1) = Array(Ref(int), 1).filled(reference) -> _selected_result_0^ else panic "unexpected none")
+        \\    values = ((match Array(Ref(int), 1).filled(reference)
+        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 1) -> _selected_result_0^
+        \\        _ -> panic "unexpected none"))
         \\func change(var target: Ref(Array(Ref(int), 1)), replacement: Ref(int))
         \\    var selected = Ref.from(target.value)
         \\    overwrite(selected.value, replacement)
         \\func run() int | none
         \\    const original = 42
-        \\    var owner: Box(Array(Ref(int), 1)) = Box.new((if const _selected_result_1: Array(Ref(int), 1) = Array(Ref(int), 1).filled(Ref.from(original)) -> _selected_result_1^ else panic "unexpected none")) else return none
+        \\    var owner = Box.new(((match Array(Ref(int), 1).filled(Ref.from(original))
+        \\        _selected_result_1 and _selected_result_1 is Array(Ref(int), 1) -> _selected_result_1^
+        \\        _ -> panic "unexpected none")))
+        \\    if not (owner is Box(Array(Ref(int), 1))) -> return none
         \\    change(Ref.from(owner.borrow()), Ref.from(original))
         \\    return 42
-        \\if const answer: int = run() -> exit(answer) else exit(91)
+        \\match run()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> exit(91)
     , 42);
 }
 
@@ -948,8 +1202,14 @@ test "compile-time direct scalar arguments copy caller storage before mutation" 
         \\    target.value = 22
         \\    return captured + 22
         \\func run() int
-        \\    var values: Array(int, 1) = Array(int, 1).filled(20) else panic "unexpected none"
-        \\    if ref target: int = values.get(0) -> return observe(target, (if const _selected_result_0: Ref(int) = Ref.from(target) -> _selected_result_0 else panic "unexpected none"))
+        \\    var values = Array(int, 1).filled(20)
+        \\    if not (values is Array(int, 1)) -> panic "unexpected none"
+        \\    match values.get(0)
+        \\        ref target and target is int ->
+        \\            return observe(target, ((match Ref.from(target)
+        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\                _ -> panic "unexpected none")))
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -958,9 +1218,16 @@ test "compile-time variant coercion preserves returned reference payloads" {
     try Fixture.expectParity(
         \\func choose(imm reference: Ref(int)) Ref(int) | none -> reference
         \\func run() int
-        \\    const values: Array(int, 1) = Array(int, 1).filled(42) else panic "unexpected none"
-        \\    if ref reference: int = values.get(0)
-        \\        if const selected: Ref(int) = choose((if const _selected_result_0: Ref(int) = Ref.from(reference) -> _selected_result_0 else panic "unexpected none")) -> return selected.value
+        \\    const values = Array(int, 1).filled(42)
+        \\    if not (values is Array(int, 1)) -> panic "unexpected none"
+        \\    match values.get(0)
+        \\        ref reference and reference is int ->
+        \\            match choose(((match Ref.from(reference)
+        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\                _ -> panic "unexpected none")))
+        \\                selected and selected is Ref(int) -> return selected.value
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -968,11 +1235,17 @@ test "compile-time variant coercion preserves returned reference payloads" {
 test "Array immutable arguments permit widening address-passed movable values" {
     try Fixture.expectParity(
         \\func inspect(imm possible: Array(int, 2) | none) int
-        \\    if const values: Array(int, 2) = possible
-        \\        if ref selected: int = values.get(1) -> return selected
+        \\    match possible
+        \\        Array(int, 2) ->
+        \\            const values = possible
+        \\            match values.get(1)
+        \\                ref selected and selected is int -> return selected
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
         \\func run() int
-        \\    const values: Array(int, 2) = Array(int, 2).filled(42) else panic "unexpected none"
+        \\    const values = Array(int, 2).filled(42)
+        \\    if not (values is Array(int, 2)) -> panic "unexpected none"
         \\    return inspect(values)
     , 42);
 }
@@ -985,9 +1258,12 @@ test "compile-time direct reference arguments copy handles without copying refer
         \\func run() int
         \\    const original = 20
         \\    const replacement = 22
-        \\    var reference: Ref(int) = Ref.from(original) else panic "unexpected none"
+        \\    var reference = Ref.from(original)
+        \\    if not (reference is Ref(int)) -> panic "unexpected none"
         \\    const captured = reference
-        \\    retarget(reference, (if const _selected_result_0: Ref(int) = Ref.from(replacement) -> _selected_result_0 else panic "unexpected none"))
+        \\    retarget(reference, ((match Ref.from(replacement)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none")))
         \\    return captured.value + reference.value
     , 42);
 }
@@ -998,10 +1274,17 @@ test "compile-time reference variants support widening and conditional results" 
         \\    return if 1 == 1 -> reference else none
         \\func widen(imm possible: Ref(int) | none) Ref(int) | none | bool -> possible
         \\func run() int
-        \\    const values: Array(int, 1) = Array(int, 1).filled(42) else panic "unexpected none"
-        \\    if ref reference: int = values.get(0)
-        \\        const possible = choose((if const _selected_result_0: Ref(int) = Ref.from(reference) -> _selected_result_0 else panic "unexpected none"))
-        \\        if const selected: Ref(int) = widen(possible) -> return selected.value
+        \\    const values = Array(int, 1).filled(42)
+        \\    if not (values is Array(int, 1)) -> panic "unexpected none"
+        \\    match values.get(0)
+        \\        ref reference and reference is int ->
+        \\            const possible = choose(((match Ref.from(reference)
+        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\                _ -> panic "unexpected none")))
+        \\            match widen(possible)
+        \\                selected and selected is Ref(int) -> return selected.value
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
     , 42);
 }

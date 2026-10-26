@@ -1784,7 +1784,8 @@ test "ownership effects compose across calls joins scopes and partial aggregates
             \\  return 1
             \\func attempt() int | none
             \\  const resource = Resource{}
-            \\  const value: int = fail_value() else return none
+            \\  const value = fail_value()
+            \\  if not (value is int) -> return none
             \\  return value
             \\if (attempt() is int) -> exit(1) else exit(0)
             ,
@@ -1877,7 +1878,9 @@ test "ownership effects compose across calls joins scopes and partial aggregates
             \\func fail_value() int | none
             \\  if not (1 < 0) -> return none
             \\  return 1
-            \\func attempt() Pair | none -> Pair{first = Resource{}, second = (if const _selected_result_0: int = fail_value() -> _selected_result_0 else return none)}
+            \\func attempt() Pair | none -> Pair{first = Resource{}, second = ((match fail_value()
+            \\    _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+            \\    _ -> return none))}
             \\if (attempt() is Pair) -> exit(1) else exit(0)
             ,
             .expected = 42,
@@ -1937,7 +1940,8 @@ test "failure and condition results enforce explicit drop" {
         \\  return 1
         \\func attempt() int | none
         \\  const resource = Resource{}
-        \\  const value: int = fail_value() else return none
+        \\  const value = fail_value()
+        \\  if not (value is int) -> return none
         \\  return value
         \\if (attempt() is int) -> exit(1) else exit(0)
         ,
@@ -2905,7 +2909,11 @@ test "field assignment widens to the declared field type" {
         \\func answer() int
         \\  var holder = Holder{value = none}
         \\  holder.value = 42
-        \\  return if const value: int = holder.value -> value else 0
+        \\  return (match holder.value
+        \\      int ->
+        \\          const value = holder.value
+        \\          value
+        \\      _ -> 0)
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{"answer"}, 42);
 }
@@ -3523,7 +3531,11 @@ test "named type aliases and integer statics resolve on demand" {
         \\static Result = int | Empty
         \\static default_value = 40
         \\func choose(value: Result) int
-        \\  return if const number: int = value -> number else default_value
+        \\  return (match value
+        \\      int ->
+        \\          const number = value
+        \\          number
+        \\      _ -> default_value)
         \\func answer() int -> choose(default_value) + 2
     );
 
@@ -3554,9 +3566,11 @@ test "bool values cross static local call return and variant boundaries" {
         \\static maybe: bool | none = enabled
         \\func identity(value: Flag) Flag -> value
         \\func score(value: bool | none) int
-        \\  return if const flag: bool = value
-        \\    if flag == true -> 10 else 0
-        \\  else 12
+        \\  return (match value
+        \\      bool ->
+        \\          const flag = value
+        \\          if flag == true -> 10 else 0
+        \\      _ -> 12)
         \\func answer() int
         \\  var selected = identity(enabled)
         \\  selected = disabled
@@ -3623,7 +3637,11 @@ test "static annotations widen values and reject mismatches when demanded" {
         \\static absent: int | none = none
         \\static completed: int | unit = unit
         \\func answer() int
-        \\  const number = if const value: int = widened -> value else 0
+        \\  const number = (match widened
+        \\      int ->
+        \\          const value = widened
+        \\          value
+        \\      _ -> 0)
         \\  const missing = if absent is none -> 1 else 0
         \\  const done = if completed is unit -> 1 else 0
         \\  return number + missing + done
@@ -3915,7 +3933,11 @@ test "compile-time interpreter executes structs variants and mutable aggregate c
         \\  if not (value > 0) -> return none
         \\  return value
         \\static Maybe = int | none
-        \\static unwrap = func(value: Maybe) int -> return if const number: int = value -> number else 0
+        \\static unwrap = func(value: Maybe) int -> return (match value
+        \\    int ->
+        \\        const number = value
+        \\        number
+        \\    _ -> 0)
         \\static aggregate = sum(Pair{right = 2, left = 40})
         \\static narrowed = unwrap(42)
         \\static mutated = comptime
@@ -3972,7 +3994,11 @@ test "deinit compile-time calls preserve coercions field transfers and completio
     defer db.deinit();
     try addSource(db, 1,
         \\func consume(deinit value: int | none) int
-        \\  if const number: int = value -> return number
+        \\  match value
+        \\      int ->
+        \\          const number = value
+        \\          return number
+        \\      _ -> ()
         \\  return 0
         \\struct Item
         \\  value: int
@@ -4028,7 +4054,11 @@ test "compile-time aggregate results are canonical and cleanup preserves reverse
         \\static MaybePair = Pair | none
         \\static boxed: MaybePair = Pair{left = 40, right = 2}
         \\static boxed_alias: MaybePair = pair
-        \\static unbox = func(value: MaybePair) int -> return if const pair_value: Pair = value -> sum(pair_value) else 0
+        \\static unbox = func(value: MaybePair) int -> return (match value
+        \\    Pair ->
+        \\        const pair_value = value
+        \\        sum(pair_value)
+        \\    _ -> 0)
         \\static boxed_sum = unbox(boxed)
         \\static boxed_alias_sum = unbox(boxed_alias)
         \\func answer() int -> sum(pair)
@@ -4740,10 +4770,18 @@ fn testStaticDeclarationAllocations(gpa: std.mem.Allocator) !void {
         \\static MaybePair = Pair | none
         \\static boxed: MaybePair = Pair{left = 1, right = 2}
         \\static sum = func(pair: Pair) int -> pair.left + pair.right
-        \\static unbox = func(value: MaybePair) int -> return if const pair: Pair = value -> sum(pair) else 0
+        \\static unbox = func(value: MaybePair) int -> return (match value
+        \\    Pair ->
+        \\        const pair = value
+        \\        sum(pair)
+        \\    _ -> 0)
         \\static computed = unbox(boxed)
         \\func answer() int -> return if enabled == true
-        \\  if const number: int = value -> number + computed + generated.value - 2 else 1
+        \\  match value
+        \\      int ->
+        \\          const number = value
+        \\          number + computed + generated.value - 2
+        \\      _ -> 1
         \\else 0
     );
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
@@ -5880,7 +5918,11 @@ test "static callable variant annotations preserve the payload representation" {
         \\static Plain: type = func(int) int
         \\func identity(value: int) int -> value
         \\static selected: Plain | none = identity
-        \\if const operation: Plain = selected -> exit(operation(42)) else exit(1)
+        \\match selected
+        \\    Plain ->
+        \\        const operation = selected
+        \\        exit(operation(42))
+        \\    _ -> exit(1)
     );
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
     try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
@@ -5894,9 +5936,15 @@ test "func calls preserve success payloads across propagation" {
         \\func positive(value: int) int | none
         \\  if not (value > 0) -> return none
         \\  return value
-        \\func sum() int | none -> (if const _selected_result_0: int = positive(20) -> _selected_result_0 else return none) + (if const _selected_result_1: int = positive(22) -> _selected_result_1 else return none)
+        \\func sum() int | none -> ((match positive(20)
+        \\    _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\    _ -> return none)) + ((match positive(22)
+        \\        _selected_result_1 and _selected_result_1 is int -> _selected_result_1
+        \\        _ -> return none))
         \\func answer() unit | none
-        \\  if not ((if const _selected_result_2: int = sum() -> _selected_result_2 else return none) == 42) -> return none
+        \\  if not (((match sum()
+        \\      _selected_result_2 and _selected_result_2 is int -> _selected_result_2
+        \\      _ -> return none)) == 42) -> return none
         \\  return ()
         \\if (answer() is unit) -> exit(42) else exit(1)
     );
@@ -5913,7 +5961,8 @@ test "func call failure propagates without later effects" {
         \\  if not (value < 0) -> return none
         \\  return value
         \\func caller() int | none
-        \\  const value: int = negative(1) else return none
+        \\  const value = negative(1)
+        \\  if not (value is int) -> return none
         \\  exit(99)
         \\  return value
         \\if (caller() is int) -> exit(1) else exit(42)
@@ -5931,12 +5980,14 @@ test "func calls preserve zero-sized and memory-returned payloads" {
         \\  if not (value > 0) -> return none
         \\  return value
         \\func inspect() unit | none
-        \\  const produced: int | none = produce(7) else return none
+        \\  const produced = produce(7)
+        \\  if not (produced is int | none) -> return none
         \\  if not (produced is int) -> return none
         \\  return ()
         \\  return ()
         \\func forward() unit | none
-        \\  const _: unit = inspect() else return none
+        \\  const checked_value_2 = inspect()
+        \\  if not (checked_value_2 is unit) -> return none
         \\  return ()
         \\if (forward() is unit) -> exit(42) else exit(1)
     );
@@ -6094,7 +6145,9 @@ test "func if condition binds its successful result" {
     defer db.deinit();
     try addSource(db, 1,
         \\func give() int | none -> 42
-        \\func answer() int -> if const result: int = give() -> result else 0
+        \\func answer() int -> (match give()
+        \\    result and result is int -> result
+        \\    _ -> 0)
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "give" }, 42);
 }
@@ -6121,17 +6174,17 @@ test "if validates conditions and expected result types" {
         },
         .{
             .file_id = 4,
-            .source = "func give() int -> 42\nfunc bad() int -> if const result: int = give() -> true else 0",
+            .source = "func give() int -> 42\nfunc bad() int -> (match give()\n    result and result is int -> true\n    _ -> 0)",
             .kind = .return_type_mismatch,
         },
         .{
             .file_id = 5,
-            .source = "func give() int | none -> 42\nfunc bad() int -> if const result: int = give() -> true else 0",
+            .source = "func give() int | none -> 42\nfunc bad() int -> (match give()\n    result and result is int -> true\n    _ -> 0)",
             .kind = .return_type_mismatch,
         },
         .{
             .file_id = 6,
-            .source = "func give() int | none -> 42\nfunc bad() int -> if const result: int = give() -> 1 else result",
+            .source = "func give() int | none -> 42\nfunc bad() int -> (match give()\n    result and result is int -> 1\n    _ -> result)",
             .kind = .unknown_value,
         },
     };
@@ -6175,7 +6228,11 @@ test "typed conditions select variant payloads and ordinary conditions test bool
         \\  const b = if false -> 10 else 0
         \\  const c = if not (v is none) -> 10 else 0
         \\  const d = if false -> 0 else 20
-        \\  return a + b + c + d + (if const x: int = v -> x else 0)
+        \\  return a + b + c + d + ((match v
+        \\      int ->
+        \\          const x = v
+        \\          x
+        \\      _ -> 0))
         \\static answer = func() int -> choose(2)
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "choose" }, 42);
@@ -6203,7 +6260,11 @@ test "variant extraction binds the narrowed value only in the success branch" {
 
     try addSource(db, 1,
         \\static extract = func(value: int | none) int
-        \\  return if const number: int = value -> number else 0
+        \\  return (match value
+        \\      int ->
+        \\          const number = value
+        \\          number
+        \\      _ -> 0)
         \\static answer = func() int -> return extract(42) + extract(none)
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "extract" }, 42);
@@ -6215,10 +6276,15 @@ test "variant extraction annotations widen successful payloads" {
 
     try addSource(db, 1,
         \\static extract = func(value: int | none) int
-        \\  return if const widened: int = value
-        \\    if const number: int = widened -> number else 1
-        \\  else
-        \\    0
+        \\  return (match value
+        \\      int ->
+        \\          const widened = value
+        \\          match widened
+        \\              int ->
+        \\                  const number = widened
+        \\                  number
+        \\              _ -> 1
+        \\      _ -> 0)
         \\static answer = func() int -> return extract(42) + extract(none)
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "extract" }, 42);
@@ -6230,12 +6296,23 @@ test "typed variant patterns remap subset tags and discard selected payloads" {
 
     try addSource(db, 1,
         \\static select = func(value: int | unit | none) int
-        \\  return if const narrowed: int | none = value
-        \\    if const number: int = narrowed -> number else 2
-        \\  else
-        \\    0
-        \\static accepts_int = func(value: int | none) int -> return if const _: int = value -> 1 else 0
-        \\static impossible = func(value: int | none) int -> return if const no: unit = value -> 0 else 42
+        \\  return (match value
+        \\      int | none ->
+        \\          const narrowed = value
+        \\          match narrowed
+        \\              int ->
+        \\                  const number = narrowed
+        \\                  number
+        \\              _ -> 2
+        \\      _ -> 0)
+        \\static accepts_int = func(value: int | none) int -> return (match value
+        \\    int -> 1
+        \\    _ -> 0)
+        \\static impossible = func(value: int | none) int -> return (match value
+        \\    unit ->
+        \\        const no = value
+        \\        0
+        \\    _ -> 42)
         \\static answer = func() int -> return select(39) + select(none) + select(unit) + accepts_int(1) + impossible(1)
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "select", "accepts_int", "impossible" }, 84);
@@ -6259,11 +6336,11 @@ test "variant inspection enforces operand and condition binding rules" {
         .{
             .file_id = 3,
             .source = "static bad = func(value: int | none) int -> return if var number: int = value -> number else 0",
-            .kind = .condition_binding_must_be_immutable,
+            .kind = .invalid_expression,
         },
         .{
             .file_id = 4,
-            .source = "static bad = func(value: int | none) int\n  const result = if const number: int = value -> number else 0\n  return number + result",
+            .source = "static bad = func(value: int | none) int\n  const result = (match value\n      int ->\n          const number = value\n          number\n      _ -> 0)\n  return number + result",
             .kind = .unknown_value,
         },
         .{
@@ -6278,7 +6355,7 @@ test "variant inspection enforces operand and condition binding rules" {
         },
         .{
             .file_id = 7,
-            .source = "static bad = func(value: int | none) int\n  const number = 0\n  return if const number: int = value -> number else 0",
+            .source = "static bad = func(value: int | none) int\n  const number = 0\n  return (match value\n      int ->\n          const number = value\n          number\n      _ -> 0)",
             .kind = .duplicate_local_binding,
         },
     };
@@ -6297,19 +6374,19 @@ test "variant inspection edits retain equal artifacts and recover diagnostics" {
     const db = try testDatabase(1);
     defer db.deinit();
 
-    const original = "static inspect = func(value: int | none) int -> return if const selected: int = value -> 42 else 24";
+    const original = "static inspect = func(value: int | none) int -> return (match value\n    int ->\n        const selected = value\n        42\n    _ -> 24)";
     try addSource(db, 1, original);
     const item = (try db.get(queries.BuildModuleScope, 1)).*.?.resolve("inspect").?;
     const instance: structures.InstanceId = .{ .item = item };
     const body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = item });
     const artifact = try db.get(queries.CompileFunction, instance);
 
-    try setSource(db, 1, "static inspect = func(value: int | none) int -> return if const selected: int = ((value)) -> 42 else 24");
+    try setSource(db, 1, "static inspect = func(value: int | none) int -> return (match value\n    int ->\n        const selected = value\n        42\n    _ -> 24)");
     // Source spans change even when executable operations are equivalent.
     try testing.expect(body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = item }));
     try testing.expectEqual(artifact, try db.get(queries.CompileFunction, instance));
 
-    try setSource(db, 1, "static inspect = func(value: int | none) int -> return if const selected: none = value -> 42 else 24");
+    try setSource(db, 1, "static inspect = func(value: int | none) int -> return (match value\n    none ->\n        const selected = value\n        42\n    _ -> 24)");
     try testing.expect(body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = item }));
     try testing.expect(artifact != try db.get(queries.CompileFunction, instance));
 
@@ -6337,9 +6414,15 @@ fn testVariantInspectionAllocations(gpa: std.mem.Allocator) !void {
     defer db.deinit();
     try addSource(db, 1,
         \\static select = func(value: int | unit | none) int
-        \\  return if const narrowed: int | none = value
-        \\    if const number: int = narrowed -> number else 2
-        \\  else 0
+        \\  return (match value
+        \\      int | none ->
+        \\          const narrowed = value
+        \\          match narrowed
+        \\              int ->
+        \\                  const number = narrowed
+        \\                  number
+        \\              _ -> 2
+        \\      _ -> 0)
         \\select(40)
     );
     try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
@@ -7638,7 +7721,8 @@ test "func owned results originate only on success edges" {
         \\  if not (value > 0) -> return none
         \\  return Resource{value = value}
         \\func answer() int | none
-        \\  const resource: Resource = make(42) else return none
+        \\  const resource = make(42)
+        \\  if not (resource is Resource) -> return none
         \\  return resource.value
         \\if (answer() is int) -> exit(42) else exit(1)
     );
@@ -7692,7 +7776,11 @@ test "condition bindings require copying the extracted value" {
         \\static Box = struct
         \\  value: int
         \\func bad(value: Box | none) int
-        \\  if const box: Box = value -> return box.value
+        \\  match value
+        \\      Box ->
+        \\          const box = value
+        \\          return box.value
+        \\      _ -> ()
         \\  return 0
     );
     const function_id = (try db.get(queries.BuildModuleScope, 1)).*.?.resolveFunction("bad").?;

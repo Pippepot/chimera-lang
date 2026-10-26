@@ -530,7 +530,10 @@ fn parseBinding(parser: *ParserState) !Node.Index {
 }
 
 fn parseBindingElse(parser: *ParserState, binding: Node.Index, token_index: u32) !Node.Index {
-    if (parser.eat(.keyword_else) == null) return binding;
+    if (parser.current().tag != .keyword_else) return binding;
+    if (parser.nodes.items[binding.index()].tag != .destructure_binding)
+        return parser.fail(.{ .invalid_expression = .keyword_else });
+    parser.index += 1;
     const otherwise = if (parser.eat(.indent) != null) try parseBlock(parser, parser.index - 1) else try parseRequiredExpression(parser);
     return parser.addNode(.{ .tag = .binding_else, .token_index = token_index, .data = .{ .node_node = .{ .a = binding, .b = otherwise } } });
 }
@@ -633,6 +636,10 @@ fn parseIfExpr(parser: *ParserState) ParseError!Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.keyword_if);
 
+    if (parser.current().tag == .keyword_const or parser.current().tag == .keyword_ref or parser.current().tag == .keyword_var) {
+        if (parser.tokens[parser.index + 1].tag == .identifier)
+            return parser.fail(.{ .invalid_expression = parser.current().tag });
+    }
     const condition = try parseRequiredExpression(parser);
     const then_body = try parseBody(parser, token_index);
     if (parser.eat(.keyword_else) != null) {
@@ -683,7 +690,7 @@ fn parseMatchCapture(parser: *ParserState) ParseError!Node.Index {
     if (mode != null and mode.?.tag == .keyword_var) return parser.fail(.match_capture_must_be_immutable);
     const name_index = parser.index;
     _ = try parser.expect(.identifier);
-    return parser.addNode(.{ .tag = .param, .token_index = name_index, .data = .{ .parameter = .{ .access = if (mode) |token| token.tag else null, .annotation = try parseTypeAnnotation(parser) } } });
+    return parser.addNode(.{ .tag = .param, .token_index = name_index, .data = .{ .parameter = .{ .access = if (mode) |token| token.tag else null, .annotation = .null } } });
 }
 
 fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
@@ -692,9 +699,7 @@ fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
         return parseRange(parser, first);
     }
     const token_index = parser.index;
-    const pattern = if (parser.current().tag == .identifier and parser.tokens[parser.index + 1].tag == .colon)
-        try parseMatchCapture(parser)
-    else switch (parser.current().tag) {
+    const pattern = switch (parser.current().tag) {
         .identifier, .keyword_func => try parseType(parser),
         .keyword_ref, .keyword_var => try parseMatchCapture(parser),
         .number_literal => try parseTokenNode(parser, .number_literal, .number_literal),
@@ -2242,7 +2247,7 @@ test "parse field assignment" {
 test "parse variant runtime operators" {
     try testParsing(
         \\if x is int | A -> print(1)
-        \\if const i: int = b -> print(i)
+        \\if b is int -> print(b)
     ,
         \\if
         \\├─is
@@ -2255,13 +2260,13 @@ test "parse variant runtime operators" {
         \\  └─call_arg_list
         \\    └─number_literal : 1
         \\if
-        \\├─const_binding
-        \\│ ├─type : int
-        \\│ └─identifier : b
+        \\├─is
+        \\│ ├─identifier : b
+        \\│ └─type : int
         \\└─call
         \\  ├─identifier : print
         \\  └─call_arg_list
-        \\    └─identifier : i
+        \\    └─identifier : b
     );
 }
 
@@ -2317,7 +2322,7 @@ test "parse calls and move postfix operators" {
         \\const a = value()
         \\const b = a^
         \\take(b^)
-        \\if const v = maybe() -> print(v)
+        \\if maybe() is int -> print(1)
     ,
         \\const_binding
         \\└─call
@@ -2331,13 +2336,14 @@ test "parse calls and move postfix operators" {
         \\  └─move_expr
         \\    └─identifier : b
         \\if
-        \\├─const_binding
-        \\│ └─call
-        \\│   └─identifier : maybe
+        \\├─is
+        \\│ ├─call
+        \\│ │ └─identifier : maybe
+        \\│ └─type : int
         \\└─call
         \\  ├─identifier : print
         \\  └─call_arg_list
-        \\    └─identifier : v
+        \\    └─number_literal : 1
     );
 }
 
@@ -2548,20 +2554,18 @@ test "parse else if chain" {
     );
 }
 
-test "parse if condition binding" {
-    try testParsing(
-        \\if const v = value
-        \\  print(v)
-    ,
-        \\if
-        \\├─const_binding
-        \\│ └─identifier : value
-        \\└─block
-        \\  └─call
-        \\    ├─identifier : print
-        \\    └─call_arg_list
-        \\      └─identifier : v
-    );
+test "removed typed and untyped conditional bindings are syntax errors" {
+    for ([_][]const u8{
+        "if const value: int = source -> use(value)",
+        "if ref value = source -> use(value)",
+        "const value: int = source else return none",
+        "match source\n    value: int -> value",
+    }) |source| {
+        var report = try parseReport(std.testing.allocator, 0, source);
+        defer report.deinit(std.testing.allocator);
+        try std.testing.expect(report.ast == null);
+        try std.testing.expectEqual(1, report.diagnostics.len);
+    }
 }
 
 test "parse calls and literals" {
@@ -2903,7 +2907,7 @@ test "truncated multiline sources preserve parser error boundaries" {
     const sources = [_][]const u8{
         "ref value: Item = target.get(index)",
         "import library.{\n  first as renamed,\n  second,\n}",
-        "func calculate(\n  imm value: int | none,\n  init other: int,\n) int\n  if const result = value\n    return other\n  else return 0",
+        "func calculate(\n  imm value: int | none,\n  init other: int,\n) int\n  if value is int\n    return other\n  else return 0",
         "static struct Container(T: type)\n  value: T\n  func get(self: Self) T -> self.value",
         "const value = call(\n  [1, 2,\n    3],\n  Item{\n    field = 4,\n  },\n)",
         "static Callback: type = func(imm int | none, init int) int",

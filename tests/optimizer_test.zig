@@ -182,7 +182,11 @@ test "constant incoming predicates bypass only exits independent of join paramet
         \\    return none
         \\func calculate(flag: bool, number: int) int
         \\    const value = pick(flag, number)
-        \\    if const integer: int = value -> return integer
+        \\    match value
+        \\        int ->
+        \\            const integer = value
+        \\            return integer
+        \\        _ -> ()
         \\    return 11
         \\func run() int -> calculate(true, 31) + calculate(false, 90)
     , 42);
@@ -198,11 +202,13 @@ test "joins retain known variant alternatives and constant aggregate fields" {
         \\    if flag -> return Value{number = number, subtract = false}
         \\    return Value{number = number + 1, subtract = false}
         \\func calculate(flag: bool, number: int) int
-        \\    const value: Value = choose(flag, number) else return 90
+        \\    const value = choose(flag, number)
+        \\    if not (value is Value) -> return 90
         \\    if value.subtract -> return value.number - 10
         \\    return value.number + 10
         \\func constant(number: int) int
-        \\    const value: Value = choose(true, number) else return 90
+        \\    const value = choose(true, number)
+        \\    if not (value is Value) -> return 90
         \\    return value.number
         \\func run() int -> calculate(true, 10) + calculate(false, 11) + constant(0)
     ;
@@ -236,10 +242,17 @@ test "scalar variant joins preserve distinct tags and inactive payloads" {
         \\    return none
         \\func calculate(mode: int, number: int) int
         \\    const value = pick(mode, number)
-        \\    if const integer: int = value -> return integer
-        \\    if const flag: bool = value
-        \\        if flag -> return 22
-        \\        return 90
+        \\    match value
+        \\        int ->
+        \\            const integer = value
+        \\            return integer
+        \\        _ -> ()
+        \\    match value
+        \\        bool ->
+        \\            const flag = value
+        \\            if flag -> return 22
+        \\            return 90
+        \\        _ -> ()
         \\    return 0
         \\func run() int -> calculate(0, 20) + calculate(1, 99) + calculate(2, 99)
     ;
@@ -260,14 +273,32 @@ test "scalar variant joins batch independent and dependent consumers" {
         \\    const first = pick(mode, number)
         \\    const second = pick(2 - mode, number + 1)
         \\    var result = 0
-        \\    if const integer: int = first -> result += integer
-        \\    if const flag: bool = first
-        \\        if flag -> result += 10
-        \\    if const integer: int = second -> result += integer
-        \\    if const flag: bool = second
-        \\        if flag -> result += 10
+        \\    match first
+        \\        int ->
+        \\            const integer = first
+        \\            result += integer
+        \\        _ -> ()
+        \\    match first
+        \\        bool ->
+        \\            const flag = first
+        \\            if flag -> result += 10
+        \\        _ -> ()
+        \\    match second
+        \\        int ->
+        \\            const integer = second
+        \\            result += integer
+        \\        _ -> ()
+        \\    match second
+        \\        bool ->
+        \\            const flag = second
+        \\            if flag -> result += 10
+        \\        _ -> ()
         \\    const third = pick(mode, result)
-        \\    if const integer: int = third -> return integer
+        \\    match third
+        \\        int ->
+        \\            const integer = third
+        \\            return integer
+        \\        _ -> ()
         \\    return result
         \\func run() int -> calculate(0, 10) + calculate(1, 99) + calculate(2, 11)
     ;
@@ -445,7 +476,9 @@ const promotion_source =
     \\    var attempts = 0
     \\    loop
     \\        attempts += 1
-    \\        if const accepted: int = positive(value) -> return accepted + attempts
+    \\        match positive(value)
+    \\            accepted and accepted is int -> return accepted + attempts
+    \\            _ -> ()
     \\        value += 5
     \\func run() int
     \\    if sum(10) <> 30 -> return 90
@@ -453,7 +486,9 @@ const promotion_source =
     \\    if merge(false, 4) <> 11 -> return 92
     \\    if borrowed(6) <> 7 -> return 93
     \\    if reopened(21) <> 42 -> return 95
-    \\    if const value: int = checked(-12) -> if value == 7 -> return 42
+    \\    match checked(-12)
+    \\        value and value is int -> if value == 7 -> return 42
+    \\        _ -> ()
     \\    return 94
 ;
 
@@ -519,12 +554,14 @@ const pipeline_source =
     \\    if a > b -> return a
     \\    return b
     \\func scan(n: int) int | none
-    \\    var values: List(int) = List(int).filled(3, n) else return none
+    \\    var values = List(int).filled(3, n)
+    \\    if not (values is List(int)) -> return none
     \\    var index = 0
     \\    var sum = 0
     \\    loop
     \\        if index >= values.len() -> break
-    \\        const value: int = values.get(index) else return none
+    \\        const value = values.get(index)
+    \\        if not (value is int) -> return none
     \\        sum += value
     \\        index += 1
     \\    return sum
@@ -542,8 +579,12 @@ const pipeline_source =
     \\        if index == 10 -> break
     \\        sum += larger(index, 3)
     \\        index += 1
-    \\    if const scanned: int = scan(4)
-    \\        if const halved: int = half(total(pair)) -> return halved + countdown(3) + sum + scanned - 45 + spin(9) - 5
+    \\    match scan(4)
+    \\        scanned and scanned is int ->
+    \\            match half(total(pair))
+    \\                halved and halved is int -> return halved + countdown(3) + sum + scanned - 45 + spin(9) - 5
+    \\                _ -> ()
+    \\        _ -> ()
     \\    return 90
 ;
 

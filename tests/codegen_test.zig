@@ -1180,7 +1180,8 @@ test "native copies preserve byte tails and adjacent guards across the bulk thre
             \\        index += 1
             \\    return 42
             \\func run() int
-            \\    if const result = calculate() -> return result
+            \\    match calculate()
+            \\        result -> return result
             \\    return 94
             \\exit(run())
         , .{ .count = count_text, .bytes = bytes.items });
@@ -1209,7 +1210,9 @@ test "native nested array addressing handles native scales zero sizes and multip
             \\    return value
             \\func calculate() int
             \\    var grid: Array(Array(byte, $width), 3) = $bytes
-            \\    if ref invalid: Array(byte, $width) = grid.get(-1) -> return 91
+            \\    match grid.get(-1)
+            \\        ref invalid and invalid is Array(byte, $width) -> return 91
+            \\        _ -> ()
             \\    var outer = 0
             \\    loop
             \\        if outer >= 3 -> break
@@ -1222,7 +1225,8 @@ test "native nested array addressing handles native scales zero sizes and multip
             \\        outer += 1
             \\    return 42
             \\func run() int
-            \\    if const result = calculate() -> return result
+            \\    match calculate()
+            \\        result -> return result
             \\    return 93
             \\exit(run())
         , .{ .width = width_text, .bytes = bytes.items });

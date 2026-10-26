@@ -69,9 +69,10 @@ const unit_body =
     \\        return 0
     \\    const variant: int | none = total
     \\    total = match variant
-    \\        value: int -> value
+    \\        int -> variant
     \\        none -> 0
-    \\    if const accepted: int = checked(total)
+    \\    const accepted = checked(total)
+    \\    if accepted is int
     \\        total = accepted
     \\    else
     \\        return 0
@@ -130,9 +131,8 @@ pub fn generate(allocator: std.mem.Allocator, target_lines: usize) !Workload {
     }
     try entry.writer.writeAll("var padding = 0\n");
     for (0..module_count) |module_index| {
-        try entry.writer.print("if const actual: int = part{d}.run(1)\n", .{module_index});
+        try entry.writer.print("if true\n    const actual = part{d}.run(1)\n    if not (actual is int) -> exit(1)\n", .{module_index});
         try entry.writer.print("    if actual <> {d} -> exit(1)\n", .{units_per_module});
-        try entry.writer.writeAll("else\n    exit(1)\n");
     }
     for (0..padding) |_| try entry.writer.writeAll("padding += 1\n");
     try entry.writer.print("if padding <> {d} -> exit(1)\n", .{padding});

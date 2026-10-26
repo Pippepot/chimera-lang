@@ -14,13 +14,17 @@ pub func write_all(stream: Stream, imm bytes: BytesView) unit | none
     var offset = 0
     loop
         if offset == bytes.byte_length() -> return unit
-        const remaining: BytesView = bytes.slice(offset..) else return none
-        const written: int = write_once(stream, remaining) else return none
+        const remaining = bytes.slice(offset..)
+        if not (remaining is BytesView) -> return none
+        const written = write_once(stream, remaining)
+        if not (written is int) -> return none
         if written <= 0 -> return none
         offset += written
 pub func write_text(stream: Stream, imm text: StringView) unit | none -> write_all(stream, text.as_bytes())
 pub overload print(print_value)
 func print_value(static T: type, imm value: T)
-    const _: unit = write_text(stdout, String(value)) else panic "standard output write failed"
-    const _: unit = write_text(stdout, "\n") else panic "standard output newline write failed"
+    const selected_result_3 = write_text(stdout, String(value))
+    if not (selected_result_3 is unit) -> panic "standard output write failed"
+    const selected_result_4 = write_text(stdout, "\n")
+    if not (selected_result_4 is unit) -> panic "standard output newline write failed"
 pub func read_bytes(stream: Stream, mut bytes: List(byte), count: int) int | none -> bytes.read_bytes(stream.descriptor, count)

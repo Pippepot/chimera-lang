@@ -50,12 +50,19 @@ test "List consuming early exits release backing allocations repeatedly" {
         \\    var iteration = 0
         \\    loop
         \\        if iteration == 384 -> break
-        \\        const values: List(Array(int, 2048)) = List(Array(int, 2048)).from([(if const _selected_result_0: Array(int, 2048) = Array(int, 2048).filled(0) -> _selected_result_0^ else return none), (if const _selected_result_1: Array(int, 2048) = Array(int, 2048).filled(0) -> _selected_result_1^ else return none)]) else return none
+        \\        const values = List(Array(int, 2048)).from([((match Array(int, 2048).filled(0)
+        \\            _selected_result_0 and _selected_result_0 is Array(int, 2048) -> _selected_result_0^
+        \\            _ -> return none)), ((match Array(int, 2048).filled(0)
+        \\                _selected_result_1 and _selected_result_1 is Array(int, 2048) -> _selected_result_1^
+        \\                _ -> return none))])
+        \\        if not (values is List(Array(int, 2048))) -> return none
         \\        for item in values^ -> break
         \\        iteration += 1
         \\    return 42
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     );
@@ -74,7 +81,8 @@ test "List removal and consuming traversal transfer nested array storage" {
     try expectCalculation(
         \\func calculate() int | none
         \\    var values: List(Array(int, 2)) = [[9, 10], [20, 22]]
-        \\    const removed: Array(int, 2) = values.remove(1) else return none
+        \\    const removed = values.remove(1)
+        \\    if not (removed is Array(int, 2)) -> return none
         \\    var total = removed[0] + removed[1]
         \\    for item in values^ -> total += item[0] - item[1] + 1
         \\    return total
@@ -85,7 +93,8 @@ test "slot selectors remap captured local indices across deferred initialization
     try expectCalculation(
         \\func select(ref values: Array(Ref(int), 2), index: int) Ref(int) | none
         \\    const picked = index + 0
-        \\    const owner: Box(Ref(int)) = Box.new(values[picked]) else return none
+        \\    const owner = Box.new(values[picked])
+        \\    if not (owner is Box(Ref(int))) -> return none
         \\    return owner.take()
         \\func calculate() int | none
         \\    var source = 42
@@ -93,8 +102,14 @@ test "slot selectors remap captured local indices across deferred initialization
         \\    if 1 == 1
         \\        var temporary = 7
         \\        var values = [Ref.from(source), Ref.from(temporary)]
-        \\        result = (if const _selected_result_0: Ref(int) = select(values, 0) -> _selected_result_0 else return none)
-        \\    if ref item: Ref(int) = result -> return item.value
+        \\        result = ((match select(values, 0)
+        \\            _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\            _ -> return none))
+        \\    match result
+        \\        Ref(int) ->
+        \\            ref item = result
+        \\            return item.value
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -103,12 +118,15 @@ test "recursive List mutations widen changing index selectors to finite contract
     try expectCalculation(
         \\func replace(mut values: List(Ref(int)), index: int, ref source: int, remaining: int) unit | none
         \\    values[index] = Ref.from(source)
-        \\    if remaining > 0 -> (if const _selected_result_0: unit = replace(values, index + 1, source, remaining - 1) -> _selected_result_0 else return none)
+        \\    if remaining > 0 -> ((match replace(values, index + 1, source, remaining - 1)
+        \\        _selected_result_0 and _selected_result_0 is unit -> _selected_result_0
+        \\        _ -> return none))
         \\    return ()
         \\func calculate() int | none
         \\    var source = 14
         \\    var values: List(Ref(int)) = [Ref.from(source), Ref.from(source), Ref.from(source)]
-        \\    const _: unit = replace(values, 0, source, 2) else return none
+        \\    const checked_value_1 = replace(values, 0, source, 2)
+        \\    if not (checked_value_1 is unit) -> return none
         \\    return values[0].value + values[1].value + values[2].value
     , 42);
 }
@@ -123,7 +141,9 @@ test "List failed growth destroys its prepared item and preserves initialized el
         \\    if trace == 3 -> return 42
         \\    return 92
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 93
     ;
     for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
@@ -185,7 +205,11 @@ test "List consuming Ref handles retain their external referents after cursor cl
         \\    const values: List(Ref(int)) = [Ref.from(source)]
         \\    var saved: Ref(int) | none = none
         \\    for item in values^ -> saved = item
-        \\    if ref item: Ref(int) = saved -> item.value += 22
+        \\    match saved
+        \\        Ref(int) ->
+        \\            ref item = saved
+        \\            item.value += 22
+        \\        _ -> ()
         \\    return source
     , 42);
 }
@@ -195,7 +219,11 @@ test "List consuming traversal rejects an escaping alias into the current item" 
         \\const values: List(int) = [42]
         \\var saved: Ref(int) | none = none
         \\for ref item in values^ -> saved = Ref.from(item)
-        \\if ref item: Ref(int) = saved -> print(item.value)
+        \\match saved
+        \\    Ref(int) ->
+        \\        ref item = saved
+        \\        print(item.value)
+        \\    _ -> ()
     , .borrow_outlives_source);
 }
 
@@ -219,7 +247,11 @@ test "List consuming traversal preserves mixed reference and owned alternatives"
         \\    const values = [if i == 0 -> reference else none for i in 0..2]
         \\    var total = 22
         \\    for item in values^
-        \\        if ref selected: int = item -> total += selected
+        \\        match item
+        \\            int ->
+        \\                ref selected = item
+        \\                total += selected
+        \\            _ -> ()
         \\    return total
     , 42);
 }
@@ -240,7 +272,8 @@ test "List removal cannot leave a live borrowed iterator over ended slots" {
         \\    var values: List(int) = [20, 22]
         \\    for item in values
         \\        print(item)
-        \\        const _: int = values.remove(0) else return none
+        \\        const checked_value_1 = values.remove(0)
+        \\        if not (checked_value_1 is int) -> return none
         \\    return ()
         \\if (invalid() is unit) -> ()
     , .borrow_outlives_source);
@@ -275,10 +308,14 @@ test "List reference append and relocation retain independent captured authority
         \\func calculate() int | none
         \\    var first = 10
         \\    var second = 20
-        \\    var values: List(Ref(int)) = List(Ref(int)).new(0) else return none
-        \\    const _: unit = values.append(Ref.from(first)) else return none
-        \\    const _: unit = values.append(Ref.from(second)) else return none
-        \\    const _: unit = values.reserve(8) else return none
+        \\    var values = List(Ref(int)).new(0)
+        \\    if not (values is List(Ref(int))) -> return none
+        \\    const checked_value_2 = values.append(Ref.from(first))
+        \\    if not (checked_value_2 is unit) -> return none
+        \\    const checked_value_3 = values.append(Ref.from(second))
+        \\    if not (checked_value_3 is unit) -> return none
+        \\    const checked_value_4 = values.reserve(8)
+        \\    if not (checked_value_4 is unit) -> return none
         \\    values[0].value += 1
         \\    values[1].value += 1
         \\    return first + second + values.len() + values.capacity()
@@ -289,10 +326,13 @@ test "List removal returns captured references independently of the old allocati
     try expectCalculation(
         \\func extract(ref source: int) Ref(int) | none
         \\    var values: List(Ref(int)) = [Ref.from(source)]
-        \\    return (if const _selected_result_0: Ref(int) = values.remove(0) -> _selected_result_0 else return none)
+        \\    return ((match values.remove(0)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> return none))
         \\func calculate() int | none
         \\    var source = 20
-        \\    var result: Ref(int) = extract(source) else return none
+        \\    var result = extract(source)
+        \\    if not (result is Ref(int)) -> return none
         \\    result.value += 22
         \\    return source
     , 42);
@@ -306,7 +346,8 @@ test "List conditional removal conservatively retains possible captures" {
         \\    if 1 == 1
         \\        var temporary = 7
         \\        values[0] = Ref.from(temporary)
-        \\        const removed: Ref(int) = values.remove(0) else return none
+        \\        const removed = values.remove(0)
+        \\        if not (removed is Ref(int)) -> return none
         \\        if removed.value <> 7 -> return 90
         \\    return values[0].value * 2
         \\_ = calculate()
@@ -340,7 +381,9 @@ test "List writes before ordinary failure replace the caller capture" {
         \\    if 1 == 1
         \\        var temporary = 7
         \\        values[0] = Ref.from(temporary)
-        \\        ref slot: Ref(int) = values.get(0) else return none
+        \\        const checked_value_1 = values.get(0)
+        \\        if not (checked_value_1 is Ref(int)) -> return none
+        \\        ref slot = checked_value_1
         \\        if (replace(slot, source) is unit) -> return 90
         \\    return values[0].value
     , 42);
@@ -349,7 +392,9 @@ test "List writes before ordinary failure replace the caller capture" {
 test "List conditional replacement conservatively retains possible captures" {
     try Fixture.expectSourceDiagnostic(
         \\func replace(mut values: List(Ref(int)), index: int, ref source: int) unit | none
-        \\    ref slot: Ref(int) = values.get(index) else return none
+        \\    const checked_value_1 = values.get(index)
+        \\    if not (checked_value_1 is Ref(int)) -> return none
+        \\    ref slot = checked_value_1
         \\    slot = Ref.from(source)
         \\    return ()
         \\func calculate() int | none
@@ -357,8 +402,10 @@ test "List conditional replacement conservatively retains possible captures" {
         \\    var values: List(Ref(int)) = [Ref.from(source)]
         \\    if 1 == 1
         \\        var temporary = 7
-        \\        const _: unit = replace(values, 0, temporary) else return none
-        \\        const _: unit = replace(values, 0, source) else return none
+        \\        const checked_value_2 = replace(values, 0, temporary)
+        \\        if not (checked_value_2 is unit) -> return none
+        \\        const checked_value_3 = replace(values, 0, source)
+        \\        if not (checked_value_3 is unit) -> return none
         \\    return values[0].value
         \\_ = calculate()
     , .borrow_outlives_source);
@@ -367,11 +414,14 @@ test "List conditional replacement conservatively retains possible captures" {
 test "indexed reference outputs remap selectors through forwarded handles" {
     const declarations =
         \\func replace(var handle: Ref(Array(Ref(int), 2)), index: int, ref source: int) unit | none
-        \\    ref slot: Ref(int) = handle.value.get(index) else return none
+        \\    const checked_value_1 = handle.value.get(index)
+        \\    if not (checked_value_1 is Ref(int)) -> return none
+        \\    ref slot = checked_value_1
         \\    slot = Ref.from(source)
         \\    return ()
         \\func forward(ref values: Array(Ref(int), 2), index: int, ref source: int) unit | none
-        \\    const _: unit = replace(Ref.from(values), index + 1, source) else return none
+        \\    const checked_value_2 = replace(Ref.from(values), index + 1, source)
+        \\    if not (checked_value_2 is unit) -> return none
         \\    return ()
     ;
     try expectCalculation(declarations ++ "\n" ++
@@ -403,7 +453,8 @@ test "List removal preserves order and bounds failures preserve contents" {
         \\    var values: List(int) = [10, 11, 21]
         \\    if (values.remove(-1) is int) -> return 90
         \\    if (values.remove(3) is int) -> return 91
-        \\    const removed: int = values.remove(1) else return none
+        \\    const removed = values.remove(1)
+        \\    if not (removed is int) -> return none
         \\    if values.len() <> 2 -> return 92
         \\    return values[0] + removed + values[1]
     , 42);
@@ -416,10 +467,12 @@ test "List filled copies one value into every slot" {
         \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
         \\func calculate() int | none
         \\    if (List(int).filled(0, -1) is List(int)) -> return 90
-        \\    const empty: List(int) = List(int).filled(0, 0) else return none
+        \\    const empty = List(int).filled(0, 0)
+        \\    if not (empty is List(int)) -> return none
         \\    if empty.len() <> 0 -> return 91
         \\    const source = Item{value = 13}
-        \\    const values: List(Item) = List(Item).filled(source, 2) else return none
+        \\    const values = List(Item).filled(source, 2)
+        \\    if not (values is List(Item)) -> return none
         \\    if values.len() <> 2 -> return 92
         \\    if values.capacity() <> 2 -> return 93
         \\    return values[0].value + values[1].value + source.value + 1
@@ -435,7 +488,13 @@ test "List consuming traversal cleans current and remaining items on early break
         \\    drop = func(deinit self: Item) -> self.trace.value = self.trace.value * 10 + self.value
         \\func run() int
         \\    var trace = 0
-        \\    const values: List(Item) = [Item{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none"), value = 1}, Item{trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else panic "unexpected none"), value = 2}, Item{trace = (if const _selected_result_2: Ref(int) = Ref.from(trace) -> _selected_result_2 else panic "unexpected none"), value = 3}]
+        \\    const values: List(Item) = [Item{trace = ((match Ref.from(trace)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none")), value = 1}, Item{trace = ((match Ref.from(trace)
+        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
+        \\            _ -> panic "unexpected none")), value = 2}, Item{trace = ((match Ref.from(trace)
+        \\                _selected_result_2 and _selected_result_2 is Ref(int) -> _selected_result_2
+        \\                _ -> panic "unexpected none")), value = 3}]
         \\    for item in values^ -> break
         \\    if trace == 321 -> return 42
         \\    return 90
@@ -463,7 +522,9 @@ test "transferred Span keeps borrowed delivery and captured authority" {
 fn expectCalculation(comptime source: []const u8, status: u8) !void {
     try Fixture.expectParity(source ++ "\n" ++
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 99
     , status);
 }

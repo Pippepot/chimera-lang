@@ -143,11 +143,13 @@ fn measureRuntime(init: std.process.Init, writer: *std.Io.Writer, skip_c: bool, 
         \\  var input: List(byte) = []
         \\  loop
         \\    if input.len() == 4 -> break
-        \\    const received: int = read_bytes(stdin, input, 4 - input.len()) else return none
+        \\    const received = read_bytes(stdin, input, 4 - input.len())
+        \\    if not (received is int) -> return none
         \\    if not (received > 0) -> return none
         \\  const limit = byte_int(input[0]) + 256 * byte_int(input[1]) + 65536 * byte_int(input[2]) + 16777216 * byte_int(input[3])
         \\  if not (limit >= 2) -> return none
-        \\  var composite: List(int) = List(int).filled(0, limit + 1) else return none
+        \\  var composite = List(int).filled(0, limit + 1)
+        \\  if not (composite is List(int)) -> return none
         \\  var factor = 2
         \\  loop
         \\    if factor * factor > limit -> break

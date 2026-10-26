@@ -1884,7 +1884,7 @@ const recovered: List(int) = List(int).from([1, 2, 3]) else panic "allocation re
 # Existing List(T).from remains the fixed-count pending-literal factory.
 
 
-# Variants and typed binding patterns
+# Variants and flow typing
 # There is one ordinary return channel. Absence and errors are ordinary variant
 # alternatives: T | none, T | E, bool | E, or T | none | E. none has no truthiness.
 # An expected type never catches control flow or manufactures none. Functions
@@ -1902,50 +1902,48 @@ func accept_small(value: int) int | none
 const small: bool = value < limit
 if small -> use_small()
 
-# A type annotation in a conditional binding is a pattern: select the active
-# alternative whose logical type is included in the annotation. It does not
-# invoke converters. Union annotations select their structural intersection.
-# A nonvariant value matches its own type. A disjoint type always mismatches.
-# The source executes once. A match binds even when the payload is false or none.
-# An unannotated binding binds the complete value and is irrefutable.
-if const value: int = accept_small(input) -> use(value)
+# Type membership inspects the active alternative and produces bool. It declares
+# no names and invokes no converter. Successful and failed branches refine reads
+# of the existing place: its declared type and storage layout remain unchanged.
+# Colon always annotates an ordinary declaration; it never filters alternatives.
+# A standalone type test does not change the following block's environment.
+const saved = accept_small(input)
+if saved is int -> use(saved)
 else -> handle_absence()
-if const flag: bool = optional_flag -> use(flag)
-if const stored = optional_flag -> use_optional(stored)
+if saved is int | bool -> use_number_or_flag(saved)
 
-# Standalone bindings use the same pattern with an explicit mismatch handler.
-# The handler must leave the enclosing flow (return, break, continue, or never).
-# Bound names are visible after the declaration; the handler cannot see them.
-# Without else, ordinary initialization must be statically valid and cannot
-# narrow a variant. Its normal conversions and ownership rules still apply.
+# and/or short circuit and carry the facts of their incoming edge. not exchanges
+# the two edges. At a join, possible alternatives are unioned. An exiting branch
+# contributes no alternatives, so a negative guard can establish a positive fact.
 func value_or(value: int | none, fallback: int) int
-    const found: int = value else return fallback
-    return found
-const size: int = read_size() else panic "missing size"
-const saved: int | none = read_size()
+    if not (value is int) -> return fallback
+    return value
 
-# Conditional bindings use immutable const or ref; standalone bindings may also
-# use var. const copies an existing borrowed payload and requires copy support.
-# ref aliases the selected payload without consuming the source. It preserves
-# the source's permission and lifetime, and never grants ownership.
-# An explicit transfer consumes the whole variant before testing. A fresh
-# result is also owned. Matching transfers its selected payload; mismatch cleans
-# the unmatched owned alternative. Explicit-drop obligations apply only to
-# alternatives possible on each path. Completed side effects are not undone.
-# The original transferred source is unavailable on either outcome. No pattern
-# narrows the type of the original binding.
-if const item: Item = source^ -> consume(item^)
-if ref item: Item = source -> inspect(item)
+# Ordinary const/var bindings copy existing values; fresh values and explicit
+# transfers provide ownership. ref aliases a place, retaining its permission and
+# lifetime. Narrowing grants no ownership and does not make readonly storage
+# writable. Writes still use the declared type of the destination. A write that
+# can replace a tested carrier invalidates its fact, including writes through
+# aliases, hooks, and calls. Writing inside its payload does not replace its tag.
+# Nested named fields can be refined independently. Unknown/dynamic element
+# selections do not establish facts about other element reads.
+# A saved bool can retain implications about the versions of places it tested;
+# after a possible mutation those implications no longer establish a type fact.
+# A loop may use an incoming proof only if every backedge preserves that proof.
+# Retesting inside the loop establishes a fact for that iteration instead.
+if saved is int
+    const number = saved
+    use(number)
 
-# Type membership inspects the active alternative and returns bool. It binds
-# nothing and does not convert or consume its operand.
-if saved is int -> found_number()
-if saved is int | bool -> found_number_or_flag()
+# Binding conditions and mismatch handlers remain available for structural
+# List/Span length checks. Their annotations retain ordinary declaration rules;
+# a type annotation never selects a variant payload.
+const [first, second] = values else return none
 
 
 # Conditionals
 # A plain if condition must be bool: true selects the body, false selects else.
-# A binding condition instead tests its pattern. Nested calls have no implicit
+# A structural binding condition instead tests its shape. Nested calls have no implicit
 # control effect. A stored optional must be inspected or matched explicitly.
 const enabled: bool = true
 if enabled -> run()
@@ -1990,11 +1988,8 @@ const maybe: int | unit = if 1 < 2 -> 1
 # A bare name resolving to a type tests the active alternative against that type.
 # Type names include aliases, qualified names, and specialized types; unions
 # select their structural intersection with the subject. Type patterns bind
-# nothing and do not narrow the original subject binding.
+# nothing and refine reads of the original matched place on the arm edge.
 # A fresh bare identifier matches anything and binds it immutably in the arm.
-# name: Type combines type selection and capture, with the same orientation and
-# copy/borrow/transfer rules as conditional bindings. ref name: Type borrows the
-# selected alternative. Typed tuple elements nest these patterns recursively.
 # Tuple: match the stated arity and apply each element pattern recursively.
 # (x, y) captures two elements; (0, y) tests one and captures the other;
 # (x, _) ignores the second without copying it. (x) groups a pattern and
@@ -2009,7 +2004,7 @@ const maybe: int | unit = if 1 < 2 -> 1
 # remain independent of those logical element types.
 # Match headers have no leading 'is' or 'pattern as name' capture syntax.
 # Payload extraction uses ordinary bindings in the arm body, e.g.
-# 'if const name: Type = subject' or 'if ref name: Type = subject'.
+# 'const name = subject' or 'ref name = subject', after a type pattern.
 # Captures own immutable values like const bindings: an existing place supplies
 # a copy, while a fresh or explicitly transferred owner supplies ownership.
 # `ref name` aliases the matched place under ordinary permission and lifetime
@@ -2042,8 +2037,8 @@ const maybe: int | unit = if 1 < 2 -> 1
 # Integer ranges and literals combine by interval coverage; adjacent ranges may
 # jointly cover the complete domain, including at any depth in a tuple pattern.
 # Every match must be exhaustive; a fully covered arm is an error.
-# Arm values join like conditional branches. Pattern bindings do not refine
-# the original value's binding.
+# Arm values join like conditional branches. Recursive type patterns refine
+# corresponding original fields; captures remain ordinary immutable bindings.
 # Ordinary transfer, explicit-drop, reference escape, and ASAP cleanup rules
 # apply on every selected arm and nonlocal exit; cleanup is not delayed to the
 # lexical end of an arm. Failed tests retain the subject for subsequent arms.

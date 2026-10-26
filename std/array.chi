@@ -20,7 +20,8 @@ pub struct Array(T: type, N: int)
         if index < 0 or index >= N -> return none
         return array_borrow(T, N, self, index)
     func get_from_end(ref self: Array(T, N), index: FromEnd) ref T | none
-        const resolved: int = index.resolve(N) else return none
+        const resolved = index.resolve(N)
+        if not (resolved is int) -> return none
         return self.get_at(resolved)
     pub overload get(get_at, get_from_end)
 
@@ -28,10 +29,12 @@ pub struct Array(T: type, N: int)
         if index < 0 or index >= N -> panic "Array index out of bounds"
         return array_borrow(T, N, self, index)
     func at_from_end(ref self: Array(T, N), index: FromEnd) ref T
-        const resolved: int = index.resolve(N) else panic "Array index out of bounds"
+        const resolved = index.resolve(N)
+        if not (resolved is int) -> panic "Array index out of bounds"
         return self.at(resolved)
     func slice_at(ref self: Array(T, N), bounds: Range) Span(T)
-        var view: Span(T) = self.slice(bounds) else panic "Array slice out of bounds"
+        var view = self.slice(bounds)
+        if not (view is Span(T)) -> panic "Array slice out of bounds"
         return view
     pub overload [](at, at_from_end, slice_at)
 

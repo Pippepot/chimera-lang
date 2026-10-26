@@ -22,28 +22,38 @@ test "evaluation heap empty oversized and zero sized allocations preserve native
         \\struct Empty
         \\    copy = trivial
         \\func compute() int | none
-        \\    const empty: Allocation(Array(int, 536870912)) = allocate(Array(int, 536870912), 0) else return none
+        \\    const empty = allocate(Array(int, 536870912), 0)
+        \\    if not (empty is Allocation(Array(int, 536870912))) -> return none
         \\    const empty_capacity = empty.capacity()
         \\    deallocate(Array(int, 536870912), empty^)
         \\    if empty_capacity <> 0 -> return 90
-        \\    if const oversized: Allocation(Array(int, 536870912)) = allocate(Array(int, 536870912), 1)
-        \\        deallocate(Array(int, 536870912), oversized^)
-        \\        return 91
-        \\    const logical: Allocation(Empty) = allocate(Empty, 2147483647) else return none
+        \\    match allocate(Array(int, 536870912), 1)
+        \\        oversized and oversized is Allocation(Array(int, 536870912)) ->
+        \\            deallocate(Array(int, 536870912), oversized^)
+        \\            return 91
+        \\        _ -> ()
+        \\    const logical = allocate(Empty, 2147483647)
+        \\    if not (logical is Allocation(Empty)) -> return none
         \\    const logical_capacity = logical.capacity()
         \\    deallocate(Empty, logical^)
         \\    if logical_capacity <> 2147483647 -> return 92
-        \\    var buffer: List(Empty) = List(Empty).new(0) else return none
+        \\    var buffer = List(Empty).new(0)
+        \\    if not (buffer is List(Empty)) -> return none
         \\    if (buffer.get(0) is Empty) -> return 93
-        \\    const empty_view: Span(Empty) = buffer.slice(0..0) else return none
+        \\    const empty_view = buffer.slice(0..0)
+        \\    if not (empty_view is Span(Empty)) -> return none
         \\    if (empty_view.get(0) is Empty) -> return 94
-        \\    const _: unit = buffer.append(Empty{}) else return none
-        \\    const _: unit = buffer.append(Empty{}) else return none
+        \\    const checked_value_5 = buffer.append(Empty{})
+        \\    if not (checked_value_5 is unit) -> return none
+        \\    const checked_value_6 = buffer.append(Empty{})
+        \\    if not (checked_value_6 is unit) -> return none
         \\    if (buffer.get(-1) is Empty) -> return 95
         \\    if (buffer.get(2) is Empty) -> return 96
         \\    return 40 + buffer.len()
         \\func run() int
-        \\    if const value: int = compute() -> return value
+        \\    match compute()
+        \\        value and value is int -> return value
+        \\        _ -> ()
         \\    return 97
     , 42);
     try std.testing.expectEqual(@as(?u32, 0), interpreter.allocationByteSize(std.math.maxInt(u32), 0));
@@ -64,16 +74,23 @@ test "evaluation heap immovable partial failure reverse destruction and extracti
         \\func construct(trace: Ref(int)) unit | none
         \\    const prefix: List(Item) = [Item{trace = trace, value = 2}, Item{trace = trace, value = 4}]
         \\    prefix.len()
-        \\    const _: Item = missing() else return none
+        \\    const checked_value_1 = missing()
+        \\    if not (checked_value_1 is Item) -> return none
         \\    forbidden()
         \\    return unit
         \\func run() int
-        \\    var trace: Array(int, 1) = Array(int, 1).filled(0) else panic "unexpected none"
-        \\    if ref target: int = trace.get(0)
-        \\        if const _: unit = construct(Ref.from(target))
-        \\            return 91
-        \\        if target <> 42 -> return 92
-        \\        if const owner: Box(int) = Box(int).new(target) -> return owner.take()
+        \\    var trace = Array(int, 1).filled(0)
+        \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
+        \\    match trace.get(0)
+        \\        ref target and target is int ->
+        \\            match construct(Ref.from(target))
+        \\                filtered_value_137 and filtered_value_137 is unit -> return 91
+        \\                _ -> ()
+        \\            if target <> 42 -> return 92
+        \\            match Box(int).new(target)
+        \\                owner and owner is Box(int) -> return owner.take()
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 93
     , 42);
     try test_sources.SourceFixture.expectParity(
@@ -88,13 +105,20 @@ test "evaluation heap immovable partial failure reverse destruction and extracti
         \\    drop = func(deinit self: Item) -> exit(90)
         \\func missing() int | none -> return none
         \\func construct(trace: Ref(int)) unit | none
-        \\    const item = Item{first = Leaf{trace = trace}, second = (if const value: int = missing() -> value else return none)}
+        \\    const item = Item{first = Leaf{trace = trace}, second = ((match missing()
+        \\        value and value is int -> value
+        \\        _ -> return none))}
         \\    return unit
         \\func run() int
-        \\    var trace: Array(int, 1) = Array(int, 1).filled(0) else panic "unexpected none"
-        \\    if ref target: int = trace.get(0)
-        \\        if const _: unit = construct(Ref.from(target)) -> return 91
-        \\        return target
+        \\    var trace = Array(int, 1).filled(0)
+        \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
+        \\    match trace.get(0)
+        \\        ref target and target is int ->
+        \\            match construct(Ref.from(target))
+        \\                filtered_value_122 and filtered_value_122 is unit -> return 91
+        \\                _ -> ()
+        \\            return target
+        \\        _ -> ()
         \\    return 92
     , 42);
 }
@@ -102,7 +126,9 @@ test "evaluation heap immovable partial failure reverse destruction and extracti
 test "evaluation heap escaping aggregates variants static arguments and conversions have a consuming diagnostic" {
     const prefix =
         \\func factory() Box(int)
-        \\    if const owner: Box(int) = Box(int).new(42) -> return owner^
+        \\    match Box(int).new(42)
+        \\        owner and owner is Box(int) -> return owner^
+        \\        _ -> ()
         \\    exit(90)
         \\struct Holder
         \\    owner: Box(int)
@@ -140,7 +166,9 @@ test "evaluation heap allocator edits skip deferred construction and recompute s
     const fixture = try test_sources.SourceFixture.init(
         \\func forbidden() int -> exit(90)
         \\func run() int
-        \\    if const owner: Box(int) = Box(int).new(forbidden()) -> return owner.take()
+        \\    match Box(int).new(forbidden())
+        \\        owner and owner is Box(int) -> return owner.take()
+        \\        _ -> ()
         \\    return 42
         \\exit(comptime -> run())
     );
@@ -181,8 +209,14 @@ test "evaluation heap compiler allocation failure is retryable without publishin
     defer db.deinit();
     try modules.registerSources(db, failing.allocator(),
         \\func compute() int
-        \\    if const owner: Box(Array(int, 2048)) = Box(Array(int, 2048)).new((if const _selected_result_0: Array(int, 2048) = Array(int, 2048).filled(42) -> _selected_result_0^ else panic "unexpected none"))
-        \\        if ref first: int = owner.borrow().get(0) -> return first
+        \\    match Box(Array(int, 2048)).new(((match Array(int, 2048).filled(42)
+        \\        _selected_result_0 and _selected_result_0 is Array(int, 2048) -> _selected_result_0^
+        \\        _ -> panic "unexpected none")))
+        \\        owner and owner is Box(Array(int, 2048)) ->
+        \\            match owner.borrow().get(0)
+        \\                ref first and first is int -> return first
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
@@ -202,7 +236,9 @@ test "evaluation heap compiler allocation failure is retryable without publishin
 test "evaluation heap rejects transient mutable copy back through the canonical call boundary" {
     const fixture = try test_sources.SourceFixture.init(
         \\func factory() Box(int)
-        \\    if const owner: Box(int) = Box(int).new(42) -> return owner^
+        \\    match Box(int).new(42)
+        \\        owner and owner is Box(int) -> return owner^
+        \\        _ -> ()
         \\    exit(90)
         \\func populate(mut value: int | Box(int))
         \\    value = factory()
@@ -237,7 +273,9 @@ test "evaluation heap independent workers share no storage and recursive snapsho
     defer db.deinit();
     const source =
         \\func factory(seed: int) Box(int)
-        \\    if const owner: Box(int) = Box(int).new(seed) -> return owner^
+        \\    match Box(int).new(seed)
+        \\        owner and owner is Box(int) -> return owner^
+        \\        _ -> ()
         \\    exit(90)
         \\func advance(ref reference: int) int
         \\    if reference == 0 -> return 42
@@ -276,29 +314,48 @@ test "evaluation heap executes independent factories nested aliases and ordinary
     try test_sources.SourceFixture.expectParity(
         \\import std.memory.{Box, Ref, List}
         \\func factory() Box(int)
-        \\    if const owner: Box(int) = Box(int).new(19) -> return owner^
+        \\    match Box(int).new(19)
+        \\        owner and owner is Box(int) -> return owner^
+        \\        _ -> ()
         \\    exit(90)
         \\func update(var target: Ref(int)) -> target.value = target.value + 4
         \\func forward(var target: Ref(int)) -> update(target)
         \\func compute() int | none
         \\    var first = factory()
         \\    const second = factory()
-        \\    forward((if const _selected_result_0: Ref(int) = Ref.from(first.borrow()) -> _selected_result_0 else return none))
+        \\    forward(((match Ref.from(first.borrow())
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> return none)))
         \\    if first.borrow() <> 23 -> return 91
         \\    if second.borrow() <> 19 -> return 92
-        \\    var buffer: List(int) = List(int).new(0) else return none
-        \\    const _: unit = buffer.append(19) else return none
-        \\    const _: unit = buffer.append(23) else return none
-        \\    const _: unit = buffer.reserve(8) else return none
-        \\    const view: Span(int) = buffer.slice(0..2) else return none
-        \\    ref left: int = view.get(0) else return none
-        \\    ref right: int = view.get(1) else return none
+        \\    var buffer = List(int).new(0)
+        \\    if not (buffer is List(int)) -> return none
+        \\    const checked_value_2 = buffer.append(19)
+        \\    if not (checked_value_2 is unit) -> return none
+        \\    const checked_value_3 = buffer.append(23)
+        \\    if not (checked_value_3 is unit) -> return none
+        \\    const checked_value_4 = buffer.reserve(8)
+        \\    if not (checked_value_4 is unit) -> return none
+        \\    const view = buffer.slice(0..2)
+        \\    if not (view is Span(int)) -> return none
+        \\    const checked_value_6 = view.get(0)
+        \\    if not (checked_value_6 is int) -> return none
+        \\    ref left = checked_value_6
+        \\    const checked_value_7 = view.get(1)
+        \\    if not (checked_value_7 is int) -> return none
+        \\    ref right = checked_value_7
         \\    const values: List(int) = [left, right]
-        \\    ref first_value: int = values.get(0) else return none
-        \\    ref second_value: int = values.get(1) else return none
+        \\    const checked_value_8 = values.get(0)
+        \\    if not (checked_value_8 is int) -> return none
+        \\    ref first_value = checked_value_8
+        \\    const checked_value_9 = values.get(1)
+        \\    if not (checked_value_9 is int) -> return none
+        \\    ref second_value = checked_value_9
         \\    return first_value + second_value
         \\func run() int
-        \\    if const result: int = compute() -> return result
+        \\    match compute()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 93
     , 42);
 }
@@ -308,9 +365,12 @@ test "evaluation heap regenerated byte views retain recursive call identity" {
         \\func repeat(imm text: String, imm view: BytesView) int -> repeat(text, text.as_bytes())
         \\func run() int | none
         \\    var text = "hi"
-        \\    const _: unit = text.append("!") else return none
+        \\    const checked_value_1 = text.append("!")
+        \\    if not (checked_value_1 is unit) -> return none
         \\    return repeat(text, text.as_bytes())
-        \\static answer = if const value: int = run() -> value else 90
+        \\static answer = (match run()
+        \\    value and value is int -> value
+        \\    _ -> 90)
         \\exit(answer)
     , .compile_time_call_cycle);
 }
@@ -707,8 +767,11 @@ test "interpreter call cycles reject unchanged references and allow changed refe
         \\    reference = reference - 1
         \\    return advance(reference)
         \\func changing() int
-        \\    var values: Array(int, 1) = Array(int, 1).filled(3) else panic "unexpected none"
-        \\    if ref reference: int = values.get(0) -> return advance(reference)
+        \\    var values = Array(int, 1).filled(3)
+        \\    if not (values is Array(int, 1)) -> panic "unexpected none"
+        \\    match values.get(0)
+        \\        ref reference and reference is int -> return advance(reference)
+        \\        _ -> ()
         \\    return 90
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
@@ -1024,10 +1087,14 @@ test "optional results publish ordinary values through nested initializer calls"
     defer db.deinit();
     try modules.registerSources(db, allocator,
         \\func fail_value() int | none -> return none
-        \\func nested() int | none -> (if const _selected_result_0: int = fail_value() -> _selected_result_0 else return none)
+        \\func nested() int | none -> ((match fail_value()
+        \\    _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\    _ -> return none))
         \\func materialize(init item: int | none) int | none -> return item
         \\func initialized() int | none -> materialize(nested())
-        \\func handled() int -> if const value: int = initialized() -> value else 42
+        \\func handled() int -> (match initialized()
+        \\    value and value is int -> value
+        \\    _ -> 42)
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
     const arguments = try db.intern(queries.CompileTimeValueTuples, .{ .values = &.{} });

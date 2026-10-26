@@ -23,6 +23,10 @@ pub fn Buffer(comptime Element: type, comptime initial: Element) type {
             return self;
         }
 
+        pub fn grow(self: *Self, len: usize) void {
+            self.len = @max(self.len, len);
+        }
+
         pub inline fn get(self: Self, index: usize) Element {
             return self.getPtr(index).*;
         }
@@ -34,20 +38,24 @@ pub fn Buffer(comptime Element: type, comptime initial: Element) type {
         }
 
         inline fn leafPage(self: Self, index: usize) ?*Page {
-            return if (self.root) |root| root.pages[index / page_size] else null;
+            const root = self.root orelse return null;
+            const page = index / page_size;
+            return if (page < root.pages.len) root.pages[page] else null;
         }
 
         fn write(self: *Self, allocator: std.mem.Allocator, index: usize) !*Element {
             std.debug.assert(index < self.len);
-            if (self.root == null or !self.root.?.writable) {
+            const pages = (self.len + page_size - 1) / page_size;
+            if (self.root == null or !self.root.?.writable or self.root.?.pages.len < pages) {
                 const root = try allocator.create(Root);
-                root.* = .{ .pages = try allocator.alloc(?*Page, (self.len + page_size - 1) / page_size) };
+                root.* = .{ .pages = try allocator.alloc(?*Page, pages) };
+                @memset(root.pages, null);
                 if (self.root) |previous| {
-                    @memcpy(root.pages, previous.pages);
+                    @memcpy(root.pages[0..previous.pages.len], previous.pages);
                     for (root.pages) |maybe_page| if (maybe_page) |page| {
                         page.writable = false;
                     };
-                } else @memset(root.pages, null);
+                }
                 self.root = root;
             }
             const slot = &self.root.?.pages[index / page_size];
@@ -159,4 +167,23 @@ test "failed persistent writes preserve snapshots and remain retryable" {
         try std.testing.expectEqual(@as(u32, 0), saved.get(512));
         try std.testing.expectEqual(@as(u32, 3), live.get(0));
     }
+}
+
+test "growing a snapshot preserves its earlier pages and independent lengths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var state = Buffer(u32, 0).init(1);
+    try state.set(allocator, 0, 7);
+    const before = state.snapshot();
+    state.grow(100);
+    try std.testing.expectEqual(0, state.get(99));
+    try state.set(allocator, 99, 23);
+    try std.testing.expectEqual(1, before.len);
+    try std.testing.expectEqual(7, before.get(0));
+    try std.testing.expect(state.sharesPage(before, 0));
+    try state.set(allocator, 0, 11);
+    try std.testing.expectEqual(7, before.get(0));
+    try std.testing.expectEqual(11, state.get(0));
+    try std.testing.expectEqual(23, state.get(99));
 }

@@ -646,9 +646,8 @@ pub const UnresolvedBody = struct {
         value: ValueUse,
         runtime_reference: ?structures.SourceSpan,
     };
-    pub const ConditionBinding = struct {
+    pub const Capture = struct {
         local: LocalId,
-        annotation_type: ?structures.TypeId,
         span: structures.SourceSpan,
         mode: BindingMode = .owned,
         mutable: bool = false,
@@ -679,7 +678,7 @@ pub const UnresolvedBody = struct {
     pub const MatchInterval = struct { first: i64, last: i64 };
     pub const MatchPattern = struct {
         shape: union(enum) { any, type: structures.TypeId, literal: ValueUse, range: MatchInterval, tuple: structures.FunctionValueRange },
-        binding: ?ConditionBinding = null,
+        binding: ?Capture = null,
         carrier: LocalId,
         read: ValueId,
         span: structures.SourceSpan,
@@ -741,14 +740,13 @@ pub const UnresolvedBody = struct {
         variant_membership: struct {
             operand: ValueUse,
             target_type: structures.TypeId,
-            binding: ?ConditionBinding = null,
         },
         iterator_membership: struct { operand: ValueUse, end_type: structures.TypeId },
         conjunction: struct { lhs: ConditionId, rhs: ConditionId, temporary: ?LocalId = null },
         disjunction: struct { lhs: ConditionId, rhs: ConditionId },
         negation: ConditionId,
         call: Call,
-        initialization: struct { value: ValueUse, binding: ?ConditionBinding = null },
+        initialization: struct { value: ValueUse },
         pattern: PatternBinding,
     };
     pub const StructInitTarget = union(enum) { concrete: structures.TypeId, inferred: structures.InstanceId };
@@ -820,7 +818,7 @@ pub const UnresolvedBody = struct {
                 carrier: LocalId,
                 operand: ValueUse,
                 end_type: structures.TypeId,
-                binding: ConditionBinding,
+                binding: Capture,
             },
         };
     };
@@ -1645,7 +1643,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .carrier = next_local,
                 .operand = poll,
                 .end_type = end_type,
-                .binding = .{ .local = item_local, .annotation_type = null, .span = name_span, .mode = item_mode },
+                .binding = .{ .local = item_local, .span = name_span, .mode = item_mode },
             } });
             if (!pattern_binding and binding.data.parameter.annotation != .null) {
                 const annotation = binding.data.parameter.annotation;
@@ -1950,30 +1948,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 }
                 return self.appendCondition(.{ .pattern = statement.bind_pattern });
             }
-            if (node.tag != .const_binding and node.tag != .var_binding and node.tag != .ref_binding) return self.buildCondition(index);
-            if (!allow_mutable and node.tag == .var_binding) return self.reject(index, .condition_binding_must_be_immutable);
-
-            const value_index = node.data.node_node.b;
-
-            const name = tokenText(self.ast, self.source, node.token_index);
-            const discard = std.mem.eql(u8, name, "_");
-            if (!discard and try self.nameIsVisible(name)) return self.reject(index, .duplicate_local_binding);
-            const local = self.newLocal();
-            const annotation_type = if (node.data.node_node.a.unwrap()) |annotation| try self.bindingType(annotation) else null;
-            const binding: UnresolvedBody.ConditionBinding = .{
-                .local = local,
-                .annotation_type = annotation_type,
-                .span = nodeFocusSpan(self.ast, value_index),
-                .mode = if (node.tag == .ref_binding) .reference else .owned,
-                .mutable = node.tag == .var_binding,
-            };
-            const condition = if (annotation_type) |target|
-                try self.appendCondition(.{ .variant_membership = .{ .operand = try self.appendUse(value_index, false), .target_type = target, .binding = binding } })
-            else
-                try self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(value_index, false), .binding = binding } });
-
-            if (!discard) try self.declare(name, .{ .place = .{ .id = local, .mutable = node.tag == .ref_binding or node.tag == .var_binding } });
-            return condition;
+            return self.buildCondition(index);
         }
 
         fn appendMatch(self: *Self, index: structures.Node.Index, result_is_type: bool) !ValueId {
@@ -2033,11 +2008,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 },
                 .param => {
                     self.buildMatchCapture(index, &pattern);
-                    if (node.data.parameter.annotation.unwrap()) |annotation| {
-                        const target = try self.bindingType(annotation);
-                        pattern.shape = .{ .type = target };
-                        if (pattern.binding) |*binding| binding.annotation_type = target;
-                    }
+                    std.debug.assert(node.data.parameter.annotation == .null);
                 },
                 .field_access, .call, .type_variant, .type_func => pattern.shape = .{ .type = try self.bindingType(index) },
                 .range, .range_inclusive => pattern.shape = .{ .range = try self.buildMatchRange(index) },
@@ -2107,7 +2078,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             pattern.shape = .any;
             if (std.mem.eql(u8, name, "_")) return;
             const reference = node.tag == .param and node.data.parameter.access == .keyword_ref;
-            pattern.binding = .{ .local = self.newLocal(), .annotation_type = null, .span = tokenSpan(self.ast, node.token_index), .mode = if (reference) .reference else .owned };
+            pattern.binding = .{ .local = self.newLocal(), .span = tokenSpan(self.ast, node.token_index), .mode = if (reference) .reference else .owned };
         }
 
         fn declareMatchCaptures(self: *Self, id: u32) anyerror!void {
@@ -2150,7 +2121,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                     .arguments = .{ .start = 0, .end = 0 },
                     .span = nodeFocusSpan(self.ast, index),
                 } }),
-                .is => self.buildVariantMembership(node, null),
+                .is => self.buildVariantMembership(node),
                 .@"and", .@"or" => {
                     const lhs = try self.buildCondition(node.data.node_node.a);
                     const rhs = try self.buildCondition(node.data.node_node.b);
@@ -2164,7 +2135,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             };
         }
 
-        fn buildVariantMembership(self: *Self, node: structures.Node, binding: ?UnresolvedBody.ConditionBinding) !UnresolvedBody.ConditionId {
+        fn buildVariantMembership(self: *Self, node: structures.Node) !UnresolvedBody.ConditionId {
             const target_type = try self.analyzeTypeOrReject(node.data.node_node.b, .inspection_type_not_supported);
             if (self.where_condition and node.tag == .is) return self.appendCondition(.{ .static_membership = .{
                 .operand = node.data.node_node.a,
@@ -2173,7 +2144,6 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             return self.appendCondition(.{ .variant_membership = .{
                 .operand = try self.appendUse(node.data.node_node.a, false),
                 .target_type = target_type,
-                .binding = binding,
             } });
         }
 

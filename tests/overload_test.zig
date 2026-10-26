@@ -127,7 +127,9 @@ test "overload array brackets preserve borrowed integers and owned range handles
         \\    const empty = values[4..4]
         \\    return values[0] + values[1] + tail.len() + selected.len() + empty.len() + values[..].len()
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -250,7 +252,9 @@ test "overload generic namespaces infer inherited static arguments" {
         \\    pub overload get(read)
         \\func run() int
         \\    const container = Container(int){value = 42}
-        \\    return (if const _selected_result_0: int = Container.get(container) -> _selected_result_0 else panic "unexpected none")
+        \\    return ((match Container.get(container)
+        \\        _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\        _ -> panic "unexpected none"))
     , 42);
 }
 
@@ -287,7 +291,9 @@ test "overload return types and func call syntax do not select implementations" 
         \\func checked(value: int) int | none -> value
         \\overload choose(plain, checked)
         \\func run() int | none -> choose(42)
-        \\if const result: int = run() -> exit(result)
+        \\match run()
+        \\    result and result is int -> exit(result)
+        \\    _ -> ()
     , .ambiguous_overload);
     try Fixture.expectSourceDiagnostic(
         \\func identity(value: int) int -> value
@@ -313,7 +319,9 @@ test "overload zero argument calls and callable effect widening retain selection
         \\overload choose(answer)
         \\func run() int
         \\    const selected: func() int = choose
-        \\    if const result: int = selected() -> return result + choose()
+        \\    match selected()
+        \\        result and result is int -> return result + choose()
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -326,8 +334,12 @@ test "overload selected alternatives retain exact fallibility" {
         \\    return 22
         \\overload choose(integer, checked)
         \\func run() int
-        \\    if const unexpected: int = choose(false) -> return 90
-        \\    if const result: int = choose(true) -> return choose(20) + result
+        \\    match choose(false)
+        \\        unexpected and unexpected is int -> return 90
+        \\        _ -> ()
+        \\    match choose(true)
+        \\        result and result is int -> return choose(20) + result
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -374,7 +386,8 @@ test "overload range indexing covers initialized lists spans and text views" {
     try Fixture.expectParity(
         \\func calculate() int | none
         \\    var values: List(int) = [10, 20, 30]
-        \\    const _: unit = values.reserve(20) else return none
+        \\    const checked_value_1 = values.reserve(20)
+        \\    if not (checked_value_1 is unit) -> return none
         \\    var selected = values[1..]
         \\    selected[0] = 22
         \\    const tail = selected[1..]
@@ -383,10 +396,14 @@ test "overload range indexing covers initialized lists spans and text views" {
         \\    const byte_slice = bytes[1..3]
         \\    const text_slice = text[1..]
         \\    const empty = values[3..3]
-        \\    if const invalid: Span(int) = values.slice(..4) -> return 90
+        \\    match values.slice(..4)
+        \\        invalid and invalid is Span(int) -> return 90
+        \\        _ -> ()
         \\    return values[0] + values[1] + tail.len() + byte_slice.byte_length() + text_slice.byte_length() + bytes[..].byte_length() + empty.len()
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -395,16 +412,28 @@ test "overload range indexing rejects reversed extreme and invalid UTF8 bounds" 
     try Fixture.expectParity(
         \\func calculate() int | none
         \\    const values = [10, 20, 30]
-        \\    if const invalid: Span(int) = values.slice(2..1) -> return 90
-        \\    if const invalid: Span(int) = values.slice(-1..2) -> return 91
-        \\    if const invalid: Span(int) = values.slice(0..2147483647) -> return 92
-        \\    if const invalid: Span(int) = values.slice(3..=3) -> return 93
+        \\    match values.slice(2..1)
+        \\        invalid and invalid is Span(int) -> return 90
+        \\        _ -> ()
+        \\    match values.slice(-1..2)
+        \\        invalid and invalid is Span(int) -> return 91
+        \\        _ -> ()
+        \\    match values.slice(0..2147483647)
+        \\        invalid and invalid is Span(int) -> return 92
+        \\        _ -> ()
+        \\    match values.slice(3..=3)
+        \\        invalid and invalid is Span(int) -> return 93
+        \\        _ -> ()
         \\    const text = StringView("a\u{e9}z")
-        \\    if const invalid: StringView = text.slice(1..2) -> return 94
+        \\    match text.slice(1..2)
+        \\        invalid and invalid is StringView -> return 94
+        \\        _ -> ()
         \\    const selected = text[1..3]
         \\    return 40 + selected.byte_length()
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 95
     , 42);
 }
@@ -414,7 +443,9 @@ test "overload range results cannot escape their backing owner" {
         \\func escaped() Span(int) | none
         \\    var values = [10, 20]
         \\    return values[..]
-        \\if const selected: Span(int) = escaped() -> exit(selected.len())
+        \\match escaped()
+        \\    selected and selected is Span(int) -> exit(selected.len())
+        \\    _ -> ()
     , .borrow_outlives_source);
 }
 
@@ -539,7 +570,9 @@ test "overload integer indexing retains checked defaults for typed literal value
         \\    const values = [0, 42]
         \\    return values[position]
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     , 42);
 }

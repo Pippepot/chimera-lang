@@ -1,0 +1,503 @@
+Incomplete flow typing: failure inventory
+
+Command: zig build test --seed=0 -Doptimize=safe -j1 --summary all
+Result: 1374/1533 passed; 19 skipped; 95 failed; 45 crashed.
+This run preceded subsequent fixes and the merge. Do not assume each case still fails.
+Latest code and the eventual merge have not passed the full suite.
+
+match_test.test.guarded match catch all copies retain feasible cleanup without changing their type [failed]
+  file 0: .{ .value_not_callable = void } at .{ .start = 453, .end = 458 }
+
+match_test.test.match immutable captures copy while explicit references alias [failed]
+  file 0: .{ .value_not_callable = void } at .{ .start = 51, .end = 56 }
+
+match_test.test.match handles none subjects and selected none results without retry [failed]
+  file 0: .{ .unknown_value = void } at .{ .start = 269, .end = 274 }
+
+match_test.test.match fresh immovable whole captures hand off without relocation [failed]
+  file 0: .{ .call_argument_type_mismatch = .{ .expected = @fromBackingInt(2147483890), .found = @fromBackingInt(2147483888) } } at .{ .start = 366, .end = 374 }
+
+match_test.test.match nonlocal exits clean retained owned subjects [failed]
+  file 0: .{ .unknown_value = void } at .{ .start = 393, .end = 398 }
+
+match_test.test.match whole owning captures retain only feasible drop obligations [failed]
+  file 0: .{ .unknown_value = void } at .{ .start = 584, .end = 592 }
+
+match_test.test.match rejects borrowed subset layouts and ambiguous text domains [failed]
+  file 0: .{ .value_not_callable = void } at .{ .start = 191, .end = 199 }
+
+binding_test.test.typed binding selects a value and keeps false distinct from none [failed]
+  file 0: .{ .value_not_callable = void } at .{ .start = 184, .end = 185 }
+
+binding_test.test.explicit variants allocate and index collections [failed]
+  file 0: .{ .value_not_callable = void } at .{ .start = 352, .end = 353 }
+
+binding_test.test.plain optional conditions and implicit narrowing are rejected [failed]
+
+binding_test.test.typed patterns never invoke converters [failed]
+  file 0: .{ .unknown_value = void } at .{ .start = 184, .end = 189 }
+
+binding_test.test.reference binding updates the selected payload in its owner [failed]
+  file 0: .{ .unknown_value = void } at .{ .start = 57, .end = 62 }
+
+binding_test.test.reference binding handles certain and disjoint selections [failed]
+  file 0: .{ .unknown_value = void } at .{ .start = 46, .end = 52 }
+
+binding_test.test.typed match capture commits an immovable explicit owner after its guard [terminated]
+  thread 438195 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162c84e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x162f1b2 in scanOpenBlock (test_sources.zig)
+
+binding_test.test.typed binding result alternatives recompute after edits [failed]
+  expected 42, found 0
+
+binding_test.test.standalone patterns support mutation and loop mismatch exits [failed]
+  file 0: .{ .loop_invalidates_type_proof = void } at .{ .start = 264, .end = 266 }
+
+binding_test.test.explicit absent results preserve deferred root field and conditional transfer cleanup [terminated]
+  thread 438265 panic: for loop over objects with non-equal lengths
+  src/optimizer/inline.zig:216:42: 0x1b7f264 in init (test_sources.zig)
+  src/optimizer/inline.zig:155:33: 0x1b87344 in inlineInstruction__func_4918 (test_sources.zig)
+
+binding_test.test.an explicit optional initializer preserves immovable storage and completed writes [failed]
+  file 0: .{ .unknown_value = void } at .{ .start = 552, .end = 557 }
+
+binding_test.test.a Box owns an optional immovable producer result in place [failed]
+  file 0: .{ .field_access_not_struct = @fromBackingInt(2147483935) } at .{ .start = 384, .end = 389 }
+
+binding_test.test.an explicit absent producer cleans partial fields before a Box stores none [terminated]
+  thread 438311 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162c84e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x162f1b2 in scanOpenBlock (test_sources.zig)
+
+codegen_test.test.native nested array addressing handles native scales zero sizes and multiplication fallback [failed]
+  file 0: .{ .unknown_value = void } at .{ .start = 130, .end = 134 }
+
+operation_test.test.indexed remainder assignment uses checked getter and owned replacement [failed]
+  file 0: .{ .value_not_callable = void } at .{ .start = 71, .end = 72 }
+
+operation_test.test.end relative indexing preserves eager setters and bounds first compound assignment [failed]
+  file 0: .{ .unknown_value = void } at .{ .start = 426, .end = 430 }
+
+operation_test.test.operation functions user indexers and qualified explicit bracket calls have parity [failed]
+  file 0: .{ .value_not_callable = void } at .{ .start = 477, .end = 480 }
+
+panic_test.test.panic traces outlined initializers and imported functions [failed]
+  expected 134, found 0
+
+optimizer_test.test.joins retain known variant alternatives and constant aggregate fields [failed]
+  expected 0, found 2
+
+optimizer_test.test.scalar variant joins preserve distinct tags and inactive payloads [failed]
+  expected 0, found 2
+
+optimizer_test.test.scalar variant joins batch independent and dependent consumers [failed]
+  expected 0, found 5
+
+optimizer_test.test.promotion turns non-escaping scalar locals into SSA values [failed]
+  expected 0, found 2
+  promotion failed for checked
+
+query_disk_cache_test.test.top-level variant snapshots recompute outcomes and explicit handlers [failed]
+  expected 0, found 1
+
+query_disk_cache_test.test.readonly aggregate snapshots preserve independent owned and reference permissions [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 429, .end = 433 }
+
+query_disk_cache_test.test.temporal reference snapshots recompute aliasing and mutation effects [failed]
+  file 0: .{ .borrow_outlives_source = void } at .{ .start = 744, .end = 751 }
+
+query_disk_cache_test.test.destructor snapshots recompute captured authority and mutation effects [failed]
+  expected .borrow_outlives_source, found .invalid_expression
+
+query_disk_cache_test.test.nested span snapshots recompute slice bounds extent and readonly backing [failed]
+
+query_disk_cache_test.test.raw borrow snapshots recompute source and registered signature edits [failed]
+  file 0: .{ .borrow_outlives_source = void } at .{ .start = 326, .end = 328 }
+
+query_disk_cache_test.test.span snapshots retain capabilities and recompute attenuation edits [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 206, .end = 208 }
+
+query_disk_cache_test.test.allocating initializer snapshots retain partial cleanup and consumption on variant mismatch [failed]
+  file 0: .{ .borrow_outlives_source = void } at .{ .start = 849, .end = 855 }
+
+query_disk_cache_test.test.array snapshots restore native and comptime fill reads writes and bounds [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 219, .end = 221 }
+
+query_disk_cache_test.test.collection snapshots restore inferred generic sequence construction [terminated]
+  thread 440723 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x14df86e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x14e21d2 in scanOpenBlock (test_sources.zig)
+
+array_test.test.operation indexing compound assignments and reference assignments have parity [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 222, .end = 224 }
+
+array_test.test.explicit checked reference acquisition skips the replacement on bounds failure [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 195, .end = 206 }
+
+array_test.test.operation indexing reads invoke ordinary copy hooks [failed]
+  expected 42, found 41
+
+array_test.test.operation indexing replacement retains stored reference origins [failed]
+  file 0: .{ .initializer_exit_outside_boundary = void } at .{ .start = 283, .end = 287 }
+
+array_test.test.operation indexing List and views use the same operator contract [failed]
+  file 0: .{ .borrow_outlives_source = void } at .{ .start = 345, .end = 347 }
+
+array_test.test.List literal constructs contextual empty and byte lists in heap storage [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 191, .end = 193 }
+
+array_test.test.List explicit factory infers length and optional elements remain ordinary data [terminated]
+  thread 442484 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162e0ee in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x1630a52 in scanOpenBlock (test_sources.zig)
+
+array_test.test.List explicit allocation failure is recoverable and skips element evaluation [terminated]
+  thread 442580 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162e0ee in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x1630a52 in scanOpenBlock (test_sources.zig)
+
+array_test.test.List cleanup releases failed allocations and destroys completed lists in reverse [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 807, .end = 808 }
+
+array_test.test.Array integer fill get and get_mut have native and comptime parity [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 219, .end = 221 }
+
+array_test.test.Array automatic cleanup drops elements in reverse index order [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 395, .end = 396 }
+
+array_test.test.Array copy hooks cannot invalidate pending borrows [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 616, .end = 620 }
+
+array_test.test.Array embedded storage supports checked mutable access [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 358, .end = 360 }
+
+array_test.test.Array boxed inline storage retains mutable element references [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 253, .end = 257 }
+
+array_test.test.Array whole copies retain contained reference origins [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 368, .end = 372 }
+
+array_test.test.Array dereferenced mutable aliases cannot retain short-lived references [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 590, .end = 594 }
+
+array_test.test.Array boxed mutable aliases retain long-lived reference origins [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 617, .end = 621 }
+
+array_test.test.Array reference parameters retain caller origins when storing other inputs [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 747, .end = 751 }
+
+overload_test.test.overload generic namespaces infer inherited static arguments [terminated]
+  thread 442982 panic: reached unreachable code
+  src/frontend/typing.zig:2591:29: 0x152a96e in requireAvailablePlace (test_sources.zig)
+  src/frontend/typing.zig:2580:43: 0x1661f6a in readLocal (test_sources.zig)
+
+query_test.test.static annotations widen values and reject mismatches when demanded [terminated]
+  thread 444393 panic: attempt to use null value
+  tests/query_test.zig:353:75: 0x1ddbe6d in expectCompiledFunctionResult (query_test.zig)
+  tests/query_test.zig:3649:37: 0x1ebe77a in test.static annotations widen values and reject mismatches when demanded (query_test.zig)
+
+query_test.test.static callable variant annotations preserve the payload representation [terminated]
+  thread 444730 panic: attempt to use null value
+  tests/query_test.zig:5927:66: 0x1e1ea05 in test.static callable variant annotations preserve the payload representation (query_test.zig)
+
+query_test.test.variant extraction annotations widen successful payloads [terminated]
+  thread 445011 panic: attempt to use null value
+  tests/query_test.zig:353:75: 0x1ddbe6d in expectCompiledFunctionResult (query_test.zig)
+  tests/query_test.zig:6290:37: 0x1e17d24 in test.variant extraction annotations widen successful payloads (query_test.zig)
+
+query_test.test.typed variant patterns remap subset tags and discard selected payloads [terminated]
+  thread 445080 panic: attempt to use null value
+  tests/query_test.zig:353:75: 0x1ddbe6d in expectCompiledFunctionResult (query_test.zig)
+  tests/query_test.zig:6318:37: 0x1e17b64 in test.typed variant patterns remap subset tags and discard selected payloads (query_test.zig)
+
+query_test.test.variant inspection enforces operand and condition binding rules [terminated]
+  thread 445091 panic: attempt to use null value
+  tests/query_test.zig:6364:78: 0x1e171e7 in test.variant inspection enforces operand and condition binding rules (query_test.zig)
+
+query_test.test.variant inspection edits retain equal artifacts and recover diagnostics [failed]
+
+membership_test.test.explicit optional selection short circuits membership and preserves cleanup [terminated]
+  thread 445665 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x160f88e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x16121f2 in scanOpenBlock (test_sources.zig)
+
+tuple_test.test.fresh and explicitly transferred Lists destructure noncopyable elements [terminated]
+  thread 445942 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x160926e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x160bbd2 in scanOpenBlock (test_sources.zig)
+
+tuple_test.test.optional tuple result patterns select only the matching payload [failed]
+  file 0: .{ .local_type_mismatch = .{ .expected = @fromBackingInt(2147483886), .found = @fromBackingInt(2147483887) } } at .{ .start = 127, .end = 128 }
+
+tuple_test.test.variant payload patterns preserve the subject ownership and reference authority [failed]
+  file 0: .{ .local_type_mismatch = .{ .expected = @fromBackingInt(2147483889), .found = @fromBackingInt(2147483890) } } at .{ .start = 159, .end = 160 }
+
+tuple_test.test.annotated conditional patterns select ordinary optional tuple results [failed]
+  file 0: .{ .local_type_mismatch = .{ .expected = @fromBackingInt(2147483886), .found = @fromBackingInt(2147483887) } } at .{ .start = 71, .end = 72 }
+
+src.query_disk_cache.test.Box and Ref alias bodies restore and invalidate after a binding edit [failed]
+
+src.query_disk_cache.test.deinit bodies restore and invalidate when parameter modes change [failed]
+
+src.query_disk_cache.test.cached nested handles reject changed capture representations [terminated]
+  thread 446424 panic: attempt to use null value
+  src/query_disk_cache.zig:1538:62: 0x204e835 in test.cached nested handles reject changed capture representations (test_sources.zig)
+
+src.query_disk_cache.test.cached initializers reject changed regions captures and value representation [failed]
+
+src.queries.test.struct public field annotations preserve declaration visibility [terminated]
+  thread 446663 panic: attempt to use null value
+  src/queries.zig:4694:65: 0x1fa7cde in test.struct public field annotations preserve declaration visibility (test_sources.zig)
+
+src.frontend.typing.test.initializer captures reserve their complete entry argument range [terminated]
+  thread 446771 panic: attempt to use null value
+  src/frontend/typing.zig:11767:62: 0x1c1e76e in test.initializer captures reserve their complete entry argument range (test_sources.zig)
+
+src.frontend.typing.test.cleanup materializer preserves effect identities across moves and repeated splits [terminated]
+  thread 446810 panic: index out of bounds: index 0, len 0
+  src/frontend/typing.zig:4402:42: 0x145c050 in activeLifetimeSpan (test_sources.zig)
+  src/frontend/typing.zig:4641:109: 0x13efa2f in recordReferenceEffects (test_sources.zig)
+
+list_test.test.List consuming early exits release backing allocations repeatedly [failed]
+  file 0: .{ .initializer_exit_outside_boundary = void } at .{ .start = 304, .end = 308 }
+
+list_test.test.List removal returns captured references independently of the old allocation [failed]
+  file 0: .{ .field_access_not_struct = @fromBackingInt(2147483921) } at .{ .start = 377, .end = 383 }
+
+reference_test.test.references ownership hooks export temporal writes at their call sites [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 127, .end = 131 }
+
+reference_test.test.references borrowed func results bind conditionally without copying [failed]
+  file 0: .{ .field_access_not_struct = @fromBackingInt(2147483890) } at .{ .start = 271, .end = 275 }
+
+reference_test.test.references variant construction rejects ambiguous storage selection [failed]
+  file 0: .{ .match_redundant_arm = void } at .{ .start = 176, .end = 177 }
+
+reference_test.test.references variant union matches copy logical reference payloads [failed]
+  file 0: .{ .match_redundant_arm = void } at .{ .start = 476, .end = 477 }
+
+reference_test.test.references generic borrowed zip preserves independent tuple captures [failed]
+  file 0: .{ .duplicate_local_binding = void } at .{ .start = 1279, .end = 1283 }
+
+reference_test.test.references tuples own cleanup only for owned members [failed]
+
+reference_test.test.references separate union alternatives do not become a whole union borrow [failed]
+
+reference_test.test.references logical payload borrows do not retain temporary carriers [failed]
+  file 0: .{ .borrow_outlives_source = void } at .{ .start = 158, .end = 162 }
+
+reference_test.test.references const aggregate copies preserve array and variant captures [failed]
+  file 0: .{ .field_access_not_struct = @fromBackingInt(2147483939) } at .{ .start = 299, .end = 305 }
+
+reference_test.test.references containers of handles expose the handle slot and copy only its contents [failed]
+  file 0: .{ .initializer_exit_outside_boundary = void } at .{ .start = 218, .end = 222 }
+
+reference_test.test.references replacing a handle slot retains the newly borrowed referent [failed]
+  file 0: .{ .initializer_exit_outside_boundary = void } at .{ .start = 238, .end = 242 }
+
+reference_test.test.references stored by a replacing call expire after the next replacement [terminated]
+  thread 447671 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x160a20e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x160cb72 in scanOpenBlock (test_sources.zig)
+
+iteration_test.test.pull standard cursors deliver items and End directly [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 653, .end = 655 }
+
+iteration_test.test.adapter feasibility type factories select owned or borrowed delivery [failed]
+  file 0: .{ .expected_token = .{ .expected = .arrow, .found = .plus_equal } } at .{ .start = 1403, .end = 1405 }
+
+iteration_test.test.adapter feasibility logical matching cannot preserve a mixed physical carrier [failed]
+  file 0: .{ .invalid_expression = .keyword_const } at .{ .start = 339, .end = 344 }
+
+iteration_test.test.pull generic borrowed filter handles predicate failure as rejection [terminated]
+  thread 448460 panic: reached unreachable code
+  src/frontend/typing.zig:2275:29: 0x184929f in captureExpectedVariant (test_sources.zig)
+  src/frontend/typing.zig:2289:48: 0x189d83b in evaluateUncapturedValue (test_sources.zig)
+
+iteration_test.test.pull generic owned filter discharges rejected and delivered items [terminated]
+  thread 448671 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x160a20e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x160cb72 in scanOpenBlock (test_sources.zig)
+
+iteration_test.test.pull generic filter uses explicitly supplied disposal for explicit-drop items [terminated]
+  thread 448698 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x160a20e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x160cb72 in scanOpenBlock (test_sources.zig)
+
+iteration_test.test.pull generic mixed zip composes nested owned and reference tuples [failed]
+  file 0: .{ .duplicate_local_binding = void } at .{ .start = 2264, .end = 2268 }
+
+iteration_test.test.pull generic zip polls left first and drops unmatched owned items [terminated]
+  thread 449157 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x160a20e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x160cb72 in scanOpenBlock (test_sources.zig)
+
+iteration_test.test.pull generic func zip cleans up the retained left item on right failure [terminated]
+  thread 449233 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x160a20e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x160cb72 in scanOpenBlock (test_sources.zig)
+
+iteration_test.test.range wide boundary matrix matches independent selected sequences [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 156, .end = 160 }
+
+iteration_test.test.for optional payload items never become exhaustion [failed]
+  file 0: .{ .call_argument_type_mismatch = .{ .expected = .int, .found = @fromBackingInt(2147483885) } } at .{ .start = 247, .end = 253 }
+
+iteration_test.test.for filter can buffer and transfer move only owned items once [terminated]
+  thread 449254 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x160a20e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x160cb72 in scanOpenBlock (test_sources.zig)
+
+iteration_test.test.for cursor lifetimes clean owned sources cursors and items on all failure stages [terminated]
+  thread 449796 panic: reached unreachable code
+  src/frontend/comptime_interpreter.zig:652:29: 0x13ca674 in borrowRead (test_sources.zig)
+  src/frontend/comptime_interpreter.zig:460:67: 0x13c61c1 in instructionValue (test_sources.zig)
+
+collection_test.test.fixed Array variant context precedes List and competing converter contexts [failed]
+  file 0: .{ .type_not_copyable = .{ .type_id = @fromBackingInt(2147483927), .is_movable = true } } at .{ .start = 495, .end = 504 }
+
+collection_test.test.multiple matching Array members retain ordinary element inference [failed]
+  file 0: .{ .type_not_copyable = .{ .type_id = @fromBackingInt(2147483926), .is_movable = true } } at .{ .start = 122, .end = 128 }
+
+collection_test.test.Array spread uses ordinary custom copies and retains the source [failed]
+  file 0: .{ .return_type_mismatch = .{ .expected = .unit, .found = .none } } at .{ .start = 410, .end = 414 }
+
+collection_test.test.runtime collection optional destinations retain contextual element types [terminated]
+  thread 450242 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162ef7e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x16318e2 in scanOpenBlock (test_sources.zig)
+
+collection_test.test.collection allocation policy runs before bounded element evaluation [terminated]
+  thread 450437 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162ef7e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x16318e2 in scanOpenBlock (test_sources.zig)
+
+collection_test.test.recoverable growth allocation failure destroys only the completed prefix [terminated]
+  thread 450478 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162ef7e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x16318e2 in scanOpenBlock (test_sources.zig)
+
+collection_test.test.indirect collection allocation failure precedes element evaluation [terminated]
+  thread 450508 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162ef7e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x16318e2 in scanOpenBlock (test_sources.zig)
+
+text_test.test.string conversion preserves owner cleanup on explicit mismatch [terminated]
+  thread 450814 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x15a367e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x15a5fe2 in scanOpenBlock (test_sources.zig)
+
+text_test.test.end relative collection bounds reject invalid distances and accept end boundaries [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 903, .end = 904 }
+
+text_test.test.range slicing preserves collection permissions and rejects sequence operands [failed]
+  file 0: .{ .expected_token = .{ .expected = .indent, .found = .identifier } } at .{ .start = 134, .end = 142 }
+
+text_test.test.span slicing returns nested views with backing authority rather than carrier lifetime [failed]
+
+text_test.test.aggregate call results cannot assume correspondence with input fields [terminated]
+  thread 450886 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x15a367e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x15a5fe2 in scanOpenBlock (test_sources.zig)
+
+text_test.test.returned readonly ranges depend on contents throughout aggregate shapes [failed]
+  file 0: .{ .expected_token = .{ .expected = .indent, .found = .identifier } } at .{ .start = 263, .end = 281 }
+
+text_test.test.ownership hook results preserve readonly content dependencies [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 509, .end = 513 }
+
+text_test.test.mutable outputs preserve readonly dependencies through owned and referenced storage [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 614, .end = 618 }
+
+text_test.test.mutable field outputs preserve untouched readonly siblings [failed]
+  file 0: .{ .invalid_expression = .keyword_else } at .{ .start = 260, .end = 264 }
+
+text_test.test.List growth and generic views have parity [failed]
+  file 0: .{ .borrow_outlives_source = void } at .{ .start = 499, .end = 500 }
+
+text_test.test.failed reads preserve the initialized byte prefix [failed]
+  file 0: .{ .borrow_outlives_source = void } at .{ .start = 350, .end = 355 }
+
+text_test.test.allocation failure preserves strings and repeated clones release their storage [terminated]
+  thread 451268 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x15a367e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x15a5fe2 in scanOpenBlock (test_sources.zig)
+
+converter_test.test.compile-time-only types reject runtime calls and raw heap storage [terminated]
+  thread 451614 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162ffde in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x1632942 in scanOpenBlock (test_sources.zig)
+
+converter_test.test.variant conversion joins borrowed identity and owned results with exact cleanup [terminated]
+  thread 451860 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162ffde in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x1632942 in scanOpenBlock (test_sources.zig)
+
+converter_test.test.builtin widening preserves members before converters [failed]
+  file 0: .{ .type_not_copyable = .{ .type_id = @fromBackingInt(2147483889), .is_movable = false } } at .{ .start = 158, .end = 163 }
+
+converter_test.test.nested conversions defer constraints until argument inference succeeds [failed]
+  file 0: .{ .invalid_expression = .keyword_const } at .{ .start = 321, .end = 326 }
+
+converter_test.test.optional arguments destroy captured owners after later ordinary failure [failed]
+  expected 56, found 134
+
+converter_test.test.optional arguments receive explicit type mismatch results without a fake payload [failed]
+  file 0: .{ .match_pattern_incompatible = .{ .expected = @fromBackingInt(2147483886), .found = .bool } } at .{ .start = 241, .end = 245 }
+
+converter_test.test.optional deinit arguments use ordinary variant construction and cleanup [terminated]
+  thread 451962 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162ffde in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x1632942 in scanOpenBlock (test_sources.zig)
+
+converter_test.test.optional arguments require explicit destruction only for present owned payloads [terminated]
+  thread 452291 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x162ffde in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x1632942 in scanOpenBlock (test_sources.zig)
+
+converter_test.test.optional values forward through deferred initializer captures [failed]
+  file 0: .{ .borrow_requires_place = void } at .{ .start = 55, .end = 60 }
+
+converter_test.test.optional converters accept ordinary absence without a successful payload [failed]
+  file 0: .{ .match_pattern_incompatible = .{ .expected = @fromBackingInt(2147483890), .found = .bool } } at .{ .start = 227, .end = 231 }
+
+comptime_interpreter_test.test.evaluation heap empty oversized and zero sized allocations preserve native size handling [terminated]
+  thread 452628 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x156970e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x156c072 in scanOpenBlock (test_sources.zig)
+
+comptime_interpreter_test.test.evaluation heap immovable partial failure reverse destruction and extraction use typed cleanup [terminated]
+  thread 452706 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x156970e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x156c072 in scanOpenBlock (test_sources.zig)
+
+comptime_interpreter_test.test.evaluation heap escaping aggregates variants static arguments and conversions have a consuming diagnostic [terminated]
+  thread 452717 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x156970e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x156c072 in scanOpenBlock (test_sources.zig)
+
+comptime_interpreter_test.test.evaluation heap allocator edits skip deferred construction and recompute successful results [terminated]
+  thread 452736 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x156970e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x156c072 in scanOpenBlock (test_sources.zig)
+
+comptime_interpreter_test.test.evaluation heap compiler allocation failure is retryable without publishing storage [terminated]
+  thread 452755 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x156970e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x156c072 in scanOpenBlock (test_sources.zig)
+
+comptime_interpreter_test.test.evaluation heap rejects transient mutable copy back through the canonical call boundary [terminated]
+  thread 452794 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x156970e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x156c072 in scanOpenBlock (test_sources.zig)
+
+comptime_interpreter_test.test.evaluation heap independent workers share no storage and recursive snapshots observe mutations [terminated]
+  thread 452814 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x156970e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x156c072 in scanOpenBlock (test_sources.zig)
+
+comptime_interpreter_test.test.evaluation heap executes independent factories nested aliases and ordinary collections [terminated]
+  thread 452824 panic: reached unreachable code
+  src/frontend/lifetime.zig:538:33: 0x156970e in applyEndings (test_sources.zig)
+  src/frontend/lifetime.zig:523:57: 0x156c072 in scanOpenBlock (test_sources.zig)

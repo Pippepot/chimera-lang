@@ -1993,6 +1993,7 @@ pub const Diagnostic = struct {
         .inspection_type_not_supported = "this inspection type is not supported yet",
         .variant_inspection_operand_not_variant = TypeId,
         .iterator_result_requires_end = TypeMismatch,
+        .loop_invalidates_type_proof = "this loop can repeat after invalidating a type proof used in its body; test the type inside the loop",
         .condition_binding_must_be_immutable = "an `if` binding must use `const`, not `var`",
         .value_not_callable = Message{ .text = "value is not callable", .source_label = true },
         .duplicate_variant_member_type = "variant contains the same member type more than once",

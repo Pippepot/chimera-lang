@@ -301,6 +301,21 @@ preparation and the receiving call without acquiring region ownership.
 Initializer handles are call-lived operands, not first-class callable values;
 they cannot be stored, returned, or escape the receiving call.
 
+Typing retains declared storage types in values. Flow snapshots contain IDs of
+immutable facts only for tested variant places. Canonical reference origins and
+field paths identify those places across aliases and inference captures. A fact
+stores possible members and a mutation version; joins union members, and writes
+invalidate overlapping carriers. Place identity for type proofs is separate from
+borrow dependencies of evaluated values. Reading copied bits does not create an
+alias. Payload projection preserves the original layout, permissions, and owner.
+
+Conditions carry facts on their CFG edges. Materialized booleans may retain
+versioned implications. Loop bodies are typed once: an incoming fact actually
+used by the body must hold on every backedge; tests inside the body establish
+independent proofs. Inference cache keys include the immutable flow environment,
+and inference reads metadata without executing arguments ahead of their effects.
+These tables belong to body analysis, with no new cross-query mutable state.
+
 Typing checks deferred reads, writes, and transfers against eager arguments,
 indirect callees, writable references, hooks, and implicit cleanup. Deferred reads
 conflict with every write to their referent; ordinary reference reads retain the

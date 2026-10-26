@@ -47,7 +47,11 @@ test "match snapshots recompute coverage captures and ownership capabilities" {
         \\    return match owner
         \\        none -> 90
         \\        Item ->
-        \\            if const selected: Item = owner -> return selected.value
+        \\            match owner
+        \\                Item ->
+        \\                    const selected = owner
+        \\                    return selected.value
+        \\                _ -> ()
         \\            return 91
         \\exit(run())
     ;
@@ -66,7 +70,7 @@ test "match snapshots recompute coverage captures and ownership capabilities" {
     defer std.testing.allocator.free(copyless);
     try fixture.db.setInput(queries.SourceText, 0, copyless);
     try fixture.expectDiagnostic(.type_not_copyable);
-    const borrowed = try std.mem.replaceOwned(u8, std.testing.allocator, copyless, "if const selected: Item =", "if ref selected: Item =");
+    const borrowed = try std.mem.replaceOwned(u8, std.testing.allocator, copyless, "const selected = owner", "ref selected = owner");
     defer std.testing.allocator.free(borrowed);
     try fixture.db.setInput(queries.SourceText, 0, borrowed);
     try fixture.expectExit(42);
@@ -80,7 +84,9 @@ test "match snapshots preserve cleanup and reference-valued result joins" {
         \\    copy = none
         \\    trace: Ref(int)
         \\    drop = func(deinit self: Tracked) -> self.trace.value += 1
-        \\func produce(ref trace: int) Tracked | none -> Tracked{trace = (if const _selected_result_0: Ref(int) = Ref.from(trace) -> _selected_result_0 else panic "unexpected none")}
+        \\func produce(ref trace: int) Tracked | none -> Tracked{trace = ((match Ref.from(trace)
+        \\    _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\    _ -> panic "unexpected none"))}
         \\func select(ref owner: int, flag: bool) ref int
         \\    return match flag
         \\        true -> owner
@@ -118,11 +124,14 @@ test "List mutation snapshots preserve conservative captures and recompute remov
         \\    if 1 == 1
         \\        var temporary = 7
         \\        values[0] = Ref.from(source)
-        \\        const removed: Ref(int) = remove(values, 0) else return none
+        \\        const removed = remove(values, 0)
+        \\        if not (removed is Ref(int)) -> return none
         \\        if removed.value <> source -> return 90
         \\    return values[0].value * 2
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 91
     ;
     for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)" }) |entry| {
@@ -188,7 +197,9 @@ test "collection snapshots retain static callback environments and recompute sel
         \\    ).amount static for i in 0..4 static if i % 2 == 1]
         \\    return callbacks[0]() + callbacks[1]()
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -211,7 +222,9 @@ test "top-level variant snapshots recompute outcomes and explicit handlers" {
     const source =
         \\func run() -> ()
         \\func check() unit | none -> if 1 < 2 -> () else none
-        \\if const _: unit = check() -> () else exit(1)
+        \\match check()
+        \\    filtered_value_28 and filtered_value_28 is unit -> ()
+        \\    _ -> exit(1)
     ;
     const fixture = try Fixture.restore(source);
     defer fixture.db.deinit();
@@ -231,7 +244,9 @@ test "top-level variant snapshots recompute outcomes and explicit handlers" {
 test "copied optional argument snapshots preserve loop growth and reject retained aliases" {
     const source =
         \\func must(static T: type, var outcome: T | none) T
-        \\    if const value: T = outcome^ -> return value^
+        \\    match outcome^
+        \\        value and value is T -> return value^
+        \\        _ -> ()
         \\    panic "required operation failed"
         \\func calculate() int | none
         \\    var pending: List(int) = [1]
@@ -243,11 +258,15 @@ test "copied optional argument snapshots preserve loop growth and reject retaine
         \\        head += 1
         \\        total += current
         \\        if current < 4
-        \\            const _: unit = pending.append(current * 2) else return none
-        \\            const _: unit = pending.append(current * 2 + 1) else return none
+        \\            const checked_value_1 = pending.append(current * 2)
+        \\            if not (checked_value_1 is unit) -> return none
+        \\            const checked_value_2 = pending.append(current * 2 + 1)
+        \\            if not (checked_value_2 is unit) -> return none
         \\    return total + 14
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -317,12 +336,17 @@ test "overload range snapshots retain backing and refresh reusable bounds" {
         \\func calculate() int | none
         \\    var values = [12, 20, 30]
         \\    const bounds = 1..
-        \\    var selected: Span(int) = values.slice(bounds) else return none
-        \\    ref first: int = selected.get(0) else return none
+        \\    var selected = values.slice(bounds)
+        \\    if not (selected is Span(int)) -> return none
+        \\    const checked_value_2 = selected.get(0)
+        \\    if not (checked_value_2 is int) -> return none
+        \\    ref first = checked_value_2
         \\    first = 28
         \\    return values[0] + values[1] + selected.len()
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -389,10 +413,13 @@ test "tuple snapshots restore values reference alternatives and member-kind edit
         \\func run() int
         \\    var owner = answer.0
         \\    var carrier: ref int | End = capture(owner)
-        \\    if ref item: int = carrier
-        \\        carrier = End{}
-        \\        item += answer.1
-        \\        return owner
+        \\    match carrier
+        \\        int ->
+        \\            ref item = carrier
+        \\            carrier = End{}
+        \\            item += answer.1
+        \\            return owner
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -421,12 +448,17 @@ test "readonly aggregate snapshots preserve independent owned and reference perm
         \\func calculate() int | none
         \\    var values = [19, 23]
         \\    var target = 41
-        \\    var owner: Box(Views) = Box.new(snapshot(Views{view = values.span(), target = (if const _selected_result_0: Ref(int) = Ref.from(target) -> _selected_result_0 else panic "unexpected none")})) else return none
+        \\    var owner = Box.new(snapshot(Views{view = values.span(), target = ((match Ref.from(target)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none"))}))
+        \\    if not (owner is Box(Views)) -> return none
         \\    ref copied = owner.borrow()
         \\    copied.target.value += 1
         \\    return copied.view[0] + copied.view[1] + target - 42
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -448,15 +480,24 @@ test "temporal reference snapshots recompute aliasing and mutation effects" {
         \\    right: Ref(T)
         \\func inspect(captures: Captures(String)) int | none
         \\    const view = captures.left.value.view()
-        \\    const _: unit = captures.right.value.append("x") else return none
+        \\    const checked_value_1 = captures.right.value.append("x")
+        \\    if not (checked_value_1 is unit) -> return none
         \\    return view.byte_length() + 39
         \\func calculate() int | none
         \\    var left: String = "abc"
         \\    var right: String = ""
-        \\    const captures = Captures(String){left = (if const _selected_result_0: Ref(String) = Ref.from(left) -> _selected_result_0 else return none), right = (if const _selected_result_1: Ref(String) = Ref.from(right) -> _selected_result_1 else return none)}
-        \\    return (if const _selected_result_2: int = inspect(captures) -> _selected_result_2 else return none)
+        \\    const captures = Captures(String){left = ((match Ref.from(left)
+        \\        _selected_result_0 and _selected_result_0 is Ref(String) -> _selected_result_0
+        \\        _ -> return none)), right = ((match Ref.from(right)
+        \\            _selected_result_1 and _selected_result_1 is Ref(String) -> _selected_result_1
+        \\            _ -> return none))}
+        \\    return ((match inspect(captures)
+        \\        _selected_result_2 and _selected_result_2 is int -> _selected_result_2
+        \\        _ -> return none))
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -492,10 +533,16 @@ test "destructor snapshots recompute captured authority and mutation effects" {
         \\    var owner: String = "abc"
         \\    const view = owner.view()
         \\    var trace = 0
-        \\    discard(Observer{owner = (if const _selected_result_0: Ref(String) = Ref.from(owner) -> _selected_result_0 else return none), trace = (if const _selected_result_1: Ref(int) = Ref.from(trace) -> _selected_result_1 else return none)})
+        \\    discard(Observer{owner = ((match Ref.from(owner)
+        \\        _selected_result_0 and _selected_result_0 is Ref(String) -> _selected_result_0
+        \\        _ -> return none)), trace = ((match Ref.from(trace)
+        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
+        \\            _ -> return none))})
         \\    return view.byte_length() + trace + 36
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -728,10 +775,15 @@ test "cursor snapshots restore literal and empty spans and recompute source edit
         \\func run() int
         \\    const values = [19, 23]
         \\    const view = values.span()
-        \\    if ref first: int = view.get(0)
-        \\        if ref second: int = view.get(1)
-        \\            if ref literal: byte = bytes.get(0)
-        \\                return first + second + empty.len() + bytes.byte_length() - 2 + byte_int(literal) - 195
+        \\    match view.get(0)
+        \\        ref first and first is int ->
+        \\            match view.get(1)
+        \\                ref second and second is int ->
+        \\                    match bytes.get(0)
+        \\                        ref literal and literal is byte -> return first + second + empty.len() + bytes.byte_length() - 2 + byte_int(literal) - 195
+        \\                        _ -> ()
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -751,13 +803,17 @@ test "nested span snapshots recompute slice bounds extent and readonly backing" 
         \\func calculate() int | none
         \\    var values = [5, 17, 23, 29, 7]
         \\    var source = values.span()
-        \\    var middle: Span(int) = source.slice(1..4) else return none
+        \\    var middle = source.slice(1..4)
+        \\    if not (middle is Span(int)) -> return none
         \\    const carrier = Ref.from(middle)
-        \\    var nested: Span(int) = select(carrier) else return none
+        \\    var nested = select(carrier)
+        \\    if not (nested is Span(int)) -> return none
         \\    nested[0] = nested[0]
         \\    return nested[0] + nested[1] + nested.len()
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -790,10 +846,13 @@ test "range snapshots restore raw bounds and recompute runtime endpoint presence
         \\static bounds = 1..3
         \\func calculate() int | none
         \\    var values = [5, 17, 23, 29, 7]
-        \\    const selected: Span(int) = values.slice(bounds) else return none
+        \\    const selected = values.slice(bounds)
+        \\    if not (selected is Span(int)) -> return none
         \\    return selected[0] + selected[1] + selected.len()
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -835,7 +894,8 @@ test "raw borrow snapshots recompute source and registered signature edits" {
     const source =
         \\import std.memory.{Allocation}
         \\func calculate() int | none
-        \\    var storage: Allocation(int) = Allocation(int).allocate(1) else return none
+        \\    var storage = Allocation(int).allocate(1)
+        \\    if not (storage is Allocation(int)) -> return none
         \\    if (storage.unsafe_initialize(0, 20) is unit) -> unit
         \\    else
         \\        storage^.deallocate()
@@ -847,7 +907,9 @@ test "raw borrow snapshots recompute source and registered signature edits" {
         \\    storage^.deallocate()
         \\    return result
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -890,9 +952,11 @@ test "span snapshots retain capabilities and recompute attenuation edits" {
         \\func run() int
         \\    var owner = [12]
         \\    var view = capture(owner)
-        \\    if ref item: int = view.get(0)
-        \\        item += 30
-        \\        return item
+        \\    match view.get(0)
+        \\        ref item and item is int ->
+        \\            item += 30
+        \\            return item
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -909,14 +973,19 @@ test "span snapshots retain capabilities and recompute attenuation edits" {
 
 test "returned text borrows reject conflicting writes after snapshot restoration" {
     const source =
-        \\func validate(imm view: Span(byte)) StringView | none -> (if const _selected_result_0: StringView = BytesView.from_span(view.as_imm()).validate_utf8() -> _selected_result_0 else return none)
+        \\func validate(imm view: Span(byte)) StringView | none -> ((match BytesView.from_span(view.as_imm()).validate_utf8()
+        \\    _selected_result_0 and _selected_result_0 is StringView -> _selected_result_0
+        \\    _ -> return none))
         \\func inspect() int | none
         \\    var bytes: Array(byte, 1) = [65]
         \\    var writable = bytes.span()
-        \\    const text: StringView = validate(writable) else return none
+        \\    const text = validate(writable)
+        \\    if not (text is StringView) -> return none
         \\    return text.byte_length() + 41
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -946,7 +1015,9 @@ test "operation snapshots restore calls indexers and invalidate signature and vi
         \\    const sum = Value{value = values[0]} + Value{value = values[1]}
         \\    return sum.value - 1
         \\func run() int
-        \\    if const calculated: int = calculate() -> return calculated
+        \\    match calculate()
+        \\        calculated and calculated is int -> return calculated
+        \\        _ -> ()
         \\    return 90
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -979,12 +1050,18 @@ test "evaluation heap snapshots restore scalar results and recompute callee elem
         \\    drop = func(deinit self: Item) -> self.trace.value = self.trace.value + self.value
         \\func element() int -> 2
         \\func calculate(var trace: Ref(int)) int | none
-        \\    const owner: Box(Item) = Box(Item).new(Item{trace = trace, value = element()}) else return none
+        \\    const owner = Box(Item).new(Item{trace = trace, value = element()})
+        \\    if not (owner is Box(Item)) -> return none
         \\    return owner.borrow().value + 38
         \\func run() int
-        \\    var trace: Array(int, 1) = Array(int, 1).filled(0) else panic "unexpected none"
-        \\    if ref target: int = trace.get(0)
-        \\        if const value: int = calculate(Ref.from(target)) -> return value + target
+        \\    var trace = Array(int, 1).filled(0)
+        \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
+        \\    match trace.get(0)
+        \\        ref target and target is int ->
+        \\            match calculate(Ref.from(target))
+        \\                value and value is int -> return value + target
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
         \\static answer = run()
         \\exit(answer)
@@ -1016,9 +1093,12 @@ test "collection snapshots restore pending carriers heap destinations and initia
         \\func run() int
         \\    const fixed: Array(int, 1) = [element()]
         \\    const values: List(int) = [23]
-        \\    if ref first: int = fixed.get(0)
-        \\        if ref second: int = values.get(0)
-        \\            return first + second
+        \\    match fixed.get(0)
+        \\        ref first and first is int ->
+        \\            match values.get(0)
+        \\                ref second and second is int -> return first + second
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -1344,7 +1424,9 @@ test "initializer consumers select explicit variants and survive snapshots" {
     const source =
         \\func materialize(init item: int | none) int | none -> item
         \\func recover(init item: int | none) int
-        \\    if const value: int = materialize(item) -> return value
+        \\    match materialize(item)
+        \\        value and value is int -> return value
+        \\        _ -> ()
         \\    return 40
         \\func run() int
         \\    const callback: func(init int | none) int = recover
@@ -1429,7 +1511,9 @@ test "initializer capture effects survive snapshots and capability edits" {
         \\        source^
         \\    else Item{value = 0})
         \\    return value + result.value
-        \\if const result: int = run() -> exit(result) else exit(98)
+        \\match run()
+        \\    result and result is int -> exit(result)
+        \\    _ -> exit(98)
     ;
     const fixture = try Fixture.restore(source);
     defer fixture.db.deinit();
@@ -1464,7 +1548,11 @@ test "initializer regions and native callbacks survive cache reuse and mode edit
         \\func run(imm base: int) int
         \\    var offset = 2
         \\    const callback: func(init int) int = forward
-        \\    if const value: int = callback(materialize((if const _selected_result_2: int = produce(base + offset) -> _selected_result_2 else panic "unexpected none"))) -> return value
+        \\    match callback(materialize(((match produce(base + offset)
+        \\        _selected_result_2 and _selected_result_2 is int -> _selected_result_2
+        \\        _ -> panic "unexpected none"))))
+        \\        value and value is int -> return value
+        \\        _ -> ()
         \\    return 0
         \\exit(run(40))
     ;
@@ -1506,10 +1594,14 @@ test "allocating initializer snapshots retain named return hooks and invalidate 
         \\    return local^
         \\func run() int | none
         \\    const callback: func(init Item) Box(Item) | none = own
-        \\    const first: Box(Item) = callback(copied()) else return none
-        \\    const second: Box(Item) = callback(moved()) else return none
+        \\    const first = callback(copied())
+        \\    if not (first is Box(Item)) -> return none
+        \\    const second = callback(moved())
+        \\    if not (second is Box(Item)) -> return none
         \\    return first.borrow().value + second.borrow().value
-        \\if const value: int = run() -> exit(value) else exit(99)
+        \\match run()
+        \\    value and value is int -> exit(value)
+        \\    _ -> exit(99)
     ;
     const fixture = try Fixture.restore(source);
     defer fixture.db.deinit();
@@ -1578,16 +1670,20 @@ test "allocating initializer snapshots retain partial cleanup and consumption on
             \\    second: int
             \\func missing() int | none -> none
             \\func assemble(var first: Leaf, second: int | none) Item | none
-            \\    const value: int = second else return none
+            \\    const value = second
+            \\    if not (value is int) -> return none
             \\    return Item{{first = first^, second = value}}
             \\func run() int
-            \\    var count: Box(int) = Box.new(40) else panic "unexpected allocation refusal"
+            \\    var count = Box.new(40)
+            \\    if not (count is Box(int)) -> panic "unexpected allocation refusal"
             \\    const callback: func(init Item | none) Box(Item | none) | none = Box(Item | none).new
             \\    var leaf = Leaf{{count = Ref.from(count.borrow())}}
-            \\    const owner: Box(Item | none) = callback(assemble(leaf^, {s})) else return 91
+            \\    const owner = callback(assemble(leaf^, {s}))
+            \\    if not (owner is Box(Item | none)) -> return 91
             \\    if owner.borrow() is Item -> return 99
             \\    return count.borrow() + 1
-            \\if const result = run() -> exit(result) else exit(98)
+            \\match run()
+            \\    result -> exit(result)
         , .{completion});
         defer std.testing.allocator.free(source);
         const fixture = try Fixture.restore(source);
@@ -1610,12 +1706,14 @@ test "raw slot initializer snapshots retain immovable destruction and recompute 
         \\func make(value: int) Item -> Item{value = value}
         \\func initialize(mut storage: Allocation(Item), init item: Item) unit | none -> storage.unsafe_initialize(1, item)
         \\func run() unit | none
-        \\    var storage: Allocation(Item) = allocate(Item, 2) else return none
+        \\    var storage = allocate(Item, 2)
+        \\    if not (storage is Allocation(Item)) -> return none
         \\    const callback: func(mut Allocation(Item), init Item) unit | none = initialize
-        \\    if const _: unit = callback(storage, make(42)) -> ()
-        \\    else
-        \\        deallocate(Item, storage)
-        \\        return none
+        \\    match callback(storage, make(42))
+        \\        filtered_value_111 and filtered_value_111 is unit -> ()
+        \\        _ ->
+        \\            deallocate(Item, storage)
+        \\            return none
         \\    storage.unsafe_destroy(1)
         \\    deallocate(Item, storage)
         \\    return ()
@@ -1642,15 +1740,21 @@ test "array snapshots restore native and comptime fill reads writes and bounds" 
     const source =
         \\import std.array.{Array}
         \\func run() int
-        \\    var values: Array(int, 3) = Array(int, 3).filled(20) else panic "unexpected none"
-        \\    if ref middle: int = values.get(1) -> middle = 22
-        \\    else return 90
+        \\    var values = Array(int, 3).filled(20)
+        \\    if not (values is Array(int, 3)) -> panic "unexpected none"
+        \\    match values.get(1)
+        \\        ref middle and middle is int -> middle = 22
+        \\        _ -> return 90
         \\    if (values.get(-1) is int) -> return 91
         \\    if (values.get(3) is int) -> return 92
         \\    if (values.get(-1) is int) -> return 93
         \\    if (values.get(3) is int) -> return 94
-        \\    if ref first: int = values.get(0)
-        \\        if ref middle: int = values.get(1) -> return first + middle
+        \\    match values.get(0)
+        \\        ref first and first is int ->
+        \\            match values.get(1)
+        \\                ref middle and middle is int -> return first + middle
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 95
     ;
     for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)", "static answer = run()\nexit(run() + answer - 42)" }) |entry| {
@@ -1669,9 +1773,13 @@ test "array snapshots restore empty and nested runtime tuple shapes" {
             \\func run() int
             \\    const row = Array(int, {d}).filled(40)
             \\    const matrix = Array(Array(int, {d}), 2).filled(row)
-            \\    if ref selected: Array(int, {d}) = matrix.get(1)
-            \\        if ref cell: int = selected.get(0) -> return cell + selected.len()
-            \\        return 42
+            \\    match matrix.get(1)
+            \\        ref selected and selected is Array(int, {d}) ->
+            \\            match selected.get(0)
+            \\                ref cell and cell is int -> return cell + selected.len()
+            \\                _ -> ()
+            \\            return 42
+            \\        _ -> ()
             \\    return 90
             \\static answer = run()
             \\exit(run() + answer - 42)
@@ -1691,11 +1799,17 @@ test "array snapshots recompute element types and counts and retain canonical in
         \\static Count = 2
         \\static Shape = Array(Element, Count)
         \\func number(value: int | none) int
-        \\    if ref selected: int = value -> return selected
+        \\    match value
+        \\        int ->
+        \\            ref selected = value
+        \\            return selected
+        \\        _ -> ()
         \\    return 90
         \\func run() int
         \\    const values = Shape.filled(40)
-        \\    if const selected: Element = values.get(1) -> return number(selected) + values.len()
+        \\    match values.get(1)
+        \\        selected and selected is Element -> return number(selected) + values.len()
+        \\        _ -> ()
         \\    return 91
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -1736,9 +1850,12 @@ test "array snapshots invalidate element copy hook bodies and capabilities" {
         \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
         \\func run() int
         \\    const original = Item{value = 40}
-        \\    const values: Array(Item, 2) = Array(Item, 2).filled(original) else panic "unexpected none"
+        \\    const values = Array(Item, 2).filled(original)
+        \\    if not (values is Array(Item, 2)) -> panic "unexpected none"
         \\    const copied = values.copy()
-        \\    if ref selected: Item = copied.get(1) -> return selected.value
+        \\    match copied.get(1)
+        \\        ref selected and selected is Item -> return selected.value
+        \\        _ -> ()
         \\    return 90
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -1763,8 +1880,11 @@ test "array snapshots invalidate source indices and standard bounds checks" {
     const source =
         \\import std.array.{Array}
         \\func run() int
-        \\    const values: Array(int, 2) = Array(int, 2).filled(42) else panic "unexpected none"
-        \\    if ref selected: int = values.get(1) -> return selected
+        \\    const values = Array(int, 2).filled(42)
+        \\    if not (values is Array(int, 2)) -> panic "unexpected none"
+        \\    match values.get(1)
+        \\        ref selected and selected is int -> return selected
+        \\        _ -> ()
         \\    return 89
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -1830,12 +1950,20 @@ test "array intern snapshots preserve nested tuple values and reuse identical ty
 
 test "array snapshots publish static nested values into runtime storage" {
     const fixture = try Fixture.restore(
-        \\static row = (if const _selected_result_0: Array(int, 2) = Array(int, 2).filled(20) -> _selected_result_0^ else panic "unexpected none")
-        \\static matrix = (if const _selected_result_1: Array(Array(int, 2), 2) = Array(Array(int, 2), 2).filled(row) -> _selected_result_1^ else panic "unexpected none")
+        \\static row = ((match Array(int, 2).filled(20)
+        \\    _selected_result_0 and _selected_result_0 is Array(int, 2) -> _selected_result_0^
+        \\    _ -> panic "unexpected none"))
+        \\static matrix = ((match Array(Array(int, 2), 2).filled(row)
+        \\    _selected_result_1 and _selected_result_1 is Array(Array(int, 2), 2) -> _selected_result_1^
+        \\    _ -> panic "unexpected none"))
         \\func run() int
         \\    const values = matrix
-        \\    if ref selected: Array(int, 2) = values.get(1)
-        \\        if ref value: int = selected.get(0) -> return value + row.len() + 20
+        \\    match values.get(1)
+        \\        ref selected and selected is Array(int, 2) ->
+        \\            match selected.get(0)
+        \\                ref value and value is int -> return value + row.len() + 20
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     );
@@ -1849,10 +1977,13 @@ test "text snapshots restore symbolic data borrowed projections and invalidate l
         \\func inspect() int | none
         \\    const view = greeting.view()
         \\    const bytes = view.as_bytes()
-        \\    const first: byte = bytes.get(0) else return none
+        \\    const first = bytes.get(0)
+        \\    if not (first is byte) -> return none
         \\    return byte_int(first) - 62
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -1871,11 +2002,15 @@ test "text snapshots restore owned string cleanup and standard stream artifacts"
         \\import std.io.{write_text, stdout}
         \\func length() int | none
         \\    var text = "hé"
-        \\    const _: unit = text.append("llo") else return none
-        \\    const _: unit = write_text(stdout, "") else return none
+        \\    const checked_value_1 = text.append("llo")
+        \\    if not (checked_value_1 is unit) -> return none
+        \\    const checked_value_2 = write_text(stdout, "")
+        \\    if not (checked_value_2 is unit) -> return none
         \\    return text.byte_length() + 36
         \\func run() int
-        \\    if const answer: int = length() -> return answer
+        \\    match length()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
         \\exit(run())
     ;
@@ -1888,7 +2023,11 @@ test "optional argument snapshots restore variant values and converters" {
     const fixture = try Fixture.restore(
         \\func missing() int | none -> return none
         \\func value_or(value: int | none) int
-        \\    if const found: int = value -> return found
+        \\    match value
+        \\        int ->
+        \\            const found = value
+        \\            return found
+        \\        _ -> ()
         \\    return 42
         \\func run() int
         \\    const good = value_or(missing()) == 42
@@ -1914,13 +2053,19 @@ test "captured owner cleanup survives snapshots and source edits" {
         \\func missing() int | none -> return none
         \\func consume(var first: Item | none, var second: Item | none, var third: Item | none, final: int) -> ()
         \\func work(var trace: Ref(int)) unit | none
-        \\    consume(make(trace, 10, false), make(trace, 11, false), make(trace, 42, true), (if const selected: int = missing() -> selected else return none))
+        \\    consume(make(trace, 10, false), make(trace, 11, false), make(trace, 42, true), ((match missing()
+        \\        selected and selected is int -> selected
+        \\        _ -> return none)))
         \\    return ()
         \\func run() int
         \\    var trace = [0]
-        \\    if ref handle: int = trace.get(0)
-        \\        if (work((if const _selected_result_4: Ref(int) = Ref.from(handle) -> _selected_result_4 else panic "unexpected none")) is unit) -> return 91
-        \\        return handle
+        \\    match trace.get(0)
+        \\        ref handle and handle is int ->
+        \\            if (work(((match Ref.from(handle)
+        \\                _selected_result_4 and _selected_result_4 is Ref(int) -> _selected_result_4
+        \\                _ -> panic "unexpected none"))) is unit) -> return 91
+        \\            return handle
+        \\        _ -> ()
         \\    return 92
         \\static answer = run()
         \\exit(answer + run() - 42)
@@ -1965,8 +2110,12 @@ test "collection snapshots retain generated callable lexical environments" {
         \\    const callbacks: Array(func() int, 2) = [(struct
         \\        pub func amount() int -> i + 19
         \\    ).amount static for i in [1, 3]]
-        \\    if const first: (func() int) = callbacks.get(0)
-        \\        if const second: (func() int) = callbacks.get(1) -> return first() + second()
+        \\    match callbacks.get(0)
+        \\        first and first is func() int ->
+        \\            match callbacks.get(1)
+        \\                second and second is func() int -> return first() + second()
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 90
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -1985,11 +2134,14 @@ test "collection snapshots retain generated callable lexical environments" {
 test "collection snapshots restore sequence carriers and callable reference origins" {
     const source =
         \\func gather(imm collect: func(init collection_sequence(Ref(int))) List(Ref(int)) | none, ref source: Array(int, 2)) int | none
-        \\    const values: List(Ref(int)) = collect([Ref.from(item) for ref item in source]) else return none
+        \\    const values = collect([Ref.from(item) for ref item in source])
+        \\    if not (values is List(Ref(int))) -> return none
         \\    return values[0].value + values[1].value
         \\func run() int
         \\    var source = [19, 23]
-        \\    if const result: int = gather(List(Ref(int)).collect, source) -> return result
+        \\    match gather(List(Ref(int)).collect, source)
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
         \\static answer = run()
         \\exit(run() + answer - 42)
@@ -2010,7 +2162,9 @@ test "collection snapshots restore inferred generic sequence construction" {
         \\func gather(static T: type, init values: collection_sequence(T)) List(T) | none
         \\    return List(T).collect(values)
         \\func run() int
-        \\    if const values: List(int) = gather([value for value in [19, 23]]) -> return values.len() + 40
+        \\    match gather([value for value in [19, 23]])
+        \\        values and values is List(int) -> return values.len() + 40
+        \\        _ -> ()
         \\    return 90
         \\static answer = run()
         \\exit(run() + answer - 42)

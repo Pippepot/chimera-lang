@@ -16,10 +16,8 @@ test "scalar string converters format decimal limits booleans and empty values i
         \\    if String(()) <> "()" or String(none) <> "none" -> return 97
         \\    const view: StringView = "hé\0"
         \\    if String(view) <> "hé\0" -> return 98
-        \\    if const text = String(42)
-        \\        if text <> "42" -> return 99
-        \\    else
-        \\        return 100
+        \\    match String(42)
+        \\        text -> if text <> "42" -> return 99
         \\    return 42
     , 42);
 }
@@ -34,7 +32,9 @@ test "collection string converters recursively borrow strings and custom move on
         \\    var values = [Item{value = -2}, Item{value = 42}]
         \\    if String(values) <> "[-2, 42]" -> return 90
         \\    if String(values.span()) <> "[-2, 42]" -> return 91
-        \\    if String((if const _selected_result_0: Span(Item) = values.slice(1..) -> _selected_result_0 else return none)) <> "[42]" -> return 92
+        \\    if String(((match values.slice(1..)
+        \\        _selected_result_0 and _selected_result_0 is Span(Item) -> _selected_result_0
+        \\        _ -> return none))) <> "[42]" -> return 92
         \\    const nested = [[1, 2], [3, 4]]
         \\    if String(nested) <> "[[1, 2], [3, 4]]" -> return 93
         \\    if String([1, 2]) <> "[1, 2]" -> return 103
@@ -50,12 +50,17 @@ test "collection string converters recursively borrow strings and custom move on
         \\    if String(empty) <> "[]" -> return 98
         \\    const bytes: Array(byte, 3) = [0, 128, 255]
         \\    if String(BytesView.from_array(3, bytes)) <> "[0, 128, 255]" -> return 99
-        \\    if String((if const _selected_result_1: Ref(Item) = Ref.from(values[1]) -> _selected_result_1 else return none)) <> "Ref(42)" -> return 100
-        \\    const boxed: Box(Item) = Box(Item).new(Item{value = 42}) else return none
+        \\    if String(((match Ref.from(values[1])
+        \\        _selected_result_1 and _selected_result_1 is Ref(Item) -> _selected_result_1
+        \\        _ -> return none))) <> "Ref(42)" -> return 100
+        \\    const boxed = Box(Item).new(Item{value = 42})
+        \\    if not (boxed is Box(Item)) -> return none
         \\    if String(boxed) <> "Box(42)" -> return 101
         \\    return values[0].value + 44
         \\func run() int
-        \\    if const result: int = inspect() -> return result
+        \\    match inspect()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 102
     , 42);
 }
@@ -70,7 +75,11 @@ test "string conversion borrows immovable elements and drops each owner once" {
         \\    drop = func(deinit self: Item) -> self.drops.value += self.value
         \\pub converter(imm value: Item) String -> String(value.value)
         \\func render(ref drops: int) String
-        \\    const values = [Item{value = 19, drops = (if const _selected_result_0: Ref(int) = Ref.from(drops) -> _selected_result_0 else panic "unexpected none")}, Item{value = 23, drops = (if const _selected_result_1: Ref(int) = Ref.from(drops) -> _selected_result_1 else panic "unexpected none")}]
+        \\    const values = [Item{value = 19, drops = ((match Ref.from(drops)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none"))}, Item{value = 23, drops = ((match Ref.from(drops)
+        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
+        \\            _ -> panic "unexpected none"))}]
         \\    const text = String(values)
         \\    if drops <> 0 -> panic "formatting consumed an element"
         \\    if values.len() <> 2 -> panic "formatting changed the source"
@@ -93,19 +102,28 @@ test "string conversion preserves owner cleanup on explicit mismatch" {
         \\func stop() Item | none -> return none
         \\func late(ref count: int) Item
         \\    count += 10
-        \\    return Item{drops = (if const _selected_result_0: Ref(int) = Ref.from(count) -> _selected_result_0 else panic "unexpected none")}
+        \\    return Item{drops = ((match Ref.from(count)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none"))}
         \\func render(ref drops: int, ref calls: int) String | none
         \\    const prefix = [Item{drops = Ref.from(drops)}]
         \\    const text = String(prefix)
-        \\    const _: Item = stop() else return none
+        \\    const checked_value_1 = stop()
+        \\    if not (checked_value_1 is Item) -> return none
         \\    late(calls)
         \\    return text^
         \\func run() int
         \\    var counters = [0, 0]
-        \\    if ref drops: int = counters.get(0)
-        \\        if ref calls: int = counters.get(1)
-        \\            if const text: String = render(drops, calls) -> return 90
-        \\            return drops + calls + 41
+        \\    match counters.get(0)
+        \\        ref drops and drops is int ->
+        \\            match counters.get(1)
+        \\                ref calls and calls is int ->
+        \\                    match render(drops, calls)
+        \\                        text and text is String -> return 90
+        \\                        _ -> ()
+        \\                    return drops + calls + 41
+        \\                _ -> ()
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -138,11 +156,16 @@ test "runtime optional range bounds share slicing and formatting consumers" {
         \\    const ranges = [select(true, true), select(false, true), select(true, false), select(false, false)]
         \\    var length = 0
         \\    for bounds in ranges
-        \\        const array_slice: Span(int) = values.slice(bounds) else return none
-        \\        const list_slice: Span(int) = list.slice(bounds) else return none
-        \\        const span_slice: Span(int) = span.slice(bounds) else return none
-        \\        const text_slice: StringView = text.slice(bounds) else return none
-        \\        const bytes_slice: BytesView = bytes.slice(bounds) else return none
+        \\        const array_slice = values.slice(bounds)
+        \\        if not (array_slice is Span(int)) -> return none
+        \\        const list_slice = list.slice(bounds)
+        \\        if not (list_slice is Span(int)) -> return none
+        \\        const span_slice = span.slice(bounds)
+        \\        if not (span_slice is Span(int)) -> return none
+        \\        const text_slice = text.slice(bounds)
+        \\        if not (text_slice is StringView) -> return none
+        \\        const bytes_slice = bytes.slice(bounds)
+        \\        if not (bytes_slice is BytesView) -> return none
         \\        const size = array_slice.len()
         \\        if not (size == list_slice.len()) -> return none
         \\        if not (size == span_slice.len()) -> return none
@@ -155,7 +178,9 @@ test "runtime optional range bounds share slicing and formatting consumers" {
         \\    if not (String(ranges[3]) == "..") -> return none
         \\    return length + 30
         \\func run() int
-        \\    if const result: int = calculate() -> return result
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -181,8 +206,10 @@ test "owned String equality survives growth cloning and literal conversion" {
     try SourceFixture.expectParity(
         \\func inspect() int | none
         \\    var text = "hé"
-        \\    const _: unit = text.append("\0") else return none
-        \\    const duplicate: String = text.clone() else return none
+        \\    const checked_value_1 = text.append("\0")
+        \\    if not (checked_value_1 is unit) -> return none
+        \\    const duplicate = text.clone()
+        \\    if not (duplicate is String) -> return none
         \\    const view: StringView = "hé\0"
         \\    if view <> text -> return 89
         \\    if text <> duplicate -> return 90
@@ -191,7 +218,9 @@ test "owned String equality survives growth cloning and literal conversion" {
         \\    if equal(text, "hé\0") -> return 42
         \\    return 92
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 93
     , 42);
 }
@@ -226,16 +255,21 @@ test "mutable view outputs still depend on compatible inline owner storage" {
         \\struct View
         \\    pub text: StringView
         \\func attach(imm source: Owner, mut target: View) unit | none
-        \\    target.text = (if const text: StringView = BytesView.from_array(1, source.bytes).validate_utf8() -> text else return none)
+        \\    target.text = ((match BytesView.from_array(1, source.bytes).validate_utf8()
+        \\        text and text is StringView -> text
+        \\        _ -> return none))
         \\    return ()
         \\func conflict(mut source: Owner, imm view: View) -> return
         \\func inspect() int | none
         \\    var owner = Owner{bytes = [65]}
         \\    var view = View{text = "literal"}
-        \\    const _: unit = attach(owner, view) else return none
+        \\    const checked_value_1 = attach(owner, view)
+        \\    if not (checked_value_1 is unit) -> return none
         \\    conflict(owner, view)
         \\    return view.text.byte_length()
-        \\if const result: int = inspect() -> exit(result)
+        \\match inspect()
+        \\    result and result is int -> exit(result)
+        \\    _ -> ()
         \\exit(90)
     ;
     try SourceFixture.expectSourceDiagnostic(source, .overlapping_mutable_arguments);
@@ -303,14 +337,18 @@ test "literal views slice on UTF-8 boundaries and widen bytes explicitly" {
     try SourceFixture.expectParity(
         \\func inspect() int | none
         \\    const text: StringView = "aé\0"
-        \\    const suffix: StringView = text.slice(1..3) else return none
+        \\    const suffix = text.slice(1..3)
+        \\    if not (suffix is StringView) -> return none
         \\    const bytes = suffix.as_bytes()
-        \\    const first: byte = bytes.get(0) else return none
+        \\    const first = bytes.get(0)
+        \\    if not (first is byte) -> return none
         \\    if text.slice(2..3) is StringView -> return 90
         \\    if text.slice(-1..0) is StringView -> return 91
         \\    return byte_int(first) - 153
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 92
     , 42);
 }
@@ -322,8 +360,16 @@ test "reference casts project variant payloads without copying" {
         \\    pub number: int
         \\func run() int
         \\    var value: Payload | none = Payload{number = 19}
-        \\    if ref payload: Payload = value -> payload.number = 42
-        \\    if ref payload: Payload = value -> return payload.number
+        \\    match value
+        \\        Payload ->
+        \\            ref payload = value
+        \\            payload.number = 42
+        \\        _ -> ()
+        \\    match value
+        \\        Payload ->
+        \\            ref payload = value
+        \\            return payload.number
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -340,10 +386,18 @@ test "borrowed variant payloads can be replaced by a different member shape" {
         \\    pub second: int
         \\func run() int
         \\    var value: Small | Large = Small{number = 1}
-        \\    if ref payload: Small = value -> payload.number = 42
+        \\    match value
+        \\        Small ->
+        \\            ref payload = value
+        \\            payload.number = 42
+        \\        _ -> ()
         \\    const replacement: Small | Large = Large{first = 19, second = 23}
         \\    value = replacement
-        \\    if ref payload: Large = value -> return payload.first + payload.second
+        \\    match value
+        \\        Large ->
+        \\            ref payload = value
+        \\            return payload.first + payload.second
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -352,16 +406,23 @@ test "strings detach literal storage grow clone and clean both owners" {
     try SourceFixture.expectParity(
         \\func calculate() int | none
         \\    var text = "hé"
-        \\    const _: unit = text.reserve(0) else return none
-        \\    const _: unit = text.append("llo") else return none
-        \\    var duplicate: String = text.clone() else return none
-        \\    const _: unit = duplicate.append("!") else return none
+        \\    const checked_value_1 = text.reserve(0)
+        \\    if not (checked_value_1 is unit) -> return none
+        \\    const checked_value_2 = text.append("llo")
+        \\    if not (checked_value_2 is unit) -> return none
+        \\    var duplicate = text.clone()
+        \\    if not (duplicate is String) -> return none
+        \\    const checked_value_4 = duplicate.append("!")
+        \\    if not (checked_value_4 is unit) -> return none
         \\    const bytes = text.as_bytes()
-        \\    if const first: byte = bytes.get(0)
-        \\        return text.byte_length() + duplicate.byte_length() + byte_int(first) - 75
+        \\    match bytes.get(0)
+        \\        first and first is byte -> return text.byte_length() + duplicate.byte_length() + byte_int(first) - 75
+        \\        _ -> ()
         \\    return 90
         \\func run() int
-        \\    if const answer: int = calculate() -> return answer
+        \\    match calculate()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -385,11 +446,16 @@ test "literal escapes and empty array views preserve exact bytes in both engines
         \\    const bytes: BytesView = "\"\\\n\r\t\0"
         \\    const array: Array(byte, 0) = []
         \\    const empty = BytesView.from_array(0, array)
-        \\    const text: StringView = empty.validate_utf8() else return none
+        \\    const text = empty.validate_utf8()
+        \\    if not (text is StringView) -> return none
         \\    if (empty.get(0) is byte) -> return 90
-        \\    return byte_int((if const _selected_result_0: byte = bytes.get(0) -> _selected_result_0 else return none)) + bytes.byte_length() + text.byte_length() + 2
+        \\    return byte_int(((match bytes.get(0)
+        \\        _selected_result_0 and _selected_result_0 is byte -> _selected_result_0
+        \\        _ -> return none))) + bytes.byte_length() + text.byte_length() + 2
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 91
     , 42);
 }
@@ -405,8 +471,11 @@ test "string literals materialize as StaticString for every runtime target" {
         \\    const owned = "jk"
         \\    const literal: StaticString = "qrstuv"
         \\    const choice: StaticString | none = "w"
-        \\    if const present: StaticString = choice
-        \\        return first.byte_length() + second.byte_length() + bytes.byte_length() + owned.byte_length() + constant.byte_length() + size(literal) + size(present) + 19
+        \\    match choice
+        \\        StaticString ->
+        \\            const present = choice
+        \\            return first.byte_length() + second.byte_length() + bytes.byte_length() + owned.byte_length() + constant.byte_length() + size(literal) + size(present) + 19
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -448,7 +517,11 @@ test "literal conversion widens into a variant containing text" {
         \\func text() StringView | none -> "hello"
         \\func run() int
         \\    const value: StringView | none = text()
-        \\    if const view: StringView = value -> return view.byte_length() + 37
+        \\    match value
+        \\        StringView ->
+        \\            const view = value
+        \\            return view.byte_length() + 37
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -484,7 +557,9 @@ test "print accepts scalar collection and custom string converters and evaluates
         \\    print(none)
         \\    print([[1, 2], [3, 4]])
         \\    print(["hello", "world"])
-        \\    print(make((if const _selected_result_0: Ref(int) = Ref.from(count) -> _selected_result_0 else panic "unexpected none")))
+        \\    print(make(((match Ref.from(count)
+        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
+        \\        _ -> panic "unexpected none"))))
         \\    print(count)
         \\    const write_integer: func(imm int) unit = print
         \\    write_integer(42)
@@ -529,10 +604,14 @@ test "text output writes exact UTF-8 NUL and newline bytes to standard streams" 
         \\import std.io.{write_text, stdout, stderr}
         \\func output() unit | none
         \\    print("é\0")
-        \\    const _: unit = write_text(stderr, "oops") else return none
-        \\    const _: unit = write_text(stdout, "") else return none
+        \\    const checked_value_1 = write_text(stderr, "oops")
+        \\    if not (checked_value_1 is unit) -> return none
+        \\    const checked_value_2 = write_text(stdout, "")
+        \\    if not (checked_value_2 is unit) -> return none
         \\    return unit
-        \\if const _: unit = output() -> exit(42)
+        \\match output()
+        \\    filtered_value_48 and filtered_value_48 is unit -> exit(42)
+        \\    _ -> ()
         \\exit(90)
     , "", "é\x00\n", "oops", 42);
 }
@@ -542,15 +621,23 @@ test "byte input initializes only the returned prefix and reports EOF" {
         \\import std.memory.{List}
         \\import std.io.{read_bytes, write_all, stdin, stdout}
         \\func echo() int | none
-        \\    var buffer: List(byte) = List(byte).new(0) else return none
-        \\    const count: int = read_bytes(stdin, buffer, 100) else return none
-        \\    const bytes: BytesView = buffer.bytes() else return none
-        \\    const _: unit = write_all(stdout, bytes) else return none
+        \\    var buffer = List(byte).new(0)
+        \\    if not (buffer is List(byte)) -> return none
+        \\    const count = read_bytes(stdin, buffer, 100)
+        \\    if not (count is int) -> return none
+        \\    const bytes = buffer.bytes()
+        \\    if not (bytes is BytesView) -> return none
+        \\    const checked_value_4 = write_all(stdout, bytes)
+        \\    if not (checked_value_4 is unit) -> return none
         \\    if (bytes.get(count) is byte) -> return 90
-        \\    const eof: int = read_bytes(stdin, buffer, 1) else return none
-        \\    const empty: int = read_bytes(stdin, buffer, 0) else return none
+        \\    const eof = read_bytes(stdin, buffer, 1)
+        \\    if not (eof is int) -> return none
+        \\    const empty = read_bytes(stdin, buffer, 0)
+        \\    if not (empty is int) -> return none
         \\    return count + eof + empty + 36
-        \\if const result: int = echo() -> exit(result)
+        \\match echo()
+        \\    result and result is int -> exit(result)
+        \\    _ -> ()
         \\exit(91)
     , "a\x00\xffé!", "a\x00\xffé!", "", 42);
 }
@@ -576,11 +663,15 @@ test "byte array views validate full UTF-8 and execute through transient interpr
         \\func inspect() int | none
         \\    const bytes: Array(byte, 4) = [240, 159, 152, 128]
         \\    const view = BytesView.from_array(4, bytes)
-        \\    const text: StringView = view.validate_utf8() else return none
-        \\    const empty: StringView = text.slice(4..4) else return none
+        \\    const text = view.validate_utf8()
+        \\    if not (text is StringView) -> return none
+        \\    const empty = text.slice(4..4)
+        \\    if not (empty is StringView) -> return none
         \\    return text.byte_length() + empty.byte_length() + 38
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
     , 42);
     const invalid = [_][]const u8{ "[128]", "[192, 128]", "[224, 128, 128]", "[237, 160, 128]", "[240, 128, 128, 128]", "[244, 144, 128, 128]", "[245, 128, 128, 128]", "[226, 130]" };
@@ -590,7 +681,9 @@ test "byte array views validate full UTF-8 and execute through transient interpr
             \\func run() int
             \\    const bytes: Array(byte, $count) = $bytes
             \\    const view = BytesView.from_array($count, bytes)
-            \\    if const _: StringView = view.validate_utf8() -> return 90
+            \\    match view.validate_utf8()
+            \\        filtered_value_25 and filtered_value_25 is StringView -> return 90
+            \\        _ -> ()
             \\    return 42
         , .{ .bytes = bytes, .count = count });
         defer std.testing.allocator.free(source);
@@ -609,18 +702,24 @@ test "views reject escape from local owners and use after owner growth" {
         \\func run() int | none
         \\    var text = "hello"
         \\    const view = text.view()
-        \\    const _: unit = text.append("!") else return none
+        \\    const checked_value_1 = text.append("!")
+        \\    if not (checked_value_1 is unit) -> return none
         \\    return view.byte_length()
-        \\if const answer: int = run() -> exit(answer)
+        \\match run()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> ()
     , .borrow_outlives_source);
     try SourceFixture.expectSourceDiagnostic(
         \\import std.memory
         \\pub struct Payload
         \\    pub number: int
         \\var value: Payload | none = Payload{number = 1}
-        \\if ref payload: Payload = value
-        \\    value = none
-        \\    exit(payload.number)
+        \\match value
+        \\    Payload ->
+        \\        ref payload = value
+        \\        value = none
+        \\        exit(payload.number)
+        \\    _ -> ()
     , .borrow_outlives_source);
 }
 
@@ -630,12 +729,18 @@ test "byte views borrow readonly elements and copy owned bytes in both engines" 
         \\func inspect() int | none
         \\    var bytes: Array(byte, 2) = [20, 22]
         \\    var view = BytesView.from_array(2, bytes)
-        \\    ref element: byte = first(view) else return none
+        \\    const checked_value_1 = first(view)
+        \\    if not (checked_value_1 is byte) -> return none
+        \\    ref element = checked_value_1
         \\    const copied = view[1]
-        \\    ref temporary: byte = BytesView.from_array(2, bytes).get(1) else return none
+        \\    const checked_value_2 = BytesView.from_array(2, bytes).get(1)
+        \\    if not (checked_value_2 is byte) -> return none
+        \\    ref temporary = checked_value_2
         \\    return byte_int(element) + byte_int(copied) + byte_int(temporary) - 22
         \\func run() int
-        \\    if const result: int = inspect() -> return result
+        \\    match inspect()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     , 42);
     try SourceFixture.expectSourceDiagnostic(
@@ -665,15 +770,25 @@ test "generic spans borrow arrays and preserve empty slicing in both engines" {
         \\func inspect() int | none
         \\    const numbers: Array(int, 3) = [17, 23, 2]
         \\    const view = Span(int).from_array(3, numbers)
-        \\    const tail: Span(int) = view.slice(1..3) else return none
-        \\    const empty: Span(int) = tail.slice(2..2) else return none
+        \\    const tail = view.slice(1..3)
+        \\    if not (tail is Span(int)) -> return none
+        \\    const empty = tail.slice(2..2)
+        \\    if not (empty is Span(int)) -> return none
         \\    if (empty.get(0) is int) -> return none
-        \\    ref first: int = view.get(0) else return none
-        \\    ref second: int = tail.get(0) else return none
-        \\    ref third: int = tail.get(1) else return none
+        \\    const checked_value_3 = view.get(0)
+        \\    if not (checked_value_3 is int) -> return none
+        \\    ref first = checked_value_3
+        \\    const checked_value_4 = tail.get(0)
+        \\    if not (checked_value_4 is int) -> return none
+        \\    ref second = checked_value_4
+        \\    const checked_value_5 = tail.get(1)
+        \\    if not (checked_value_5 is int) -> return none
+        \\    ref third = checked_value_5
         \\    return first + second + third + empty.len() + Span(int).empty().len()
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -684,10 +799,14 @@ test "range slicing preserves reusable empty reversed and inclusive bounds" {
         \\    var values = [7, 17, 23, 11]
         \\    var view = values.span()
         \\    const bounds = 1..3
-        \\    const selected: Span(int) = view.slice(bounds) else return none
-        \\    const inclusive: Span(int) = view.slice(1..=2) else return none
-        \\    const empty: Span(int) = view.slice(2..2) else return none
-        \\    const endpoint: Span(int) = view.slice(4..4) else return none
+        \\    const selected = view.slice(bounds)
+        \\    if not (selected is Span(int)) -> return none
+        \\    const inclusive = view.slice(1..=2)
+        \\    if not (inclusive is Span(int)) -> return none
+        \\    const empty = view.slice(2..2)
+        \\    if not (empty is Span(int)) -> return none
+        \\    const endpoint = view.slice(4..4)
+        \\    if not (endpoint is Span(int)) -> return none
         \\    if (view.slice(2..1) is Span(int)) -> return 91
         \\    if (view.slice(4..=4) is Span(int)) -> return 92
         \\    if inclusive.len() <> 2 -> return 93
@@ -696,7 +815,9 @@ test "range slicing preserves reusable empty reversed and inclusive bounds" {
         \\    for index in bounds -> count += 1
         \\    return selected[0] + selected[1] + count + empty.len() + endpoint.len()
         \\func run() int
-        \\    if const result: int = inspect() -> return result
+        \\    match inspect()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -712,10 +833,14 @@ test "end relative collection indexing and slicing preserve native and comptime 
         \\    values[^distance(calls)] += 2
         \\    if not (calls == 1) -> return none
         \\    if not (values[^1] == 42) -> return none
-        \\    if not ((if const _selected_result_0: int = values.get(^4) -> _selected_result_0 else return none) == 10) -> return none
+        \\    if not (((match values.get(^4)
+        \\        _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\        _ -> return none)) == 10) -> return none
         \\    var span = values.span()
         \\    span[^2] = 31
-        \\    if not ((if const _selected_result_1: int = span.get(^2) -> _selected_result_1 else return none) == 31) -> return none
+        \\    if not (((match span.get(^2)
+        \\        _selected_result_1 and _selected_result_1 is int -> _selected_result_1
+        \\        _ -> return none)) == 31) -> return none
         \\    const prefix = ..^1
         \\    const suffix = ^2..
         \\    const selected = values[suffix]
@@ -723,24 +848,35 @@ test "end relative collection indexing and slicing preserve native and comptime 
         \\    if not (values[prefix].len() == 3) -> return none
         \\    if not (values[1..=^1].len() == 3) -> return none
         \\    var list: List(int) = [17, 20]
-        \\    const _: unit = list.reserve(8) else return none
+        \\    const checked_value_1 = list.reserve(8)
+        \\    if not (checked_value_1 is unit) -> return none
         \\    list[^1] += 3
-        \\    if not ((if const _selected_result_2: int = list.get(^1) -> _selected_result_2 else return none) == 23) -> return none
+        \\    if not (((match list.get(^1)
+        \\        _selected_result_2 and _selected_result_2 is int -> _selected_result_2
+        \\        _ -> return none)) == 23) -> return none
         \\    if not (list[prefix].len() == 1) -> return none
         \\    if not (list[suffix].len() == 2) -> return none
         \\    const bytes: BytesView = "abcd"
         \\    if not (byte_int(bytes[^1]) == 100) -> return none
-        \\    if not (byte_int((if const _selected_result_3: byte = bytes.get(^4) -> _selected_result_3 else return none)) == 97) -> return none
+        \\    if not (byte_int(((match bytes.get(^4)
+        \\        _selected_result_3 and _selected_result_3 is byte -> _selected_result_3
+        \\        _ -> return none))) == 97) -> return none
         \\    if not (bytes[prefix].byte_length() == 3) -> return none
         \\    const text: StringView = "aéz"
         \\    if text[..^1] <> "aé" -> return none
         \\    if text[^3..^1] <> "é" -> return none
         \\    if text[..=^1] <> text -> return none
-        \\    if const _: StringView = text.slice(^2..) -> return 90
-        \\    if const _: StringView = text.slice(..^2) -> return 91
+        \\    match text.slice(^2..)
+        \\        filtered_value_315 and filtered_value_315 is StringView -> return 90
+        \\        _ -> ()
+        \\    match text.slice(..^2)
+        \\        filtered_value_328 and filtered_value_328 is StringView -> return 91
+        \\        _ -> ()
         \\    return 42
         \\func run() int
-        \\    if const result: int = inspect() -> return result
+        \\    match inspect()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 92
     , 42);
 }
@@ -750,32 +886,57 @@ test "end relative collection bounds reject invalid distances and accept end bou
         \\func inspect() int | none
         \\    var values = [10, 20, 30]
         \\    var list: List(int) = [10, 20, 30]
-        \\    const _: unit = list.reserve(8) else return none
+        \\    const checked_value_1 = list.reserve(8)
+        \\    if not (checked_value_1 is unit) -> return none
         \\    var span = values.span()
         \\    const bytes: BytesView = "abc"
         \\    for distance in [-2147483648, -1, 0, 4, 2147483647]
-        \\        if const _: int = values.get(^distance) -> return 90
-        \\        if const _: int = list.get(^distance) -> return 91
-        \\        if const _: int = span.get(^distance) -> return 92
-        \\        if const _: byte = bytes.get(^distance) -> return 93
-        \\    if ref target: int = list.get(^4)
-        \\        target = 0
-        \\        return 94
+        \\        match values.get(^distance)
+        \\            filtered_value_57 and filtered_value_57 is int -> return 90
+        \\            _ -> ()
+        \\        match list.get(^distance)
+        \\            filtered_value_68 and filtered_value_68 is int -> return 91
+        \\            _ -> ()
+        \\        match span.get(^distance)
+        \\            filtered_value_79 and filtered_value_79 is int -> return 92
+        \\            _ -> ()
+        \\        match bytes.get(^distance)
+        \\            filtered_value_90 and filtered_value_90 is byte -> return 93
+        \\            _ -> ()
+        \\    match list.get(^4)
+        \\        ref target and target is int ->
+        \\            target = 0
+        \\            return 94
+        \\        _ -> ()
         \\    if not (list[^1] == 30) -> return none
         \\    const whole = values[..^0]
         \\    const empty = values[^0..]
         \\    if not (whole.len() == 3 and empty.len() == 0) -> return none
-        \\    if const _: Span(int) = values.slice(..=^0) -> return 95
-        \\    if const _: Span(int) = values.slice(^4..) -> return 96
-        \\    if const _: Span(int) = values.slice(..^4) -> return 97
+        \\    match values.slice(..=^0)
+        \\        filtered_value_161 and filtered_value_161 is Span(int) -> return 95
+        \\        _ -> ()
+        \\    match values.slice(^4..)
+        \\        filtered_value_177 and filtered_value_177 is Span(int) -> return 96
+        \\        _ -> ()
+        \\    match values.slice(..^4)
+        \\        filtered_value_193 and filtered_value_193 is Span(int) -> return 97
+        \\        _ -> ()
         \\    var absent: Array(int, 0) = []
         \\    if not (absent[^0..^0].len() == 0) -> return none
-        \\    if const _: int = absent.get(^0) -> return 98
-        \\    if const _: int = absent.get(^1) -> return 99
-        \\    if const _: Span(int) = absent.slice(..=^0) -> return 100
+        \\    match absent.get(^0)
+        \\        filtered_value_226 and filtered_value_226 is int -> return 98
+        \\        _ -> ()
+        \\    match absent.get(^1)
+        \\        filtered_value_237 and filtered_value_237 is int -> return 99
+        \\        _ -> ()
+        \\    match absent.slice(..=^0)
+        \\        filtered_value_253 and filtered_value_253 is Span(int) -> return 100
+        \\        _ -> ()
         \\    return 42
         \\func run() int
-        \\    if const result: int = inspect() -> return result
+        \\    match inspect()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 101
     , 42);
 }
@@ -794,26 +955,28 @@ test "end relative slicing matches independent absolute endpoint combinations" {
         \\                    const limit_bound = if absolute_limit -> limit else ^limit
         \\                    const start = if absolute_first -> first else 5 - first
         \\                    const end = if absolute_limit -> limit else 5 - limit
-        \\                    if const selected: Span(int) = values.slice(start_bound..limit_bound)
-        \\                        if not (start >= 0 and start <= end and end <= 5) -> return none
-        \\                        if not (selected.len() == end - start) -> return none
-        \\                        var offset = 0
-        \\                        for value in selected
-        \\                            if not (value == (start + offset + 1) * 2) -> return none
-        \\                            offset += 1
-        \\                        accepted += 1
-        \\                    else
-        \\                        if start >= 0 and start <= end and end <= 5 -> return none
-        \\                    if const selected: Span(int) = values.slice(start_bound..=limit_bound)
-        \\                        if not (start >= 0 and start <= end and end < 5) -> return none
-        \\                        if not (selected.len() == end - start + 1) -> return none
-        \\                        included += 1
-        \\                    else
-        \\                        if start >= 0 and start <= end and end < 5 -> return none
+        \\                    match values.slice(start_bound..limit_bound)
+        \\                        selected and selected is Span(int) ->
+        \\                            if not (start >= 0 and start <= end and end <= 5) -> return none
+        \\                            if not (selected.len() == end - start) -> return none
+        \\                            var offset = 0
+        \\                            for value in selected
+        \\                                if not (value == (start + offset + 1) * 2) -> return none
+        \\                                offset += 1
+        \\                            accepted += 1
+        \\                        _ -> if start >= 0 and start <= end and end <= 5 -> return none
+        \\                    match values.slice(start_bound..=limit_bound)
+        \\                        selected and selected is Span(int) ->
+        \\                            if not (start >= 0 and start <= end and end < 5) -> return none
+        \\                            if not (selected.len() == end - start + 1) -> return none
+        \\                            included += 1
+        \\                        _ -> if start >= 0 and start <= end and end < 5 -> return none
         \\    if not (accepted == 84 and included == 60) -> return none
         \\    return 42
         \\func run() int
-        \\    if const result: int = inspect() -> return result
+        \\    match inspect()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -823,11 +986,15 @@ test "end relative access preserves borrow permissions and invalidation" {
         \\func last(ref values: Array(int, 3)) ref int | none -> values[^1]
         \\func inspect() int | none
         \\    var values = [7, 11, 40]
-        \\    ref item: int = last(values) else return none
+        \\    const checked_value_1 = last(values)
+        \\    if not (checked_value_1 is int) -> return none
+        \\    ref item = checked_value_1
         \\    item += 2
         \\    return values[^1]
         \\func run() int
-        \\    if const result: int = inspect() -> return result
+        \\    match inspect()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     ;
     try SourceFixture.expectParity(source, 42);
@@ -840,9 +1007,12 @@ test "end relative access preserves borrow permissions and invalidation" {
         \\func inspect() int | none
         \\    var values: List(int) = [40]
         \\    ref item = values[^1]
-        \\    const _: unit = values.append(2) else return none
+        \\    const checked_value_1 = values.append(2)
+        \\    if not (checked_value_1 is unit) -> return none
         \\    return item
-        \\if const result: int = inspect() -> exit(result)
+        \\match inspect()
+        \\    result and result is int -> exit(result)
+        \\    _ -> ()
     , .borrow_outlives_source);
 }
 
@@ -853,27 +1023,38 @@ test "range slicing resolves independently omitted bounds against initialized ex
         \\    const all = ..
         \\    const prefix = ..3
         \\    const suffix = 2..
-        \\    const whole: Span(int) = values.slice(all) else return none
-        \\    const head: Span(int) = values.slice(prefix) else return none
-        \\    const tail: Span(int) = values.slice(suffix) else return none
-        \\    const inclusive: Span(int) = values.slice(..=2) else return none
-        \\    const explicit_head: Span(int) = values.slice(none..3) else return none
-        \\    const explicit_tail: Span(int) = values.slice(2..none) else return none
+        \\    const whole = values.slice(all)
+        \\    if not (whole is Span(int)) -> return none
+        \\    const head = values.slice(prefix)
+        \\    if not (head is Span(int)) -> return none
+        \\    const tail = values.slice(suffix)
+        \\    if not (tail is Span(int)) -> return none
+        \\    const inclusive = values.slice(..=2)
+        \\    if not (inclusive is Span(int)) -> return none
+        \\    const explicit_head = values.slice(none..3)
+        \\    if not (explicit_head is Span(int)) -> return none
+        \\    const explicit_tail = values.slice(2..none)
+        \\    if not (explicit_tail is Span(int)) -> return none
         \\    if whole.len() <> 4 or head.len() <> 3 or tail.len() <> 2 -> return 91
         \\    if inclusive.len() <> 3 or explicit_head.len() <> 3 or explicit_tail.len() <> 2 -> return 92
         \\    if (values.slice(5..) is Span(int)) -> return 93
         \\    if (values.slice(..5) is Span(int)) -> return 94
         \\    var empty: Array(int, 0) = []
-        \\    const absent: Span(int) = empty.slice(all) else return none
+        \\    const absent = empty.slice(all)
+        \\    if not (absent is Span(int)) -> return none
         \\    if (absent.get(0) is int) -> return 95
         \\    var list: List(int) = [17, 23]
-        \\    const _: unit = list.reserve(8) else return none
+        \\    const checked_value_8 = list.reserve(8)
+        \\    if not (checked_value_8 is unit) -> return none
         \\    if (list.slice(..3) is Span(int)) -> return 96
-        \\    var selected: Span(int) = list.slice(all) else return none
+        \\    var selected = list.slice(all)
+        \\    if not (selected is Span(int)) -> return none
         \\    selected[0] += 2
         \\    return selected[0] + selected[1] + absent.len()
         \\func run() int
-        \\    if const result: int = inspect() -> return result
+        \\    match inspect()
+        \\        result and result is int -> return result
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -884,11 +1065,13 @@ test "range slicing preserves collection permissions and rejects sequence operan
         const source = try test_sources.renderTemplate(std.testing.allocator,
             \\func inspect() int
             \\    $declaration
-            \\    var selected: Span(int) = values.slice(..) else return 90
+            \\    var selected = values.slice(..)
+            \\    if not (selected is Span(int)) -> return 90
             \\    selected[0] += 2
             \\    return values[0]
             \\func run() int
-            \\    if const result = inspect() -> return result
+            \\    match inspect()
+            \\        result -> return result
             \\    return 90
         , .{ .declaration = declaration });
         defer std.testing.allocator.free(source);
@@ -899,7 +1082,7 @@ test "range slicing preserves collection permissions and rejects sequence operan
         defer std.testing.allocator.free(rejected);
         try SourceFixture.expectSourceDiagnostic(rejected, .reference_not_writable);
     }
-    const sequences = [_][]const u8{ "(0..1).reversed()", "(if const selected: RangeSequence = (0..1).step_by(1) -> selected else panic \"unexpected none\")" };
+    const sequences = [_][]const u8{ "(0..1).reversed()", "match 0..1.step_by(1)\n    selected and selected is RangeSequence -> selected\n    _ -> panic \"unexpected none\")" };
     for (sequences) |sequence| {
         const source = try test_sources.renderTemplate(std.testing.allocator,
             \\import std.range.{RangeSequence}
@@ -907,7 +1090,8 @@ test "range slicing preserves collection permissions and rejects sequence operan
             \\    var values = [42]
             \\    const selected = values.slice($sequence)
             \\    return selected[0]
-            \\if const result = inspect() -> exit(result)
+            \\match inspect()
+            \\    result -> exit(result)
         , .{ .sequence = sequence });
         defer std.testing.allocator.free(source);
         try SourceFixture.expectSourceDiagnostic(source, .call_argument_type_mismatch);
@@ -923,28 +1107,28 @@ test "span slicing matches an independent endpoint boundary matrix" {
         \\    var accepted_inclusive = 0
         \\    for start in 0..=6
         \\        for limit in 0..=6
-        \\            if const selected: Span(int) = source.slice(start..limit)
-        \\                if start > limit or limit > 5 -> return 90
-        \\                if selected.len() <> limit - start -> return 91
-        \\                var actual = 0
-        \\                for value in selected -> actual += value
-        \\                var expected = 0
-        \\                for position in start..limit -> expected += (position + 1) * 2
-        \\                if actual <> expected -> return 92
-        \\                accepted += 1
-        \\            else
-        \\                if start <= limit and limit <= 5 -> return 93
-        \\            if const included: Span(int) = source.slice(start..=limit)
-        \\                if start > limit or limit >= 5 -> return 95
-        \\                if included.len() <> limit - start + 1 -> return 96
-        \\                var actual = 0
-        \\                for value in included -> actual += value
-        \\                var expected = 0
-        \\                for position in start..=limit -> expected += (position + 1) * 2
-        \\                if actual <> expected -> return 97
-        \\                accepted_inclusive += 1
-        \\            else
-        \\                if start <= limit and limit < 5 -> return 98
+        \\            match source.slice(start..limit)
+        \\                selected and selected is Span(int) ->
+        \\                    if start > limit or limit > 5 -> return 90
+        \\                    if selected.len() <> limit - start -> return 91
+        \\                    var actual = 0
+        \\                    for value in selected -> actual += value
+        \\                    var expected = 0
+        \\                    for position in start..limit -> expected += (position + 1) * 2
+        \\                    if actual <> expected -> return 92
+        \\                    accepted += 1
+        \\                _ -> if start <= limit and limit <= 5 -> return 93
+        \\            match source.slice(start..=limit)
+        \\                included and included is Span(int) ->
+        \\                    if start > limit or limit >= 5 -> return 95
+        \\                    if included.len() <> limit - start + 1 -> return 96
+        \\                    var actual = 0
+        \\                    for value in included -> actual += value
+        \\                    var expected = 0
+        \\                    for position in start..=limit -> expected += (position + 1) * 2
+        \\                    if actual <> expected -> return 97
+        \\                    accepted_inclusive += 1
+        \\                _ -> if start <= limit and limit < 5 -> return 98
         \\    if accepted <> 21 -> return 94
         \\    if accepted_inclusive <> 15 -> return 99
         \\    return 42
@@ -965,9 +1149,11 @@ test "span slicing rejects extreme bounds before offset arithmetic" {
         \\    if (source.slice(1..=2147483647) is Span(int)) -> return 96
         \\    if (source.slice(2147483647..=2147483647) is Span(int)) -> return 97
         \\    if (source.slice(-2147483648..2147483647) is Span(int)) -> return 98
-        \\    if const endpoint: Span(int) = source.slice(3..3)
-        \\        if (endpoint.get(0) is int) -> return 99
-        \\        return 42 + endpoint.len()
+        \\    match source.slice(3..3)
+        \\        endpoint and endpoint is Span(int) ->
+        \\            if (endpoint.get(0) is int) -> return 99
+        \\            return 42 + endpoint.len()
+        \\        _ -> ()
         \\    return 100
     , 42);
 }
@@ -981,26 +1167,26 @@ test "span slicing validates empty zero sized extents without exposing an elemen
         \\    var empty = absent.span()
         \\    if (empty.slice(0..1) is Span(Empty)) -> return 90
         \\    if (empty.slice(1..1) is Span(Empty)) -> return 91
-        \\    if const selected: Span(Empty) = empty.slice(0..0)
-        \\        if (selected.get(0) is Empty) -> return 92
-        \\        if (selected.get(-1) is Empty) -> return 93
-        \\    else
-        \\        return 94
+        \\    match empty.slice(0..0)
+        \\        selected and selected is Span(Empty) ->
+        \\            if (selected.get(0) is Empty) -> return 92
+        \\            if (selected.get(-1) is Empty) -> return 93
+        \\        _ -> return 94
         \\    var values: Array(Empty, 3) = [Empty{}, Empty{}, Empty{}]
         \\    var source = values.span()
-        \\    if const tail: Span(Empty) = source.slice(^0..)
-        \\        if tail.len() <> 0 -> return 99
-        \\    else
-        \\        return 100
-        \\    if const complete: Span(Empty) = source.slice(^3..^0)
-        \\        if complete.len() <> 3 -> return 101
-        \\    else
-        \\        return 102
+        \\    match source.slice(^0..)
+        \\        tail and tail is Span(Empty) -> if tail.len() <> 0 -> return 99
+        \\        _ -> return 100
+        \\    match source.slice(^3..^0)
+        \\        complete and complete is Span(Empty) -> if complete.len() <> 3 -> return 101
+        \\        _ -> return 102
         \\    if (source.get(^0) is Empty) -> return 97
         \\    if not (source.get(^1) is Empty) -> return 98
-        \\    if const endpoint: Span(Empty) = source.slice(3..3)
-        \\        if (endpoint.get(0) is Empty) -> return 95
-        \\        return 42 + endpoint.len()
+        \\    match source.slice(3..3)
+        \\        endpoint and endpoint is Span(Empty) ->
+        \\            if (endpoint.get(0) is Empty) -> return 95
+        \\            return 42 + endpoint.len()
+        \\        _ -> ()
         \\    return 96
     , 42);
 }
@@ -1009,22 +1195,26 @@ test "span slicing returns nested views with backing authority rather than carri
     const source =
         \\func tail(ref values: Array(int, 4)) Span(int) | none
         \\    var all = values.span()
-        \\    var selected: Span(int) = all.slice(1..4) else return none
+        \\    var selected = all.slice(1..4)
+        \\    if not (selected is Span(int)) -> return none
         \\    return selected.slice(1..2)
         \\func inspect() int | none
         \\    var values = [7, 11, 40, 13]
-        \\    var view: Span(int) = tail(values) else return none
+        \\    var view = tail(values)
+        \\    if not (view is Span(int)) -> return none
         \\    view[0] += 2
         \\    return values[2]
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
     ;
     try SourceFixture.expectParity(source, 42);
     const readonly_cases = [_]struct { original: []const u8, replacement: []const u8 }{
         .{ .original = "var values = [7, 11, 40, 13]", .replacement = "const values = [7, 11, 40, 13]" },
         .{ .original = "var selected: Span(int)", .replacement = "const selected: Span(int)" },
-        .{ .original = "var view: Span(int) = tail(values) else return none", .replacement = "var view: Span(int) = (if const found: Span(int) = tail(values) -> found.as_imm() else return none)" },
+        .{ .original = "var view: Span(int) = tail(values) else return none", .replacement = "var view: Span(int) = ((match tail(values)\n    found and found is Span(int) -> found.as_imm()\n    _ -> return none))" },
     };
     for (readonly_cases) |case| {
         const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, case.original, case.replacement);
@@ -1037,12 +1227,16 @@ test "span slicing returns nested views with backing authority rather than carri
         \\func escape() Span(int) | none
         \\    var values = [7, 11, 40, 13]
         \\    var all = values.span()
-        \\    var selected: Span(int) = all.slice(1..4) else return none
+        \\    var selected = all.slice(1..4)
+        \\    if not (selected is Span(int)) -> return none
         \\    return selected.slice(1..2)
         \\func inspect() int | none
-        \\    const view: Span(int) = escape() else return none
+        \\    const view = escape()
+        \\    if not (view is Span(int)) -> return none
         \\    return view[0]
-        \\if const answer: int = inspect() -> exit(answer)
+        \\match inspect()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> ()
     , .borrow_outlives_source);
 }
 
@@ -1059,11 +1253,14 @@ test "span slicing separates owned field access from captured reference authorit
         \\    var owned = first.span()
         \\    var captured = second.span()
         \\    const carrier = Views{owned = owned, captured = captured}
-        \\    var selected: Span(int) = carrier.captured_tail() else return none
+        \\    var selected = carrier.captured_tail()
+        \\    if not (selected is Span(int)) -> return none
         \\    selected[0] += 2
         \\    return second[0]
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
     ;
     try SourceFixture.expectParity(source, 42);
@@ -1087,12 +1284,16 @@ test "generic spans retain writable access and attenuate in both engines" {
         \\    var numbers: Array(int, 2) = [17, 23]
         \\    var writable = Span(int).from_array(2, numbers)
         \\    writable[0] = 18
-        \\    ref element: int = writable.get(0) else return none
+        \\    const checked_value_1 = writable.get(0)
+        \\    if not (checked_value_1 is int) -> return none
+        \\    ref element = checked_value_1
         \\    element = 19
         \\    const readonly = writable.as_imm()
         \\    return readonly[0] + readonly[1]
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -1102,7 +1303,9 @@ test "attenuated empty spans publish readonly cursors in both engines" {
         \\static empty = Span(int).empty().as_imm()
         \\func run() int
         \\    const source = empty
-        \\    if const endpoint: Span(int) = source.slice(0..0) -> return endpoint.len() + 42
+        \\    match source.slice(0..0)
+        \\        endpoint and endpoint is Span(int) -> return endpoint.len() + 42
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -1111,7 +1314,7 @@ test "aggregate call results cannot assume correspondence with input fields" {
     const cases = [_]struct { result_type: []const u8, construct: []const u8, select: []const u8 }{
         .{ .result_type = "Pair", .construct = "Pair{first = value.second, second = value.first}", .select = "reordered" },
         .{ .result_type = "Array(Pair, 1)", .construct = "[Pair{first = value.second, second = value.first}]", .select = "reordered[0]" },
-        .{ .result_type = "Box(Pair)", .construct = "(if const _selected_result_0: Box(Pair) = Box(Pair).new(Pair{first = value.second, second = value.first}) -> _selected_result_0^ else panic \"unexpected none\")", .select = "Ref.from(reordered.borrow()).value" },
+        .{ .result_type = "Box(Pair)", .construct = "match Box(Pair).new(Pair{first = value.second, second = value.first})\n    _selected_result_0 and _selected_result_0 is Box(Pair) -> _selected_result_0^\n    _ -> panic \"unexpected none\"", .select = "Ref.from(reordered.borrow()).value" },
     };
     for (cases) |case| {
         for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
@@ -1125,15 +1328,21 @@ test "aggregate call results cannot assume correspondence with input fields" {
                 \\func inspect() int
                 \\    var first_bytes: Array(byte, 1) = [65]
                 \\    var second_bytes: Array(byte, 1) = [66]
-                \\    ref first: byte = first_bytes.get(0) else panic "missing first byte"
-                \\    ref second: byte = second_bytes.get(0) else panic "missing second byte"
+                \\    const checked_value_1 = first_bytes.get(0)
+                \\    if not (checked_value_1 is byte) -> panic "missing first byte"
+                \\    ref first = checked_value_1
+                \\    const checked_value_2 = second_bytes.get(0)
+                \\    if not (checked_value_2 is byte) -> panic "missing second byte"
+                \\    ref second = checked_value_2
                 \\    var reordered = swap(Pair{first = Ref.from(first), second = Ref.from(second)})
                 \\    var selected = $select
-                \\    const text: StringView = BytesView.from_array(1, second_bytes).validate_utf8() else panic "invalid text"
+                \\    const text = BytesView.from_array(1, second_bytes).validate_utf8()
+                \\    if not (text is StringView) -> panic "invalid text"
                 \\    selected.first.value = 255
                 \\    return byte_int(text.as_bytes()[0])
                 \\func run() int
-                \\    if const answer = inspect() -> return answer
+                \\    match inspect()
+                \\        answer -> return answer
                 \\    return 90
                 \\$entry
             , .{ .result_type = case.result_type, .construct = case.construct, .select = case.select, .entry = entry });
@@ -1148,9 +1357,9 @@ test "returned readonly ranges depend on contents throughout aggregate shapes" {
         .{ .result_type = "StringView", .construct = "text", .select = "returned" },
         .{ .result_type = "Wrapped", .construct = "Wrapped{view = text}", .select = "returned.view" },
         .{ .result_type = "Array(StringView, 1)", .construct = "[text]", .select = "returned[0]" },
-        .{ .result_type = "Box(StringView)", .construct = "(if const _selected_result_0: Box(StringView) = Box(StringView).new(text) -> _selected_result_0^ else panic \"unexpected none\")", .select = "Ref.from(returned.borrow()).value" },
+        .{ .result_type = "Box(StringView)", .construct = "match Box(StringView).new(text)\n    _selected_result_0 and _selected_result_0 is Box(StringView) -> _selected_result_0^\n    _ -> panic \"unexpected none\"", .select = "Ref.from(returned.borrow()).value" },
         .{ .result_type = "List(StringView)", .construct = "[text]", .select = "returned[0]" },
-        .{ .result_type = "StringView | none", .construct = "text", .select = "if const view: StringView = returned -> view else panic \"missing text\"" },
+        .{ .result_type = "StringView | none", .construct = "text", .select = "match returned\n    StringView ->\n        const view = returned\n        view\n    _ -> panic \"missing text\"" },
     };
     for (cases) |case| {
         for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
@@ -1158,7 +1367,8 @@ test "returned readonly ranges depend on contents throughout aggregate shapes" {
                 \\struct Wrapped
                 \\    pub view: StringView
                 \\func validate(imm view: Span(byte)) $result_type
-                \\    const text: StringView = BytesView.from_span(view.as_imm()).validate_utf8() else panic "invalid text"
+                \\    const text = BytesView.from_span(view.as_imm()).validate_utf8()
+                \\    if not (text is StringView) -> panic "invalid text"
                 \\    return $construct
                 \\func inspect() int
                 \\    var bytes: Array(byte, 1) = [65]
@@ -1168,7 +1378,8 @@ test "returned readonly ranges depend on contents throughout aggregate shapes" {
                 \\    writable[0] = 255
                 \\    return byte_int(text.as_bytes()[0])
                 \\func run() int
-                \\    if const answer = inspect() -> return answer
+                \\    match inspect()
+                \\        answer -> return answer
                 \\    return 90
                 \\$entry
             , .{ .result_type = case.result_type, .construct = case.construct, .select = case.select, .entry = entry });
@@ -1184,17 +1395,22 @@ test "returned aggregates preserve writable handle storage dependencies" {
         \\    pub writable: Span(byte)
         \\    pub readonly: StringView
         \\func views(ref source: Span(byte)) Views | none
-        \\    return Views{writable = source, readonly = (if const _selected_result_0: StringView = BytesView.from_span(source.as_imm()).validate_utf8() -> _selected_result_0 else return none)}
+        \\    return Views{writable = source, readonly = ((match BytesView.from_span(source.as_imm()).validate_utf8()
+        \\        _selected_result_0 and _selected_result_0 is StringView -> _selected_result_0
+        \\        _ -> return none))}
         \\func inspect() int | none
         \\    var bytes: Array(byte, 1) = [65]
         \\    var input = bytes.span()
-        \\    var wrapped: Views = views(input) else return none
+        \\    var wrapped = views(input)
+        \\    if not (wrapped is Views) -> return none
         \\    var writable = wrapped.writable
         \\    writable[0] = 41
         \\    writable[0] = 42
         \\    return byte_int(writable[0])
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -1211,7 +1427,8 @@ test "ownership hook results preserve readonly content dependencies" {
                 \\    pub writable: Span(byte)
                 \\    pub readonly: StringView
                 \\    $operation = func($mode self: Views) Views
-                \\        if const text: StringView = BytesView.from_span(self.writable.as_imm()).validate_utf8()
+                \\        const text = BytesView.from_span(self.writable.as_imm()).validate_utf8()
+                \\        if text is StringView
                 \\            return Views{writable = self.writable, readonly = text}
                 \\        exit(90)
                 \\func inspect() int
@@ -1224,7 +1441,7 @@ test "ownership hook results preserve readonly content dependencies" {
                 \\    writable[0] = 255
                 \\    return byte_int(changed.readonly.as_bytes()[0])
                 \\func run() int
-                \\    if const answer = inspect() -> return answer
+                \\    return inspect()
                 \\    return 90
                 \\$entry
             , .{ .operation = case.operation, .mode = case.mode, .transfer = case.transfer, .entry = entry });
@@ -1249,18 +1466,21 @@ test "mutable outputs preserve readonly dependencies through owned and reference
             \\struct Wrapped
             \\    pub view: View
             \\func refresh(mut value: View, imm source: Span(byte))
-            \\    const text: StringView = BytesView.from_span(source.as_imm()).validate_utf8() else panic "invalid text"
+            \\    const text = BytesView.from_span(source.as_imm()).validate_utf8()
+            \\    if not (text is StringView) -> panic "invalid text"
             \\    value.text = text
             \\func inspect() int
             \\    var first: Array(byte, 1) = [65]
             \\    var second: Array(byte, 1) = [66]
             \\    var writable = second.span()
-            \\    const original: StringView = BytesView.from_array(1, first).validate_utf8() else panic "invalid text"
+            \\    const original = BytesView.from_array(1, first).validate_utf8()
+            \\    if not (original is StringView) -> panic "invalid text"
             \\    $setup
             \\    refresh($place, writable)
             \\    return byte_int($select.as_bytes()[0]) - 24
             \\func run() int
-            \\    if const answer = inspect() -> return answer
+            \\    match inspect()
+            \\        answer -> return answer
             \\    return 90
         , .{ .setup = case.setup, .place = case.place, .select = case.select });
         defer std.testing.allocator.free(source);
@@ -1281,20 +1501,27 @@ test "mutable outputs preserve writable handle storage dependencies" {
         \\    pub writable: Span(byte)
         \\    pub readonly: StringView
         \\func refresh(mut value: Views, ref source: Span(byte)) unit | none
-        \\    value = Views{writable = source, readonly = (if const _selected_result_0: StringView = BytesView.from_span(source.as_imm()).validate_utf8() -> _selected_result_0 else return none)}
+        \\    value = Views{writable = source, readonly = ((match BytesView.from_span(source.as_imm()).validate_utf8()
+        \\        _selected_result_0 and _selected_result_0 is StringView -> _selected_result_0
+        \\        _ -> return none))}
         \\    return ()
         \\func inspect() int | none
         \\    var first: Array(byte, 1) = [65]
         \\    var second: Array(byte, 1) = [66]
         \\    var writable = second.span()
-        \\    var views = Views{writable = writable, readonly = (if const _selected_result_1: StringView = BytesView.from_array(1, first).validate_utf8() -> _selected_result_1 else return none)}
-        \\    const _: unit = refresh(views, writable) else return none
+        \\    var views = Views{writable = writable, readonly = ((match BytesView.from_array(1, first).validate_utf8()
+        \\        _selected_result_1 and _selected_result_1 is StringView -> _selected_result_1
+        \\        _ -> return none))}
+        \\    const checked_value_1 = refresh(views, writable)
+        \\    if not (checked_value_1 is unit) -> return none
         \\    var changed = views.writable
         \\    changed[0] = 41
         \\    changed[0] = 42
         \\    return byte_int(changed[0])
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -1322,7 +1549,7 @@ test "mutable field outputs preserve untouched readonly siblings" {
             \\    writable[0] = 255
             \\    return byte_int(untouched.as_bytes()[0]) - 23
             \\func run() int
-            \\    if const answer = inspect() -> return answer
+            \\    return inspect()
             \\    return 90
         , .{ .alias = alias, .place = if (alias.len == 0) "views.changed" else "alias.value" });
         defer std.testing.allocator.free(source);
@@ -1338,10 +1565,14 @@ test "generic spans borrow noncopyable elements without copying" {
         \\func inspect() int | none
         \\    const entries: Array(Entry, 2) = [Entry{score = 17}, Entry{score = 40}]
         \\    const view = entries.span()
-        \\    ref element: Entry = view.get(1) else return none
+        \\    const checked_value_1 = view.get(1)
+        \\    if not (checked_value_1 is Entry) -> return none
+        \\    ref element = checked_value_1
         \\    return element.score + view.len()
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -1353,13 +1584,18 @@ test "generic spans preserve zero-sized writable ranges" {
         \\func inspect() int | none
         \\    var entries: Array(Empty, 3) = [Empty{}, Empty{}, Empty{}]
         \\    var source = entries.span()
-        \\    var view: Span(Empty) = source.slice(1..3) else return none
-        \\    ref element: Empty = view.get(1) else return none
+        \\    var view = source.slice(1..3)
+        \\    if not (view is Span(Empty)) -> return none
+        \\    const checked_value_2 = view.get(1)
+        \\    if not (checked_value_2 is Empty) -> return none
+        \\    ref element = checked_value_2
         \\    element = Empty{}
         \\    if (view.get(2) is Empty) -> return none
         \\    return view.len() + 40
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -1369,55 +1605,75 @@ test "generic spans cannot escalate readonly access" {
         \\func inspect() int | none
         \\    const entries = [42]
         \\    const view = entries.span()
-        \\    ref element: int = view.get(0) else return none
+        \\    const checked_value_1 = view.get(0)
+        \\    if not (checked_value_1 is int) -> return none
+        \\    ref element = checked_value_1
         \\    element = 17
         \\    return element
-        \\if const answer: int = inspect() -> exit(answer)
+        \\match inspect()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> ()
     , .reference_not_writable);
 }
 
 test "generic spans reject stale validated text through aggregate calls and loops" {
     try SourceFixture.expectAnySourceDiagnostic(
         \\func replace(ref view: Span(byte)) unit | none
-        \\    ref element: byte = view.get(0) else return none
+        \\    const checked_value_1 = view.get(0)
+        \\    if not (checked_value_1 is byte) -> return none
+        \\    ref element = checked_value_1
         \\    element = 255
         \\    return ()
         \\func inspect() int | none
         \\    var entries: Array(byte, 1) = [65]
         \\    var writable = entries.span()
-        \\    const text: StringView = BytesView.from_span(writable.as_imm()).validate_utf8() else return none
+        \\    const text = BytesView.from_span(writable.as_imm()).validate_utf8()
+        \\    if not (text is StringView) -> return none
         \\    var index = 0
         \\    loop
         \\        if index == 2 -> break
-        \\        const _: unit = replace(writable) else return none
+        \\        const checked_value_3 = replace(writable)
+        \\        if not (checked_value_3 is unit) -> return none
         \\        index += 1
         \\    return text.byte_length()
-        \\if const answer: int = inspect() -> exit(answer)
+        \\match inspect()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> ()
     , .borrow_outlives_source);
     try SourceFixture.expectAnySourceDiagnostic(
         \\import std.memory
         \\func inspect() int | none
         \\    var entries: Array(byte, 1) = [65]
         \\    var writable = entries.span()
-        \\    const text: StringView = BytesView.from_span(writable.as_imm()).validate_utf8() else return none
+        \\    const text = BytesView.from_span(writable.as_imm()).validate_utf8()
+        \\    if not (text is StringView) -> return none
         \\    const alias = Ref.from(text)
         \\    writable[0] = 255
         \\    return alias.value.byte_length()
-        \\if const answer: int = inspect() -> exit(answer)
+        \\match inspect()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> ()
     , .borrow_outlives_source);
 }
 
 test "List growth and generic views have parity" {
     try SourceFixture.expectParity(
         \\func inspect() int | none
-        \\    var values: List(int) = List(int).new(0) else return none
-        \\    const _: unit = values.append(17) else return none
-        \\    const _: unit = values.append(23) else return none
-        \\    const _: unit = values.reserve(8) else return none
-        \\    const view: Span(int) = values.slice(0..2) else return none
+        \\    var values = List(int).new(0)
+        \\    if not (values is List(int)) -> return none
+        \\    const checked_value_2 = values.append(17)
+        \\    if not (checked_value_2 is unit) -> return none
+        \\    const checked_value_3 = values.append(23)
+        \\    if not (checked_value_3 is unit) -> return none
+        \\    const checked_value_4 = values.reserve(8)
+        \\    if not (checked_value_4 is unit) -> return none
+        \\    const view = values.slice(0..2)
+        \\    if not (view is Span(int)) -> return none
         \\    return view[0] + view[1] + view.len()
         \\func run() int
-        \\    if const answer: int = inspect() -> return answer
+        \\    match inspect()
+        \\        answer and answer is int -> return answer
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -1428,17 +1684,23 @@ test "generic spans cannot escape local storage or survive owner transfer" {
         \\    const entries = [42]
         \\    return entries.span()
         \\const view = escape()
-        \\if ref element: int = view.get(0) -> exit(element)
+        \\match view.get(0)
+        \\    ref element and element is int -> exit(element)
+        \\    _ -> ()
     , .borrow_outlives_source);
     try SourceFixture.expectAnySourceDiagnostic(
         \\func consume(deinit values: List(int)) int -> values.len()
         \\func inspect() int | none
-        \\    var entries: List(int) = List(int).new(1) else return none
-        \\    const _: unit = entries.append(42) else return none
+        \\    var entries = List(int).new(1)
+        \\    if not (entries is List(int)) -> return none
+        \\    const checked_value_2 = entries.append(42)
+        \\    if not (checked_value_2 is unit) -> return none
         \\    const view = entries.span()
         \\    consume(entries)
         \\    return view[0]
-        \\if const answer: int = inspect() -> exit(answer)
+        \\match inspect()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> ()
     , .use_after_transfer);
 }
 
@@ -1446,11 +1708,16 @@ test "validated text views reject content changes through byte references" {
     try SourceFixture.expectAnySourceDiagnostic(
         \\func inspect() int | none
         \\    var bytes: Array(byte, 1) = [65]
-        \\    ref writable: byte = bytes.get(0) else return none
-        \\    const view: StringView = BytesView.from_array(1, bytes).validate_utf8() else return none
+        \\    const checked_value_1 = bytes.get(0)
+        \\    if not (checked_value_1 is byte) -> return none
+        \\    ref writable = checked_value_1
+        \\    const view = BytesView.from_array(1, bytes).validate_utf8()
+        \\    if not (view is StringView) -> return none
         \\    writable = 255
         \\    return view.byte_length()
-        \\if const answer: int = inspect() -> exit(answer)
+        \\match inspect()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> ()
     , .borrow_outlives_source);
 }
 
@@ -1463,14 +1730,21 @@ test "variant payload references follow their owner through loop joins" {
         \\    pub payload: Payload | none
         \\func run() int
         \\    var owner = Owner{payload = Payload{number = 19}}
-        \\    if ref value: Payload = owner.payload
-        \\        var index = 0
-        \\        loop
-        \\            if index == 3 -> break
-        \\            value.number += 1
-        \\            index += 1
-        \\        value.number += 20
-        \\    if ref value: Payload = owner.payload -> return value.number
+        \\    match owner.payload
+        \\        Payload ->
+        \\            ref value = owner.payload
+        \\            var index = 0
+        \\            loop
+        \\                if index == 3 -> break
+        \\                value.number += 1
+        \\                index += 1
+        \\            value.number += 20
+        \\        _ -> ()
+        \\    match owner.payload
+        \\        Payload ->
+        \\            ref value = owner.payload
+        \\            return value.number
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -1494,7 +1768,8 @@ test "owned strings convert to borrowed text for ordinary print callables" {
     try expectIo(
         \\func output() unit | none
         \\    var text = "hello"
-        \\    const _: unit = text.append("!") else return none
+        \\    const checked_value_1 = text.append("!")
+        \\    if not (checked_value_1 is unit) -> return none
         \\    const writer: func(imm String) unit = print
         \\    writer(text)
         \\    return ()
@@ -1508,9 +1783,11 @@ test "from_utf8 validates before allocation and owns a copy independent of its i
         \\func output() unit | none
         \\    var array: Array(byte, 2) = [195, 169]
         \\    const bytes = BytesView.from_array(2, array)
-        \\    var text: String = String.from_utf8(bytes) else return none
+        \\    var text = String.from_utf8(bytes)
+        \\    if not (text is String) -> return none
         \\    array[0] = 65
-        \\    const _: unit = text.append("!") else return none
+        \\    const checked_value_2 = text.append("!")
+        \\    if not (checked_value_2 is unit) -> return none
         \\    const invalid: Array(byte, 1) = [128]
         \\    if (String.from_utf8(BytesView.from_array(1, invalid)) is String) -> return none
         \\    print(text)
@@ -1552,13 +1829,16 @@ test "short writes report progress" {
     const term = try runWithStreams(
         \\import std.io.{write_once, write_all, stdout}
         \\func run() int
-        \\    const array: Array(byte, 16384) = Array(byte, 16384).filled(42) else panic "unexpected none"
+        \\    const array = Array(byte, 16384).filled(42)
+        \\    if not (array is Array(byte, 16384)) -> panic "unexpected none"
         \\    const bytes = BytesView.from_array(16384, array)
-        \\    if const count: int = write_once(stdout, bytes)
-        \\        if count <= 0 -> return 90
-        \\        if count >= 16384 -> return 91
-        \\        if (write_all(stdout, bytes) is unit) -> return 92
-        \\        return 42
+        \\    match write_once(stdout, bytes)
+        \\        count and count is int ->
+        \\            if count <= 0 -> return 90
+        \\            if count >= 16384 -> return 91
+        \\            if (write_all(stdout, bytes) is unit) -> return 92
+        \\            return 42
+        \\        _ -> ()
         \\    return 93
         \\exit(run())
     , .ignore, .{ .file = pipe[1] }, false);
@@ -1575,7 +1855,8 @@ test "write_all preserves completed writes before an OS failure" {
     try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.fcntl(pipe[1].handle, std.os.linux.F.SETPIPE_SZ, 4096)));
     const term = try runWithStreams(
         \\import std.io.{write_all, stdout}
-        \\const array: Array(byte, 16384) = Array(byte, 16384).filled(42) else panic "unexpected none"
+        \\const array = Array(byte, 16384).filled(42)
+        \\if not (array is Array(byte, 16384)) -> panic "unexpected none"
         \\const bytes = BytesView.from_array(16384, array)
         \\if (write_all(stdout, bytes) is unit) -> exit(90)
         \\exit(42)
@@ -1605,12 +1886,17 @@ test "failed reads preserve the initialized byte prefix" {
         \\import std.memory.{List}
         \\import std.io.{read_bytes, stdin}
         \\func run() int | none
-        \\    var buffer: List(byte) = List(byte).new(1) else return none
-        \\    const _: unit = buffer.append(41) else return none
+        \\    var buffer = List(byte).new(1)
+        \\    if not (buffer is List(byte)) -> return none
+        \\    const checked_value_2 = buffer.append(41)
+        \\    if not (checked_value_2 is unit) -> return none
         \\    if (read_bytes(stdin, buffer, 16) is int) -> return 90
-        \\    if const first = buffer[0] -> return buffer.len() + byte_int(first)
+        \\    match buffer[0]
+        \\        first -> return buffer.len() + byte_int(first)
         \\    return 91
-        \\if const answer: int = run() -> exit(answer)
+        \\match run()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> ()
         \\exit(92)
     , .{ .file = input }, .ignore, false);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, term);
@@ -1624,10 +1910,9 @@ test "allocation failure preserves strings and repeated clones release their sto
         \\    loop
         \\        if index == 1000 -> break
         \\        if (text.reserve(2147483647) is unit) -> return 90
-        \\        if const copy: String = text.clone()
-        \\            if copy.byte_length() <> 5 -> return 91
-        \\        else
-        \\            return 92
+        \\        match text.clone()
+        \\            copy and copy is String -> if copy.byte_length() <> 5 -> return 91
+        \\            _ -> return 92
         \\        index += 1
         \\    return text.byte_length() + 37
         \\exit(run())
@@ -1675,9 +1960,15 @@ test "borrowing a by-value variant payload cannot escape its callee frame" {
         \\    copy = trivial
         \\    pub value: int
         \\func bad(imm value: Payload | none) Ref(Payload) | none
-        \\    if ref payload: Payload = value -> return Ref.from(payload)
+        \\    match value
+        \\        Payload ->
+        \\            ref payload = value
+        \\            return Ref.from(payload)
+        \\        _ -> ()
         \\    return none
-        \\if const handle: Ref(Payload) = bad(Payload{value = 42}) -> exit(handle.value.value)
+        \\match bad(Payload{value = 42})
+        \\    handle and handle is Ref(Payload) -> exit(handle.value.value)
+        \\    _ -> ()
     , .borrow_outlives_source);
 }
 
@@ -1685,17 +1976,22 @@ test "permanent text views survive deferred construction and forwarding" {
     try SourceFixture.expectSourceExit(
         \\func run() int | none
         \\    const values: List(StringView) = ["hello", "é"]
-        \\    if const first = values[0]
-        \\        if const second = values[1]
-        \\            return first.byte_length() + second.byte_length() + 35
+        \\    match values[0]
+        \\        first ->
+        \\            match values[1]
+        \\                second -> return first.byte_length() + second.byte_length() + 35
         \\    return 90
-        \\if const answer: int = run() -> exit(answer)
+        \\match run()
+        \\    answer and answer is int -> exit(answer)
+        \\    _ -> ()
         \\exit(91)
     , 42);
     try SourceFixture.expectParity(
         \\func forward(init value: StringView) StringView -> value
         \\func run() int
-        \\    if const value: StringView = forward("hello") -> return value.byte_length() + 37
+        \\    match forward("hello")
+        \\        value and value is StringView -> return value.byte_length() + 37
+        \\        _ -> ()
         \\    return 90
     , 42);
 }
@@ -1745,10 +2041,13 @@ test "print panics when its newline fails and preserves completed text" {
     defer std.Io.File.closeMany(std.testing.io, &pipe);
     try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.fcntl(pipe[1].handle, std.os.linux.F.SETPIPE_SZ, 4096)));
     const term = try runWithStreams(
-        \\const array: Array(byte, 4096) = Array(byte, 4096).filled(65) else panic "unexpected none"
-        \\if const text: StringView = BytesView.from_array(4096, array).validate_utf8()
-        \\    print(text)
-        \\    exit(90)
+        \\const array = Array(byte, 4096).filled(65)
+        \\if not (array is Array(byte, 4096)) -> panic "unexpected none"
+        \\match BytesView.from_array(4096, array).validate_utf8()
+        \\    text and text is StringView ->
+        \\        print(text)
+        \\        exit(90)
+        \\    _ -> ()
         \\exit(91)
     , .ignore, .{ .file = pipe[1] }, false);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 134 }, term);

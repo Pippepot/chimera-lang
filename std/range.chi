@@ -15,22 +15,29 @@ pub struct Range
     pub limit: int | FromEnd | none
     inclusive: bool
     pub func contains(imm self: Range, imm value: int) bool
-        const first: int = self.first else return false
-        const limit: int = self.limit else return false
+        const first = self.first
+        if not (first is int) -> return false
+        const limit = self.limit
+        if not (limit is int) -> return false
         return value >= first and (if self.inclusive -> value <= limit else value < limit)
     pub func iter(self: Range) RangeIterator
-        const sequence: RangeSequence = self.sequence() else panic "range iteration requires both endpoints as absolute integers"
+        const sequence = self.sequence()
+        if not (sequence is RangeSequence) -> panic "range iteration requires both endpoints as absolute integers"
         return sequence.iter()
     pub func reversed(self: Range) RangeSequence
-        const sequence: RangeSequence = self.sequence() else panic "range reversal requires both endpoints as absolute integers"
+        const sequence = self.sequence()
+        if not (sequence is RangeSequence) -> panic "range reversal requires both endpoints as absolute integers"
         return sequence.reversed()
     pub func step_by(self: Range, factor: int) RangeSequence | none
-        const sequence: RangeSequence = self.sequence() else return none
+        const sequence = self.sequence()
+        if not (sequence is RangeSequence) -> return none
         return sequence.step_by(factor)
     pub func resolve(self: Range, length: int) (int, int) | none
         if length < 0 -> return none
-        const start: int = resolve_bound(self.first, length, 0) else return none
-        const limit: int = resolve_bound(self.limit, length, length) else return none
+        const start = resolve_bound(self.first, length, 0)
+        if not (start is int) -> return none
+        const limit = resolve_bound(self.limit, length, length)
+        if not (limit is int) -> return none
         if start < 0 or start > limit -> return none
         if self.inclusive
             if self.limit is none or limit >= length -> return none
@@ -38,8 +45,10 @@ pub struct Range
         if limit > length -> return none
         return (start, limit)
     func sequence(self: Range) RangeSequence | none
-        const first: int = self.first else return none
-        const limit: int = self.limit else return none
+        const first = self.first
+        if not (first is int) -> return none
+        const limit = self.limit
+        if not (limit is int) -> return none
         if self.inclusive
             return RangeSequence{first = first, last = limit, stride = 1, descending = false, empty = first > limit}
         if first >= limit
@@ -113,24 +122,31 @@ pub func inclusive(first: int | FromEnd | none, limit: int | FromEnd | none) Ran
     return Range{first = first, limit = limit, inclusive = true}
 
 pub converter(imm value: Range) String
-    const result: String = format_range(value) else panic "string conversion allocation failed"
+    const result = format_range(value)
+    if not (result is String) -> panic "string conversion allocation failed"
     return result^
 func format_range(imm value: Range) String | none
     var result = String.empty()
-    const _: unit = append_bound(result, value.first) else return none
-    const _: unit = result.append("..") else return none
+    const selected_result_11 = append_bound(result, value.first)
+    if not (selected_result_11 is unit) -> return none
+    const selected_result_12 = result.append("..")
+    if not (selected_result_12 is unit) -> return none
     if value.inclusive
-        const _: unit = result.append("=") else return none
-    const _: unit = append_bound(result, value.limit) else return none
+        const selected_result_13 = result.append("=")
+        if not (selected_result_13 is unit) -> return none
+    const selected_result_14 = append_bound(result, value.limit)
+    if not (selected_result_14 is unit) -> return none
     return result^
 func resolve_bound(bound: int | FromEnd | none, length: int, omitted: int) int | none
-    if const value: int = bound -> return value
-    if const value: FromEnd = bound -> return value.resolve(length)
+    if bound is int -> return bound
+    if bound is FromEnd -> return bound.resolve(length)
     return omitted
 func append_bound(mut result: String, bound: int | FromEnd | none) unit | none
-    if const value: int = bound -> return result.append(String(value))
-    if const value: FromEnd = bound
-        const _: unit = result.append("^") else return none
+    if bound is int -> return result.append(String(bound))
+    if bound is FromEnd
+        const value = bound
+        const selected_result_15 = result.append("^")
+        if not (selected_result_15 is unit) -> return none
         return result.append(String(value.distance))
     return unit
 
