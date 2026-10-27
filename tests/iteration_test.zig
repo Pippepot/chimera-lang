@@ -24,7 +24,9 @@ test "pull standard cursors deliver items and End directly" {
         \\            first += 13
         \\        _ -> return 94
         \\    match span_cursor.next()
-        \\        ref second and second is int -> second += sum
+        \\        ref _matched_second and _matched_second is int ->
+        \\            ref second = _matched_second
+        \\            second += sum
         \\        _ -> return 95
         \\    if not (span_cursor.next() is End) -> return 96
         \\    return values[0] + values[1] - sum
@@ -49,9 +51,7 @@ test "pull for polls next exactly once for owned items" {
         \\        return value
         \\func run() int
         \\    var calls = 0
-        \\    var cursor = Cursor{value = 0, calls = ((match Ref.from(calls)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    var cursor = Cursor{value = 0, calls = Ref.from(calls)}
         \\    var sum = 0
         \\    for item in cursor -> sum += item
         \\    return calls * 10 + sum - 1
@@ -153,9 +153,7 @@ test "pull for binds fresh immovable owned payloads in place" {
         \\        return Item{value = 32, trace = self.trace}
         \\func run() int
         \\    var trace = 0
-        \\    var cursor = Cursor{ready = true, trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    var cursor = Cursor{ready = true, trace = Ref.from(trace)}
         \\    var sum = 0
         \\    for item in cursor -> sum += item.value
         \\    return sum + trace
@@ -292,9 +290,7 @@ test "pull for preserves storage kinds across multiple item alternatives" {
         \\        return End{}
         \\func run() int
         \\    var owner = Item{value = 30}
-        \\    var cursor = Cursor{owner = ((match Ref.from(owner)
-        \\        _selected_result_0 and _selected_result_0 is Ref(Item) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), position = 0}
+        \\    var cursor = Cursor{owner = Ref.from(owner), position = 0}
         \\    var sum = 0
         \\    for item in cursor
         \\        match item
@@ -328,11 +324,7 @@ test "pull for preserves storage kinds across multiple item alternatives" {
         \\func run() int
         \\    var left = Left{value = 12}
         \\    var right = Right{value = 30}
-        \\    var cursor = Cursor{left = ((match Ref.from(left)
-        \\        _selected_result_0 and _selected_result_0 is Ref(Left) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), right = ((match Ref.from(right)
-        \\            _selected_result_1 and _selected_result_1 is Ref(Right) -> _selected_result_1
-        \\            _ -> panic "unexpected none")), position = 0}
+        \\    var cursor = Cursor{left = Ref.from(left), right = Ref.from(right), position = 0}
         \\    var sum = 0
         \\    for item in cursor
         \\        match item
@@ -486,7 +478,7 @@ test "adapter feasibility type factories select owned or borrowed delivery" {
             .source_type = if (borrowed) "SpanIterator(Item)" else "RangeIterator",
             .borrowed = if (borrowed) "true" else "false",
             .source = if (borrowed) "values.iter()" else "(1..=2).iter()",
-            .sum = if (borrowed) "item.value += 1\n            total += item.value" else "total += item",
+            .sum = if (borrowed) "item.value += 1\n                total += item.value" else "total += item",
             .scale = if (borrowed) "1" else "14",
         });
         defer std.testing.allocator.free(source);
@@ -570,7 +562,8 @@ test "adapter feasibility logical matching cannot preserve a mixed physical carr
         const source = try test_sources.renderTemplate(std.testing.allocator, declarations ++ "\n" ++
             \\func narrow(ref owner: Item) (Item | ref Item, int) | End
             \\    var result = choose(owner, true)
-            \\    if $mode item: Item = result^
+            \\    if result is Item
+            \\        $mode item = result
             \\        const pair: (Item | ref Item, int) = ($item, 0)
             \\        return pair^
             \\    return End{}
@@ -598,7 +591,8 @@ test "pull generic borrowed filter handles predicate failure as rejection" {
         \\    func next(mut self: Filtered(S, T)) ref T | End
         \\        loop
         \\            match self.source.next()
-        \\                ref item and item is T ->
+        \\                ref _matched_item and _matched_item is T ->
+        \\                    ref item = _matched_item
         \\                    match self.predicate(item)
         \\                        accepted and accepted is bool -> if accepted -> return item
         \\                        _ -> ()
@@ -612,7 +606,9 @@ test "pull generic borrowed filter handles predicate failure as rejection" {
         \\    var sum = 0
         \\    loop
         \\        match filtered.next()
-        \\            ref item and item is Item -> sum += item.value
+        \\            ref _matched_item and _matched_item is Item ->
+        \\                ref item = _matched_item
+        \\                sum += item.value
         \\            _ -> break
         \\    return sum
     , 42);
@@ -643,9 +639,7 @@ test "pull generic owned filter discharges rejected and delivered items" {
         \\func accept(item: Item) bool -> item.value % 2 == 0
         \\func run() int
         \\    var trace = 0
-        \\    var filtered = Filtered(Source, Item){source = Source{position = 0, trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}, predicate = accept}
+        \\    var filtered = Filtered(Source, Item){source = Source{position = 0, trace = Ref.from(trace)}, predicate = accept}
         \\    var sum = 0
         \\    loop
         \\        match filtered.next()
@@ -688,9 +682,7 @@ test "pull generic filter uses explicitly supplied disposal for explicit-drop it
         \\func dispose(deinit item: Item) -> item.trace.value += 1
         \\func run() int
         \\    var trace = 0
-        \\    var filtered = Filtered(Source, Item){source = Source{position = 0, trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}, predicate = accept, dispose = dispose}
+        \\    var filtered = Filtered(Source, Item){source = Source{position = 0, trace = Ref.from(trace)}, predicate = accept, dispose = dispose}
         \\    var sum = 0
         \\    loop
         \\        match filtered.next()
@@ -723,9 +715,7 @@ test "pull generic func filter propagates producer failure after rejected predic
         \\                _ -> return End{}
         \\func accept(item: int) bool -> item % 2 == 0
         \\func calculate(ref polls: int) int | none
-        \\    var filtered = Filtered(Source, int){source = Source{polls = ((match Ref.from(polls)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> return none))}, predicate = accept}
+        \\    var filtered = Filtered(Source, int){source = Source{polls = Ref.from(polls)}, predicate = accept}
         \\    const first = filtered.next()
         \\    if not (first is int | End) -> return none
         \\    match first
@@ -798,16 +788,11 @@ test "pull generic mixed zip composes nested owned and reference tuples" {
         \\func run() int
         \\    var item = Item{value = 30}
         \\    const other = Item{value = 7}
-        \\    var inner = Zip(RangeIterator, Once(Item), int, Item){left = (12..=12).iter(), right = Once(Item){source = ((match Ref.from(item)
-        \\        _selected_result_0 and _selected_result_0 is Ref(Item) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), ready = true}}
-        \\    var nested = NestedZip(RangeIterator, Once(Item), Once(Item), int, Item, Item){left = inner^, right = Once(Item){source = ((match Ref.from(other)
-        \\        _selected_result_1 and _selected_result_1 is Ref(Item) -> _selected_result_1
-        \\        _ -> panic "unexpected none")), ready = true}}
+        \\    var inner = Zip(RangeIterator, Once(Item), int, Item){left = (12..=12).iter(), right = Once(Item){source = Ref.from(item), ready = true}}
+        \\    var nested = NestedZip(RangeIterator, Once(Item), Once(Item), int, Item, Item){left = inner^, right = Once(Item){source = Ref.from(other), ready = true}}
         \\    const result = nested.next()
         \\    match result
-        \\        ((int, ref Item), ref Item) ->
-        \\            const pair = result
+        \\        pair and pair is ((int, ref Item), ref Item) ->
         \\            if pair.0.0 <> 12 -> return 90
         \\            if pair.1.value <> 7 -> return 91
         \\            pair.0.1.value += 12
@@ -863,23 +848,11 @@ test "pull generic zip polls left first and drops unmatched owned items" {
         \\        return End{}
         \\func exhaust(ref trace: int, left_ready: bool, right_ready: bool)
         \\    const owner = 12
-        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), ready = left_ready}, right = Right{trace = ((match Ref.from(trace)
-        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\            _ -> panic "unexpected none")), source = ((match Ref.from(owner)
-        \\                _selected_result_2 and _selected_result_2 is Ref(int) -> _selected_result_2
-        \\                _ -> panic "unexpected none")), ready = right_ready}}
+        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = Ref.from(trace), ready = left_ready}, right = Right{trace = Ref.from(trace), source = Ref.from(owner), ready = right_ready}}
         \\    if not (zipped.next() is End) -> exit(90)
         \\func deliver(ref trace: int) int
         \\    const owner = 12
-        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = ((match Ref.from(trace)
-        \\        _selected_result_3 and _selected_result_3 is Ref(int) -> _selected_result_3
-        \\        _ -> panic "unexpected none")), ready = true}, right = Right{trace = ((match Ref.from(trace)
-        \\            _selected_result_4 and _selected_result_4 is Ref(int) -> _selected_result_4
-        \\            _ -> panic "unexpected none")), source = ((match Ref.from(owner)
-        \\                _selected_result_5 and _selected_result_5 is Ref(int) -> _selected_result_5
-        \\                _ -> panic "unexpected none")), ready = true}}
+        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = Ref.from(trace), ready = true}, right = Right{trace = Ref.from(trace), source = Ref.from(owner), ready = true}}
         \\    const result = zipped.next()
         \\    match result^
         \\        pair and pair is (Item, ref int) -> return pair.0.value + pair.1
@@ -933,11 +906,7 @@ test "pull generic func zip cleans up the retained left item on right failure" {
         \\            _ -> ()
         \\        return End{}
         \\func calculate(ref trace: int) unit | none
-        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> return none))}, right = Right{trace = ((match Ref.from(trace)
-        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\            _ -> return none))}}
+        \\    var zipped = Zip(Left, Right, Item, int){left = Left{trace = Ref.from(trace)}, right = Right{trace = Ref.from(trace)}}
         \\    const result = zipped.next()
         \\    if not (result is End | (Item, ref int)) -> return none
         \\    _ = result
@@ -1459,9 +1428,7 @@ test "for collection item references can outlive the cursor when backing remains
         \\func run() int
         \\    var values = [42]
         \\    var retained: Ref(int) | none = none
-        \\    for ref value in values -> retained = ((match Ref.from(value)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))
+        \\    for ref value in values -> retained = Ref.from(value)
         \\    match retained
         \\        Ref(int) ->
         \\            ref handle = retained
@@ -1683,7 +1650,8 @@ test "range wide boundary matrix matches independent selected sequences" {
     const source = try test_sources.renderTemplate(allocator,
         \\import std.range.{RangeSequence}
         \\func step(static S: type, values: S, factor: int) RangeSequence
-        \\    const selected: RangeSequence = values.step_by(factor) else panic "invalid step"
+        \\    const selected = values.step_by(factor)
+        \\    if not (selected is RangeSequence) -> panic "invalid step"
         \\    return selected
         \\func check(static N: int, values: RangeSequence, imm expected: Array(int, N))
         \\    var cursor = values.iter()
@@ -1723,9 +1691,7 @@ test "for owned cursors and items clean up on continue and break" {
         \\        return Item{trace = self.trace, value = self.position}
         \\func run() int
         \\    var trace = 0
-        \\    for item in Cursor{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), position = 0}
+        \\    for item in Cursor{trace = Ref.from(trace), position = 0}
         \\        if item.value == 1 -> continue
         \\        break
         \\    return trace
@@ -1748,9 +1714,7 @@ test "for discards still acquire and destroy exactly one item per step" {
         \\        return Item{trace = self.trace}
         \\func run() int
         \\    var trace = 9
-        \\    for _ in Cursor{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), position = 0} -> ()
+        \\    for _ in Cursor{trace = Ref.from(trace), position = 0} -> ()
         \\    return trace
     , 42);
 }
@@ -1765,11 +1729,7 @@ test "for source temporaries retain borrowed items through their final use" {
         \\func run() int
         \\    var trace = 0
         \\    var sum = 0
-        \\    for item in [Item{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), value = 20}, Item{trace = ((match Ref.from(trace)
-        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\            _ -> panic "unexpected none")), value = 22}
+        \\    for item in [Item{trace = Ref.from(trace), value = 20}, Item{trace = Ref.from(trace), value = 22}
         \\    ]
         \\        if trace <> 0 -> return 90
         \\        sum += item.value
@@ -1790,9 +1750,7 @@ test "for named cursor cleanup remains with its caller" {
         \\        return self.position
         \\func run() int
         \\    var trace = 0
-        \\    var cursor = Cursor{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), position = 0}
+        \\    var cursor = Cursor{trace = Ref.from(trace), position = 0}
         \\    for value in cursor -> break
         \\    if trace <> 0 -> return 90
         \\    for value in cursor -> break
@@ -1863,9 +1821,7 @@ test "for map filter take compose without repeated materialization or overpull" 
         \\    const bounds = 0..100
         \\    var cursor = Taken{
         \\        source = Filtered{
-        \\            source = Mapped{source = bounds.iter(), trace = ((match Ref.from(trace)
-        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\                _ -> panic "unexpected none"))},
+        \\            source = Mapped{source = bounds.iter(), trace = Ref.from(trace)},
         \\        },
         \\        remaining = 3,
         \\    }
@@ -1965,9 +1921,7 @@ test "for filter can buffer and transfer move only owned items once" {
         \\func run() int
         \\    var trace = 0
         \\    var sum = 0
-        \\    for item in Filtered{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), position = 0, buffered = none}
+        \\    for item in Filtered{trace = Ref.from(trace), position = 0, buffered = none}
         \\        sum += item.value
         \\    if trace <> 4 -> return 90
         \\    return sum * 7
@@ -1986,9 +1940,7 @@ test "for gives explicit iterator factories precedence over cursor fallback" {
         \\    pub func next(mut self: Source) int | End -> 99
         \\func run() int
         \\    var calls = 0
-        \\    const source = Source{calls = ((match Ref.from(calls)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    const source = Source{calls = Ref.from(calls)}
         \\    var sum = 0
         \\    for value in source -> sum += value
         \\    if calls <> 1 -> return 90

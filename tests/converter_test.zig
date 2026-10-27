@@ -988,15 +988,7 @@ test "variant conversion evaluates once borrows payloads and runs only the activ
         \\func run() int
         \\    var calls = 0
         \\    var drops = 0
-        \\    const total = int(make(true, ((match Ref.from(calls)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), ((match Ref.from(drops)
-        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\            _ -> panic "unexpected none")))) + int(make(false, ((match Ref.from(calls)
-        \\                _selected_result_2 and _selected_result_2 is Ref(int) -> _selected_result_2
-        \\                _ -> panic "unexpected none")), ((match Ref.from(drops)
-        \\                    _selected_result_3 and _selected_result_3 is Ref(int) -> _selected_result_3
-        \\                    _ -> panic "unexpected none"))))
+        \\    const total = int(make(true, Ref.from(calls), Ref.from(drops))) + int(make(false, Ref.from(calls), Ref.from(drops)))
         \\    if calls <> 22 or drops <> 2 -> return 90
         \\    return total
     , 42);
@@ -1041,9 +1033,7 @@ test "variant conversion joins borrowed identity and owned results with exact cl
         \\    return total
         \\func run() int
         \\    var drops = 0
-        \\    const total = calculate(((match Ref.from(drops)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")))
+        \\    const total = calculate(Ref.from(drops))
         \\    if drops <> 2 -> return 91
         \\    return total
     , 42);
@@ -1164,9 +1154,9 @@ test "builtin widening preserves members before converters" {
         \\    const literal = [10, "Hello", [1, 2, 3]]
         \\    const bound = [number, "Hello", [1, 2, 3]]
         \\    match literal[0]
-        \\        first and first is int ->
+        \\        ref first and first is int ->
         \\            match bound[0]
-        \\                second and second is int -> return first + second + 22
+        \\                ref second and second is int -> return first + second + 22
         \\                _ -> ()
         \\        _ -> ()
         \\    return 90
@@ -1400,7 +1390,7 @@ test "nested conversions defer constraints until argument inference succeeds" {
     for ([_][]const u8{ "0 == 1", "stop()" }) |constraint| {
         for ([_][]const u8{ "", "init " }) |mode| {
             for (cases) |case| {
-                const source = try std.fmt.allocPrint(testing.allocator, "{s}converter(value: Source) Target where {s} -> Target{{value = value.value}}\nfunc unresolved(static T: type, {s}value: {s}) int -> 42\nif const answer: int = unresolved({s}) -> exit(answer)\nexit(90)", .{ declarations, constraint, mode, case.parameter, case.expression });
+                const source = try std.fmt.allocPrint(testing.allocator, "{s}converter(value: Source) Target where {s} -> Target{{value = value.value}}\nfunc unresolved(static T: type, {s}value: {s}) int -> 42\nexit(unresolved({s}))", .{ declarations, constraint, mode, case.parameter, case.expression });
                 defer testing.allocator.free(source);
                 try Fixture.expectAnySourceDiagnostic(source, .static_argument_cannot_be_inferred);
             }
@@ -2039,10 +2029,9 @@ test "ordinary arguments destroy prepared copies after later failure" {
         \\func run() int
         \\    var trace = [0]
         \\    match trace.get(0)
-        \\        ref handle and handle is int ->
-        \\            if (work(((match Ref.from(handle)
-        \\                _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\                _ -> panic "unexpected none"))) is unit) -> return 91
+        \\        ref _matched_handle and _matched_handle is int ->
+        \\            ref handle = _matched_handle
+        \\            if (work(Ref.from(handle)) is unit) -> return 91
         \\            return handle
         \\        _ -> ()
         \\    return 92
@@ -2070,10 +2059,9 @@ test "optional arguments destroy captured owners after later ordinary failure" {
         \\func run() int
         \\    var trace = [0]
         \\    match trace.get(0)
-        \\        ref handle and handle is int ->
-        \\            if (work(((match Ref.from(handle)
-        \\                _selected_result_4 and _selected_result_4 is Ref(int) -> _selected_result_4
-        \\                _ -> panic "unexpected none"))) is unit) -> return 91
+        \\        ref _matched_handle and _matched_handle is int ->
+        \\            ref handle = _matched_handle
+        \\            if (work(Ref.from(handle)) is unit) -> return 91
         \\            return handle
         \\        _ -> ()
         \\    return 92
@@ -2101,13 +2089,12 @@ test "optional arguments destroy captured owners after later ordinary failure" {
         \\func run() int
         \\    var trace = [0]
         \\    match trace.get(0)
-        \\        ref handle and handle is int ->
+        \\        ref _matched_handle and _matched_handle is int ->
+        \\            ref handle = _matched_handle
         \\            var mask = 0
         \\            loop
         \\                if mask == 16 -> break
-        \\                if (work(((match Ref.from(handle)
-        \\                    _selected_result_4 and _selected_result_4 is Ref(int) -> _selected_result_4
-        \\                    _ -> panic "unexpected none")), mask) is unit) -> ()
+        \\                if (work(Ref.from(handle), mask) is unit) -> ()
         \\                mask += 1
         \\            return handle
         \\        _ -> ()
@@ -2137,7 +2124,7 @@ test "optional arguments include nested construction and extraction failures" {
         \\func missing() int | none -> return none
         \\func construct() Pair | none
         \\    return Pair{first = 1, second = ((match missing()
-        \\        second and second is int -> second
+        \\        ref second and second is int -> second
         \\        _ -> return none))}
         \\func receive(pair: Pair | none) int
         \\    match pair
@@ -2239,9 +2226,7 @@ test "optional arguments receive explicit type mismatch results without a fake p
         \\    return 42
         \\func run() int
         \\    const value: int | none = 1
-        \\    return receive((match value
-        \\        bool -> 0
-        \\        _ -> none))
+        \\    return receive((if value is bool -> 0 else none))
     , 42);
 }
 
@@ -2374,9 +2359,7 @@ test "optional values forward through deferred initializer captures" {
     try Fixture.expectParity(
         \\func materialize(init value: int | none) int
         \\    match value
-        \\        int ->
-        \\            const found = value
-        \\            return found
+        \\        found and found is int -> return found
         \\        _ -> ()
         \\    return 42
         \\func forward(value: int | none) int -> materialize(value)
@@ -2497,7 +2480,8 @@ test "explicit mismatch destroys partially constructed successful prefixes" {
         \\func run() int
         \\    var trace = [0]
         \\    match trace.get(0)
-        \\        ref handle and handle is int ->
+        \\        ref _matched_handle and _matched_handle is int ->
+        \\            ref handle = _matched_handle
         \\            receive(construct(Ref.from(handle)))
         \\            return handle
         \\        _ -> ()
@@ -2594,9 +2578,7 @@ test "optional converters accept ordinary absence without a successful payload" 
         \\converter(value: int | none) Flag -> Flag{value = value is int}
         \\func run() int
         \\    const value: int | none = 1
-        \\    const first: Flag = (match value
-        \\        bool -> 0
-        \\        _ -> none)
+        \\    const first: Flag = (if value is bool -> 0 else none)
         \\    const second: Flag = missing()
         \\    if not first.value and not second.value -> return 42
         \\    return 0

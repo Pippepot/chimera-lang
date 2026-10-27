@@ -1346,9 +1346,10 @@ test "nested aggregate writable references invalidate replaced contents" {
         \\      _ -> return none))
         \\  return ()
         \\func run() int | none
-        \\  var outer: Box(Box(int)) = Box.new(((match Box.new(17)
+        \\  var outer = Box.new(((match Box.new(17)
         \\      _selected_result_1 and _selected_result_1 is Box(int) -> _selected_result_1^
-        \\      _ -> panic "unexpected none"))) else return none
+        \\      _ -> panic "unexpected none")))
+        \\  if not (outer is Box(Box(int))) -> return none
         \\  var handle = Ref.from(outer.borrow())
         \\  const old = Ref.from(handle.value.borrow())
         \\  var wrapper = Wrapper{handles = Handles{handle = handle}}
@@ -1447,7 +1448,7 @@ test "writable references inside boxed aggregates invalidate replaced contents" 
     const fixture = try Fixture.initFiles(source, &.{});
     defer fixture.deinit();
     try fixture.expectDiagnostic(0, .borrow_outlives_source);
-    const without_write = try std.mem.replaceOwned(u8, testing.allocator, source, "  const _: unit = replace(handles) else return none\n", "");
+    const without_write = try std.mem.replaceOwned(u8, testing.allocator, source, "  const checked_value_2 = replace(handles)\n  if not (checked_value_2 is unit) -> return none\n", "");
     defer testing.allocator.free(without_write);
     try fixture.db.setInput(queries.SourceText, 0, without_write);
     try fixture.expectExit(0, 17);
@@ -1695,7 +1696,9 @@ test "a failing indirect in-place producer invalidates replaced references" {
         \\  match Box.new(producer(handle))
         \\      produced and produced is Box(Pinned | none) ->
         \\          match produced.borrow()
-        \\              ref item and item is Pinned -> return item.value
+        \\              ref _matched_item and _matched_item is Pinned ->
+        \\                  ref item = _matched_item
+        \\                  return item.value
         \\              _ -> ()
         \\          return old.value
         \\      _ -> return old.value
@@ -1792,6 +1795,7 @@ test "replacing an inner Box does not revive a handle to an old outer Box" {
         \\      _ -> panic "unexpected none")))
         \\      _selected_result_1 and _selected_result_1 is Box(Box(int)) -> _selected_result_1^
         \\      _ -> return none))
+        \\  if not (outer is Box(Box(int))) -> return none
         \\  var fresh = Ref.from(outer.borrow())
         \\  const checked_value_3 = replace(fresh)
         \\  if not (checked_value_3 is unit) -> return none
@@ -3249,6 +3253,7 @@ test "an owned sibling can be borrowed after a partial transfer join" {
         \\  var chosen = Box.new(0)
         \\  if not (chosen is Box(int)) -> return none
         \\  if flag == 1 -> chosen = pair.movable^
+        \\  if not (chosen is Box(int)) -> return none
         \\  return (Ref.from(pair.stable.borrow())).value + (Ref.from(chosen.borrow())).value
         \\match run(1)
         \\    result and result is int -> exit(result)
@@ -3730,7 +3735,9 @@ test "list get checks bounds and borrows an initialized element" {
         \\  const checked_value_2 = buffer.append(42)
         \\  if not (checked_value_2 is unit) -> return none
         \\  const element: Ref(int) = Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none)))
         \\  const observed = (element).value
         \\  if (buffer.get(-1) is int) -> exit(1)
@@ -3754,11 +3761,15 @@ test "list get checks bounds and replaces a writable initialized element" {
         \\  if (buffer.get(-1) is int) -> return 2
         \\  if (buffer.get(1) is int) -> return 3
         \\  var writable: Ref(int) = Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none)))
         \\  writable.value = 42
         \\  return Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_1 and _selected_result_1 is int -> _selected_result_1
+        \\      ref _matched__selected_result_1 and _matched__selected_result_1 is int ->
+        \\          ref _selected_result_1 = _matched__selected_result_1
+        \\          _selected_result_1
         \\      _ -> return none))).value
         \\match run()
         \\    result and result is int -> exit(result)
@@ -3775,10 +3786,14 @@ test "list element replacement preserves earlier slot and view borrows" {
         \\  const checked_value_2 = buffer.append(17)
         \\  if not (checked_value_2 is unit) -> return none
         \\  const previous = Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none)))
         \\  var writable = Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_1 and _selected_result_1 is int -> _selected_result_1
+        \\      ref _matched__selected_result_1 and _matched__selected_result_1 is int ->
+        \\          ref _selected_result_1 = _matched__selected_result_1
+        \\          _selected_result_1
         \\      _ -> return none)))
         \\  writable.value = 42
         \\  return previous.value
@@ -3795,11 +3810,15 @@ test "list element replacement preserves earlier slot and view borrows" {
         \\  const view = buffer.slice(0..1)
         \\  if not (view is Span(int)) -> return none
         \\  var writable = Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none)))
         \\  writable.value = 42
         \\  return Ref.from(((match view.get(0)
-        \\      ref _selected_result_1 and _selected_result_1 is int -> _selected_result_1
+        \\      ref _matched__selected_result_1 and _matched__selected_result_1 is int ->
+        \\          ref _selected_result_1 = _matched__selected_result_1
+        \\          _selected_result_1
         \\      _ -> return none))).value
         \\match run()
         \\    result and result is int -> exit(result)
@@ -3819,13 +3838,17 @@ test "list append invalidates a writable element Ref without growth" {
         \\  const checked_value_2 = buffer.append(17)
         \\  if not (checked_value_2 is unit) -> return none
         \\  var writable = Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none)))
         \\  const checked_value_3 = buffer.append(7)
         \\  if not (checked_value_3 is unit) -> return none
         \\  writable.value = 42
         \\  return Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_1 and _selected_result_1 is int -> _selected_result_1
+        \\      ref _matched__selected_result_1 and _matched__selected_result_1 is int ->
+        \\          ref _selected_result_1 = _matched__selected_result_1
+        \\          _selected_result_1
         \\      _ -> return none))).value
         \\match run()
         \\    result and result is int -> exit(result)
@@ -3840,7 +3863,9 @@ test "writing through list get needs a mutable list place" {
         \\  const buffer = List(int).new(1)
         \\  if not (buffer is List(int)) -> return none
         \\  Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none))).value = 42
         \\  return 0
         \\match run()
@@ -3859,11 +3884,15 @@ test "an explicit reference writes through checked List element access" {
         \\  const checked_value_2 = buffer.append(17)
         \\  if not (checked_value_2 is unit) -> return none
         \\  var item = Ref.from(Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none))).value)
         \\  item.value = 42
         \\  return Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_1 and _selected_result_1 is int -> _selected_result_1
+        \\      ref _matched__selected_result_1 and _matched__selected_result_1 is int ->
+        \\          ref _selected_result_1 = _matched__selected_result_1
+        \\          _selected_result_1
         \\      _ -> return none))).value
         \\match run()
         \\    result and result is int -> exit(result)
@@ -3897,7 +3926,9 @@ test "appending without growth invalidates an earlier list element Ref" {
         \\  const checked_value_2 = buffer.append(17)
         \\  if not (checked_value_2 is unit) -> return none
         \\  const element = Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none)))
         \\  const checked_value_3 = buffer.append(42)
         \\  if not (checked_value_3 is unit) -> return none
@@ -3921,7 +3952,9 @@ test "list reserve preserves initialized elements on allocation failure" {
         \\  const checked_value_3 = buffer.reserve(3)
         \\  if not (checked_value_3 is unit) -> return none
         \\  return (Ref.from(((match buffer.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none)))).value - buffer.len() - buffer.capacity() + 4
         \\match run()
         \\    result and result is int -> exit(result)
@@ -4000,7 +4033,9 @@ test "a list view borrows a checked subrange" {
         \\  if (buffer.slice(-1..0) is Span(int)) -> exit(2)
         \\  if (buffer.slice(1..3) is Span(int)) -> exit(3)
         \\  return (Ref.from(((match view.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none)))).value + view.len() - 1
         \\match run()
         \\    result and result is int -> exit(result)
@@ -4050,7 +4085,9 @@ test "list view reads an initialized element" {
         \\  const view = buffer.slice(0..1)
         \\  if not (view is Span(int)) -> return none
         \\  return (Ref.from(((match view.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none)))).value
         \\match run()
         \\    result and result is int -> exit(result)
@@ -4075,7 +4112,9 @@ test "a list view returned through an immutable parameter keeps its backing owne
         \\  const view = tail(buffer)
         \\  if not (view is Span(int)) -> return none
         \\  return (Ref.from(((match view.get(0)
-        \\      ref _selected_result_1 and _selected_result_1 is int -> _selected_result_1
+        \\      ref _matched__selected_result_1 and _matched__selected_result_1 is int ->
+        \\          ref _selected_result_1 = _matched__selected_result_1
+        \\          _selected_result_1
         \\      _ -> return none)))).value
         \\match run()
         \\    result and result is int -> exit(result)
@@ -4165,7 +4204,9 @@ test "mutating a list invalidates a previously borrowed view" {
         \\  const checked_value_4 = buffer.append(42)
         \\  if not (checked_value_4 is unit) -> return none
         \\  return (Ref.from(((match view.get(0)
-        \\      ref _selected_result_0 and _selected_result_0 is int -> _selected_result_0
+        \\      ref _matched__selected_result_0 and _matched__selected_result_0 is int ->
+        \\          ref _selected_result_0 = _matched__selected_result_0
+        \\          _selected_result_0
         \\      _ -> return none)))).value
         \\match run()
         \\    result and result is int -> exit(result)
@@ -4518,7 +4559,7 @@ test "a returned Ref distinguishes its origins from mut Ref writeback inputs" {
         .{ .invalidate = "first = ((match Box.new(23)\n    _selected_result_0 and _selected_result_0 is Box(int) -> _selected_result_0^\n    _ -> panic \"unexpected none\"))", .diagnostic = .borrow_outlives_source },
         .{ .invalidate = "second = ((match Box.new(23)\n    _selected_result_0 and _selected_result_0 is Box(int) -> _selected_result_0^\n    _ -> panic \"unexpected none\"))", .diagnostic = null },
         .{ .invalidate = "other = ((match Box.new(23)\n    _selected_result_0 and _selected_result_0 is Box(int) -> _selected_result_0^\n    _ -> panic \"unexpected none\"))", .diagnostic = null },
-        .{ .invalidate = "second = (if const replacement: Box(int) = Box.new(23) -> replacement^ else panic \"allocation refused\")\n  _ = output.value", .diagnostic = .borrow_outlives_source },
+        .{ .invalidate = "second = (match Box.new(23)\n    replacement and replacement is Box(int) -> replacement^\n    _ -> panic \"allocation refused\")\n  _ = output.value", .diagnostic = .borrow_outlives_source },
     }) |case| {
         const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .invalidate = case.invalidate });
         defer testing.allocator.free(entry);
@@ -5373,7 +5414,7 @@ test "Box infers member call results without evaluating their receivers or argum
         const forbidden_receiver = try std.mem.replaceOwned(u8, testing.allocator, forbidden_copy, "func make_factory() Factory -> Factory{create = make}", "func make_factory() Factory -> exit(92)");
         defer testing.allocator.free(forbidden_receiver);
         try fixture.db.setInput(queries.SourceText, 0, forbidden_receiver);
-        try replaceAllocationSource(fixture, "        var storage: Allocation(T) = allocate(T, 1) else return none", "        exit(43)\n        var storage: Allocation(T) = allocate(T, 1) else return none");
+        try replaceAllocationSource(fixture, "        var storage = allocate(T, 1)", "        exit(43)\n        var storage = allocate(T, 1)");
         try fixture.expectExit(0, 43);
     }
 }
@@ -5411,7 +5452,7 @@ test "Box obtains storage before producer arguments conditions and ownership hoo
         defer testing.allocator.free(source);
         const fixture = try Fixture.initFiles(source, &.{});
         defer fixture.deinit();
-        try replaceAllocationSource(fixture, "        var storage: Allocation(T) = allocate(T, 1) else return none", "        exit(42)\n        var storage: Allocation(T) = allocate(T, 1) else return none");
+        try replaceAllocationSource(fixture, "        var storage = allocate(T, 1)", "        exit(42)\n        var storage = allocate(T, 1)");
         try fixture.expectExit(0, 42);
     }
 }
@@ -5432,15 +5473,13 @@ test "allocating init consumers preserve Box ordering through aliases and indire
             \\func make(value: int) Item -> Item{{value = value}}
             \\{s}
             \\match {s}
-            \\    Box(Item) ->
-            \\        const owner = {s}
-            \\        exit(1)
+            \\    Box(Item) -> exit(1)
             \\    _ -> exit(42)
         , .{ case.setup, case.call });
         defer testing.allocator.free(source);
         const fixture = try Fixture.initFiles(source, &.{});
         defer fixture.deinit();
-        try replaceAllocationSource(fixture, "var storage: Allocation(T) = allocate(T, 1) else return none", "var storage: Allocation(T) = allocate(T, -1) else return none");
+        try replaceAllocationSource(fixture, "var storage = allocate(T, 1)", "var storage = allocate(T, -1)");
         try fixture.expectExit(0, 42);
     }
 }
@@ -5527,7 +5566,7 @@ test "Box allocation failure skips initialization and preserves its source" {
         \\exit(run())
     , &.{});
     defer fixture.deinit();
-    try replaceAllocationSource(fixture, "var storage: Allocation(T) = allocate(T, 1) else return none", "var storage: Allocation(T) = allocate(T, -1) else return none");
+    try replaceAllocationSource(fixture, "var storage = allocate(T, 1)", "var storage = allocate(T, -1)");
     try fixture.expectExit(0, 42);
 }
 
@@ -5555,7 +5594,7 @@ test "Box destination construction recomputes after copy capability and allocato
     try fixture.expectDiagnostic(0, .type_not_copyable);
     try fixture.db.setInput(queries.SourceText, 0, source);
     try fixture.expectExit(0, 42);
-    try replaceAllocationSource(fixture, "var storage: Allocation(T) = allocate(T, 1) else return none", "var storage: Allocation(T) = allocate(T, -1) else return none");
+    try replaceAllocationSource(fixture, "var storage = allocate(T, 1)", "var storage = allocate(T, -1)");
     try fixture.expectExit(0, 43);
     const file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_allocation))).*;
     try fixture.db.setInput(queries.SourceText, file, standard_library.source("memory/allocation.chi"));
@@ -6521,7 +6560,7 @@ fn expectNoRelocation(fixture: Fixture, name: []const u8) !void {
     for (body.instructions) |instruction| {
         const copied: ?structures.TypeId = switch (instruction) {
             .field_access => |operation| operation.field_type,
-            .variant_extract => |operation| operation.target_type,
+            .variant_extract => |operation| if (operation.destination == null) operation.target_type else null,
             .variant_coerce => |operation| if (operation.destination == null) operation.target_type else null,
             .value_copy => |operation| if (operation.destination == null) operation.type_id else null,
             else => null,
@@ -7526,7 +7565,7 @@ test "Box allocation failure skips fresh producer arguments" {
         \\if (run() is unit) -> exit(1) else exit(42)
     , &.{});
     defer fixture.deinit();
-    try replaceAllocationSource(fixture, "var storage: Allocation(T) = allocate(T, 1) else return none", "var storage: Allocation(T) = allocate(T, -1) else return none");
+    try replaceAllocationSource(fixture, "var storage = allocate(T, 1)", "var storage = allocate(T, -1)");
     try fixture.expectExit(0, 42);
 }
 
@@ -7618,9 +7657,10 @@ test "inferred nested Box initialization cleans up leaves before later fields" {
         \\  deallocate(int, storage^)
         \\  return 1
         \\func run() unit | none
-        \\  const owner: Box(Container(Inner)) = Box.new(Container{item = Inner{leaf = Tracked{value = 42}}, later = ((match fail_value()
+        \\  const owner = Box.new(Container{item = Inner{leaf = Tracked{value = 42}}, later = ((match fail_value()
         \\      _selected_result_0 and _selected_result_0 is int -> _selected_result_0
-        \\      _ -> panic "unexpected none"))}) else return none
+        \\      _ -> panic "unexpected none"))})
+        \\  if not (owner is Box(Container(Inner))) -> return none
         \\  _ = owner
         \\  return ()
         \\if (run() is unit) -> exit(1) else exit(2)
@@ -7646,9 +7686,10 @@ test "nested in-place Box initialization cleans up leaves on failure" {
         \\  deallocate(int, storage^)
         \\  return 1
         \\func run() unit | none
-        \\  const owner: Box(Outer) = Box.new(Outer{inner = Inner{leaf = Tracked{value = 42}}, later = ((match fail_value()
+        \\  const owner = Box.new(Outer{inner = Inner{leaf = Tracked{value = 42}}, later = ((match fail_value()
         \\      _selected_result_0 and _selected_result_0 is int -> _selected_result_0
-        \\      _ -> panic "unexpected none"))}) else return none
+        \\      _ -> panic "unexpected none"))})
+        \\  if not (owner is Box(Outer)) -> return none
         \\  _ = owner
         \\  return ()
         \\if (run() is unit) -> exit(1) else exit(2)
@@ -8002,8 +8043,10 @@ test "custom copies and moves retain all possible field origins" {
         \\  $hook
         \\    return Pair{first = self.second, second = self.first}
         \\func run() int
-        \\  var first_owner: Box(Item) = Box.new(Item{value = 17}) else panic "unexpected allocation refusal"
-        \\  var second_owner: Box(Item) = Box.new(Item{value = 23}) else panic "unexpected allocation refusal"
+        \\  var first_owner = Box.new(Item{value = 17})
+        \\  if not (first_owner is Box(Item)) -> panic "unexpected allocation refusal"
+        \\  var second_owner = Box.new(Item{value = 23})
+        \\  if not (second_owner is Box(Item)) -> panic "unexpected allocation refusal"
         \\  var first = Ref.from(first_owner.borrow())
         \\  var second = Ref.from(second_owner.borrow())
         \\  const source = Pair{first = first, second = second}
@@ -8011,7 +8054,7 @@ test "custom copies and moves retain all possible field origins" {
         \\  const handle = copied.first
         \\  $replacement
         \\  return handle.value.value
-        \\if const result = run() -> exit(result) else exit(1)
+        \\exit(run())
     ;
     inline for (.{
         .{ .hook = "copy = func(imm self: Pair) Pair", .operand = "source" },
@@ -8177,7 +8220,7 @@ test "implicit drop effects invalidate pending expression borrows" {
     for ([_][]const u8{
         "Replacer{target = reference}",
         "Wrapper{guard = Replacer{target = reference}}",
-        "match Box.new(Replacer{target = reference})\n    _selected_result_0 and _selected_result_0 is Box(Replacer) -> _selected_result_0^\n    _ -> panic \"unexpected none\"",
+        "match Box.new(Replacer{target = reference})\n        _selected_result_0 and _selected_result_0 is Box(Replacer) -> _selected_result_0^\n        _ -> panic \"unexpected none\"",
         "if 1 == 1 -> Replacer{target = reference} else Replacer{target = reference}",
         "loop -> break Replacer{target = reference}",
     }) |guard| {
@@ -8195,8 +8238,8 @@ test "implicit drop effects invalidate pending expression borrows" {
 test "custom copy permissions and move effects protect pending borrows" {
     const cases = .{
         .{ .movement = "", .hook = "copy = func(imm", .parameter = "Copier", .argument = "source", .access = "copied.target.value.value" },
-        .{ .movement = "", .hook = "copy = func(imm", .parameter = "Box(Copier)", .argument = "match Box(Copier).new(source)\n    _selected_result_0 and _selected_result_0 is Box(Copier) -> _selected_result_0^\n    _ -> panic \"unexpected none\"", .access = "Ref.from(copied.borrow()).value.target.value.value" },
-        .{ .movement = "  move = none\n", .hook = "copy = func(imm", .parameter = "Box(Copier)", .argument = "match Box(Copier).new(source)\n    _selected_result_0 and _selected_result_0 is Box(Copier) -> _selected_result_0^\n    _ -> panic \"unexpected none\"", .access = "Ref.from(copied.borrow()).value.target.value.value" },
+        .{ .movement = "", .hook = "copy = func(imm", .parameter = "Box(Copier)", .argument = "match Box(Copier).new(source)\n        _selected_result_0 and _selected_result_0 is Box(Copier) -> _selected_result_0^\n        _ -> panic \"unexpected none\"", .access = "Ref.from(copied.borrow()).value.target.value.value" },
+        .{ .movement = "  move = none\n", .hook = "copy = func(imm", .parameter = "Box(Copier)", .argument = "match Box(Copier).new(source)\n        _selected_result_0 and _selected_result_0 is Box(Copier) -> _selected_result_0^\n        _ -> panic \"unexpected none\"", .access = "Ref.from(copied.borrow()).value.target.value.value" },
         .{ .movement = "", .hook = "move = func(deinit", .parameter = "Copier", .argument = "source^", .access = "copied.target.value.value" },
     };
     inline for (cases) |case| {
@@ -8211,9 +8254,9 @@ test "custom copy permissions and move effects protect pending borrows" {
             ") int -> previous.value + ",
             case.access,
             if (is_copy) " - 17" else " - 42",
-            "\nfunc run() int\n  var owner: Box(Item) = Box.new(Item{value = 17}) else panic \"unexpected allocation refusal\"\n  var reference = Ref.from(owner.borrow())\n  var source = Copier{target = reference}\n  return observe(reference.value, ",
+            "\nfunc run() int\n  var owner = Box.new(Item{value = 17})\n  if not (owner is Box(Item)) -> panic \"unexpected allocation refusal\"\n  var reference = Ref.from(owner.borrow())\n  var source = Copier{target = reference}\n  return observe(reference.value, ",
             case.argument,
-            ")\nif const result: int = run() -> exit(result) else exit(1)",
+            ")\nconst result = run()\nif result is int -> exit(result) else exit(1)",
         });
         defer testing.allocator.free(source);
         const fixture = try Fixture.initFiles(source, &.{});
@@ -10288,8 +10331,8 @@ test "init capture nested reference projections survive selection and wrapping" 
         \\func run() int | none
         \\    var value = 42
         \\    const source = Outer{inner = Inner{reference = Ref.from(value)}}
-        \\    const selected = forward(Ref(int), source.inner.reference) else return none
-        \\    const wrapped = forward(Outer, Outer{inner = source.inner}) else return none
+        \\    const selected = forward(Ref(int), source.inner.reference)
+        \\    const wrapped = forward(Outer, Outer{inner = source.inner})
         \\    return selected.value + wrapped.inner.reference.value - 42
         \\match run()
         \\    status and status is int -> exit(status)
@@ -10670,7 +10713,7 @@ test "init lexical pending consumption discharges explicit ownership only at cal
         \\    _ -> exit(98)
     ;
     for ([_]bool{ false, true }) |fails| {
-        const fixture_source = try std.mem.replaceOwned(u8, testing.allocator, source, "eager", if (fails) "match fail_value()\n    value and value is int -> value\n    _ -> return none" else "0");
+        const fixture_source = try std.mem.replaceOwned(u8, testing.allocator, source, "eager", if (fails) "(match fail_value()\n        value and value is int -> value\n        _ -> return none)" else "0");
         defer testing.allocator.free(fixture_source);
         const fixture = try Fixture.initFiles(fixture_source, &.{});
         defer fixture.deinit();
@@ -11436,17 +11479,11 @@ test "init checkpoint nested pending handles preserve ordinary construction" {
         \\        result
         \\    )
         \\func pair(init first: int, init second: int) int
-        \\    const left: int = materialize(((match wrap(first)
-        \\        _selected_result_1 and _selected_result_1 is int -> _selected_result_1
-        \\        _ -> return none)))
-        \\    const right: int = materialize(((match wrap(second)
-        \\        _selected_result_2 and _selected_result_2 is int -> _selected_result_2
-        \\        _ -> return none)))
+        \\    const left: int = materialize(wrap(first))
+        \\    const right: int = materialize(wrap(second))
         \\    return left + right
         \\func run() int | none
-        \\    return ((match wrap(42)
-        \\        _selected_result_3 and _selected_result_3 is int -> _selected_result_3
-        \\        _ -> return none))
+        \\    return wrap(42)
         \\static answer = (match run()
         \\    computed and computed is int -> computed
         \\    _ -> 97)
@@ -11545,14 +11582,10 @@ test "init checkpoint preserves mutable copy back and finite forwarding recursio
         \\    return value + count
         \\func walk(init item: int, imm depth: int) int
         \\    if depth == 0 -> return item
-        \\    return ((match walk(item, depth - 1)
-        \\        _selected_result_0 and _selected_result_0 is int -> _selected_result_0
-        \\        _ -> return none))
+        \\    return walk(item, depth - 1)
         \\func run() int | none
         \\    var count = 0
-        \\    const value = receive(count, ((match walk(40, 3)
-        \\        _selected_result_1 and _selected_result_1 is int -> _selected_result_1
-        \\        _ -> return none)))
+        \\    const value = receive(count, walk(40, 3))
         \\    if not (value is int) -> return none
         \\    return value + count
         \\static answer = (match run()
@@ -11625,7 +11658,8 @@ test "init inference determines fresh immovable variants before selecting storag
         \\    if value is Pinned -> return 21 else return 0
         \\func leave(imm flag: int) int | none
         \\    const value: none | Pinned = materialize(loop
-        \\        if flag == 1 -> break Pinned{value = 21} else break none
+        \\        if flag == 1 -> break Pinned{value = 21}
+        \\        break none
         \\    )
         \\    if value is Pinned -> return 21 else return 0
         \\static answer = (match choose(1)
@@ -11838,9 +11872,7 @@ test "init comptime cycle checks permit fresh environments with changing values"
         \\func walk(init item: int) int
         \\    const value = item
         \\    if value == 0 -> return 42
-        \\    return ((match walk(value - 1)
-        \\        _selected_result_0 and _selected_result_0 is int -> _selected_result_0
-        \\        _ -> return none))
+        \\    return walk(value - 1)
         \\static answer = (match walk(3)
         \\    computed and computed is int -> computed
         \\    _ -> 97)
@@ -11857,9 +11889,7 @@ test "init comptime cycle checks detect repeated nested wrapped captures" {
         \\    if depth == 0 -> return ((match repeat(depth, item)
         \\        _selected_result_0 and _selected_result_0 is int -> _selected_result_0
         \\        _ -> return none))
-        \\    return ((match repeat(depth - 1, ((match materialize(item)
-        \\        _selected_result_2 and _selected_result_2 is int -> _selected_result_2
-        \\        _ -> return none)))
+        \\    return ((match repeat(depth - 1, materialize(item))
         \\        _selected_result_1 and _selected_result_1 is int -> _selected_result_1
         \\        _ -> return none))
         \\static answer = (match repeat(3, 42)
@@ -12358,9 +12388,9 @@ test "movable replacement reads its target independently of storage representati
 
 test "movable replacement completes its RHS before dropping the old generation" {
     for ([_][]const u8{
-        "var items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]\n        items = produce(handle)\n        if handle.value <> 321 -> return 90\n        _ = items",
-        "var pair = Pair{items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]}\n        pair.items = produce(handle)\n        if handle.value <> 321 -> return 90\n        _ = pair",
-        "var items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]\n        reset(items, handle)\n        if handle.value <> 321 -> return 90\n        _ = items",
+        "var items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]\n            items = produce(handle)\n            if handle.value <> 321 -> return 90\n            _ = items",
+        "var pair = Pair{items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]}\n            pair.items = produce(handle)\n            if handle.value <> 321 -> return 90\n            _ = pair",
+        "var items = [Item{trace = handle, value = 1}, Item{trace = handle, value = 2}]\n            reset(items, handle)\n            if handle.value <> 321 -> return 90\n            _ = items",
     }) |body| {
         const source = try test_sources.renderTemplate(testing.allocator,
             \\struct Item
@@ -12378,7 +12408,8 @@ test "movable replacement completes its RHS before dropping the old generation" 
             \\func calculate() int
             \\    var trace = [0]
             \\    match trace.get(0)
-            \\        ref slot and slot is int ->
+            \\        ref _matched_slot and _matched_slot is int ->
+            \\            ref slot = _matched_slot
             \\            var handle = Ref.from(slot)
             \\            $body
             \\            if handle.value == 32154 -> return 42
@@ -12498,7 +12529,7 @@ test "replacement retains its old generation through a divergent RHS" {
 
 test "reference and indexed replacement keep their owners alive through divergent preparation" {
     for ([_]struct { binding: []const u8, replacement: []const u8 }{
-        .{ .binding = "var owner: Box(Item) = Box.new(Item{value = 90}) else panic \"unexpected none\"", .replacement = "var target = Ref.from(owner.borrow())\n    target.value = exit(42)" },
+        .{ .binding = "var owner = Box.new(Item{value = 90})\n    if not (owner is Box(Item)) -> panic \"unexpected none\"", .replacement = "var target = Ref.from(owner.borrow())\n    target.value = exit(42)" },
         .{ .binding = "var values: List(Item) = [Item{value = 90}]", .replacement = "values[0] = exit(42)" },
         .{ .binding = "var values = [Item{value = 90}]", .replacement = "values[0] = exit(42)" },
         .{ .binding = "var values = [Item{value = 90}]", .replacement = "var span = values.span()\n    span[0] = exit(42)" },
@@ -12816,10 +12847,13 @@ test "review fixes explicit indexed borrows compose fields nesting and handled b
         \\    var score = Ref.from(rows[0][0].score)
         \\    score.value += 1
         \\    match rows.get(1)
-        \\        ref invalid and invalid is Array(Row, 2) -> return 90
+        \\        ref _matched_invalid and _matched_invalid is Array(Row, 2) ->
+        \\            ref invalid = _matched_invalid
+        \\            return 90
         \\        _ -> ()
         \\    match rows[0].get(1)
-        \\        ref row and row is Row ->
+        \\        ref _matched_row and _matched_row is Row ->
+        \\            ref row = _matched_row
         \\            row.score += 0
         \\            const first = Ref.from(rows[0][0])
         \\            return first.value.score + row.score
@@ -13045,11 +13079,12 @@ test "disjunction joins consumed recursive owners without retaining ended bindin
         \\        _ -> ()
         \\    return none
         \\func evaluate() int | none
-        \\    var tree: Box(Expr) = Box.new(Expr{term = Pair{left = ((match Box.new(Expr{term = Constant{value = 1}})
+        \\    var tree = Box.new(Expr{term = Pair{left = ((match Box.new(Expr{term = Constant{value = 1}})
         \\        _selected_result_0 and _selected_result_0 is Box(Expr) -> _selected_result_0^
         \\        _ -> panic "unexpected none")), right = ((match Box.new(Expr{term = Constant{value = 2}})
         \\            _selected_result_1 and _selected_result_1 is Box(Expr) -> _selected_result_1^
-        \\            _ -> panic "unexpected none"))}}) else return none
+        \\            _ -> panic "unexpected none"))}})
+        \\    if not (tree is Box(Expr)) -> return none
         \\    var owned = tree.take()
         \\    if owned.term is Pair
         \\        const pair = owned.term^
@@ -13110,11 +13145,12 @@ test "disjunction joins consumed recursive owners preserve cleanup and short cir
         \\func check(left: int, right: int, expected: int, expected_calls: int) unit | none
         \\    var calls = Box.new(0)
         \\    if not (calls is Box(int)) -> return none
-        \\    const tree: Box(Expr) = Box.new(Expr{term = Pair{left = ((match Box.new(Expr{term = Constant{value = left}})
+        \\    const tree = Box.new(Expr{term = Pair{left = ((match Box.new(Expr{term = Constant{value = left}})
         \\        _selected_result_4 and _selected_result_4 is Box(Expr) -> _selected_result_4^
         \\        _ -> panic "unexpected none")), right = ((match Box.new(Expr{term = Constant{value = right}})
         \\            _selected_result_5 and _selected_result_5 is Box(Expr) -> _selected_result_5^
-        \\            _ -> panic "unexpected none"))}}) else return none
+        \\            _ -> panic "unexpected none"))}})
+        \\    if not (tree is Box(Expr)) -> return none
         \\    if not (((match inspect(tree^, Ref.from(calls.borrow()))
         \\        _selected_result_6 and _selected_result_6 is int -> _selected_result_6
         \\        _ -> return none)) == expected) -> return none

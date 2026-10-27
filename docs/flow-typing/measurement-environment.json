@@ -1,0 +1,55 @@
+{
+  "baseline": "b3d46674a72b63d29a1a823521fb3ca1b9b79bb7",
+  "final_code_sha256": "a0efc08116f673aef71e73ede778a1275439d09ce1acfe2934b92c0baca0b0f2",
+  "common_generator_sha256": "9279761120b29d9cd1311290becbac13895a3f06a85ab790d2bdd823d732ae90",
+  "zig": "0.17.0",
+  "machine": "Linux-7.2.9-arch1-1-x86_64-with-glibc2.44",
+  "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "timing_cpu": 2,
+  "compiler_mode": "fast",
+  "seed": 0,
+  "code_hash_policy": "SHA-256 over sorted source paths in src/ and std/, build.zig and build.zig.zon: UTF-8 path, NUL, bytes, NUL",
+  "loc_command": "bash /Repos/chimera-lang/loc.sh --json, run in each source tree",
+  "history_workers": 0,
+  "flow_workers": 1,
+  "driver_hashes": {
+    "parent": {
+      "flow_benchmark.zig": "677828dcb93fe6ad079e4f4f0739621fa9aae9680386dc092b9ac6c20d7a95e7",
+      "history_benchmark.zig": "3e2b6e391af8004af95d033231c707c2baab7739256e554363548d1cb21c9fd5",
+      "history_sampling.zig": "e6fa44ed277958060a5cff8794659c632d6b1b0cd8ef985b5b7272de4866f7e2"
+    },
+    "final": {
+      "flow_benchmark.zig": "1cdf61a0b16dd975f0208d1560b09efddf6b542f5a785b982f9cf8f897c975bf",
+      "history_benchmark.zig": "6bc086fc57049560dc64279d8a44fb9d465e419d5b695fffce72a1ae77b090d1",
+      "history_sampling.zig": "e6fa44ed277958060a5cff8794659c632d6b1b0cd8ef985b5b7272de4866f7e2"
+    }
+  },
+  "status": {
+    "typing": "three complete matched trials",
+    "cold_incremental": "not completed",
+    "runtime": "not completed",
+    "final_safe_suite": "pending after identity traversal refinement"
+  }
+}

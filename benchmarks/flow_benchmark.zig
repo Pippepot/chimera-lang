@@ -62,7 +62,10 @@ fn appendLine(source: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime
     try source.appendSlice(allocator, line);
 }
 
-fn benchmark(init: std.process.Init, writer: *std.Io.Writer, count: u32, owning: bool) !void {
+const Kind = enum { scalar, owning, narrowing };
+
+fn benchmark(init: std.process.Init, writer: *std.Io.Writer, count: u32, kind: Kind) !void {
+    const owning = kind == .owning;
     var source: std.ArrayList(u8) = .empty;
     defer source.deinit(init.gpa);
     if (owning) try source.appendSlice(init.gpa, "struct Item\n  value: int\n  drop = func(deinit self: Item) -> return\n");
@@ -70,12 +73,18 @@ fn benchmark(init: std.process.Init, writer: *std.Io.Writer, count: u32, owning:
     for (0..count) |index| {
         if (owning) {
             try appendLine(&source, init.gpa, "  var v{d} = Item{{value = flag + {d}}}\n", .{ index, index });
+        } else if (kind == .narrowing) {
+            try appendLine(&source, init.gpa, "  var v{d}: int | none = if flag < {d} -> none else {d}\n", .{ index, index, index });
         } else {
             try appendLine(&source, init.gpa, "  var v{d} = flag + {d}\n", .{ index, index });
         }
     }
-    for (0..count) |index| try appendLine(&source, init.gpa, "  if flag < {d} -> v{d}{s} += 1\n", .{ index, index, if (owning) ".value" else "" });
-    for (0..count) |index| try appendLine(&source, init.gpa, "  total += v{d}{s}\n", .{ index, if (owning) ".value" else "" });
+    if (kind == .narrowing) {
+        for (0..count) |index| try appendLine(&source, init.gpa, "  const selected{d} = v{d} is int\n  if selected{d}\n    ref alias{d} = v{d}\n    loop\n      alias{d} += 1\n      break\n    total += v{d}\n", .{ index, index, index, index, index, index, index });
+    } else {
+        for (0..count) |index| try appendLine(&source, init.gpa, "  if flag < {d} -> v{d}{s} += 1\n", .{ index, index, if (owning) ".value" else "" });
+        for (0..count) |index| try appendLine(&source, init.gpa, "  total += v{d}{s}\n", .{ index, if (owning) ".value" else "" });
+    }
     try source.appendSlice(init.gpa, "  return total\n");
 
     var times: [5]i96 = undefined;
@@ -91,8 +100,8 @@ fn benchmark(init: std.process.Init, writer: *std.Io.Writer, count: u32, owning:
         } else times[sample_index] = result.nanoseconds;
     }
     std.mem.sort(i96, &times, {}, std.sort.asc(i96));
-    try writer.print("{s},{d},{d},{d},{d},{d},{d},{d}\n", .{
-        if (owning) "owning" else "scalar",
+    try writer.print("{s},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d},{d}\n", .{
+        @tagName(kind),
         count,
         times[2],
         measured.snapshots,
@@ -100,7 +109,12 @@ fn benchmark(init: std.process.Init, writer: *std.Io.Writer, count: u32, owning:
         measured.blocks,
         measured.generations,
         measured.lifetime_table_bytes,
+        measured.flow_fact_bytes,
+        measured.flow_place_bytes,
+        measured.flow_predicate_bytes,
+        measured.inference_key_bytes,
     });
+    try writer.flush();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -108,9 +122,9 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
     const writer = &stdout.interface;
-    try writer.writeAll("kind,branches,typing_ns,snapshots,snapshot_bytes,blocks,generations,lifetime_bytes\n");
-    for ([_]bool{ false, true }) |owning| {
-        for ([_]u32{ 8, 32, 128, 256, 512 }) |count| try benchmark(init, writer, count, owning);
+    try writer.writeAll("kind,branches,typing_ns,snapshots,snapshot_bytes,blocks,generations,lifetime_bytes,flow_fact_bytes,flow_place_bytes,flow_predicate_bytes,inference_key_bytes\n");
+    for ([_]Kind{ .scalar, .owning, .narrowing }) |kind| {
+        for ([_]u32{ 8, 32, 128, 256, 512 }) |count| try benchmark(init, writer, count, kind);
     }
     try writer.flush();
 }

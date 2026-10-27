@@ -8,13 +8,12 @@ Settle missing semantics before implementation. Each milestone covers
 diagnostics, execution, ownership, and incremental/cache behavior. Legacy parity
 is not a goal.
 
-## Deferred flow typing integration
+## Flow typing acceptance
 
-Complete the unfinished flow typing implementation and source migration before
-considering it accepted. Ownership/lifetime invariants, failing suites, diagnostics,
-cache verification, and performance comparisons remain open. See the
-[handoff and failure inventory](docs/FLOW_TYPING_HANDOFF.md) for the concrete work.
-Fixes are deferred at the user's request.
+The implementation and source migration are in place. Complete Safe verification
+of the final identity traversal, investigate measured typing/memory overhead, and
+finish matched cold, incremental, and runtime measurements before acceptance.
+See the [current status and remaining work](docs/FLOW_TYPING_HANDOFF.md).
 
 ## Immediate engineering priority
 

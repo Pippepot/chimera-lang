@@ -110,9 +110,7 @@ test "membership evaluates source operands once from left to right" {
         \\    return 19
         \\func choices(ref trace: int) Choices
         \\    trace = trace * 10 + 2
-        \\    return Choices{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    return Choices{trace = Ref.from(trace)}
         \\func run() int
         \\    var trace = 0
         \\    if produce_value(trace) in choices(trace)
@@ -143,9 +141,7 @@ test "membership prepares scalar reads and conversions before the collection" {
         \\    if not (number in 0..change(number)) -> return 90
         \\    if number <> 23 -> return 91
         \\    var trace = 0
-        \\    const source = Source{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    const source = Source{trace = Ref.from(trace)}
         \\    if source in choices(trace)
         \\        if trace == 12 -> return 42
         \\    return 92

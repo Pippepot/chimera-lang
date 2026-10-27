@@ -726,7 +726,6 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         .private_struct_field => |type_id| try writeTypedMessage(types, writer, "cannot name a private field of ", type_id, " outside its defining module"),
         .assignment_type_mismatch => |mismatch| try writeMismatch(types, writer, "assignment type mismatch: ", mismatch),
         .condition_not_bool => |found| try writeTypedMessage(types, writer, "condition requires bool, found ", found, ""),
-        .variant_inspection_operand_not_variant => |found| try writeTypedMessage(types, writer, "variant inspection requires a variant value, found ", found, ""),
         .iterator_result_requires_end => |mismatch| try writeTypePair(types, writer, "next must return an item variant with owned ", mismatch.expected, ", found ", mismatch.found),
         .local_type_mismatch => |mismatch| try writeMismatch(types, writer, "initializer type mismatch: ", mismatch),
         .comparison_operand_not_int => |found| try writeTypedMessage(types, writer, "comparison requires `int`, found ", found, ""),
@@ -784,6 +783,19 @@ pub fn renderDiagnostic(
         try writer.writeByte('\n');
     }
     try writeFunctionContext(types, writer, diagnostic.instance);
+    for (diagnostic.notes) |note| {
+        const line = lineInfoForOffset(file.source, note.span.start);
+        try writer.print("\x1b[36mnote:\x1b[0m {s}:{d}:{d}", .{ file.path, line.line, line.column });
+        try writer.writeAll(switch (note.kind) {
+            .type_proof => ": this type proof was established here\n",
+            .proof_invalidated => ": this write invalidated the type proof\n",
+        });
+        try writer.print("{s}\n", .{file.source[line.line_start..line.line_end]});
+        try writer.splatByteAll(' ', line.column - 1);
+        try writer.writeByte('^');
+        try writer.splatByteAll('~', highlightLen(note.span, line.line_start, line.line_end) - 1);
+        try writer.writeByte('\n');
+    }
 }
 
 fn writeFunctionContext(types: anytype, writer: *std.Io.Writer, instance: ?structures.InstanceId) !void {

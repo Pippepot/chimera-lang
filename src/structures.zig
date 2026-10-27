@@ -1778,10 +1778,19 @@ pub const SourceSpan = struct {
 };
 
 pub const Diagnostic = struct {
+    pub fn eql(a: Diagnostic, b: Diagnostic) bool {
+        return value_operations.equal(Diagnostic, a, b);
+    }
+
+    pub const Note = struct {
+        span: SourceSpan,
+        kind: enum { type_proof, proof_invalidated },
+    };
     file_id: FileId,
     span: ?SourceSpan,
     kind: Kind,
     instance: ?InstanceId = null,
+    notes: []const Note = &.{},
 
     pub const TypeMismatch = struct {
         expected: TypeId,
@@ -1991,7 +2000,6 @@ pub const Diagnostic = struct {
         .invalid_string_utf8 = "string literal is not valid UTF-8",
         .condition_not_bool = TypeId,
         .inspection_type_not_supported = "this inspection type is not supported yet",
-        .variant_inspection_operand_not_variant = TypeId,
         .iterator_result_requires_end = TypeMismatch,
         .loop_invalidates_type_proof = "this loop can repeat after invalidating a type proof used in its body; test the type inside the loop",
         .condition_binding_must_be_immutable = "an `if` binding must use `const`, not `var`",

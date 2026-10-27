@@ -70,7 +70,8 @@ test "machine indexed constant stores preserve base encoding and spill fallback"
 test "loop allocation bases preserve checked element reads and writes" {
     try test_sources.SourceFixture.expectParity(
         \\func run() int
-        \\    var values: List(int) = List(int).filled(0, 16) else return 0
+        \\    var values = List(int).filled(0, 16)
+        \\    if not (values is List(int)) -> return 0
         \\    var index = 0
         \\    loop
         \\        if index == values.len() -> break
@@ -1211,7 +1212,9 @@ test "native nested array addressing handles native scales zero sizes and multip
             \\func calculate() int
             \\    var grid: Array(Array(byte, $width), 3) = $bytes
             \\    match grid.get(-1)
-            \\        ref invalid and invalid is Array(byte, $width) -> return 91
+            \\        ref _matched_invalid and _matched_invalid is Array(byte, $width) ->
+            \\            ref invalid = _matched_invalid
+            \\            return 91
             \\        _ -> ()
             \\    var outer = 0
             \\    loop

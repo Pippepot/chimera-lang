@@ -1,0 +1,28 @@
+--- a/benchmarks/history_workload.zig
++++ b/benchmarks/history_workload.zig
+@@ -68,14 +68,9 @@
+     \\    else
+     \\        return 0
+     \\    const variant: int | none = total
+-    \\    total = match variant
+-    \\        int -> variant
+-    \\        none -> 0
++    \\    if not (variant is int) -> return 0
+     \\    const accepted = checked(total)
+-    \\    if accepted is int
+-    \\        total = accepted
+-    \\    else
+-    \\        return 0
++    \\    if not (accepted is int) -> return 0
+     \\    if checked(-1) is int -> return 0
+     \\    total += choose(seed)
+     \\    total += choose(true)
+@@ -131,7 +126,7 @@
+     }
+     try entry.writer.writeAll("var padding = 0\n");
+     for (0..module_count) |module_index| {
+-        try entry.writer.print("if true\n    const actual = part{d}.run(1)\n    if not (actual is int) -> exit(1)\n", .{module_index});
++        try entry.writer.print("if true\n    const actual = part{d}.run(1)\n    if false -> exit(1)\n", .{module_index});
+         try entry.writer.print("    if actual <> {d} -> exit(1)\n", .{units_per_module});
+     }
+     for (0..padding) |_| try entry.writer.writeAll("padding += 1\n");

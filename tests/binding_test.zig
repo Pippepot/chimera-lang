@@ -56,7 +56,7 @@ test "explicit variants allocate and index collections" {
     , 42);
 }
 
-test "plain optional conditions and implicit narrowing are rejected" {
+test "plain optional conditions and unproven narrowing are rejected" {
     try Fixture.expectSourceDiagnostic(
         \\const value: bool | none = false
         \\if value -> exit(1)
@@ -69,7 +69,8 @@ test "plain optional conditions and implicit narrowing are rejected" {
         \\func optional() int | none -> none
         \\const value = optional()
         \\if not (value is int) -> ()
-    , .binding_else_must_exit);
+        \\exit(value + 1)
+    , .missing_operation);
 }
 
 test "typed patterns never invoke converters" {
@@ -81,11 +82,7 @@ test "typed patterns never invoke converters" {
         \\pub converter(imm value: Input) Output -> exit(99)
         \\func run() int
         \\    const input: Input | none = Input{value = 19}
-        \\    match input
-        \\        Output ->
-        \\            const value = input
-        \\            return value.value
-        \\        _ -> ()
+        \\    if input is Output -> return 90
         \\    return 42
     , 42);
 }
@@ -109,30 +106,23 @@ test "reference binding handles certain and disjoint selections" {
     try Fixture.expectParity(
         \\func run() int
         \\    var number = 19
-        \\    match number
-        \\        bool ->
-        \\            ref missing = number
-        \\            return 90
-        \\        _ -> ()
-        \\    match number
-        \\        int ->
-        \\            ref selected = number
-        \\            selected += 23
-        \\        _ -> ()
+        \\    if number is bool -> return 90
+        \\    if number is int
+        \\        ref selected = number
+        \\        selected += 23
         \\    return number
     , 42);
     try Fixture.expectParity(
         \\func run() int
         \\    var number = 19
-        \\    const checked_value_1 = number
-        \\    if not (checked_value_1 is int) -> return 90
-        \\    ref selected = checked_value_1
+        \\    if not (number is int) -> return 90
+        \\    ref selected = number
         \\    selected += 23
         \\    return number
     , 42);
 }
 
-test "typed match capture commits an immovable explicit owner after its guard" {
+test "type patterns commit an immovable explicit owner after their guard" {
     try Fixture.expectParity(
         \\struct Token
         \\    copy = none
@@ -142,9 +132,10 @@ test "typed match capture commits an immovable explicit owner after its guard" {
         \\func dispose(deinit token: Token) int -> token.value
         \\func produce() Token | none -> Token{value = 42}
         \\func run() int
-        \\    return match produce()
-        \\        token and token is Token and false -> dispose(token)
-        \\        token and token is Token -> dispose(token)
+        \\    const token = produce()
+        \\    return match token
+        \\        Token and false -> dispose(token)
+        \\        Token -> dispose(token)
         \\        _ -> 0
     , 42);
 }
@@ -231,8 +222,9 @@ test "range indexing preserves writable backing and checked slices return varian
 test "standalone patterns support mutation and loop mismatch exits" {
     try Fixture.expectParity(
         \\func run() int
-        \\    var total = if true -> 0 else none
-        \\    if not (total is int) -> return 1
+        \\    const initial = if true -> 0 else none
+        \\    if not (initial is int) -> return 1
+        \\    var total: int = initial
         \\    const values: Array(int | none, 3) = [none, 19, 23]
         \\    for candidate in values
         \\        const value = candidate
@@ -369,7 +361,9 @@ test "a Box owns an optional immovable producer result in place" {
         \\    var owner = Box.new(produce(drops))
         \\    if not (owner is Box(Pinned | none)) -> return 1
         \\    const value = (match owner.borrow()
-        \\        ref item and item is Pinned -> item.value
+        \\        ref _matched_item and _matched_item is Pinned ->
+        \\            ref item = _matched_item
+        \\            item.value
         \\        _ -> 0)
         \\    return value + drops + 20
     , 42);

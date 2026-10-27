@@ -108,7 +108,10 @@ fn candidate(function: *Function, context: anytype, cache: *Cache, call: structu
             const reference = function.definition(function.find(value)) orelse return null;
             if (reference != .initializer_ref) return null;
             const operation = reference.initializer_ref;
-            const region = &function.regions.items[operation.region];
+            // Inlining appends nested regions and may relocate the region table.
+            // The selected body's header must remain stable throughout the splice.
+            const region = try function.scratch.create(Body);
+            region.* = function.regions.items[operation.region];
             break :region .{
                 .instance = region.root_instance orelse function.root_instance orelse context.instance,
                 .region = true,

@@ -82,7 +82,8 @@ test "evaluation heap immovable partial failure reverse destruction and extracti
         \\    var trace = Array(int, 1).filled(0)
         \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
         \\    match trace.get(0)
-        \\        ref target and target is int ->
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
         \\            match construct(Ref.from(target))
         \\                filtered_value_137 and filtered_value_137 is unit -> return 91
         \\                _ -> ()
@@ -113,7 +114,8 @@ test "evaluation heap immovable partial failure reverse destruction and extracti
         \\    var trace = Array(int, 1).filled(0)
         \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
         \\    match trace.get(0)
-        \\        ref target and target is int ->
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
         \\            match construct(Ref.from(target))
         \\                filtered_value_122 and filtered_value_122 is unit -> return 91
         \\                _ -> ()
@@ -209,12 +211,12 @@ test "evaluation heap compiler allocation failure is retryable without publishin
     defer db.deinit();
     try modules.registerSources(db, failing.allocator(),
         \\func compute() int
-        \\    match Box(Array(int, 2048)).new(((match Array(int, 2048).filled(42)
-        \\        _selected_result_0 and _selected_result_0 is Array(int, 2048) -> _selected_result_0^
-        \\        _ -> panic "unexpected none")))
+        \\    match Box(Array(int, 2048)).new(Array(int, 2048).filled(42))
         \\        owner and owner is Box(Array(int, 2048)) ->
         \\            match owner.borrow().get(0)
-        \\                ref first and first is int -> return first
+        \\                ref _matched_first and _matched_first is int ->
+        \\                    ref first = _matched_first
+        \\                    return first
         \\                _ -> ()
         \\        _ -> ()
         \\    return 90
@@ -323,9 +325,7 @@ test "evaluation heap executes independent factories nested aliases and ordinary
         \\func compute() int | none
         \\    var first = factory()
         \\    const second = factory()
-        \\    forward(((match Ref.from(first.borrow())
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> return none)))
+        \\    forward(Ref.from(first.borrow()))
         \\    if first.borrow() <> 23 -> return 91
         \\    if second.borrow() <> 19 -> return 92
         \\    var buffer = List(int).new(0)
@@ -770,7 +770,9 @@ test "interpreter call cycles reject unchanged references and allow changed refe
         \\    var values = Array(int, 1).filled(3)
         \\    if not (values is Array(int, 1)) -> panic "unexpected none"
         \\    match values.get(0)
-        \\        ref reference and reference is int -> return advance(reference)
+        \\        ref _matched_reference and _matched_reference is int ->
+        \\            ref reference = _matched_reference
+        \\            return advance(reference)
         \\        _ -> ()
         \\    return 90
     , &.{}, &.{});

@@ -1130,19 +1130,23 @@ test "Box and Ref alias bodies restore and invalidate after a binding edit" {
     const initial_source =
         \\import std.memory
         \\func run() int | none
-        \\  var owner: Box(int) = Box.new(17) else return none
+        \\  var owner = Box.new(17)
+        \\  if not (owner is Box(int)) -> return none
         \\  var item = Ref.from(owner.borrow())
         \\  return item.value
-        \\if const result: int = run() -> exit(result) else exit(1)
+        \\const result = run()
+        \\if result is int -> exit(result) else exit(1)
     ;
     const edited_source =
         \\import std.memory
         \\func run() int | none
-        \\  var owner: Box(int) = Box.new(17) else return none
+        \\  var owner = Box.new(17)
+        \\  if not (owner is Box(int)) -> return none
         \\  var item = Ref.from(owner.borrow())
         \\  item.value = 42
         \\  return item.value
-        \\if const result: int = run() -> exit(result) else exit(1)
+        \\const result = run()
+        \\if result is int -> exit(result) else exit(1)
     ;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1284,7 +1288,7 @@ test "deinit bodies restore and invalidate when parameter modes change" {
     const io = std.testing.io;
     const source =
         \\func take(deinit value: int | none) int
-        \\  if const number: int = value -> return number
+        \\  if value is int -> return value
         \\  return 1
         \\func pick(flag: int) int
         \\  const first: int | none = 20
@@ -1533,7 +1537,8 @@ test "cached nested handles reject changed capture representations" {
     try modules.registerSources(db, allocator,
         \\func materialize(init item: int) int -> return item
         \\func forward(init item: int) int -> return materialize(materialize(item))
-        \\if const result: int = forward(42) -> exit(result) else exit(99)
+        \\const result = forward(42)
+        \\if result is int -> exit(result) else exit(99)
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
     const original = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction("forward").? })).*.?;
@@ -1589,7 +1594,8 @@ test "cached initializers reject changed regions captures and value representati
     try modules.registerSources(db, allocator,
         \\func materialize(init item: int) int -> return item
         \\func run(imm value: int) int | none -> return materialize(value + 2)
-        \\if const result: int = run(40) -> exit(result) else exit(99)
+        \\const result = run(40)
+        \\if result is int -> exit(result) else exit(99)
     , &.{}, &.{});
     const executable = (try db.get(queries.BuildExecutable, 0)).*;
     try std.testing.expect(executable != null);

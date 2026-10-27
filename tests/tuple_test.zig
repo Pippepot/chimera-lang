@@ -139,8 +139,12 @@ test "optional tuple result patterns select only the matching payload" {
         \\    if not (value > 0) -> return none
         \\    return (19, 23)
         \\func run() int
-        \\    if const (a, b): (int, int) = point(0) -> return 90
-        \\    if const (a, b): (int, int) = point(1) -> return a + b
+        \\    const absent = point(0)
+        \\    if absent is (int, int) -> return 90
+        \\    const present = point(1)
+        \\    if present is (int, int)
+        \\        const (a, b): (int, int) = present
+        \\        return a + b
         \\    return 91
     , 42);
 }
@@ -155,11 +159,7 @@ test "patterns drop ignored and extracted owners exactly once" {
         \\func run() int
         \\    var trace = 0
         \\    if true
-        \\        const (a, _) = (Item{trace = ((match Ref.from(trace)
-        \\            _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\            _ -> panic "unexpected none")), value = 19}, Item{trace = ((match Ref.from(trace)
-        \\                _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\                _ -> panic "unexpected none")), value = 23})
+        \\        const (a, _) = (Item{trace = Ref.from(trace), value = 19}, Item{trace = Ref.from(trace), value = 23})
         \\    return trace
     , 42);
     try Fixture.expectParity(
@@ -171,11 +171,7 @@ test "patterns drop ignored and extracted owners exactly once" {
         \\func run() int
         \\    var trace = 0
         \\    if true
-        \\        const [a, _] = [Item{trace = ((match Ref.from(trace)
-        \\            _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\            _ -> panic "unexpected none")), value = 19}, Item{trace = ((match Ref.from(trace)
-        \\                _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\                _ -> panic "unexpected none")), value = 23}]
+        \\        const [a, _] = [Item{trace = Ref.from(trace), value = 19}, Item{trace = Ref.from(trace), value = 23}]
         \\    return trace
     , 42);
 }
@@ -281,9 +277,7 @@ test "nested pattern failure cleans all owners and preserves borrowed sources" {
         \\    return (Item{trace = trace, value = 10}, [Item{trace = trace, value = 12}, Item{trace = trace, value = 20}])
         \\func run() int
         \\    var trace = 0
-        \\    if const (first, [second]) = produce(((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))) -> return 90
+        \\    if const (first, [second]) = produce(Ref.from(trace)) -> return 90
         \\    return trace
     , 42);
     try Fixture.expectParity(
@@ -324,9 +318,7 @@ test "loop pattern carriers keep immovable payloads in place and clean early exi
         \\        return (Item{trace = self.trace, value = 19}, Item{trace = self.trace, value = 23})
         \\func run() int
         \\    var trace = 0
-        \\    for (ref a, ref b) in Cursor{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    for (ref a, ref b) in Cursor{trace = Ref.from(trace)}
         \\        if a.value + b.value <> 42 -> return 90
         \\        break
         \\    return trace
@@ -343,11 +335,7 @@ test "counted List transfer keeps captured references and drops each moved eleme
         \\func run() int
         \\    var trace = 0
         \\    if true
-        \\        const values: List(Item) = [Item{trace = ((match Ref.from(trace)
-        \\            _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\            _ -> panic "unexpected none")), value = 19}, Item{trace = ((match Ref.from(trace)
-        \\                _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\                _ -> panic "unexpected none")), value = 23}]
+        \\        const values: List(Item) = [Item{trace = Ref.from(trace), value = 19}, Item{trace = Ref.from(trace), value = 23}]
         \\        if const [first, _] = values^
         \\            ()
         \\        else
@@ -364,9 +352,11 @@ test "variant payload patterns preserve the subject ownership and reference auth
         \\func produce() (Item, int) | none -> (Item{value = 19}, 23)
         \\func run() int
         \\    var subject = produce()
-        \\    if const (ref a, b): (Item, int) = subject
+        \\    if subject is (Item, int)
+        \\        const (ref a, b): (Item, int) = subject
         \\        a.value += 1
-        \\        if const (ref x, y): (Item, int) = subject -> return x.value + y - 1
+        \\        const (ref x, y): (Item, int) = subject
+        \\        return x.value + y - 1
         \\    return 90
     , 42);
     try Fixture.expectParity(
@@ -376,16 +366,22 @@ test "variant payload patterns preserve the subject ownership and reference auth
         \\func consume(deinit item: Item) int -> item.value
         \\func produce() (Item, int) | none -> (Item{value = 19}, 23)
         \\func run() int
-        \\    if const (a, b): (Item, int) = produce() -> return consume(a^) + b
+        \\    const subject = produce()
+        \\    if subject is (Item, int)
+        \\        const (a, b): (Item, int) = subject^
+        \\        return consume(a^) + b
         \\    return 90
     , 42);
 }
 
-test "annotated conditional patterns select ordinary optional tuple results" {
+test "annotated patterns destructure an already narrowed optional tuple result" {
     try Fixture.expectParity(
         \\func point() (int, int) | none -> (19, 23)
         \\func run() int
-        \\    if const (a, b): (int, int) = point() -> return a + b
+        \\    const subject = point()
+        \\    if subject is (int, int)
+        \\        const (a, b): (int, int) = subject
+        \\        return a + b
         \\    return 90
     , 42);
 }

@@ -69,7 +69,8 @@ test "operation indexing compound assignments and reference assignments have par
         \\    values[0] -= 2
         \\    values[0] /= 2
         \\    match values.get(1)
-        \\        ref reference and reference is int ->
+        \\        ref _matched_reference and _matched_reference is int ->
+        \\            ref reference = _matched_reference
         \\            reference += 1
         \\            reference *= 2
         \\            reference -= 2
@@ -173,7 +174,8 @@ test "optional replacement cleans its prepared owned value on mismatch" {
         \\func run() int
         \\    var trace = [0]
         \\    match trace.get(0)
-        \\        ref handle and handle is int ->
+        \\        ref _matched_handle and _matched_handle is int ->
+        \\            ref handle = _matched_handle
         \\            var sink = Sink{}
         \\            match sink.replace(99, Item{trace = Ref.from(handle), value = 42})
         \\                filtered_value_81 and filtered_value_81 is unit -> return 90
@@ -193,7 +195,9 @@ test "explicit checked reference acquisition skips the replacement on bounds fai
         \\    var values = [20]
         \\    var calls = 0
         \\    match values.get(99)
-        \\        ref target and target is int -> target = replacement(calls)
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
+        \\            target = replacement(calls)
         \\        _ -> ()
         \\    match values.get(0)
         \\        first and first is int -> return first + calls + 22
@@ -226,8 +230,11 @@ test "operation indexing reads invoke ordinary copy hooks" {
         \\    copy = func(imm self: Item) Item -> Item{value = self.value + 1}
         \\func run() int
         \\    const values = [Item{value = 41}]
-        \\    match values.get(0)
-        \\        selected and selected is Item -> return selected.value
+        \\    const result = values.get(0)
+        \\    match result
+        \\        Item ->
+        \\            const selected = result
+        \\            return selected.value
         \\        _ -> ()
         \\    return 90
     , 42);
@@ -252,13 +259,10 @@ test "operation indexing replacement retains stored reference origins" {
         \\func calculate() int | none
         \\    var original = [17]
         \\    match original.get(0)
-        \\        ref item and item is int ->
-        \\            var values = [((match Ref.from(item)
-        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\                _ -> return none))]
-        \\            values[0] = ((match Ref.from(item)
-        \\                _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\                _ -> return none))
+        \\        ref _matched_item and _matched_item is int ->
+        \\            ref item = _matched_item
+        \\            var values = [Ref.from(item)]
+        \\            values[0] = Ref.from(item)
         \\            ref stored = values[0]
         \\            stored.value = 42
         \\            return item
@@ -302,12 +306,17 @@ test "List literal constructs contextual empty and byte lists in heap storage" {
         \\    const empty: List(int) = []
         \\    const bytes: List(byte) = [1, 2]
         \\    match values.get(0)
-        \\        ref first and first is int -> first = 20
+        \\        ref _matched_first and _matched_first is int ->
+        \\            ref first = _matched_first
+        \\            first = 20
         \\        _ -> ()
         \\    match values.get(0)
-        \\        ref first and first is int ->
+        \\        ref _matched_first and _matched_first is int ->
+        \\            ref first = _matched_first
         \\            match values.get(1)
-        \\                ref second and second is int -> return first + second + empty.len() + bytes.len() - 3
+        \\                ref _matched_second and _matched_second is int ->
+        \\                    ref second = _matched_second
+        \\                    return first + second + empty.len() + bytes.len() - 3
         \\                _ -> ()
         \\        _ -> ()
         \\    return 90
@@ -362,13 +371,16 @@ test "List prefix cleanup on explicit mismatch is reversed and skips later work"
         \\    var trace = Array(int, 1).filled(0)
         \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
         \\    match trace.get(0)
-        \\        ref target and target is int ->
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
         \\            match construct(Ref.from(target))
         \\                filtered_value_153 and filtered_value_153 is unit -> return 92
         \\                _ -> ()
         \\        _ -> ()
         \\    match trace.get(0)
-        \\        ref result and result is int -> return result
+        \\        ref _matched_result and _matched_result is int ->
+        \\            ref result = _matched_result
+        \\            return result
         \\        _ -> ()
         \\    return 93
         \\exit(run())
@@ -382,9 +394,11 @@ test "List explicit factory infers length and optional elements remain ordinary 
         \\    match List(int).from([19, 23])
         \\        values and values is List(int) ->
         \\            match values.get(0)
-        \\                ref first and first is int ->
+        \\                ref _matched_first and _matched_first is int ->
+        \\                    ref first = _matched_first
         \\                    match values.get(1)
-        \\                        ref second and second is int ->
+        \\                        ref _matched_second and _matched_second is int ->
+        \\                            ref second = _matched_second
         \\                            const optional = List(int | none).from([missing()])
         \\                            if not (optional is List(int | none)) -> return 91
         \\                            match optional[0]
@@ -443,7 +457,8 @@ test "List cleanup releases failed allocations and destroys completed lists in r
         \\    var trace = Array(int, 1).filled(0)
         \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
         \\    match trace.get(0)
-        \\        ref target and target is int ->
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
         \\            var iteration = 0
         \\            loop
         \\                if iteration == 384 -> break
@@ -456,15 +471,13 @@ test "List cleanup releases failed allocations and destroys completed lists in r
         \\                else
         \\                    return 92
         \\            target = 0
-        \\            const complete: List(Item) = [Item{trace = ((match Ref.from(target)
-        \\                _selected_result_4 and _selected_result_4 is Ref(int) -> _selected_result_4
-        \\                _ -> panic "unexpected none")), value = 2}, Item{trace = ((match Ref.from(target)
-        \\                    _selected_result_5 and _selected_result_5 is Ref(int) -> _selected_result_5
-        \\                    _ -> panic "unexpected none")), value = 4}]
+        \\            const complete: List(Item) = [Item{trace = Ref.from(target), value = 2}, Item{trace = Ref.from(target), value = 4}]
         \\            complete.len()
         \\        _ -> ()
         \\    match trace.get(0)
-        \\        ref result and result is int -> return result
+        \\        ref _matched_result and _matched_result is int ->
+        \\            ref result = _matched_result
+        \\            return result
         \\        _ -> ()
         \\    return 93
         \\exit(run())
@@ -478,12 +491,12 @@ test "List construction and borrowing preserve stored external reference origins
         \\    const original = Array(int, 1).filled(42)
         \\    if not (original is Array(int, 1)) -> panic "unexpected none"
         \\    match original.get(0)
-        \\        ref reference and reference is int ->
-        \\            const values = make(((match Ref.from(reference)
-        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\                _ -> panic "unexpected none")))
+        \\        ref _matched_reference and _matched_reference is int ->
+        \\            ref reference = _matched_reference
+        \\            const values = make(Ref.from(reference))
         \\            match values.get(0)
-        \\                ref stored and stored is Ref(int) ->
+        \\                ref _matched_stored and _matched_stored is Ref(int) ->
+        \\                    ref stored = _matched_stored
         \\                    const result = stored
         \\                    return result.value
         \\                _ -> ()
@@ -510,12 +523,9 @@ test "collection initializer consumers infer the pending shape and construct eac
         \\    var trace = Array(int, 1).filled(0)
         \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
         \\    match trace.get(0)
-        \\        ref target and target is int ->
-        \\            match count([element(((match Ref.from(target)
-        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\                _ -> panic "unexpected none"))), element(((match Ref.from(target)
-        \\                    _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\                    _ -> panic "unexpected none")))
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
+        \\            match count([element(Ref.from(target)), element(Ref.from(target))
         \\            ])
         \\                size and size is int -> return target + size + 38
         \\                _ -> ()
@@ -532,11 +542,15 @@ test "collection literals default contextual empty nested and byte arrays have p
         \\    const bytes: Array(byte, 2) = [1, 2]
         \\    const nested: Array(Array(int, 2), 1) = [[19, 23]]
         \\    match values.get(0)
-        \\        ref first and first is int ->
+        \\        ref _matched_first and _matched_first is int ->
+        \\            ref first = _matched_first
         \\            match nested.get(0)
-        \\                ref last and last is Array(int, 2) ->
+        \\                ref _matched_last and _matched_last is Array(int, 2) ->
+        \\                    ref last = _matched_last
         \\                    match last.get(1)
-        \\                        ref second and second is int -> return first + second + empty.len() + bytes.len() - 2
+        \\                        ref _matched_second and _matched_second is int ->
+        \\                            ref second = _matched_second
+        \\                            return first + second + empty.len() + bytes.len() - 2
         \\                        _ -> ()
         \\                _ -> ()
         \\        _ -> ()
@@ -567,13 +581,16 @@ test "Array prefix cleanup on explicit mismatch is reversed and skips later work
         \\    var trace = Array(int, 1).filled(0)
         \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
         \\    match trace.get(0)
-        \\        ref target and target is int ->
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
         \\            match construct(Ref.from(target))
         \\                filtered_value_154 and filtered_value_154 is unit -> return 92
         \\                _ -> ()
         \\        _ -> ()
         \\    match trace.get(0)
-        \\        ref result and result is int -> return result
+        \\        ref _matched_result and _matched_result is int ->
+        \\            ref result = _matched_result
+        \\            return result
         \\        _ -> ()
         \\    return 93
     , 42);
@@ -586,12 +603,17 @@ test "Array integer fill get and get_mut have native and comptime parity" {
         \\    var values = Array(int, 3).filled(20)
         \\    if not (values is Array(int, 3)) -> panic "unexpected none"
         \\    match values.get(1)
-        \\        ref middle and middle is int -> middle = 22
+        \\        ref _matched_middle and _matched_middle is int ->
+        \\            ref middle = _matched_middle
+        \\            middle = 22
         \\        _ -> return 90
         \\    match values.get(0)
-        \\        ref first and first is int ->
+        \\        ref _matched_first and _matched_first is int ->
+        \\            ref first = _matched_first
         \\            match values.get(1)
-        \\                ref middle and middle is int -> return first + middle
+        \\                ref _matched_middle and _matched_middle is int ->
+        \\                    ref middle = _matched_middle
+        \\                    return first + middle
         \\                _ -> ()
         \\        _ -> ()
         \\    return 91
@@ -609,7 +631,9 @@ test "Array filled evaluates its source once" {
         \\    const values = Array(int, 4).filled(next(calls))
         \\    if not (values is Array(int, 4)) -> panic "unexpected none"
         \\    match values.get(3)
-        \\        ref last and last is int -> return last + calls
+        \\        ref _matched_last and _matched_last is int ->
+        \\            ref last = _matched_last
+        \\            return last + calls
         \\        _ -> ()
         \\    return 90
     , 42);
@@ -644,7 +668,9 @@ test "Array populated bounds reject negative and past end indices" {
         \\    if (values.get(-1) is int) -> return 92
         \\    if (values.get(2) is int) -> return 93
         \\    match values.get(1)
-        \\        ref last and last is int -> return last
+        \\        ref _matched_last and _matched_last is int ->
+        \\            ref last = _matched_last
+        \\            return last
         \\        _ -> ()
         \\    return 94
     , 42);
@@ -659,9 +685,12 @@ test "Array nested fill and element borrows retain shape" {
         \\    const matrix = Array(Array(int, 3), 2).filled(row)
         \\    if not (matrix is Array(Array(int, 3), 2)) -> panic "unexpected none"
         \\    match matrix.get(1)
-        \\        ref selected and selected is Array(int, 3) ->
+        \\        ref _matched_selected and _matched_selected is Array(int, 3) ->
+        \\            ref selected = _matched_selected
         \\            match selected.get(2)
-        \\                ref cell and cell is int -> return cell
+        \\                ref _matched_cell and _matched_cell is int ->
+        \\                    ref cell = _matched_cell
+        \\                    return cell
         \\                _ -> ()
         \\        _ -> ()
         \\    return 90
@@ -682,7 +711,9 @@ test "Array fill and whole copy invoke immovable element custom copies" {
         \\    const copied = values.copy()
         \\    if original.value <> 40 -> return 90
         \\    match copied.get(2)
-        \\        ref selected and selected is Item -> return selected.value
+        \\        ref _matched_selected and _matched_selected is Item ->
+        \\            ref selected = _matched_selected
+        \\            return selected.value
         \\        _ -> ()
         \\    return 91
     , 42);
@@ -701,7 +732,9 @@ test "Array whole move invokes element custom moves" {
         \\    if not (values is Array(Item, 3)) -> panic "unexpected none"
         \\    const moved = values.move()
         \\    match moved.get(2)
-        \\        ref selected and selected is Item -> return selected.value
+        \\        ref _matched_selected and _matched_selected is Item ->
+        \\            ref selected = _matched_selected
+        \\            return selected.value
         \\        _ -> ()
         \\    return 90
     , 42);
@@ -721,9 +754,12 @@ test "Array nested whole copies invoke every element custom copy" {
         \\    if not (matrix is Array(Array(Item, 3), 2)) -> panic "unexpected none"
         \\    const copied = matrix.copy()
         \\    match copied.get(1)
-        \\        ref selected and selected is Array(Item, 3) ->
+        \\        ref _matched_selected and _matched_selected is Array(Item, 3) ->
+        \\            ref selected = _matched_selected
         \\            match selected.get(2)
-        \\                ref cell and cell is Item -> return cell.value
+        \\                ref _matched_cell and _matched_cell is Item ->
+        \\                    ref cell = _matched_cell
+        \\                    return cell.value
         \\                _ -> ()
         \\        _ -> ()
         \\    return 90
@@ -743,15 +779,22 @@ test "Array automatic cleanup drops elements in reverse index order" {
         \\    var values = Array(Item, 2).filled(Item{value = 0})
         \\    if not (values is Array(Item, 2)) -> panic "unexpected none"
         \\    match values.get(0)
-        \\        ref first and first is Item -> first = Item{value = 41}
+        \\        ref _matched_first and _matched_first is Item ->
+        \\            ref first = _matched_first
+        \\            first = Item{value = 41}
         \\        _ -> ()
         \\    match values.get(1)
-        \\        ref last and last is Item -> last = Item{value = 42}
+        \\        ref _matched_last and _matched_last is Item ->
+        \\            ref last = _matched_last
+        \\            last = Item{value = 42}
         \\        _ -> ()
         \\    match values.get(0)
-        \\        ref first and first is Item ->
+        \\        ref _matched_first and _matched_first is Item ->
+        \\            ref first = _matched_first
         \\            match values.get(1)
-        \\                ref last and last is Item -> if first.value + last.value <> 83 -> exit(90)
+        \\                ref _matched_last and _matched_last is Item ->
+        \\                    ref last = _matched_last
+        \\                    if first.value + last.value <> 83 -> exit(90)
         \\                _ -> ()
         \\        _ -> ()
         \\run()
@@ -810,7 +853,9 @@ test "Array borrowed element cannot escape its local array" {
         \\    const values = Array(int, 2).filled(42)
         \\    if not (values is Array(int, 2)) -> panic "unexpected none"
         \\    match values.get(1)
-        \\        ref selected and selected is int -> return Ref.from(selected)
+        \\        ref _matched_selected and _matched_selected is int ->
+        \\            ref selected = _matched_selected
+        \\            return Ref.from(selected)
         \\        _ -> ()
         \\    return bad()
         \\const reference = bad()
@@ -824,9 +869,7 @@ test "Array fill cannot return references to a local source" {
         \\import std.memory.{Ref}
         \\func bad() Array(Ref(int), 2)
         \\    const value = 42
-        \\    return ((match Array(Ref(int), 2).filled(Ref.from(value))
-        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 2) -> _selected_result_0^
-        \\        _ -> panic "unexpected none"))
+        \\    return Array(Ref(int), 2).filled(Ref.from(value))
         \\const values = bad()
         \\exit(values.len())
     , .borrow_outlives_source);
@@ -837,16 +880,14 @@ test "Array fill and nested reference reads preserve runtime source dependencies
         \\import std.array.{Array}
         \\import std.memory.{Ref}
         \\func fill(imm source: Ref(int)) Array(Ref(int), 2)
-        \\    return ((match Array(Ref(int), 2).filled(source)
-        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 2) -> _selected_result_0^
-        \\        _ -> panic "unexpected none"))
+        \\    return Array(Ref(int), 2).filled(source)
         \\func run() int
         \\    const value = 42
-        \\    const values = fill(((match Ref.from(value)
-        \\        _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\        _ -> panic "unexpected none")))
+        \\    const values = fill(Ref.from(value))
         \\    match values.get(1)
-        \\        ref selected and selected is Ref(int) -> return selected.value
+        \\        ref _matched_selected and _matched_selected is Ref(int) ->
+        \\            ref selected = _matched_selected
+        \\            return selected.value
         \\        _ -> ()
         \\    return 90
     , 42);
@@ -858,7 +899,9 @@ test "Array get_mut requires mutable source storage" {
         \\const values = Array(int, 2).filled(42)
         \\if not (values is Array(int, 2)) -> panic "unexpected none"
         \\match values.get(0)
-        \\    ref selected and selected is int -> selected = 1
+        \\    ref _matched_selected and _matched_selected is int ->
+        \\        ref selected = _matched_selected
+        \\        selected = 1
         \\    _ -> ()
         \\exit(42)
     );
@@ -893,18 +936,17 @@ test "Array copy hooks cannot invalidate pending borrows" {
 
 test "Array static nested values publish into runtime storage" {
     try Fixture.expectSourceExit(
-        \\static row = ((match Array(int, 2).filled(20)
-        \\    _selected_result_0 and _selected_result_0 is Array(int, 2) -> _selected_result_0^
-        \\    _ -> panic "unexpected none"))
-        \\static matrix = ((match Array(Array(int, 2), 2).filled(row)
-        \\    _selected_result_1 and _selected_result_1 is Array(Array(int, 2), 2) -> _selected_result_1^
-        \\    _ -> panic "unexpected none"))
+        \\static row = Array(int, 2).filled(20)
+        \\static matrix = Array(Array(int, 2), 2).filled(row)
         \\func run() int
         \\    const values = matrix
         \\    match values.get(1)
-        \\        ref selected and selected is Array(int, 2) ->
+        \\        ref _matched_selected and _matched_selected is Array(int, 2) ->
+        \\            ref selected = _matched_selected
         \\            match selected.get(0)
-        \\                ref value and value is int -> return value + row.len() + 20
+        \\                ref _matched_value and _matched_value is int ->
+        \\                    ref value = _matched_value
+        \\                    return value + row.len() + 20
         \\                _ -> ()
         \\        _ -> ()
         \\    return 90
@@ -930,15 +972,17 @@ test "Array embedded storage supports checked mutable access" {
         \\    values: Array(int, 3)
         \\    copy = fieldwise
         \\func run() int
-        \\    var holder = Holder{values = ((match Array(int, 3).filled(20)
-        \\        _selected_result_0 and _selected_result_0 is Array(int, 3) -> _selected_result_0^
-        \\        _ -> panic "unexpected none"))}
+        \\    var holder = Holder{values = Array(int, 3).filled(20)}
         \\    match holder.values.get(1)
-        \\        ref selected and selected is int -> selected = 22
+        \\        ref _matched_selected and _matched_selected is int ->
+        \\            ref selected = _matched_selected
+        \\            selected = 22
         \\        _ -> return 90
         \\    const copied = holder.copy()
         \\    match copied.values.get(1)
-        \\        ref selected and selected is int -> return selected + 20
+        \\        ref _matched_selected and _matched_selected is int ->
+        \\            ref selected = _matched_selected
+        \\            return selected + 20
         \\        _ -> ()
         \\    return 91
     , 42);
@@ -948,17 +992,19 @@ test "Array boxed inline storage retains mutable element references" {
     try Fixture.expectParity(
         \\import std.memory
         \\func calculate() int | none
-        \\    var owner = Box.new(((match Array(int, 3).filled(20)
-        \\        _selected_result_0 and _selected_result_0 is Array(int, 3) -> _selected_result_0^
-        \\        _ -> panic "unexpected none")))
+        \\    var owner = Box.new(Array(int, 3).filled(20))
         \\    if not (owner is Box(Array(int, 3))) -> return none
         \\    var values = Ref.from(owner.borrow())
         \\    if not (values is Ref(Array(int, 3))) -> return none
         \\    match values.value.get(1)
-        \\        ref selected and selected is int -> selected = 22
+        \\        ref _matched_selected and _matched_selected is int ->
+        \\            ref selected = _matched_selected
+        \\            selected = 22
         \\        _ -> return 90
         \\    match values.value.get(1)
-        \\        ref selected and selected is int -> return selected + 20
+        \\        ref _matched_selected and _matched_selected is int ->
+        \\            ref selected = _matched_selected
+        \\            return selected + 20
         \\        _ -> ()
         \\    return 91
         \\func run() int
@@ -984,7 +1030,9 @@ test "Array variant payload copies immovable nested elements in place" {
         \\        Array(Item, 2) ->
         \\            const selected = possible
         \\            match selected.get(1)
-        \\                ref element and element is Item -> return element.value
+        \\                ref _matched_element and _matched_element is Item ->
+        \\                    ref element = _matched_element
+        \\                    return element.value
         \\                _ -> ()
         \\        _ -> ()
         \\    return 90
@@ -1012,13 +1060,13 @@ test "Array whole copies retain contained reference origins" {
         \\    return values.copy()
         \\func run() int
         \\    const source = 42
-        \\    const original = Array(Ref(int), 2).filled(((match Ref.from(source)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")))
+        \\    const original = Array(Ref(int), 2).filled(Ref.from(source))
         \\    if not (original is Array(Ref(int), 2)) -> panic "unexpected none"
         \\    const values = duplicate(original)
         \\    match values.get(1)
-        \\        ref selected and selected is Ref(int) -> return selected.value
+        \\        ref _matched_selected and _matched_selected is Ref(int) ->
+        \\            ref selected = _matched_selected
+        \\            return selected.value
         \\        _ -> ()
         \\    return 90
     , 42);
@@ -1040,10 +1088,9 @@ test "Array element references observe whole storage replacement" {
         \\    var values = Array(int, 2).filled(42)
         \\    if not (values is Array(int, 2)) -> panic "unexpected none"
         \\    match values.get(1)
-        \\        ref selected and selected is int ->
-        \\            values = ((match Array(int, 2).filled(17)
-        \\                _selected_result_0 and _selected_result_0 is Array(int, 2) -> _selected_result_0^
-        \\                _ -> panic "unexpected none"))
+        \\        ref _matched_selected and _matched_selected is int ->
+        \\            ref selected = _matched_selected
+        \\            values = Array(int, 2).filled(17)
         \\            return selected
         \\        _ -> ()
         \\    return 90
@@ -1094,9 +1141,7 @@ test "Array mutable alias calls retain newly stored reference origins" {
         \\import std.memory
         \\import std.memory.{Ref}
         \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
-        \\    values = ((match Array(Ref(int), 1).filled(reference)
-        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 1) -> _selected_result_0^
-        \\        _ -> panic "unexpected none"))
+        \\    values = Array(Ref(int), 1).filled(reference)
         \\func run() int
         \\    const original = 42
         \\    var values = Array(Ref(int), 1).filled(Ref.from(original))
@@ -1106,7 +1151,9 @@ test "Array mutable alias calls retain newly stored reference origins" {
         \\        ref selected = values
         \\        overwrite(selected, Ref.from(temporary))
         \\    match values.get(0)
-        \\        ref selected and selected is Ref(int) -> return selected.value
+        \\        ref _matched_selected and _matched_selected is Ref(int) ->
+        \\            ref selected = _matched_selected
+        \\            return selected.value
         \\        _ -> ()
         \\    return 90
         \\exit(run())
@@ -1118,14 +1165,10 @@ test "Array dereferenced mutable aliases cannot retain short-lived references" {
         \\import std.memory
         \\import std.memory.{Ref}
         \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
-        \\    values = ((match Array(Ref(int), 1).filled(reference)
-        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 1) -> _selected_result_0^
-        \\        _ -> panic "unexpected none"))
+        \\    values = Array(Ref(int), 1).filled(reference)
         \\func run() int | none
         \\    const original = 42
-        \\    var owner = Box.new(((match Array(Ref(int), 1).filled(Ref.from(original))
-        \\        _selected_result_1 and _selected_result_1 is Array(Ref(int), 1) -> _selected_result_1^
-        \\        _ -> panic "unexpected none")))
+        \\    var owner = Box.new(Array(Ref(int), 1).filled(Ref.from(original)))
         \\    if not (owner is Box(Array(Ref(int), 1))) -> return none
         \\    if 1 == 1
         \\        const temporary = 17
@@ -1133,7 +1176,9 @@ test "Array dereferenced mutable aliases cannot retain short-lived references" {
         \\        overwrite(selected.value, Ref.from(temporary))
         \\    var selected = Ref.from(owner.borrow())
         \\    match selected.value.get(0)
-        \\        ref element and element is Ref(int) -> return element.value
+        \\        ref _matched_element and _matched_element is Ref(int) ->
+        \\            ref element = _matched_element
+        \\            return element.value
         \\        _ -> ()
         \\    return 90
         \\match run()
@@ -1147,22 +1192,20 @@ test "Array boxed mutable aliases retain long-lived reference origins" {
         \\import std.memory
         \\import std.memory.{Ref}
         \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
-        \\    values = ((match Array(Ref(int), 1).filled(reference)
-        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 1) -> _selected_result_0^
-        \\        _ -> panic "unexpected none"))
+        \\    values = Array(Ref(int), 1).filled(reference)
         \\func run() int | none
         \\    const original = 17
         \\    const replacement = 42
-        \\    var owner = Box.new(((match Array(Ref(int), 1).filled(Ref.from(original))
-        \\        _selected_result_1 and _selected_result_1 is Array(Ref(int), 1) -> _selected_result_1^
-        \\        _ -> panic "unexpected none")))
+        \\    var owner = Box.new(Array(Ref(int), 1).filled(Ref.from(original)))
         \\    if not (owner is Box(Array(Ref(int), 1))) -> return none
         \\    if 1 == 1
         \\        var selected = Ref.from(owner.borrow())
         \\        overwrite(selected.value, Ref.from(replacement))
         \\    var selected = Ref.from(owner.borrow())
         \\    match selected.value.get(0)
-        \\        ref element and element is Ref(int) -> return element.value
+        \\        ref _matched_element and _matched_element is Ref(int) ->
+        \\            ref element = _matched_element
+        \\            return element.value
         \\        _ -> ()
         \\    return 90
         \\match run()
@@ -1176,17 +1219,13 @@ test "Array reference parameters retain caller origins when storing other inputs
         \\import std.memory
         \\import std.memory.{Ref}
         \\func overwrite(mut values: Array(Ref(int), 1), imm reference: Ref(int))
-        \\    values = ((match Array(Ref(int), 1).filled(reference)
-        \\        _selected_result_0 and _selected_result_0 is Array(Ref(int), 1) -> _selected_result_0^
-        \\        _ -> panic "unexpected none"))
+        \\    values = Array(Ref(int), 1).filled(reference)
         \\func change(var target: Ref(Array(Ref(int), 1)), replacement: Ref(int))
         \\    var selected = Ref.from(target.value)
         \\    overwrite(selected.value, replacement)
         \\func run() int | none
         \\    const original = 42
-        \\    var owner = Box.new(((match Array(Ref(int), 1).filled(Ref.from(original))
-        \\        _selected_result_1 and _selected_result_1 is Array(Ref(int), 1) -> _selected_result_1^
-        \\        _ -> panic "unexpected none")))
+        \\    var owner = Box.new(Array(Ref(int), 1).filled(Ref.from(original)))
         \\    if not (owner is Box(Array(Ref(int), 1))) -> return none
         \\    change(Ref.from(owner.borrow()), Ref.from(original))
         \\    return 42
@@ -1205,10 +1244,9 @@ test "compile-time direct scalar arguments copy caller storage before mutation" 
         \\    var values = Array(int, 1).filled(20)
         \\    if not (values is Array(int, 1)) -> panic "unexpected none"
         \\    match values.get(0)
-        \\        ref target and target is int ->
-        \\            return observe(target, ((match Ref.from(target)
-        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\                _ -> panic "unexpected none")))
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
+        \\            return observe(target, Ref.from(target))
         \\        _ -> ()
         \\    return 90
     , 42);
@@ -1221,10 +1259,9 @@ test "compile-time variant coercion preserves returned reference payloads" {
         \\    const values = Array(int, 1).filled(42)
         \\    if not (values is Array(int, 1)) -> panic "unexpected none"
         \\    match values.get(0)
-        \\        ref reference and reference is int ->
-        \\            match choose(((match Ref.from(reference)
-        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\                _ -> panic "unexpected none")))
+        \\        ref _matched_reference and _matched_reference is int ->
+        \\            ref reference = _matched_reference
+        \\            match choose(Ref.from(reference))
         \\                selected and selected is Ref(int) -> return selected.value
         \\                _ -> ()
         \\        _ -> ()
@@ -1239,7 +1276,9 @@ test "Array immutable arguments permit widening address-passed movable values" {
         \\        Array(int, 2) ->
         \\            const values = possible
         \\            match values.get(1)
-        \\                ref selected and selected is int -> return selected
+        \\                ref _matched_selected and _matched_selected is int ->
+        \\                    ref selected = _matched_selected
+        \\                    return selected
         \\                _ -> ()
         \\        _ -> ()
         \\    return 90
@@ -1261,9 +1300,7 @@ test "compile-time direct reference arguments copy handles without copying refer
         \\    var reference = Ref.from(original)
         \\    if not (reference is Ref(int)) -> panic "unexpected none"
         \\    const captured = reference
-        \\    retarget(reference, ((match Ref.from(replacement)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")))
+        \\    retarget(reference, Ref.from(replacement))
         \\    return captured.value + reference.value
     , 42);
 }
@@ -1277,10 +1314,9 @@ test "compile-time reference variants support widening and conditional results" 
         \\    const values = Array(int, 1).filled(42)
         \\    if not (values is Array(int, 1)) -> panic "unexpected none"
         \\    match values.get(0)
-        \\        ref reference and reference is int ->
-        \\            const possible = choose(((match Ref.from(reference)
-        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\                _ -> panic "unexpected none")))
+        \\        ref _matched_reference and _matched_reference is int ->
+        \\            ref reference = _matched_reference
+        \\            const possible = choose(Ref.from(reference))
         \\            match widen(possible)
         \\                selected and selected is Ref(int) -> return selected.value
         \\                _ -> ()

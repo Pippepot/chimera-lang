@@ -13,8 +13,8 @@ pub const Generation = struct {
     cleanup_fields: bool,
     cleanup_condition: ?structures.FunctionValueId = null,
     lifetime_origin: ?GenerationId = null,
-    cleanup_members: ?[]const structures.TypeId = null,
-    missing_fields: []const []const u32 = &.{},
+    cleanup_selections: []const @import("cleanup_shape.zig").Selection = &.{},
+    missing_fields: []const []const structures.ReferencePathStep = &.{},
 };
 
 pub const LifetimeEffect = union(enum) {

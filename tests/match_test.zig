@@ -202,9 +202,7 @@ test "tuple match conditions inspect the actual custom copy" {
         \\        return Item{copies = self.copies, value = self.value + 1}
         \\func run() int
         \\    var copies = 0
-        \\    const pair = (Item{copies = ((match Ref.from(copies)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), value = 40}, 1)
+        \\    const pair = (Item{copies = Ref.from(copies), value = 40}, 1)
         \\    const result = match pair
         \\        (item, extra) and item.value == 0 -> 90
         \\        (item, extra) and item.value == 41 -> item.value + extra
@@ -381,15 +379,11 @@ test "tuple match guard derived references survive stable ownership commit" {
         \\    drops: Ref(int)
         \\    drop = func(deinit self: Fixed) -> self.drops.value += 1
         \\func remember(imm item: Fixed, mut saved: Ref(Fixed) | none) unit
-        \\    saved = ((match Ref.from(item)
-        \\        _selected_result_0 and _selected_result_0 is Ref(Fixed) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))
+        \\    saved = Ref.from(item)
         \\func run() int
         \\    var drops = 0
         \\    var saved: Ref(Fixed) | none = none
-        \\    const result = match (Fixed{value = 42, drops = ((match Ref.from(drops)
-        \\        _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\        _ -> panic "unexpected none"))}, 0
+        \\    const result = match (Fixed{value = 42, drops = Ref.from(drops)}, 0
         \\    )
         \\        (item, _) and (remember(item, saved) is unit) ->
         \\            match saved
@@ -869,9 +863,7 @@ test "guarded match catch all copies retain feasible cleanup without changing th
         \\func dispose(deinit token: Token) unit -> ()
         \\func run() int
         \\    var drops = 0
-        \\    const owner: Token | Item = Item{drops = ((match Ref.from(drops)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    const owner: Token | Item = Item{drops = Ref.from(drops)}
         \\    const answer = match owner
         \\        Token ->
         \\            match owner
@@ -1112,23 +1104,17 @@ test "match selected and rejected owners are dropped once with ASAP timing" {
         \\    digit: int
         \\    drop = func(deinit self: Tracked)
         \\        self.trace.value = self.trace.value * 10 + self.digit
-        \\func produce(ref trace: int) Tracked | int | none -> Tracked{trace = ((match Ref.from(trace)
-        \\    _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\    _ -> panic "unexpected none")), digit = 1}
+        \\func produce(ref trace: int) Tracked | int | none -> Tracked{trace = Ref.from(trace), digit = 1}
         \\func observe(imm first: Tracked, imm second: Tracked) -> ()
         \\func run() int
         \\    var trace = 0
-        \\    const outer = Tracked{trace = ((match Ref.from(trace)
-        \\        _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\        _ -> panic "unexpected none")), digit = 2}
+        \\    const outer = Tracked{trace = Ref.from(trace), digit = 2}
         \\    match produce(trace)
         \\        none -> ()
         \\        0 -> ()
         \\        int -> ()
         \\        Tracked ->
-        \\            const inner = Tracked{trace = ((match Ref.from(trace)
-        \\                _selected_result_2 and _selected_result_2 is Ref(int) -> _selected_result_2
-        \\                _ -> panic "unexpected none")), digit = 3}
+        \\            const inner = Tracked{trace = Ref.from(trace), digit = 3}
         \\            observe(outer, inner)
         \\    if trace == 132 -> return 42
         \\    return trace
@@ -1148,9 +1134,7 @@ test "match narrows explicit drop obligations across continuations" {
         \\func dispose(deinit token: Token) -> ()
         \\func produce(ref trace: int, token: bool) Token | Tracked | none
         \\    if token -> return Token{number = 19}
-        \\    return Tracked{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    return Tracked{trace = Ref.from(trace)}
         \\func inspect(ref trace: int, token: bool) int
         \\    return match produce(trace, token)
         \\        none -> 90
@@ -1510,14 +1494,10 @@ test "match captures use ordinary copy hooks and explicit transfer" {
         \\        return Item{copies = self.copies, value = self.value}
         \\func run() int
         \\    var copies = 0
-        \\    const owner = Item{copies = ((match Ref.from(copies)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), value = 14}
+        \\    const owner = Item{copies = Ref.from(copies), value = 14}
         \\    const first = match owner
         \\        selected -> selected.value
-        \\    const second = match Item{copies = ((match Ref.from(copies)
-        \\        _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\        _ -> panic "unexpected none")), value = 14}
+        \\    const second = match Item{copies = Ref.from(copies), value = 14}
         \\        selected -> selected.value
         \\    const third = match owner^
         \\        selected -> selected.value
@@ -1543,9 +1523,7 @@ test "match whole owning captures retain only feasible drop obligations" {
         \\    trace: Ref(int)
         \\    drop = func(deinit self: Tracked) -> self.trace.value += 1
         \\func dispose(deinit token: Token) -> ()
-        \\func produce(ref trace: int) Token | Tracked | none -> Tracked{trace = ((match Ref.from(trace)
-        \\    _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\    _ -> panic "unexpected none"))}
+        \\func produce(ref trace: int) Token | Tracked | none -> Tracked{trace = Ref.from(trace)}
         \\func run() int
         \\    var trace = 0
         \\    const result = match produce(trace)
@@ -1590,7 +1568,7 @@ test "match rejects borrowed subset layouts and ambiguous text domains" {
         \\        match selected
         \\            int | bool ->
         \\                ref subset = selected
-        \\                ()
+        \\                exit(0)
         \\            _ -> ()
     , .reference_projection_requires_member);
     try Fixture.expectSourceDiagnostic(

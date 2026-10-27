@@ -6,8 +6,8 @@ Chimera brings native code and checked ownership to a small, expressive syntax.
 Describe optional values and errors with variants, bind their alternatives
 explicitly, and run ordinary functions at compile time.
 
-Flow typing is unfinished; see the [implementation handoff](docs/FLOW_TYPING_HANDOFF.md)
-for known failures and remaining work.
+Flow typing is implemented; final verification and performance acceptance remain.
+See the [status and remaining work](docs/FLOW_TYPING_HANDOFF.md).
 
 ## A first look
 
@@ -35,8 +35,8 @@ hold an integer or be absent:
 ```chimera
 const limit: int | none = 42
 
-if const value: int = limit
-  exit(value)
+if limit is int
+  exit(limit)
 else
   exit(64)
 ```
@@ -44,9 +44,9 @@ else
 `int | none` is a **variant**: here, either an integer or the value `none`.
 Assign either directly; there is no wrapper to construct.
 
-`if const value: int = limit` tests the active alternative and names the integer
-inside the first branch. Otherwise, `else` runs. The annotation is a pattern;
-it does not convert the value.
+`limit is int` tests the active alternative. Inside that branch, reads of
+`limit` have type `int`; otherwise, `else` runs. An annotation declares a type
+and never filters alternatives.
 Change `42` to `none` and the program uses the default exit code of `64`.
 
 Variants are not limited to optional values. Combine types with `|` to describe
@@ -165,7 +165,9 @@ A `ref` binding aliases existing storage and inherits its permission:
 
 ```chimera
 var scores = [20, 21]
-if ref item: int = scores.get(1)
+const result = scores.get(1)
+if result is int
+  ref item = result
   item += 1
 ```
 

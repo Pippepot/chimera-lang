@@ -177,9 +177,7 @@ test "references owned optional argument preparation copies only successful payl
         \\    return 0
         \\func run() int
         \\    var copies = 0
-        \\    const values = [Item{copies = ((match Ref.from(copies)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), value = 20}]
+        \\    const values = [Item{copies = Ref.from(copies), value = 20}]
         \\    var total = 0
         \\    for index in 0..3 -> total += receive(values.get(index % 2))
         \\    return total + copies
@@ -280,11 +278,7 @@ test "references custom drops enforce projected write authority and effects" {
         \\    var owner: String = "abc"
         \\    const view = owner.view()
         \\    var trace = 0
-        \\    discard(Observer{owner = ((match Ref.from(owner)
-        \\        _selected_result_0 and _selected_result_0 is Ref(String) -> _selected_result_0
-        \\        _ -> return none)), trace = ((match Ref.from(trace)
-        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\            _ -> return none))})
+        \\    discard(Observer{owner = Ref.from(owner), trace = Ref.from(trace)})
         \\    return view.byte_length() + trace + 36
         \\func run() int
         \\    match calculate()
@@ -363,7 +357,7 @@ test "references ownership hooks export temporal writes at their call sites" {
             \\struct Hook
             \\    target: Ref(String)
             \\    $member = func($mode self: Hook) Hook
-            \\        const _: unit = self.target.value.append("x") else panic "append failed"
+            \\        if not (self.target.value.append("x") is unit) -> panic "append failed"
             \\        return Hook{target = self.target}
             \\struct Wrapper
             \\    $member = fieldwise
@@ -458,10 +452,9 @@ test "references readonly borrows preserve owner cleanup authority" {
         \\    var trace = Array(int, 1).filled(0)
         \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
         \\    match trace.get(0)
-        \\        ref target and target is int ->
-        \\            match calculate(((match Ref.from(target)
-        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\                _ -> panic "unexpected none")))
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
+        \\            match calculate(Ref.from(target))
         \\                value and value is int -> return value + target
         \\                _ -> ()
         \\        _ -> ()
@@ -592,10 +585,14 @@ test "references borrowed func results bind conditionally without copying" {
         \\func run() int
         \\    var owner = Payload{value = 12}
         \\    match select(owner, 0)
-        \\        ref item and item is Payload -> item.value += 30
+        \\        ref _matched_item and _matched_item is Payload ->
+        \\            ref item = _matched_item
+        \\            item.value += 30
         \\        _ -> ()
         \\    match select(owner, 1)
-        \\        ref absent and absent is Payload -> return 90
+        \\        ref _matched_absent and _matched_absent is Payload ->
+        \\            ref absent = _matched_absent
+        \\            return 90
         \\        _ -> ()
         \\    return owner.value
     , 42);
@@ -673,8 +670,6 @@ test "references variant construction rejects ambiguous storage selection" {
         \\        int ->
         \\            ref result = carrier
         \\            return result
-        \\        _ -> ()
-        \\    return 90
     , 42);
 }
 
@@ -737,8 +732,6 @@ test "references variant union matches copy logical reference payloads" {
         \\                    return value + 25
         \\                _ -> ()
         \\            return 42
-        \\        _ -> ()
-        \\    return 90
         \\func run() int
         \\    var owner = 17
         \\    if inspect(owner, true) <> 42 -> return 91
@@ -804,9 +797,7 @@ test "references readonly recursive owners preserve captured authority when forw
         \\func forward(imm node: Node) -> update(node)
         \\func run() int
         \\    var target = 41
-        \\    const node = Node{next = none, target = ((match Ref.from(target)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    const node = Node{next = none, target = Ref.from(target)}
         \\    forward(node)
         \\    return target
     , 42);
@@ -857,13 +848,9 @@ test "references readonly recursive owners return writable captured handles" {
         \\func forward(imm node: Node) Ref(int) -> selected(node)
         \\func calculate() int | none
         \\    var target = 41
-        \\    var leaf = Box.new(Node{next = none, target = ((match Ref.from(target)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))})
+        \\    var leaf = Box.new(Node{next = none, target = Ref.from(target)})
         \\    if not (leaf is Box(Node)) -> return none
-        \\    const root = Node{next = leaf^, target = ((match Ref.from(target)
-        \\        _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\        _ -> return none))}
+        \\    const root = Node{next = leaf^, target = Ref.from(target)}
         \\    const handle = forward(root)
         \\    handle.value += 1
         \\    return target
@@ -886,9 +873,7 @@ test "references recursive parameter outputs retain replacement authority and li
         \\            ref next = node.next
         \\            replace(next.borrow(), source)
         \\        _ ->
-        \\            node.target = ((match Ref.from(source)
-        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\                _ -> panic "unexpected none"))
+        \\            node.target = Ref.from(source)
         \\func selected(ref node: Node) Ref(int)
         \\    match node.next
         \\        Box(Node) ->
@@ -899,13 +884,9 @@ test "references recursive parameter outputs retain replacement authority and li
         \\func calculate() int | none
         \\    var original = 0
         \\    var replacement = 41
-        \\    var leaf = Box.new(Node{next = none, target = ((match Ref.from(original)
-        \\        _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\        _ -> panic "unexpected none"))})
+        \\    var leaf = Box.new(Node{next = none, target = Ref.from(original)})
         \\    if not (leaf is Box(Node)) -> return none
-        \\    var root = Node{next = leaf^, target = ((match Ref.from(original)
-        \\        _selected_result_2 and _selected_result_2 is Ref(int) -> _selected_result_2
-        \\        _ -> return none))}
+        \\    var root = Node{next = leaf^, target = Ref.from(original)}
         \\    replace(root, replacement)
         \\    const handle = selected(root)
         \\    handle.value += 1
@@ -971,7 +952,7 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\    var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
         \\    const result = zipped.next()
         \\    match result
-        \\        (ref Left, ref Right) ->
+        \\        (Left, Right) ->
         \\            ref pair = result
         \\            pair.0.value += 30
         \\            if pair.1.value <> 7 -> return 90
@@ -985,7 +966,7 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
         \\const result = zipped.next()
         \\match result
-        \\    (ref Left, ref Right) ->
+        \\    (Left, Right) ->
         \\        ref pair = result
         \\        pair.1.value += 1
         \\    _ -> ()
@@ -996,7 +977,7 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\    var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
         \\    const result = zipped.next()
         \\    match result
-        \\        (ref Left, ref Right) ->
+        \\        (Left, Right) ->
         \\            const pair = result
         \\            return pair.0
         \\        _ -> ()
@@ -1014,7 +995,7 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\    var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
         \\    const result = zipped.next()
         \\    match result
-        \\        (ref Left, ref Right) ->
+        \\        (Left, Right) ->
         \\            const pair = result
         \\            if pair.0.value <> 7 -> return 90
         \\            pair.1.value += 30
@@ -1028,7 +1009,7 @@ test "references generic borrowed zip preserves independent tuple captures" {
         \\var zipped = Zip(Cursor(Left), Cursor(Right), Left, Right){left = Cursor(Left){source = Ref.from(left), ready = true}, right = Cursor(Right){source = Ref.from(right), ready = true}}
         \\const result = zipped.next()
         \\match result
-        \\    (ref Left, ref Right) ->
+        \\    (Left, Right) ->
         \\        const pair = result
         \\        pair.0.value += 1
         \\    _ -> ()
@@ -1051,9 +1032,7 @@ test "references tuples own cleanup only for owned members" {
         \\    _ = copied.1.value
         \\func run() int
         \\    var effects = 0
-        \\    var owner = Tracked{value = 17, effects = ((match Ref.from(effects)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    var owner = Tracked{value = 17, effects = Ref.from(effects)}
         \\    exercise(owner)
         \\    const result = effects + 20
         \\    _ = owner.value
@@ -1067,8 +1046,11 @@ test "references tuples own cleanup only for owned members" {
         \\    copy = trivial
         \\func capture(ref value: Item) ref Item | End -> value
         \\var owner = Item{value = 42}
-        \\match capture(owner)
-        \\    copied and copied is Item -> exit(copied.value)
+        \\const result = capture(owner)
+        \\match result
+        \\    Item ->
+        \\        const copied = result
+        \\        exit(copied.value)
         \\    _ -> ()
     , .type_not_copyable);
 }
@@ -1084,7 +1066,9 @@ test "references separate union alternatives do not become a whole union borrow"
         \\    var number = 42
         \\    var flag = false
         \\    match choose(number, flag, true)
-        \\        ref item and item is int | bool -> return 1
+        \\        ref _matched_item and _matched_item is int | bool ->
+        \\            ref item = _matched_item
+        \\            return 1
         \\        _ -> ()
         \\    return 0
         \\_ = run()
@@ -1117,7 +1101,9 @@ test "references logical payload borrows do not retain temporary carriers" {
     try Fixture.expectParity(declarations ++ "\n" ++
         \\func selected(ref owner: int) ref int
         \\    match capture(owner)
-        \\        ref item and item is int -> return item
+        \\        ref _matched_item and _matched_item is int ->
+        \\            ref item = _matched_item
+        \\            return item
         \\        _ -> ()
         \\    exit(90)
         \\func run() int
@@ -1145,14 +1131,18 @@ test "references logical payload borrows do not retain temporary carriers" {
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
         \\const owner = 12
         \\match capture(owner)
-        \\    ref item and item is int -> item += 30
+        \\    ref _matched_item and _matched_item is int ->
+        \\        ref item = _matched_item
+        \\        item += 30
         \\    _ -> ()
     , .reference_not_writable);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
         \\func invalid() ref int
         \\    var owner = 12
         \\    match capture(owner)
-        \\        ref item and item is int -> return item
+        \\        ref _matched_item and _matched_item is int ->
+        \\            ref item = _matched_item
+        \\            return item
         \\        _ -> ()
         \\    exit(90)
         \\_ = invalid()
@@ -1214,9 +1204,7 @@ test "references const aggregate copies preserve independent reference and stora
         \\func run() int
         \\    var owner = 12
         \\    var values = [1]
-        \\    const original = Mixed{target = ((match Ref.from(owner)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), view = values.span()}
+        \\    const original = Mixed{target = Ref.from(owner), view = values.span()}
         \\    var copied = original
         \\    copied.target.value += 30
         \\    return owner
@@ -1244,12 +1232,12 @@ test "references const aggregate copies preserve array and variant captures" {
     try Fixture.expectParity(
         \\func run() int
         \\    var owner = 12
-        \\    const original = [((match Ref.from(owner)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))]
+        \\    const original = [Ref.from(owner)]
         \\    var copied = original
         \\    match copied.get(0)
-        \\        ref handle and handle is Ref(int) -> handle.value += 30
+        \\        ref _matched_handle and _matched_handle is Ref(int) ->
+        \\            ref handle = _matched_handle
+        \\            handle.value += 30
         \\        _ -> ()
         \\    return owner
     , 42);
@@ -1419,9 +1407,7 @@ test "references returning a referent does not capture an intermediate handle ow
         \\func capture(ref owner: int) Ref(int)
         \\    var temporary = Ref.from(owner)
         \\    if not (temporary is Ref(int)) -> panic "unexpected none"
-        \\    return ((match Ref.from(referent(temporary))
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))
+        \\    return Ref.from(referent(temporary))
         \\func run() int
         \\    var owner = 12
         \\    var result = capture(owner)
@@ -1436,9 +1422,7 @@ test "references returned origin excludes unrelated reference arguments" {
         \\func first(ref left: int, ref right: int) ref int -> left
         \\func capture(ref source: int) Ref(int)
         \\    var unrelated = 90
-        \\    return ((match Ref.from(first(source, unrelated))
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))
+        \\    return Ref.from(first(source, unrelated))
         \\func run() int
         \\    var source = 12
         \\    var result = capture(source)
@@ -1471,9 +1455,7 @@ test "references containers of handles expose the handle slot and copy only its 
     try Fixture.expectParity(
         \\import std.memory.{Ref}
         \\func capture(ref source: int) Ref(int) | none
-        \\    var handles = [((match Ref.from(source)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> return none))]
+        \\    var handles = [Ref.from(source)]
         \\    ref slot = handles[0]
         \\    slot.value += 10
         \\    return handles[0]
@@ -1617,9 +1599,7 @@ test "references owned handles keep captured permission during argument preparat
         \\func discard(var item: Item) -> unit
         \\func run() int
         \\    var source = 0
-        \\    discard(Item{trace = ((match Ref.from(source)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))})
+        \\    discard(Item{trace = Ref.from(source)})
         \\    return source
     , 42);
 }
@@ -1631,10 +1611,9 @@ test "references owned handles survive borrowed variant conversion through an im
         \\func run() int
         \\    const source = [42]
         \\    match source.get(0)
-        \\        ref element and element is int ->
-        \\            match choose(((match Ref.from(element)
-        \\                _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\                _ -> panic "unexpected none")))
+        \\        ref _matched_element and _matched_element is int ->
+        \\            ref element = _matched_element
+        \\            match choose(Ref.from(element))
         \\                handle and handle is Ref(int) -> return handle.value
         \\                _ -> ()
         \\        _ -> ()
@@ -1681,9 +1660,7 @@ test "references read-only helpers do not invalidate another live element refere
         \\    const checked_value_1 = owner.get(0)
         \\    if not (checked_value_1 is int) -> return none
         \\    ref element = checked_value_1
-        \\    const observed = inspect(((match Ref.from(element)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> return none)))
+        \\    const observed = inspect(Ref.from(element))
         \\    element += 18
         \\    return observed + element
         \\func run() int
@@ -1730,13 +1707,9 @@ test "references replacing a handle slot retains the newly borrowed referent" {
         \\func calculate() int | none
         \\    var first = 12
         \\    var second = 42
-        \\    var handles = [((match Ref.from(first)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> return none))]
+        \\    var handles = [Ref.from(first)]
         \\    ref slot = handles[0]
-        \\    slot = ((match Ref.from(second)
-        \\        _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\        _ -> return none))
+        \\    slot = Ref.from(second)
         \\    return slot.value
         \\func run() int
         \\    match calculate()
@@ -1774,9 +1747,7 @@ test "references recursive reference fields infer a finite return contract" {
         \\    return node
         \\func run() int
         \\    var first = Node{next = none, value = 12}
-        \\    var second = Node{next = ((match Ref.from(first)
-        \\        _selected_result_0 and _selected_result_0 is Ref(Node) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), value = 30}
+        \\    var second = Node{next = Ref.from(first), value = 30}
         \\    ref found = select(second, 1)
         \\    return found.value + 30
     , 42);
@@ -1897,9 +1868,7 @@ test "references assignments to returned places evaluate their receiver once" {
         \\    return item
         \\func handle(ref item: int, mut calls: int) Ref(int)
         \\    calls += 1
-        \\    return ((match Ref.from(item)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))
+        \\    return Ref.from(item)
         \\func run() int
         \\    var source = 10
         \\    var calls = 0
@@ -1954,9 +1923,7 @@ test "references a parameter payload cannot survive replacing its variant tag" {
 test "references parameter replacement retains the new referent" {
     try Fixture.expectParity(
         \\import std.memory.{Ref}
-        \\func replace(ref slot: Ref(int), ref source: int) -> slot = ((match Ref.from(source)
-        \\    _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\    _ -> panic "unexpected none"))
+        \\func replace(ref slot: Ref(int), ref source: int) -> slot = Ref.from(source)
         \\func run() int
         \\    var first = 10
         \\    var second = 40
@@ -2021,17 +1988,13 @@ test "references ownership hook writes retain newly installed loans" {
 
 test "references handle parameter writes retain new loans and reject expired referents" {
     try Fixture.expectParity(
-        \\func install(var target: Ref(Ref(int)), ref source: int) -> target.value = ((match Ref.from(source)
-        \\    _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\    _ -> panic "unexpected none"))
+        \\func install(var target: Ref(Ref(int)), ref source: int) -> target.value = Ref.from(source)
         \\func run() int
         \\    var original = 1
         \\    var replacement = 42
         \\    var slot = Ref.from(original)
         \\    if not (slot is Ref(int)) -> panic "unexpected none"
-        \\    install(((match Ref.from(slot)
-        \\        _selected_result_1 and _selected_result_1 is Ref(Ref(int)) -> _selected_result_1
-        \\        _ -> panic "unexpected none")), replacement)
+        \\    install(Ref.from(slot), replacement)
         \\    return slot.value
     , 42);
     try Fixture.expectSourceDiagnostic(

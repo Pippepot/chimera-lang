@@ -512,12 +512,16 @@ const computed_block = comptime
 # between calls or extend storage beyond its evaluation.
 func make_twenty() Box(int) | none -> Box.new(20)
 func inspect_allocations() int | none
-    var first: Box(int) = make_twenty() else return none
-    const second: Box(int) = make_twenty() else return none
+    var first = make_twenty()
+    if not (first is Box(int)) -> return none
+    const second = make_twenty()
+    if not (second is Box(int)) -> return none
     ref borrowed = first.borrow()
     borrowed = 22
     return first.borrow() + second.borrow()
-static allocated_answer = if const value: int = inspect_allocations() -> value else 0
+static allocated_answer = match inspect_allocations()
+    value and value is int -> value
+    _ -> 0
 # allocated_answer is ordinary data: 42. Both Boxes are destroyed normally.
 # static escaped = make_twenty() # source error: retains evaluation-local storage
 
@@ -1122,8 +1126,9 @@ func forward_initializer(static T: type, init item: T) T
 # Explicit handles are requested with Ref.from(values[i]) or
 # Ref.from(owner.borrow()). No separate get_mut or borrow_mut accessor is needed.
 #
-# `if ref item: Member = value` selects an existing variant payload without
-# copying or consuming it. `if ref item: T = values.get(index)` binds a present item.
+# `if value is Member` selects an existing variant payload; `ref item = value`
+# inside that branch aliases it without copying or consuming it. A checked getter
+# result is first saved, then tested with `is T`, then borrowed with `ref`.
 # Matching uses logical type and can select owned or reference alternatives.
 # An owned payload borrow retains its carrier and active-tag dependency; selecting
 # a reference alternative follows its captured referent without also borrowing
@@ -1649,8 +1654,8 @@ const widened: number_or_bool = int_or_float_value
 var reassigned: number_or_bool = 1
 reassigned = int_or_float_value
 
-# Variants never narrow implicitly. Control flow does not refine existing
-# bindings; extraction or a pattern introduces a separate narrowed binding.
+# Variant reads narrow only with a control-flow proof, as described under
+# Variants and flow typing. The declared storage type remains unchanged.
 
 # Inline named variant cases (planned)
 # A variant declaration may introduce named cases alongside ordinary type
@@ -1792,7 +1797,9 @@ const read_only = handle
 # execution share this API and its checked-reference semantics.
 # Collection construction and iteration are specified separately below.
 var repeated = Array(int, 4).filled(7)
-const first: int = repeated.get(0) else panic "missing element"
+const first_result = repeated.get(0)
+if not (first_result is int) -> panic "missing element"
+const first: int = first_result
 
 
 # Collection literals
@@ -1831,7 +1838,8 @@ const first: int = repeated.get(0) else panic "missing element"
 # Both paths share the same element construction and ownership rules.
 const values: List(int) = [1, 2, 3]
 const bytes: List(byte) = [1, 2]
-const recovered: List(int) = List(int).from([1, 2, 3]) else panic "allocation refused"
+const recovered = List(int).from([1, 2, 3])
+if not (recovered is List(int)) -> panic "allocation refused"
 
 
 # Collection expansion
@@ -1926,7 +1934,9 @@ func value_or(value: int | none, fallback: int) int
 # can replace a tested carrier invalidates its fact, including writes through
 # aliases, hooks, and calls. Writing inside its payload does not replace its tag.
 # Nested named fields can be refined independently. Unknown/dynamic element
-# selections do not establish facts about other element reads.
+# selections do not establish facts about other element reads. A bound ref
+# keeps its selected address and can be tested and read through that alias;
+# a fresh dynamic element selection does not inherit the alias's proof.
 # A saved bool can retain implications about the versions of places it tested;
 # after a possible mutation those implications no longer establish a type fact.
 # A loop may use an incoming proof only if every backedge preserves that proof.
@@ -2176,9 +2186,11 @@ loop
 # ending at 2147483647 terminate without wrapping. Reversal and stepping do not
 # add items outside the original sequence. Reversing an empty range is empty.
 func range_examples()
-    const selected: RangeSequence = (0..10).step_by(4) else panic "invalid stride" # 0, 4, 8
+    const selected = (0..10).step_by(4) # 0, 4, 8
+    if not (selected is RangeSequence) -> panic "invalid stride"
     const backward = selected.reversed() # 8, 4, 0
-    const other: RangeSequence = (0..10).reversed().step_by(4) else panic "invalid stride" # 9, 5, 1
+    const other = (0..10).reversed().step_by(4) # 9, 5, 1
+    if not (other is RangeSequence) -> panic "invalid stride"
 
 # Iteration protocol
 # Iterators are ordinary structs specialized through static parameters, with no

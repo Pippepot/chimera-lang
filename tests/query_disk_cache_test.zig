@@ -84,9 +84,7 @@ test "match snapshots preserve cleanup and reference-valued result joins" {
         \\    copy = none
         \\    trace: Ref(int)
         \\    drop = func(deinit self: Tracked) -> self.trace.value += 1
-        \\func produce(ref trace: int) Tracked | none -> Tracked{trace = ((match Ref.from(trace)
-        \\    _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\    _ -> panic "unexpected none"))}
+        \\func produce(ref trace: int) Tracked | none -> Tracked{trace = Ref.from(trace)}
         \\func select(ref owner: int, flag: bool) ref int
         \\    return match flag
         \\        true -> owner
@@ -233,7 +231,7 @@ test "top-level variant snapshots recompute outcomes and explicit handlers" {
     defer std.testing.allocator.free(rejected);
     try fixture.db.setInput(queries.SourceText, 0, rejected);
     try fixture.expectExit(1);
-    const handled = try std.mem.replaceOwned(u8, std.testing.allocator, rejected, "else exit(1)", "else ()");
+    const handled = try std.mem.replaceOwned(u8, std.testing.allocator, rejected, "_ -> exit(1)", "_ -> ()");
     defer std.testing.allocator.free(handled);
     try fixture.db.setInput(queries.SourceText, 0, handled);
     try fixture.expectExit(0);
@@ -448,9 +446,7 @@ test "readonly aggregate snapshots preserve independent owned and reference perm
         \\func calculate() int | none
         \\    var values = [19, 23]
         \\    var target = 41
-        \\    var owner = Box.new(snapshot(Views{view = values.span(), target = ((match Ref.from(target)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}))
+        \\    var owner = Box.new(snapshot(Views{view = values.span(), target = Ref.from(target)}))
         \\    if not (owner is Box(Views)) -> return none
         \\    ref copied = owner.borrow()
         \\    copied.target.value += 1
@@ -486,11 +482,7 @@ test "temporal reference snapshots recompute aliasing and mutation effects" {
         \\func calculate() int | none
         \\    var left: String = "abc"
         \\    var right: String = ""
-        \\    const captures = Captures(String){left = ((match Ref.from(left)
-        \\        _selected_result_0 and _selected_result_0 is Ref(String) -> _selected_result_0
-        \\        _ -> return none)), right = ((match Ref.from(right)
-        \\            _selected_result_1 and _selected_result_1 is Ref(String) -> _selected_result_1
-        \\            _ -> return none))}
+        \\    const captures = Captures(String){left = Ref.from(left), right = Ref.from(right)}
         \\    return ((match inspect(captures)
         \\        _selected_result_2 and _selected_result_2 is int -> _selected_result_2
         \\        _ -> return none))
@@ -510,7 +502,7 @@ test "temporal reference snapshots recompute aliasing and mutation effects" {
     defer std.testing.allocator.free(aliased);
     try fixture.db.setInput(queries.SourceText, 0, aliased);
     try fixture.expectDiagnostic(.borrow_outlives_source);
-    const no_mutation = try std.mem.replaceOwned(u8, std.testing.allocator, aliased, "const _: unit = captures.right.value.append(\"x\") else return none", "_ = 0");
+    const no_mutation = try std.mem.replaceOwned(u8, std.testing.allocator, aliased, "const checked_value_1 = captures.right.value.append(\"x\")\n    if not (checked_value_1 is unit) -> return none", "_ = 0");
     defer std.testing.allocator.free(no_mutation);
     try fixture.db.setInput(queries.SourceText, 0, no_mutation);
     try fixture.expectExit(42);
@@ -533,11 +525,7 @@ test "destructor snapshots recompute captured authority and mutation effects" {
         \\    var owner: String = "abc"
         \\    const view = owner.view()
         \\    var trace = 0
-        \\    discard(Observer{owner = ((match Ref.from(owner)
-        \\        _selected_result_0 and _selected_result_0 is Ref(String) -> _selected_result_0
-        \\        _ -> return none)), trace = ((match Ref.from(trace)
-        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\            _ -> return none))})
+        \\    discard(Observer{owner = Ref.from(owner), trace = Ref.from(trace)})
         \\    return view.byte_length() + trace + 36
         \\func run() int
         \\    match calculate()
@@ -549,7 +537,7 @@ test "destructor snapshots recompute captured authority and mutation effects" {
     const fixture = try Fixture.restore(source);
     defer fixture.db.deinit();
     try fixture.expectExit(42);
-    const mutation = try std.mem.replaceOwned(u8, std.testing.allocator, source, "self.trace.value += self.owner.value.byte_length()", "const _: unit = self.owner.value.append(\"x\") else return");
+    const mutation = try std.mem.replaceOwned(u8, std.testing.allocator, source, "self.trace.value += self.owner.value.byte_length()", "if not (self.owner.value.append(\"x\") is unit) -> return");
     defer std.testing.allocator.free(mutation);
     try fixture.db.setInput(queries.SourceText, 0, mutation);
     try fixture.expectDiagnostic(.borrow_outlives_source);
@@ -776,11 +764,15 @@ test "cursor snapshots restore literal and empty spans and recompute source edit
         \\    const values = [19, 23]
         \\    const view = values.span()
         \\    match view.get(0)
-        \\        ref first and first is int ->
+        \\        ref _matched_first and _matched_first is int ->
+        \\            ref first = _matched_first
         \\            match view.get(1)
-        \\                ref second and second is int ->
+        \\                ref _matched_second and _matched_second is int ->
+        \\                    ref second = _matched_second
         \\                    match bytes.get(0)
-        \\                        ref literal and literal is byte -> return first + second + empty.len() + bytes.byte_length() - 2 + byte_int(literal) - 195
+        \\                        ref _matched_literal and _matched_literal is byte ->
+        \\                            ref literal = _matched_literal
+        \\                            return first + second + empty.len() + bytes.byte_length() - 2 + byte_int(literal) - 195
         \\                        _ -> ()
         \\                _ -> ()
         \\        _ -> ()
@@ -829,7 +821,7 @@ test "nested span snapshots recompute slice bounds extent and readonly backing" 
     defer std.testing.allocator.free(shortened);
     try fixture.db.setInput(queries.SourceText, 0, shortened);
     try fixture.expectExit(138);
-    const readonly = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var middle: Span(int)", "const middle: Span(int)");
+    const readonly = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var middle =", "const middle =");
     defer std.testing.allocator.free(readonly);
     try fixture.db.setInput(queries.SourceText, 0, readonly);
     try fixture.expectDiagnostic(.reference_not_writable);
@@ -953,7 +945,8 @@ test "span snapshots retain capabilities and recompute attenuation edits" {
         \\    var owner = [12]
         \\    var view = capture(owner)
         \\    match view.get(0)
-        \\        ref item and item is int ->
+        \\        ref _matched_item and _matched_item is int ->
+        \\            ref item = _matched_item
         \\            item += 30
         \\            return item
         \\        _ -> ()
@@ -1057,7 +1050,8 @@ test "evaluation heap snapshots restore scalar results and recompute callee elem
         \\    var trace = Array(int, 1).filled(0)
         \\    if not (trace is Array(int, 1)) -> panic "unexpected none"
         \\    match trace.get(0)
-        \\        ref target and target is int ->
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
         \\            match calculate(Ref.from(target))
         \\                value and value is int -> return value + target
         \\                _ -> ()
@@ -1094,9 +1088,12 @@ test "collection snapshots restore pending carriers heap destinations and initia
         \\    const fixed: Array(int, 1) = [element()]
         \\    const values: List(int) = [23]
         \\    match fixed.get(0)
-        \\        ref first and first is int ->
+        \\        ref _matched_first and _matched_first is int ->
+        \\            ref first = _matched_first
         \\            match values.get(0)
-        \\                ref second and second is int -> return first + second
+        \\                ref _matched_second and _matched_second is int ->
+        \\                    ref second = _matched_second
+        \\                    return first + second
         \\                _ -> ()
         \\        _ -> ()
         \\    return 90
@@ -1743,16 +1740,21 @@ test "array snapshots restore native and comptime fill reads writes and bounds" 
         \\    var values = Array(int, 3).filled(20)
         \\    if not (values is Array(int, 3)) -> panic "unexpected none"
         \\    match values.get(1)
-        \\        ref middle and middle is int -> middle = 22
+        \\        ref _matched_middle and _matched_middle is int ->
+        \\            ref middle = _matched_middle
+        \\            middle = 22
         \\        _ -> return 90
         \\    if (values.get(-1) is int) -> return 91
         \\    if (values.get(3) is int) -> return 92
         \\    if (values.get(-1) is int) -> return 93
         \\    if (values.get(3) is int) -> return 94
         \\    match values.get(0)
-        \\        ref first and first is int ->
+        \\        ref _matched_first and _matched_first is int ->
+        \\            ref first = _matched_first
         \\            match values.get(1)
-        \\                ref middle and middle is int -> return first + middle
+        \\                ref _matched_middle and _matched_middle is int ->
+        \\                    ref middle = _matched_middle
+        \\                    return first + middle
         \\                _ -> ()
         \\        _ -> ()
         \\    return 95
@@ -1774,9 +1776,12 @@ test "array snapshots restore empty and nested runtime tuple shapes" {
             \\    const row = Array(int, {d}).filled(40)
             \\    const matrix = Array(Array(int, {d}), 2).filled(row)
             \\    match matrix.get(1)
-            \\        ref selected and selected is Array(int, {d}) ->
+            \\        ref _matched_selected and _matched_selected is Array(int, {d}) ->
+            \\            ref selected = _matched_selected
             \\            match selected.get(0)
-            \\                ref cell and cell is int -> return cell + selected.len()
+            \\                ref _matched_cell and _matched_cell is int ->
+            \\                    ref cell = _matched_cell
+            \\                    return cell + selected.len()
             \\                _ -> ()
             \\            return 42
             \\        _ -> ()
@@ -1854,7 +1859,9 @@ test "array snapshots invalidate element copy hook bodies and capabilities" {
         \\    if not (values is Array(Item, 2)) -> panic "unexpected none"
         \\    const copied = values.copy()
         \\    match copied.get(1)
-        \\        ref selected and selected is Item -> return selected.value
+        \\        ref _matched_selected and _matched_selected is Item ->
+        \\            ref selected = _matched_selected
+        \\            return selected.value
         \\        _ -> ()
         \\    return 90
         \\static answer = run()
@@ -1883,7 +1890,9 @@ test "array snapshots invalidate source indices and standard bounds checks" {
         \\    const values = Array(int, 2).filled(42)
         \\    if not (values is Array(int, 2)) -> panic "unexpected none"
         \\    match values.get(1)
-        \\        ref selected and selected is int -> return selected
+        \\        ref _matched_selected and _matched_selected is int ->
+        \\            ref selected = _matched_selected
+        \\            return selected
         \\        _ -> ()
         \\    return 89
         \\static answer = run()
@@ -1950,18 +1959,17 @@ test "array intern snapshots preserve nested tuple values and reuse identical ty
 
 test "array snapshots publish static nested values into runtime storage" {
     const fixture = try Fixture.restore(
-        \\static row = ((match Array(int, 2).filled(20)
-        \\    _selected_result_0 and _selected_result_0 is Array(int, 2) -> _selected_result_0^
-        \\    _ -> panic "unexpected none"))
-        \\static matrix = ((match Array(Array(int, 2), 2).filled(row)
-        \\    _selected_result_1 and _selected_result_1 is Array(Array(int, 2), 2) -> _selected_result_1^
-        \\    _ -> panic "unexpected none"))
+        \\static row = Array(int, 2).filled(20)
+        \\static matrix = Array(Array(int, 2), 2).filled(row)
         \\func run() int
         \\    const values = matrix
         \\    match values.get(1)
-        \\        ref selected and selected is Array(int, 2) ->
+        \\        ref _matched_selected and _matched_selected is Array(int, 2) ->
+        \\            ref selected = _matched_selected
         \\            match selected.get(0)
-        \\                ref value and value is int -> return value + row.len() + 20
+        \\                ref _matched_value and _matched_value is int ->
+        \\                    ref value = _matched_value
+        \\                    return value + row.len() + 20
         \\                _ -> ()
         \\        _ -> ()
         \\    return 90
@@ -2060,10 +2068,9 @@ test "captured owner cleanup survives snapshots and source edits" {
         \\func run() int
         \\    var trace = [0]
         \\    match trace.get(0)
-        \\        ref handle and handle is int ->
-        \\            if (work(((match Ref.from(handle)
-        \\                _selected_result_4 and _selected_result_4 is Ref(int) -> _selected_result_4
-        \\                _ -> panic "unexpected none"))) is unit) -> return 91
+        \\        ref _matched_handle and _matched_handle is int ->
+        \\            ref handle = _matched_handle
+        \\            if (work(Ref.from(handle)) is unit) -> return 91
         \\            return handle
         \\        _ -> ()
         \\    return 92

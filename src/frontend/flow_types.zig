@@ -11,6 +11,9 @@ pub const Fact = struct {
     type_id: ?structures.TypeId = null,
     span: structures.SourceSpan = .{ .start = 0, .end = 0 },
     previous: u32 = 0,
+    // Refinement and join ancestry retain dependence on an incoming proof.
+    // An independent tag test starts a new proof instead.
+    parents: [2]u32 = .{ 0, 0 },
 };
 
 pub const Store = struct {
@@ -37,6 +40,20 @@ pub const Store = struct {
         const result = self.next_version;
         self.next_version = std.math.add(u32, result, 1) catch return error.AnalysisTooLarge;
         return result;
+    }
+
+    pub fn dependsOn(self: *const Store, allocator: std.mem.Allocator, fact: u32, ancestor: u32) !bool {
+        var pending: std.ArrayList(u32) = .empty;
+        defer pending.deinit(allocator);
+        var visited: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer visited.deinit(allocator);
+        try pending.append(allocator, fact);
+        while (pending.pop()) |id| {
+            if (id == ancestor) return true;
+            if (id < ancestor or (try visited.getOrPut(allocator, id)).found_existing) continue;
+            try pending.appendSlice(allocator, &self.record(id).parents);
+        }
+        return false;
     }
 
     pub fn invalidate(self: *Store, allocator: std.mem.Allocator, state: *State, place: usize, span: structures.SourceSpan) !void {

@@ -50,9 +50,7 @@ test "collection string converters recursively borrow strings and custom move on
         \\    if String(empty) <> "[]" -> return 98
         \\    const bytes: Array(byte, 3) = [0, 128, 255]
         \\    if String(BytesView.from_array(3, bytes)) <> "[0, 128, 255]" -> return 99
-        \\    if String(((match Ref.from(values[1])
-        \\        _selected_result_1 and _selected_result_1 is Ref(Item) -> _selected_result_1
-        \\        _ -> return none))) <> "Ref(42)" -> return 100
+        \\    if String(Ref.from(values[1])) <> "Ref(42)" -> return 100
         \\    const boxed = Box(Item).new(Item{value = 42})
         \\    if not (boxed is Box(Item)) -> return none
         \\    if String(boxed) <> "Box(42)" -> return 101
@@ -75,11 +73,7 @@ test "string conversion borrows immovable elements and drops each owner once" {
         \\    drop = func(deinit self: Item) -> self.drops.value += self.value
         \\pub converter(imm value: Item) String -> String(value.value)
         \\func render(ref drops: int) String
-        \\    const values = [Item{value = 19, drops = ((match Ref.from(drops)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}, Item{value = 23, drops = ((match Ref.from(drops)
-        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\            _ -> panic "unexpected none"))}]
+        \\    const values = [Item{value = 19, drops = Ref.from(drops)}, Item{value = 23, drops = Ref.from(drops)}]
         \\    const text = String(values)
         \\    if drops <> 0 -> panic "formatting consumed an element"
         \\    if values.len() <> 2 -> panic "formatting changed the source"
@@ -102,9 +96,7 @@ test "string conversion preserves owner cleanup on explicit mismatch" {
         \\func stop() Item | none -> return none
         \\func late(ref count: int) Item
         \\    count += 10
-        \\    return Item{drops = ((match Ref.from(count)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))}
+        \\    return Item{drops = Ref.from(count)}
         \\func render(ref drops: int, ref calls: int) String | none
         \\    const prefix = [Item{drops = Ref.from(drops)}]
         \\    const text = String(prefix)
@@ -115,9 +107,11 @@ test "string conversion preserves owner cleanup on explicit mismatch" {
         \\func run() int
         \\    var counters = [0, 0]
         \\    match counters.get(0)
-        \\        ref drops and drops is int ->
+        \\        ref _matched_drops and _matched_drops is int ->
+        \\            ref drops = _matched_drops
         \\            match counters.get(1)
-        \\                ref calls and calls is int ->
+        \\                ref _matched_calls and _matched_calls is int ->
+        \\                    ref calls = _matched_calls
         \\                    match render(drops, calls)
         \\                        text and text is String -> return 90
         \\                        _ -> ()
@@ -557,9 +551,7 @@ test "print accepts scalar collection and custom string converters and evaluates
         \\    print(none)
         \\    print([[1, 2], [3, 4]])
         \\    print(["hello", "world"])
-        \\    print(make(((match Ref.from(count)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none"))))
+        \\    print(make(Ref.from(count)))
         \\    print(count)
         \\    const write_integer: func(imm int) unit = print
         \\    write_integer(42)
@@ -904,7 +896,8 @@ test "end relative collection bounds reject invalid distances and accept end bou
         \\            filtered_value_90 and filtered_value_90 is byte -> return 93
         \\            _ -> ()
         \\    match list.get(^4)
-        \\        ref target and target is int ->
+        \\        ref _matched_target and _matched_target is int ->
+        \\            ref target = _matched_target
         \\            target = 0
         \\            return 94
         \\        _ -> ()
@@ -1082,7 +1075,7 @@ test "range slicing preserves collection permissions and rejects sequence operan
         defer std.testing.allocator.free(rejected);
         try SourceFixture.expectSourceDiagnostic(rejected, .reference_not_writable);
     }
-    const sequences = [_][]const u8{ "(0..1).reversed()", "match 0..1.step_by(1)\n    selected and selected is RangeSequence -> selected\n    _ -> panic \"unexpected none\")" };
+    const sequences = [_][]const u8{ "(0..1).reversed()", "(match (0..1).step_by(1)\n        sequence and sequence is RangeSequence -> sequence\n        _ -> panic \"unexpected none\")" };
     for (sequences) |sequence| {
         const source = try test_sources.renderTemplate(std.testing.allocator,
             \\import std.range.{RangeSequence}
@@ -1213,8 +1206,8 @@ test "span slicing returns nested views with backing authority rather than carri
     try SourceFixture.expectParity(source, 42);
     const readonly_cases = [_]struct { original: []const u8, replacement: []const u8 }{
         .{ .original = "var values = [7, 11, 40, 13]", .replacement = "const values = [7, 11, 40, 13]" },
-        .{ .original = "var selected: Span(int)", .replacement = "const selected: Span(int)" },
-        .{ .original = "var view: Span(int) = tail(values) else return none", .replacement = "var view: Span(int) = ((match tail(values)\n    found and found is Span(int) -> found.as_imm()\n    _ -> return none))" },
+        .{ .original = "var selected = all.slice", .replacement = "const selected = all.slice" },
+        .{ .original = "var view = tail(values)", .replacement = "var view: Span(int) = ((match tail(values)\n        found and found is Span(int) -> found.as_imm()\n        _ -> return none))" },
     };
     for (readonly_cases) |case| {
         const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, case.original, case.replacement);
@@ -1357,9 +1350,9 @@ test "returned readonly ranges depend on contents throughout aggregate shapes" {
         .{ .result_type = "StringView", .construct = "text", .select = "returned" },
         .{ .result_type = "Wrapped", .construct = "Wrapped{view = text}", .select = "returned.view" },
         .{ .result_type = "Array(StringView, 1)", .construct = "[text]", .select = "returned[0]" },
-        .{ .result_type = "Box(StringView)", .construct = "match Box(StringView).new(text)\n    _selected_result_0 and _selected_result_0 is Box(StringView) -> _selected_result_0^\n    _ -> panic \"unexpected none\"", .select = "Ref.from(returned.borrow()).value" },
+        .{ .result_type = "Box(StringView)", .construct = "match Box(StringView).new(text)\n        _selected_result_0 and _selected_result_0 is Box(StringView) -> _selected_result_0^\n        _ -> panic \"unexpected none\"", .select = "Ref.from(returned.borrow()).value" },
         .{ .result_type = "List(StringView)", .construct = "[text]", .select = "returned[0]" },
-        .{ .result_type = "StringView | none", .construct = "text", .select = "match returned\n    StringView ->\n        const view = returned\n        view\n    _ -> panic \"missing text\"" },
+        .{ .result_type = "StringView | none", .construct = "text", .select = "match returned\n        StringView ->\n            const view = returned\n            view\n        _ -> panic \"missing text\"" },
     };
     for (cases) |case| {
         for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
@@ -1435,7 +1428,8 @@ test "ownership hook results preserve readonly content dependencies" {
                 \\    var first: Array(byte, 1) = [65]
                 \\    var second: Array(byte, 1) = [66]
                 \\    var writable = second.span()
-                \\    const text: StringView = BytesView.from_array(1, first).validate_utf8() else panic "invalid text"
+                \\    const text = BytesView.from_array(1, first).validate_utf8()
+                \\    if not (text is StringView) -> panic "invalid text"
                 \\    const original = Views{writable = writable, readonly = text}
                 \\    const changed = original$transfer
                 \\    writable[0] = 255
@@ -1456,7 +1450,7 @@ test "mutable outputs preserve readonly dependencies through owned and reference
         .{ .setup = "var view = View{text = original}", .place = "view", .select = "view.text" },
         .{ .setup = "var wrapped = Wrapped{view = View{text = original}}", .place = "wrapped.view", .select = "wrapped.view.text" },
         .{ .setup = "var wrapped = Wrapped{view = View{text = original}}\n    var alias = Ref.from(wrapped.view)", .place = "alias.value", .select = "wrapped.view.text" },
-        .{ .setup = "var boxed: Box(View) = Box(View).new(View{text = original}) else panic \"unexpected allocation refusal\"\n    var alias = Ref.from(boxed.borrow())", .place = "alias.value", .select = "boxed.borrow().text" },
+        .{ .setup = "var boxed = Box(View).new(View{text = original})\n    if not (boxed is Box(View)) -> panic \"unexpected allocation refusal\"\n    var alias = Ref.from(boxed.borrow())", .place = "alias.value", .select = "boxed.borrow().text" },
     };
     for (cases) |case| {
         const source = try test_sources.renderTemplate(std.testing.allocator,
@@ -1536,13 +1530,15 @@ test "mutable field outputs preserve untouched readonly siblings" {
             \\    pub changed: View
             \\    pub untouched: StringView
             \\func refresh(mut value: View, imm source: Span(byte))
-            \\    const text: StringView = BytesView.from_span(source.as_imm()).validate_utf8() else panic "invalid text"
+            \\    const text = BytesView.from_span(source.as_imm()).validate_utf8()
+            \\    if not (text is StringView) -> panic "invalid text"
             \\    value.text = text
             \\func inspect() int
             \\    var first: Array(byte, 1) = [65]
             \\    var second: Array(byte, 1) = [66]
             \\    var writable = second.span()
-            \\    const original: StringView = BytesView.from_array(1, first).validate_utf8() else panic "invalid text"
+            \\    const original = BytesView.from_array(1, first).validate_utf8()
+            \\    if not (original is StringView) -> panic "invalid text"
             \\    var views = Views{changed = View{text = original}, untouched = original}
             \\$alias    refresh($place, writable)
             \\    const untouched = views.untouched
@@ -1685,7 +1681,9 @@ test "generic spans cannot escape local storage or survive owner transfer" {
         \\    return entries.span()
         \\const view = escape()
         \\match view.get(0)
-        \\    ref element and element is int -> exit(element)
+        \\    ref _matched_element and _matched_element is int ->
+        \\        ref element = _matched_element
+        \\        exit(element)
         \\    _ -> ()
     , .borrow_outlives_source);
     try SourceFixture.expectAnySourceDiagnostic(

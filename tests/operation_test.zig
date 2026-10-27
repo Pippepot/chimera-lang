@@ -44,7 +44,8 @@ test "indexed remainder assignment uses checked getter and owned replacement" {
         \\    var values = [17, 23]
         \\    values[0] %= 5
         \\    match values.get(9)
-        \\        ref value and value is int ->
+        \\        ref _matched_value and _matched_value is int ->
+        \\            ref value = _matched_value
         \\            value %= 5
         \\            return 90
         \\        _ -> ()
@@ -74,13 +75,15 @@ test "end relative indexing preserves eager setters and bounds first compound as
         \\    const index = ^distance(calls)
         \\    const next = replacement(calls)
         \\    match values.get(index)
-        \\        ref value and value is int ->
+        \\        ref _matched_value and _matched_value is int ->
+        \\            ref value = _matched_value
         \\            value = next
         \\            return 90
         \\        _ -> ()
         \\    if not (calls == 11) -> return none
         \\    match values.get(^distance(calls))
-        \\        ref value and value is int ->
+        \\        ref _matched_value and _matched_value is int ->
+        \\            ref value = _matched_value
         \\            value += replacement(calls)
         \\            return 91
         \\        _ -> ()

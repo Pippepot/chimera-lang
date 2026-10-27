@@ -306,8 +306,9 @@ source/target pairs. `first` includes index construction and first match;
 `consumers` requests 256 distinct consuming queries; `total` adds database setup
 and discovery, excluding teardown. It does not compile a complete program.
 
-The flow driver covers scalar and owning functions with 8, 32, 128, 256, and
-512 branches. Each row is the median of five fresh one-worker databases.
+The flow driver covers scalar, owning, and narrowing functions with 8, 32, 128,
+256, and 512 branches. Narrowing cases combine saved bool proofs, reference aliases,
+and loop backedges. Each row is the median of five fresh one-worker databases.
 Signatures and semantic construction precede the timer; typing includes workspace
 compaction/release, ownership lowering, and lifetime planning, but not codegen or
 published-body teardown. A separate sixth database measures retained storage.
@@ -318,7 +319,11 @@ Snapshot bytes count saved handles and each unique pointer-table root and
 availability, initializer, and completion buffers. Default pages allocate
 nothing. Lifetime bytes count availability/demand bitsets and populated sparse
 operand entries, not map capacity, scheduling flags, or other scratch. Neither
-figure is process RSS or allocation traffic.
+figure is process RSS or allocation traffic. Flow fact, place/path/key, predicate,
+and inference-key columns separately count retained table payloads. Predicate and
+inference environments count additional unique snapshot pages, sharing the same
+visited-page set as ordinary snapshots. Table payload counts exclude hash bucket
+metadata, spare capacity, and arena allocation overhead.
 
 For CLI worker scaling and warm/edited disk reuse:
 

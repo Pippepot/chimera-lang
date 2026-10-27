@@ -50,11 +50,7 @@ test "List consuming early exits release backing allocations repeatedly" {
         \\    var iteration = 0
         \\    loop
         \\        if iteration == 384 -> break
-        \\        const values = List(Array(int, 2048)).from([((match Array(int, 2048).filled(0)
-        \\            _selected_result_0 and _selected_result_0 is Array(int, 2048) -> _selected_result_0^
-        \\            _ -> return none)), ((match Array(int, 2048).filled(0)
-        \\                _selected_result_1 and _selected_result_1 is Array(int, 2048) -> _selected_result_1^
-        \\                _ -> return none))])
+        \\        const values = List(Array(int, 2048)).from([Array(int, 2048).filled(0), Array(int, 2048).filled(0)])
         \\        if not (values is List(Array(int, 2048))) -> return none
         \\        for item in values^ -> break
         \\        iteration += 1
@@ -488,13 +484,7 @@ test "List consuming traversal cleans current and remaining items on early break
         \\    drop = func(deinit self: Item) -> self.trace.value = self.trace.value * 10 + self.value
         \\func run() int
         \\    var trace = 0
-        \\    const values: List(Item) = [Item{trace = ((match Ref.from(trace)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> panic "unexpected none")), value = 1}, Item{trace = ((match Ref.from(trace)
-        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\            _ -> panic "unexpected none")), value = 2}, Item{trace = ((match Ref.from(trace)
-        \\                _selected_result_2 and _selected_result_2 is Ref(int) -> _selected_result_2
-        \\                _ -> panic "unexpected none")), value = 3}]
+        \\    const values: List(Item) = [Item{trace = Ref.from(trace), value = 1}, Item{trace = Ref.from(trace), value = 2}, Item{trace = Ref.from(trace), value = 3}]
         \\    for item in values^ -> break
         \\    if trace == 321 -> return 42
         \\    return 90

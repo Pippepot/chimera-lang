@@ -350,7 +350,10 @@ fn expectCompiledFunctionResult(
     try functions.append(testing.allocator, .{ .instance = entry_id, .artifact = exit_with_result });
     for (reachable_names) |name| {
         const instance: structures.InstanceId = .{ .item = scope.resolve(name).? };
-        const artifact = (try db.get(queries.CompileFunction, instance)).*.?;
+        const artifact = (try db.get(queries.CompileFunction, instance)).* orelse {
+            try (test_sources.SourceFixture{ .db = db }).printDiagnostics(file_id);
+            return error.ExpectedCompiledFunction;
+        };
         try functions.append(testing.allocator, .{ .instance = instance, .artifact = artifact });
     }
 
@@ -3635,12 +3638,10 @@ test "static annotations widen values and reject mismatches when demanded" {
     try addSource(db, 1,
         \\static widened: int | none = 40
         \\static absent: int | none = none
-        \\static completed: int | unit = unit
+        \\static completed: int | unit = ()
         \\func answer() int
         \\  const number = (match widened
-        \\      int ->
-        \\          const value = widened
-        \\          value
+        \\      value and value is int -> value
         \\      _ -> 0)
         \\  const missing = if absent is none -> 1 else 0
         \\  const done = if completed is unit -> 1 else 0
@@ -5919,12 +5920,10 @@ test "static callable variant annotations preserve the payload representation" {
         \\func identity(value: int) int -> value
         \\static selected: Plain | none = identity
         \\match selected
-        \\    Plain ->
-        \\        const operation = selected
-        \\        exit(operation(42))
+        \\    operation and operation is Plain -> exit(operation(42))
         \\    _ -> exit(1)
     );
-    const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
+    const executable = try (test_sources.SourceFixture{ .db = db }).executable(1);
     try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
 }
 
@@ -6278,7 +6277,7 @@ test "variant extraction annotations widen successful payloads" {
         \\static extract = func(value: int | none) int
         \\  return (match value
         \\      int ->
-        \\          const widened = value
+        \\          const widened: int | none = value
         \\          match widened
         \\              int ->
         \\                  const number = widened
@@ -6308,11 +6307,7 @@ test "typed variant patterns remap subset tags and discard selected payloads" {
         \\static accepts_int = func(value: int | none) int -> return (match value
         \\    int -> 1
         \\    _ -> 0)
-        \\static impossible = func(value: int | none) int -> return (match value
-        \\    unit ->
-        \\        const no = value
-        \\        0
-        \\    _ -> 42)
+        \\static impossible = func(value: int | none) int -> return if value is unit -> 0 else 42
         \\static answer = func() int -> return select(39) + select(none) + select(unit) + accepts_int(1) + impossible(1)
     );
     try expectCompiledFunctionResult(db, 1, "answer", &.{ "answer", "select", "accepts_int", "impossible" }, 84);
@@ -6345,7 +6340,7 @@ test "variant inspection enforces operand and condition binding rules" {
         },
         .{
             .file_id = 5,
-            .source = "static bad = func(value: int | none) int -> return if value is int -> value else 0",
+            .source = "static bad = func(value: int | none) int -> return if value is int -> value else none",
             .kind = .return_type_mismatch,
         },
         .{
@@ -6361,6 +6356,13 @@ test "variant inspection enforces operand and condition binding rules" {
     };
     for (cases) |case| {
         try addSource(db, case.file_id, case.source);
+        if (case.file_id == 3) {
+            try testing.expect((try db.get(queries.BuildModuleScope, case.file_id)).* == null);
+            const diagnostics = try db.transitiveAccumulatorValues(queries.BuildModuleScope, case.file_id, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(diagnostics);
+            try testing.expectEqual(case.kind, std.meta.activeTag(diagnostics[0].kind));
+            continue;
+        }
         const bad_id = (try db.get(queries.BuildModuleScope, case.file_id)).*.?.resolve("bad").?;
         try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = bad_id })).* == null);
         const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = bad_id }, structures.Diagnostic, testing.allocator);
@@ -6381,7 +6383,7 @@ test "variant inspection edits retain equal artifacts and recover diagnostics" {
     const body = try db.get(queries.AnalyzeFunctionInstance, .{ .item = item });
     const artifact = try db.get(queries.CompileFunction, instance);
 
-    try setSource(db, 1, "static inspect = func(value: int | none) int -> return (match value\n    int ->\n        const selected = value\n        42\n    _ -> 24)");
+    try setSource(db, 1, "static inspect = func(value: int | none) int -> return (match value\n    int ->\n        const renamed = value\n        42\n    _ -> 24)");
     // Source spans change even when executable operations are equivalent.
     try testing.expect(body != try db.get(queries.AnalyzeFunctionInstance, .{ .item = item }));
     try testing.expectEqual(artifact, try db.get(queries.CompileFunction, instance));

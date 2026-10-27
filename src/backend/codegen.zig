@@ -741,7 +741,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                     coercion.target_type,
                     self.resultLocation(coercion.destination, destination),
                 ),
-                .variant_extract => |extraction| try self.emitVariantExtract(extraction, destination),
+                .variant_extract => |extraction| try self.emitVariantExtract(extraction, self.resultLocation(extraction.destination, destination)),
                 .value_copy => |operation| try self.copyValue(
                     operation.type_id,
                     self.valueLocation(operation.source),

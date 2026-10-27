@@ -402,7 +402,7 @@ fn ExecutionFrame(comptime Executor: type) type {
                     switch (try self.instructionValue(instruction, span)) {
                         .returned => |value| {
                             const destination = switch (instruction) {
-                                inline .call, .value_copy, .variant_coerce, .static_conversion => |operation| operation.destination,
+                                inline .call, .value_copy, .variant_coerce, .variant_extract, .static_conversion => |operation| operation.destination,
                                 else => null,
                             };
                             try self.store(@backingInt(self.body.instructionValue(index)), destination, value);

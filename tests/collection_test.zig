@@ -125,7 +125,9 @@ test "diverging collection elements preserve inferred bottom types and empty res
         \\func run() int
         \\    const values = [exit(90) for i in 0..0]
         \\    match values.get(0)
-        \\        ref item and item is never -> return forward(item)
+        \\        ref _matched_item and _matched_item is never ->
+        \\            ref item = _matched_item
+        \\            return forward(item)
         \\        _ -> ()
         \\    if (values.get(0) is never) -> return 92
         \\    return values.len() + 42
@@ -159,14 +161,14 @@ test "fixed Array variant context precedes List and competing converter contexts
         \\    const with_converter: Array(int, 2) | Other = [first, second]
         \\    const contextual: Array(byte, 2) | List(int) = [19, 23]
         \\    const empty: Array(byte, 0) | List(int) = []
+        \\    if not (with_list is Array(int, 2)) -> return none
         \\    const a = with_list
-        \\    if not (a is Array(int, 2)) -> return none
+        \\    if not (with_converter is Array(int, 2)) -> return none
         \\    const b = with_converter
-        \\    if not (b is Array(int, 2)) -> return none
+        \\    if not (contextual is Array(byte, 2)) -> return none
         \\    const c = contextual
-        \\    if not (c is Array(byte, 2)) -> return none
+        \\    if not (empty is Array(byte, 0)) -> return none
         \\    const d = empty
-        \\    if not (d is Array(byte, 0)) -> return none
         \\    return a[0] + b[1] + byte_int(c[0]) - 19 + d.len()
         \\func run() int
         \\    match calculate()
@@ -180,8 +182,8 @@ test "multiple matching Array members retain ordinary element inference" {
     try Fixture.expectParity(
         \\func calculate() int | none
         \\    const values: Array(byte, 2) | Array(int, 2) | List(byte) = [19, 23]
+        \\    if not (values is Array(int, 2)) -> return none
         \\    const integers = values
-        \\    if not (integers is Array(int, 2)) -> return none
         \\    return integers[0] + integers[1]
         \\func run() int
         \\    match calculate()
@@ -223,7 +225,9 @@ test "bounded runtime comprehension stores ordinary absence and cleans immovable
         \\        const values: List(Item | none) = [make(Ref.from(trace), i) for i in [2, 4, 6]]
         \\        if values.len() <> 3 -> return 90
         \\        match values.get(2)
-        \\            ref item and item is Item -> return 91
+        \\            ref _matched_item and _matched_item is Item ->
+        \\                ref item = _matched_item
+        \\                return 91
         \\            _ -> ()
         \\    return trace
     , 42);
@@ -335,11 +339,7 @@ test "Array spread uses ordinary custom copies and retains the source" {
         \\        return Item{value = self.value, count = self.count}
         \\func calculate() int | none
         \\    var copies = 0
-        \\    const input = [Item{value = 19, count = ((match Ref.from(copies)
-        \\        _selected_result_0 and _selected_result_0 is Ref(int) -> _selected_result_0
-        \\        _ -> return none))}, Item{value = 21, count = ((match Ref.from(copies)
-        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\            _ -> return none))}]
+        \\    const input = [Item{value = 19, count = Ref.from(copies)}, Item{value = 21, count = Ref.from(copies)}]
         \\    const values = [..input]
         \\    return values[0].value + values[1].value + copies
         \\func run() int
@@ -401,7 +401,9 @@ test "producer absence remains item data and preserves named cursor state and cl
         \\            _ -> none) for value in cursor]
         \\        if values.len() <> 3 -> return 90
         \\        match values.get(2)
-        \\            ref item and item is Item -> return 91
+        \\            ref _matched_item and _matched_item is Item ->
+        \\                ref item = _matched_item
+        \\                return 91
         \\            _ -> ()
         \\    return trace + cursor.position - 4
     , 42);
@@ -551,11 +553,7 @@ test "recoverable growth allocation failure destroys only the completed prefix" 
         \\    drop = func(deinit self: Item) -> self.trace.value += 1
         \\func run() int
         \\    var trace = 0
-        \\    match List(Item).collect([Item{payload = ((match Array(int, 65536).filled(0)
-        \\        _selected_result_0 and _selected_result_0 is Array(int, 65536) -> _selected_result_0^
-        \\        _ -> panic "unexpected none")), trace = ((match Ref.from(trace)
-        \\            _selected_result_1 and _selected_result_1 is Ref(int) -> _selected_result_1
-        \\            _ -> panic "unexpected none"))} for i in 0..100
+        \\    match List(Item).collect([Item{payload = Array(int, 65536).filled(0), trace = Ref.from(trace)} for i in 0..100
         \\    ])
         \\        values and values is List(Item) -> return 90
         \\        _ -> ()
