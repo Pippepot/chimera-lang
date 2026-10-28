@@ -2137,7 +2137,20 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             }
         }
 
-        fn joinBindingIdentities(self: *Self, first: BindingIdentity, second: BindingIdentity) !BindingIdentity {
+        /// A completed loop without a backedge has exactly its entry identity.
+        fn unwrapBindingIdentity(self: *const Self, identity: BindingIdentity) BindingIdentity {
+            var current = identity;
+            while (current == .join) {
+                const join = self.binding_joins.items[current.join];
+                if (!join.complete or join.alternatives.items.len != 0) break;
+                current = join.initial;
+            }
+            return current;
+        }
+
+        fn joinBindingIdentities(self: *Self, left: BindingIdentity, right: BindingIdentity) !BindingIdentity {
+            const first = self.unwrapBindingIdentity(left);
+            const second = self.unwrapBindingIdentity(right);
             if (std.meta.eql(first, second)) return first;
             const index: u32 = @intCast(self.binding_joins.items.len);
             try self.binding_joins.append(self.gpa, .{ .initial = first, .complete = true });
@@ -5370,6 +5383,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             var result: ResolvedBindingIdentity = .{};
             var current = identity;
             while (true) {
+                current = self.unwrapBindingIdentity(current);
                 switch (current) {
                     .unknown => result.conflicting = true,
                     .fixed => |fixed| {
@@ -9174,7 +9188,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn predicateValue(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan) !Value {
             const baseline = try self.captureAvailability();
-            const flow = try self.condition(id);
+            const flow = try self.condition(.{ .value = id, .span = span });
             var exits: std.ArrayList(FlowExit) = .empty;
             for ([_]?FlowExit{ flow.matched, flow.unmatched }, [_]bool{ true, false }) |maybe_exit, truth| {
                 if (maybe_exit) |exit| {
@@ -9187,7 +9201,6 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (exits.items.len == 0) return flow.diverged orelse .{ .id = @fromBackingInt(0), .type_id = .never };
             const joined = try self.mergeScopedExits(baseline, exits.items, .{ .value = .{ .expected_type = .bool } }, .condition);
             try self.enterFlowExit(joined);
-            _ = span;
             var result = joined.constructed.?;
             if (self.flow) |data| if (flow.matched != null and flow.unmatched != null) {
                 const matched = self.states.items[@backingInt(flow.matched.?.state)].refinements.snapshot();
@@ -9200,9 +9213,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             return result;
         }
 
-        fn condition(self: *Self, id: semantic.UnresolvedBody.ValueId) anyerror!ConditionFlow {
-            if (self.values.get(@backingInt(id))) |value_to_test| return self.booleanCondition(value_to_test, self.valueSpan(id), false);
-            const expression = self.expressionOperation(id) orelse return self.booleanCondition(try self.value(id), self.valueSpan(id), false);
+        fn condition(self: *Self, use: semantic.UnresolvedBody.ValueUse) anyerror!ConditionFlow {
+            const id = use.value;
+            if (self.values.get(@backingInt(id))) |value_to_test| return self.booleanCondition(value_to_test, use.span, false);
+            const expression = self.expressionOperation(id) orelse return self.booleanCondition(try self.value(id), use.span, false);
             switch (expression.*) {
                 .static_membership => |membership| return self.staticMembershipCondition(membership),
                 .variant_membership => |membership| return self.variantMembershipCondition(membership),
@@ -9214,7 +9228,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .disjunction => |logical| return self.disjunctionCondition(logical),
                 .negation => |operand| return self.negatedCondition(operand),
                 .pattern_test => |binding| return self.patternCondition(binding),
-                else => return self.booleanCondition(try self.valueWithContext(id, .{ .access = .initialize }), self.valueSpan(id), false),
+                else => return self.booleanCondition(try self.valueWithContext(id, .{ .access = .initialize }), use.span, false),
             }
         }
 
@@ -9604,7 +9618,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             };
         }
 
-        fn negatedCondition(self: *Self, operand: semantic.UnresolvedBody.ValueId) !ConditionFlow {
+        fn negatedCondition(self: *Self, operand: semantic.UnresolvedBody.ValueUse) !ConditionFlow {
             const flow = try self.condition(operand);
             return .{ .matched = flow.unmatched, .unmatched = flow.matched, .diverged = flow.diverged };
         }
@@ -9829,7 +9843,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     output.variant_identity = try self.joinBindingIdentities(output.variant_identity orelse output.binding_identity, current.variant_identity orelse current.binding_identity);
                     output.binding_identity = try self.joinBindingIdentities(output.binding_identity, current.binding_identity);
                 }
-                if (policy == .branch and !std.meta.eql(original_identity, output.binding_identity)) {
+                if (policy == .branch and !std.meta.eql(self.unwrapBindingIdentity(original_identity), self.unwrapBindingIdentity(output.binding_identity))) {
                     const joined_identity = output.binding_identity;
                     output.binding_identity = try self.newBindingIdentity();
                     self.binding_versions.items[output.binding_identity.fixed] = .{ .alias = joined_identity };
@@ -11966,15 +11980,7 @@ fn testInitMaterializerBuilder(context: *TestMaterializerContext) TestMaterializ
         .file_id = 1,
         .unresolved = .{
             .parameter_count = 0,
-            .parameter_spans = &.{},
             .local_count = 0,
-            .expressions = &.{},
-            .conditions = &.{},
-            .blocks = &.{},
-            .statements = &.{},
-            .method_call_arguments = &.{},
-            .struct_field_values = &.{},
-            .assignment_fields = &.{},
             .root_block = @fromBackingInt(@intCast(0)),
         },
         .return_type = .unit,

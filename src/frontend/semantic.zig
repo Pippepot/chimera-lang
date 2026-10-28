@@ -683,7 +683,7 @@ pub const UnresolvedBody = struct {
     };
     pub const MatchArm = struct {
         pattern: u32,
-        condition: ?ValueId = null,
+        condition: ?ValueUse = null,
         body: BlockId,
         span: structures.SourceSpan,
     };
@@ -702,7 +702,7 @@ pub const UnresolvedBody = struct {
         continue_loop: structures.SourceSpan,
         return_nothing: structures.SourceSpan,
         return_value: struct { value: ValueUse, implicit: bool },
-        bind_conditional: struct { condition: ValueId, otherwise: BlockId, span: structures.SourceSpan },
+        bind_conditional: struct { condition: ValueUse, otherwise: BlockId, span: structures.SourceSpan },
     };
     pub const Call = struct {
         target: Target,
@@ -744,9 +744,9 @@ pub const UnresolvedBody = struct {
                 target_type: structures.TypeId,
             },
             iterator_membership: struct { operand: ValueUse, end_type: structures.TypeId },
-            conjunction: struct { lhs: ValueId, rhs: ValueId },
-            disjunction: struct { lhs: ValueId, rhs: ValueId },
-            negation: ValueId,
+            conjunction: BinaryOperands,
+            disjunction: BinaryOperands,
+            negation: ValueUse,
             pattern_test: PatternBinding,
             integer_literal: i64,
             int_literal_value: i64,
@@ -791,7 +791,7 @@ pub const UnresolvedBody = struct {
             sequence: BinaryOperands,
             call: Call,
             if_else: struct {
-                condition: ValueId,
+                condition: ValueUse,
                 then_block: BlockId,
                 else_block: BlockId,
             },
@@ -1671,7 +1671,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             }, success_unit, span);
             const unit = try self.appendExpression(index, .unit);
             const exhausted = try self.finishBlock(&.{.{ .break_loop = unit }}, null, span);
-            const dispatch = try self.appendExpression(index, .{ .if_else = .{ .condition = condition, .then_block = success, .else_block = exhausted } });
+            const dispatch = try self.appendExpression(index, .{ .if_else = .{ .condition = .{ .value = condition, .span = span }, .then_block = success, .else_block = exhausted } });
             const body_unit = try self.appendExpression(index, .unit);
             const body = try self.finishBlock(&.{
                 .{ .bind_local = .{ .local = next_local, .value = next, .span = span, .mutable = true, .mode = .inferred } },
@@ -1923,11 +1923,11 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             return .{ .bind_conditional = .{ .condition = condition, .otherwise = otherwise, .span = nodeFocusSpan(self.ast, index) } };
         }
 
-        fn buildIfCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueId {
+        fn buildIfCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueUse {
             return self.buildBindingCondition(index, false);
         }
 
-        fn buildBindingCondition(self: *Self, index: structures.Node.Index, allow_mutable: bool) !UnresolvedBody.ValueId {
+        fn buildBindingCondition(self: *Self, index: structures.Node.Index, allow_mutable: bool) !UnresolvedBody.ValueUse {
             const node = self.ast.nodes[index.index()];
             if (node.tag == .destructure_binding) {
                 const first_pattern = self.binding_patterns.items.len;
@@ -1935,9 +1935,9 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 for (self.binding_patterns.items[first_pattern..]) |pattern| {
                     if (!allow_mutable and pattern.shape == .name and pattern.shape.name.mutable) return self.reject(index, .condition_binding_must_be_immutable);
                 }
-                return self.appendExpression(index, .{ .pattern_test = statement.bind_pattern });
+                return .{ .value = try self.appendExpression(index, .{ .pattern_test = statement.bind_pattern }), .span = nodeFocusSpan(self.ast, index) };
             }
-            return self.append(index, false);
+            return self.appendUse(index, false);
         }
 
         fn appendMatch(self: *Self, index: structures.Node.Index, result_is_type: bool) !ValueId {
@@ -1961,7 +1961,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 }
                 const pattern = try self.buildMatchPattern(pattern_index);
                 try self.declareMatchCaptures(pattern);
-                const condition = if (condition_index) |guard| try self.append(guard, false) else null;
+                const condition = if (condition_index) |guard| try self.appendUse(guard, false) else null;
                 try arms.append(self.gpa, .{
                     .pattern = pattern,
                     .condition = condition,
@@ -2111,14 +2111,14 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 } }),
                 .is => self.buildVariantMembership(index),
                 .@"and", .@"or" => {
-                    const lhs = try self.append(node.data.node_node.a, false);
-                    const rhs = try self.append(node.data.node_node.b, false);
+                    const lhs = try self.appendUse(node.data.node_node.a, false);
+                    const rhs = try self.appendUse(node.data.node_node.b, false);
                     return self.appendExpression(index, if (node.tag == .@"and")
                         .{ .conjunction = .{ .lhs = lhs, .rhs = rhs } }
                     else
                         .{ .disjunction = .{ .lhs = lhs, .rhs = rhs } });
                 },
-                .not => self.appendExpression(index, .{ .negation = try self.append(node.data.node, false) }),
+                .not => self.appendExpression(index, .{ .negation = try self.appendUse(node.data.node, false) }),
                 else => unreachable,
             };
         }

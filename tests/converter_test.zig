@@ -2277,9 +2277,12 @@ test "optional deferred initializers are selected explicitly by their receiver" 
         \\func absent(mut count: int) unit | none
         \\    count += 1
         \\    return none
-        \\func outcome(init value: unit | none) bool -> value is unit
+        \\func outcome(init value: unit | none) bool
+        \\    const constructed = value
+        \\    return constructed is unit
         \\func queried(init value: bool) int
-        \\    if value -> return 2
+        \\    const constructed = value
+        \\    if constructed -> return 2
         \\    return 1
         \\func run() int
         \\    var count = 0

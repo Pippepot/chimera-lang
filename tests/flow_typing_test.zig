@@ -370,3 +370,30 @@ test "successive guarded loops preserve shared binding identity ancestors" {
     try source.writer.writeAll("  return total - 258\n");
     try Fixture.expectParity(source.written(), 42);
 }
+
+test "successive guarded loops preserve proofs and references across real backedges" {
+    var source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    try source.writer.writeAll("func run() int\n  var total = 0\n");
+    for (0..24) |index| try source.writer.print("  var v{d}: int | none = {d}\n", .{ index, index });
+    for (0..24) |index| try source.writer.print(
+        "  const selected{d} = v{d} is int\n  if selected{d}\n    ref alias{d} = v{d}\n    loop\n      alias{d} += 1\n      if alias{d} >= {d} -> break\n    total += v{d}\n",
+        .{ index, index, index, index, index, index, index, index + 2, index },
+    );
+    try source.writer.writeAll("  return total - 282\n");
+    try Fixture.expectParity(source.written(), 42);
+}
+
+test "single pass loops retain writes that invalidate an incoming proof" {
+    try Fixture.expectSourceDiagnostic(
+        \\func run() int
+        \\    var value: int | none = 42
+        \\    if value is int
+        \\        loop
+        \\            value = none
+        \\            break
+        \\        return value + 1
+        \\    return 0
+        \\exit(run())
+    , .missing_operation);
+}

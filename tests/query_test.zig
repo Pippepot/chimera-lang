@@ -3039,8 +3039,8 @@ test "struct value diagnostics reject invalid fields and targets" {
                 const start = std.mem.lastIndexOf(u8, case.source, "Pair").?;
                 try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "Pair".len }, diagnostics[0].span.?);
                 const missing = diagnostics[0].kind.missing_struct_initializer_field;
-                const types: queries.AnalysisContext(*Database) = .{ .ctx = db };
-                const definition = (try types.structDefinition(missing.type_id)).?;
+                const facts: queries.TypeFacts(*Database) = .{ .ctx = db };
+                const definition = (try facts.structDefinition(missing.type_id)).?;
                 try testing.expectEqualStrings("right", definition.fields[missing.field_index].name);
             },
             else => {},
@@ -6202,6 +6202,10 @@ test "ordinary conditions reject non-bool values and variants" {
     const sources = [_][]const u8{
         "static bad = func(v: int) int -> return if v -> 1 else 2\nbad(1)",
         "static bad = func(v: int | none) int -> return if v -> 1 else 2\nbad(1)",
+        "static bad = func(v: int) int -> return if not v -> 1 else 2\nbad(1)",
+        "static bad = func(v: int) int -> return if true and v -> 1 else 2\nbad(1)",
+        "static bad = func(v: int) int -> return if false or v -> 1 else 2\nbad(1)",
+        "static bad = func(v: int) int -> return match 0\n  _ and v -> 1\n  _ -> 2\nbad(1)",
     };
     for (sources) |source| {
         const db = try testDatabase(2);
@@ -6209,7 +6213,7 @@ test "ordinary conditions reject non-bool values and variants" {
         try addSource(db, 1, source);
         try testing.expect((try db.get(queries.ParseFile, 1)).* != null);
         try testing.expect((try db.get(queries.BuildExecutable, 1)).* == null);
-        const marker_start = std.mem.indexOf(u8, source, "if v").? + "if ".len;
+        const marker_start = std.mem.indexOf(u8, source, "v ->").?;
         const span: structures.SourceSpan = .{ .start = marker_start, .end = marker_start + 1 };
         const bad = (try db.get(queries.BuildModuleScope, 1)).*.?.resolve("bad").?;
         const signature = (try db.get(queries.FunctionSignature, bad)).*.?;
@@ -6597,8 +6601,8 @@ test "edits that change return reachability update only reachable calls" {
     const answer_id = scope.resolve("answer").?;
     const leaf_id = scope.resolve("leaf").?;
     const reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
-    try testing.expectEqual(@as(usize, 4), reachable.instances.len);
-    try testing.expectEqual(leaf_id, reachable.instances[3].item);
+    try testing.expectEqual(@as(usize, 3), reachable.instances.len);
+    try testing.expectEqual(leaf_id, reachable.instances[2].item);
 
     try setSource(db, 1,
         \\static leaf = func() int -> 42
@@ -6608,9 +6612,9 @@ test "edits that change return reachability update only reachable calls" {
         \\answer(1)
     );
     const updated = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer_id })).*.?;
-    try testing.expectEqual(@as(usize, 2), updated.call_arguments.len);
+    for (updated.instructions) |instruction| try testing.expect(instruction != .call);
     const updated_reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
-    try testing.expectEqual(@as(usize, 3), updated_reachable.instances.len);
+    try testing.expectEqual(@as(usize, 2), updated_reachable.instances.len);
     try testing.expectEqual(answer_id, updated_reachable.instances[1].item);
 }
 
@@ -10143,6 +10147,15 @@ test "ownership strategies require bare strategy names" {
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
     try testing.expectEqual(DiagnosticKind.invalid_struct_property_value, std.meta.activeTag(diagnostics[0].kind));
+    try setSource(db, 1,
+        \\struct S
+        \\  copy = trivial
+        \\const value = S{}
+    );
+    try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
+    const recovered = try db.transitiveAccumulatorValues(queries.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(recovered);
+    try testing.expectEqual(@as(usize, 0), recovered.len);
 }
 
 test "static aggregate parameters dominate every specialized branch" {

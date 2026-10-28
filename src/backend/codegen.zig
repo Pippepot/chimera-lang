@@ -612,7 +612,9 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             while (instruction_index < block.instruction_end) : (instruction_index += 1) {
                 self.current_span = if (ssa.instruction_spans.len == ssa.instructions.len) ssa.instruction_spans[instruction_index] else null;
                 self.current_frame = if (ssa.instruction_frames.len != 0) ssa.instruction_frames[instruction_index] else .root;
-                if (ssa.instructions[instruction_index] == .compare and try self.emitConditionalIncrement(instruction_index, block.instruction_end)) {
+                if ((ssa.instructions[instruction_index] == .compare or ssa.instructions[instruction_index] == .addi) and
+                    try self.emitConditionalIncrement(instruction_index, block.instruction_end))
+                {
                     instruction_index += 2;
                     if (buffered) try self.encoder.stream.instructions.append(self.gpa, .scratch_dead);
                     continue;
@@ -668,10 +670,13 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
 
         fn emitConditionalIncrement(self: *Self, index: usize, end: usize) !bool {
             if (index + 2 >= end) return false;
-            const condition = self.ssa.instructionValue(index);
-            const increment = self.ssa.instructionValue(index + 1);
+            const comparison_index = if (self.ssa.instructions[index] == .compare) index else index + 1;
+            const addition_index = if (comparison_index == index) index + 1 else index;
+            if (self.ssa.instructions[comparison_index] != .compare) return false;
+            const condition = self.ssa.instructionValue(comparison_index);
+            const increment = self.ssa.instructionValue(addition_index);
             if (self.plan.uses[@backingInt(condition)] != .used or self.plan.uses[@backingInt(increment)] != .used) return false;
-            const addition = self.ssa.instructions[index + 1];
+            const addition = self.ssa.instructions[addition_index];
             const selection = self.ssa.instructions[index + 2];
             if (addition != .addi or selection != .select) return false;
             const select = selection.select;
@@ -682,7 +687,8 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                 addition.addi.rhs
             else
                 return false;
-            var comparison = self.ssa.instructions[index].compare;
+            var comparison = self.ssa.instructions[comparison_index].compare;
+            if (comparison.operands.lhs == increment or comparison.operands.rhs == increment) return false;
             if (select.then_value != increment or select.else_value != base) {
                 if (select.else_value != increment or select.then_value != base) return false;
                 comparison.operation = comparison.operation.negated();

@@ -1,0 +1,586 @@
+--- a/benchmarks/flow_benchmark.zig
++++ b/benchmarks/flow_benchmark.zig
+@@ -62,10 +62,11 @@
+     try source.appendSlice(allocator, line);
+ }
+ 
+-const Kind = enum { scalar, owning, narrowing };
++const Kind = enum { scalar, owning, narrowing, backedges };
+ 
+ fn benchmark(init: std.process.Init, writer: *std.Io.Writer, count: u32, kind: Kind) !void {
+     const owning = kind == .owning;
++    const narrowing = kind == .narrowing or kind == .backedges;
+     var source: std.ArrayList(u8) = .empty;
+     defer source.deinit(init.gpa);
+     if (owning) try source.appendSlice(init.gpa, "struct Item\n  value: int\n  drop = func(deinit self: Item) -> return\n");
+@@ -73,14 +74,20 @@
+     for (0..count) |index| {
+         if (owning) {
+             try appendLine(&source, init.gpa, "  var v{d} = Item{{value = flag + {d}}}\n", .{ index, index });
+-        } else if (kind == .narrowing) {
++        } else if (narrowing) {
+             try appendLine(&source, init.gpa, "  var v{d}: int | none = if flag < {d} -> none else {d}\n", .{ index, index, index });
+         } else {
+             try appendLine(&source, init.gpa, "  var v{d} = flag + {d}\n", .{ index, index });
+         }
+     }
+-    if (kind == .narrowing) {
+-        for (0..count) |index| try appendLine(&source, init.gpa, "  const selected{d} = v{d} is int\n  if selected{d}\n    ref alias{d} = v{d}\n    loop\n      alias{d} += 1\n      break\n    total += v{d}\n", .{ index, index, index, index, index, index, index });
++    if (narrowing) {
++        for (0..count) |index| {
++            try appendLine(&source, init.gpa, "  const selected{d} = v{d} is int\n  if selected{d}\n    ref alias{d} = v{d}\n    loop\n      alias{d} += 1\n", .{ index, index, index, index, index, index });
++            if (kind == .backedges) {
++                try appendLine(&source, init.gpa, "      if alias{d} >= {d} -> break\n", .{ index, index + 2 });
++            } else try source.appendSlice(init.gpa, "      break\n");
++            try appendLine(&source, init.gpa, "    total += v{d}\n", .{index});
++        }
+     } else {
+         for (0..count) |index| try appendLine(&source, init.gpa, "  if flag < {d} -> v{d}{s} += 1\n", .{ index, index, if (owning) ".value" else "" });
+         for (0..count) |index| try appendLine(&source, init.gpa, "  total += v{d}{s}\n", .{ index, if (owning) ".value" else "" });
+@@ -123,7 +130,7 @@
+     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+     const writer = &stdout.interface;
+     try writer.writeAll("kind,branches,typing_ns,snapshots,snapshot_bytes,blocks,generations,lifetime_bytes,flow_fact_bytes,flow_place_bytes,flow_predicate_bytes,inference_key_bytes\n");
+-    for ([_]Kind{ .scalar, .owning, .narrowing }) |kind| {
++    for ([_]Kind{ .scalar, .owning, .narrowing, .backedges }) |kind| {
+         for ([_]u32{ 8, 32, 128, 256, 512 }) |count| try benchmark(init, writer, count, kind);
+     }
+     try writer.flush();
+--- a/src/backend/codegen.zig
++++ b/src/backend/codegen.zig
+@@ -612,7 +612,9 @@
+             while (instruction_index < block.instruction_end) : (instruction_index += 1) {
+                 self.current_span = if (ssa.instruction_spans.len == ssa.instructions.len) ssa.instruction_spans[instruction_index] else null;
+                 self.current_frame = if (ssa.instruction_frames.len != 0) ssa.instruction_frames[instruction_index] else .root;
+-                if (ssa.instructions[instruction_index] == .compare and try self.emitConditionalIncrement(instruction_index, block.instruction_end)) {
++                if ((ssa.instructions[instruction_index] == .compare or ssa.instructions[instruction_index] == .addi) and
++                    try self.emitConditionalIncrement(instruction_index, block.instruction_end))
++                {
+                     instruction_index += 2;
+                     if (buffered) try self.encoder.stream.instructions.append(self.gpa, .scratch_dead);
+                     continue;
+@@ -668,10 +670,13 @@
+ 
+         fn emitConditionalIncrement(self: *Self, index: usize, end: usize) !bool {
+             if (index + 2 >= end) return false;
+-            const condition = self.ssa.instructionValue(index);
+-            const increment = self.ssa.instructionValue(index + 1);
++            const comparison_index = if (self.ssa.instructions[index] == .compare) index else index + 1;
++            const addition_index = if (comparison_index == index) index + 1 else index;
++            if (self.ssa.instructions[comparison_index] != .compare) return false;
++            const condition = self.ssa.instructionValue(comparison_index);
++            const increment = self.ssa.instructionValue(addition_index);
+             if (self.plan.uses[@backingInt(condition)] != .used or self.plan.uses[@backingInt(increment)] != .used) return false;
+-            const addition = self.ssa.instructions[index + 1];
++            const addition = self.ssa.instructions[addition_index];
+             const selection = self.ssa.instructions[index + 2];
+             if (addition != .addi or selection != .select) return false;
+             const select = selection.select;
+@@ -682,7 +687,8 @@
+                 addition.addi.rhs
+             else
+                 return false;
+-            var comparison = self.ssa.instructions[index].compare;
++            var comparison = self.ssa.instructions[comparison_index].compare;
++            if (comparison.operands.lhs == increment or comparison.operands.rhs == increment) return false;
+             if (select.then_value != increment or select.else_value != base) {
+                 if (select.else_value != increment or select.then_value != base) return false;
+                 comparison.operation = comparison.operation.negated();
+--- a/src/frontend/semantic.zig
++++ b/src/frontend/semantic.zig
+@@ -683,7 +683,7 @@
+     };
+     pub const MatchArm = struct {
+         pattern: u32,
+-        condition: ?ValueId = null,
++        condition: ?ValueUse = null,
+         body: BlockId,
+         span: structures.SourceSpan,
+     };
+@@ -702,7 +702,7 @@
+         continue_loop: structures.SourceSpan,
+         return_nothing: structures.SourceSpan,
+         return_value: struct { value: ValueUse, implicit: bool },
+-        bind_conditional: struct { condition: ValueId, otherwise: BlockId, span: structures.SourceSpan },
++        bind_conditional: struct { condition: ValueUse, otherwise: BlockId, span: structures.SourceSpan },
+     };
+     pub const Call = struct {
+         target: Target,
+@@ -744,9 +744,9 @@
+                 target_type: structures.TypeId,
+             },
+             iterator_membership: struct { operand: ValueUse, end_type: structures.TypeId },
+-            conjunction: struct { lhs: ValueId, rhs: ValueId },
+-            disjunction: struct { lhs: ValueId, rhs: ValueId },
+-            negation: ValueId,
++            conjunction: BinaryOperands,
++            disjunction: BinaryOperands,
++            negation: ValueUse,
+             pattern_test: PatternBinding,
+             integer_literal: i64,
+             int_literal_value: i64,
+@@ -791,7 +791,7 @@
+             sequence: BinaryOperands,
+             call: Call,
+             if_else: struct {
+-                condition: ValueId,
++                condition: ValueUse,
+                 then_block: BlockId,
+                 else_block: BlockId,
+             },
+@@ -1671,7 +1671,7 @@
+             }, success_unit, span);
+             const unit = try self.appendExpression(index, .unit);
+             const exhausted = try self.finishBlock(&.{.{ .break_loop = unit }}, null, span);
+-            const dispatch = try self.appendExpression(index, .{ .if_else = .{ .condition = condition, .then_block = success, .else_block = exhausted } });
++            const dispatch = try self.appendExpression(index, .{ .if_else = .{ .condition = .{ .value = condition, .span = span }, .then_block = success, .else_block = exhausted } });
+             const body_unit = try self.appendExpression(index, .unit);
+             const body = try self.finishBlock(&.{
+                 .{ .bind_local = .{ .local = next_local, .value = next, .span = span, .mutable = true, .mode = .inferred } },
+@@ -1923,11 +1923,11 @@
+             return .{ .bind_conditional = .{ .condition = condition, .otherwise = otherwise, .span = nodeFocusSpan(self.ast, index) } };
+         }
+ 
+-        fn buildIfCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueId {
++        fn buildIfCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueUse {
+             return self.buildBindingCondition(index, false);
+         }
+ 
+-        fn buildBindingCondition(self: *Self, index: structures.Node.Index, allow_mutable: bool) !UnresolvedBody.ValueId {
++        fn buildBindingCondition(self: *Self, index: structures.Node.Index, allow_mutable: bool) !UnresolvedBody.ValueUse {
+             const node = self.ast.nodes[index.index()];
+             if (node.tag == .destructure_binding) {
+                 const first_pattern = self.binding_patterns.items.len;
+@@ -1935,9 +1935,9 @@
+                 for (self.binding_patterns.items[first_pattern..]) |pattern| {
+                     if (!allow_mutable and pattern.shape == .name and pattern.shape.name.mutable) return self.reject(index, .condition_binding_must_be_immutable);
+                 }
+-                return self.appendExpression(index, .{ .pattern_test = statement.bind_pattern });
+-            }
+-            return self.append(index, false);
++                return .{ .value = try self.appendExpression(index, .{ .pattern_test = statement.bind_pattern }), .span = nodeFocusSpan(self.ast, index) };
++            }
++            return self.appendUse(index, false);
+         }
+ 
+         fn appendMatch(self: *Self, index: structures.Node.Index, result_is_type: bool) !ValueId {
+@@ -1961,7 +1961,7 @@
+                 }
+                 const pattern = try self.buildMatchPattern(pattern_index);
+                 try self.declareMatchCaptures(pattern);
+-                const condition = if (condition_index) |guard| try self.append(guard, false) else null;
++                const condition = if (condition_index) |guard| try self.appendUse(guard, false) else null;
+                 try arms.append(self.gpa, .{
+                     .pattern = pattern,
+                     .condition = condition,
+@@ -2111,14 +2111,14 @@
+                 } }),
+                 .is => self.buildVariantMembership(index),
+                 .@"and", .@"or" => {
+-                    const lhs = try self.append(node.data.node_node.a, false);
+-                    const rhs = try self.append(node.data.node_node.b, false);
++                    const lhs = try self.appendUse(node.data.node_node.a, false);
++                    const rhs = try self.appendUse(node.data.node_node.b, false);
+                     return self.appendExpression(index, if (node.tag == .@"and")
+                         .{ .conjunction = .{ .lhs = lhs, .rhs = rhs } }
+                     else
+                         .{ .disjunction = .{ .lhs = lhs, .rhs = rhs } });
+                 },
+-                .not => self.appendExpression(index, .{ .negation = try self.append(node.data.node, false) }),
++                .not => self.appendExpression(index, .{ .negation = try self.appendUse(node.data.node, false) }),
+                 else => unreachable,
+             };
+         }
+--- a/src/frontend/typing.zig
++++ b/src/frontend/typing.zig
+@@ -2137,7 +2137,20 @@
+             }
+         }
+ 
+-        fn joinBindingIdentities(self: *Self, first: BindingIdentity, second: BindingIdentity) !BindingIdentity {
++        /// A completed loop without a backedge has exactly its entry identity.
++        fn unwrapBindingIdentity(self: *const Self, identity: BindingIdentity) BindingIdentity {
++            var current = identity;
++            while (current == .join) {
++                const join = self.binding_joins.items[current.join];
++                if (!join.complete or join.alternatives.items.len != 0) break;
++                current = join.initial;
++            }
++            return current;
++        }
++
++        fn joinBindingIdentities(self: *Self, left: BindingIdentity, right: BindingIdentity) !BindingIdentity {
++            const first = self.unwrapBindingIdentity(left);
++            const second = self.unwrapBindingIdentity(right);
+             if (std.meta.eql(first, second)) return first;
+             const index: u32 = @intCast(self.binding_joins.items.len);
+             try self.binding_joins.append(self.gpa, .{ .initial = first, .complete = true });
+@@ -5370,6 +5383,7 @@
+             var result: ResolvedBindingIdentity = .{};
+             var current = identity;
+             while (true) {
++                current = self.unwrapBindingIdentity(current);
+                 switch (current) {
+                     .unknown => result.conflicting = true,
+                     .fixed => |fixed| {
+@@ -9174,7 +9188,7 @@
+ 
+         fn predicateValue(self: *Self, id: semantic.UnresolvedBody.ValueId, span: structures.SourceSpan) !Value {
+             const baseline = try self.captureAvailability();
+-            const flow = try self.condition(id);
++            const flow = try self.condition(.{ .value = id, .span = span });
+             var exits: std.ArrayList(FlowExit) = .empty;
+             for ([_]?FlowExit{ flow.matched, flow.unmatched }, [_]bool{ true, false }) |maybe_exit, truth| {
+                 if (maybe_exit) |exit| {
+@@ -9187,7 +9201,6 @@
+             if (exits.items.len == 0) return flow.diverged orelse .{ .id = @fromBackingInt(0), .type_id = .never };
+             const joined = try self.mergeScopedExits(baseline, exits.items, .{ .value = .{ .expected_type = .bool } }, .condition);
+             try self.enterFlowExit(joined);
+-            _ = span;
+             var result = joined.constructed.?;
+             if (self.flow) |data| if (flow.matched != null and flow.unmatched != null) {
+                 const matched = self.states.items[@backingInt(flow.matched.?.state)].refinements.snapshot();
+@@ -9200,9 +9213,10 @@
+             return result;
+         }
+ 
+-        fn condition(self: *Self, id: semantic.UnresolvedBody.ValueId) anyerror!ConditionFlow {
+-            if (self.values.get(@backingInt(id))) |value_to_test| return self.booleanCondition(value_to_test, self.valueSpan(id), false);
+-            const expression = self.expressionOperation(id) orelse return self.booleanCondition(try self.value(id), self.valueSpan(id), false);
++        fn condition(self: *Self, use: semantic.UnresolvedBody.ValueUse) anyerror!ConditionFlow {
++            const id = use.value;
++            if (self.values.get(@backingInt(id))) |value_to_test| return self.booleanCondition(value_to_test, use.span, false);
++            const expression = self.expressionOperation(id) orelse return self.booleanCondition(try self.value(id), use.span, false);
+             switch (expression.*) {
+                 .static_membership => |membership| return self.staticMembershipCondition(membership),
+                 .variant_membership => |membership| return self.variantMembershipCondition(membership),
+@@ -9214,7 +9228,7 @@
+                 .disjunction => |logical| return self.disjunctionCondition(logical),
+                 .negation => |operand| return self.negatedCondition(operand),
+                 .pattern_test => |binding| return self.patternCondition(binding),
+-                else => return self.booleanCondition(try self.valueWithContext(id, .{ .access = .initialize }), self.valueSpan(id), false),
++                else => return self.booleanCondition(try self.valueWithContext(id, .{ .access = .initialize }), use.span, false),
+             }
+         }
+ 
+@@ -9604,7 +9618,7 @@
+             };
+         }
+ 
+-        fn negatedCondition(self: *Self, operand: semantic.UnresolvedBody.ValueId) !ConditionFlow {
++        fn negatedCondition(self: *Self, operand: semantic.UnresolvedBody.ValueUse) !ConditionFlow {
+             const flow = try self.condition(operand);
+             return .{ .matched = flow.unmatched, .unmatched = flow.matched, .diverged = flow.diverged };
+         }
+@@ -9829,7 +9843,7 @@
+                     output.variant_identity = try self.joinBindingIdentities(output.variant_identity orelse output.binding_identity, current.variant_identity orelse current.binding_identity);
+                     output.binding_identity = try self.joinBindingIdentities(output.binding_identity, current.binding_identity);
+                 }
+-                if (policy == .branch and !std.meta.eql(original_identity, output.binding_identity)) {
++                if (policy == .branch and !std.meta.eql(self.unwrapBindingIdentity(original_identity), self.unwrapBindingIdentity(output.binding_identity))) {
+                     const joined_identity = output.binding_identity;
+                     output.binding_identity = try self.newBindingIdentity();
+                     self.binding_versions.items[output.binding_identity.fixed] = .{ .alias = joined_identity };
+@@ -11966,15 +11980,7 @@
+         .file_id = 1,
+         .unresolved = .{
+             .parameter_count = 0,
+-            .parameter_spans = &.{},
+             .local_count = 0,
+-            .expressions = &.{},
+-            .conditions = &.{},
+-            .blocks = &.{},
+-            .statements = &.{},
+-            .method_call_arguments = &.{},
+-            .struct_field_values = &.{},
+-            .assignment_fields = &.{},
+             .root_block = @fromBackingInt(@intCast(0)),
+         },
+         .return_type = .unit,
+--- a/src/optimizer/hoisting.zig
++++ b/src/optimizer/hoisting.zig
+@@ -13,13 +13,13 @@
+     const scratch = function.scratch;
+     const graph = (try function.controlFlow()).*;
+     const found = try loops.find(scratch, function, graph);
++    var changed = try snapshotAllocationReads(function, found);
+     const memory = try effects.Memory.init(function);
+     const owner = try scratch.alloc(u32, function.instructions.items.len);
+     @memset(owner, std.math.maxInt(u32));
+     for (function.blocks.items, 0..) |block, index| for (block.instructions.items) |instruction| {
+         owner[instruction] = @intCast(index);
+     };
+-    var changed = false;
+     for (found) |loop| {
+         const preheader = loops.preheader(function, graph, loop) orelse continue;
+         var writes: effects.Writes = .{};
+@@ -46,6 +46,30 @@
+             instructions.shrinkRetainingCapacity(kept);
+         }
+     }
++    return changed;
++}
++
++/// Element addressing reads the descriptor at this point, independently of the
++/// element index. Explicit reads let ordinary memory analysis move that load.
++fn snapshotAllocationReads(function: *Function, found: []const loops.Loop) !bool {
++    var changed = false;
++    for (found) |loop| for (loop.blocks) |block| {
++        var position: usize = 0;
++        while (position < function.blocks.items[block].instructions.items.len) : (position += 1) {
++            const index = function.blocks.items[block].instructions.items[position];
++            const instruction = function.instructions.items[index];
++            if (function.removed.items[index] or instruction != .allocation_element) continue;
++            const allocation = function.find(instruction.allocation_element.allocation);
++            if (function.plainValue(allocation)) continue;
++            const snapshot = try function.insertInstruction(block, position, .{ .value_copy = .{
++                .source = allocation,
++                .type_id = function.valueType(allocation),
++            } }, function.instructionSpan(index), function.instructionFrame(index));
++            function.instructions.items[index].allocation_element.allocation = snapshot;
++            position += 1;
++            changed = true;
++        }
++    };
+     return changed;
+ }
+ 
+--- a/src/queries.zig
++++ b/src/queries.zig
+@@ -628,11 +628,14 @@
+         }
+ 
+         pub fn structDefinition(self: @This(), type_id: structures.TypeId) !?*const structures.StructDefinition {
+-            return switch ((try typeData(self.ctx, type_id)) orelse return null) {
+-                .structure => |identity| getStructDefinition(self.ctx, identity),
+-                .tuple => if ((try self.ctx.get(TupleDefinition, type_id)).*) |*definition| definition else null,
+-                .reference, .variant, .callable, .array => null,
+-            };
++            switch ((try typeData(self.ctx, type_id)) orelse return null) {
++                .structure => |identity| return (try getStructDefinition(self.ctx, identity)) orelse error.Unavailable,
++                .tuple => {
++                    const definition = try self.ctx.get(TupleDefinition, type_id);
++                    return if (definition.*) |*value| value else error.Unavailable;
++                },
++                .reference, .variant, .callable, .array => return null,
++            }
+         }
+ 
+         pub fn components(self: @This(), type_id: structures.TypeId) !structures.TypeComponents {
+@@ -666,7 +669,8 @@
+         }
+ 
+         pub fn staticStringBytes(self: @This(), type_id: structures.TypeId) !?structures.TypeId {
+-            const definition = (try self.structDefinition(type_id)) orelse return null;
++            const identity = (try self.structIdentity(type_id)) orelse return null;
++            const definition = (try getStructDefinition(self.ctx, identity)) orelse return null;
+             return if (try intrinsics.validStaticString(self, definition)) definition.fields[0].type_id else null;
+         }
+ 
+--- a/src/query_disk_cache.zig
++++ b/src/query_disk_cache.zig
+@@ -885,7 +885,7 @@
+     var branch_arguments = [_]structures.FunctionValueUse{.{ .value = @fromBackingInt(@intCast(0)) }};
+     var call_arguments: [0]structures.FunctionCallArgument = .{};
+     var instructions = [_]structures.FunctionInstruction{.{ .value_copy = .{
+-        .destination = @fromBackingInt(1),
++        .destination = @fromBackingInt(2),
+         .source = @fromBackingInt(@intCast(0)),
+         .type_id = .int,
+     } }};
+@@ -921,7 +921,7 @@
+     block_arguments[0].representation = .value;
+     body.instructions = instructions[0..0];
+     blocks[0].instruction_end = 0;
+-    instructions[0] = .{ .value_copy = .{ .destination = @fromBackingInt(1), .source = @fromBackingInt(0), .type_id = .int } };
++    instructions[0] = .{ .value_copy = .{ .destination = @fromBackingInt(2), .source = @fromBackingInt(0), .type_id = .int } };
+ 
+     blocks[0].terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(0)), .arguments = .{ .start = 0, .end = 0 } } };
+     try std.testing.expect(!validFunctionBody(body));
+--- a/tests/codegen_test.zig
++++ b/tests/codegen_test.zig
+@@ -84,6 +84,26 @@
+     , 42);
+ }
+ 
++test "loop allocation snapshots follow descriptor replacement through variant aliases" {
++    try test_sources.SourceFixture.expectParity(
++        \\func run() int
++        \\    var values = List(int).new(1)
++        \\    if not (values is List(int)) -> return 90
++        \\    ref selected = values
++        \\    var index = 0
++        \\    loop
++        \\        if index == 8 -> break
++        \\        const appended = selected.append(index + 1)
++        \\        if not (appended is unit) -> return 91
++        \\        selected[0] += 1
++        \\        index += 1
++        \\    var total = 0
++        \\    for position in 0..8
++        \\        total += selected[position]
++        \\    return total - 2
++    , 42);
++}
++
+ test "conditional counting preserves wrapping and both predicate outcomes" {
+     try test_sources.SourceFixture.expectParity(
+         \\func run() int
+@@ -96,6 +116,35 @@
+         \\    if wrapping <> -2147483648 -> return 0
+         \\    return count
+     , 42);
++}
++
++test "conditional increments preserve both instruction orders and comparison dependencies" {
++    for (0..3) |order| for ([_]bool{ false, true }) |matched| {
++        const comparison_index: u32 = if (order == 0) 4 else 5;
++        const addition_index: u32 = if (order == 0) 5 else 4;
++        var instructions = [_]structures.FunctionInstruction{
++            .{ .const_int = if (matched) 41 else 42 },
++            .{ .const_int = 1 },
++            .{ .const_int = 7 },
++            .{ .const_int = if (order == 2) 42 else if (matched) 7 else 9 },
++            .const_unit,
++            .const_unit,
++            .{ .select = .{ .condition = @fromBackingInt(comparison_index), .then_value = @fromBackingInt(addition_index), .else_value = @fromBackingInt(0), .type_id = .int } },
++            .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
++        };
++        instructions[addition_index] = .{ .addi = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1) } };
++        instructions[comparison_index] = .{ .compare = .{ .operation = .eqi, .operands = .{ .lhs = @fromBackingInt(if (order == 2) addition_index else 2), .rhs = @fromBackingInt(3) } } };
++        const body: structures.FunctionBodyAnalysis = .{
++            .return_type = .unit,
++            .call_arguments = &.{.{ .prepared = .{ .value = @fromBackingInt(6) } }},
++            .instructions = &instructions,
++            .blocks = &.{.{ .argument_start = 0, .argument_end = 0, .instruction_start = 0, .instruction_end = instructions.len, .terminator = .diverge }},
++            .entry = @fromBackingInt(0),
++        };
++        var artifact = try codegen.compileFunction(&body, TestTypes{}, std.testing.allocator);
++        defer artifact.deinit(std.testing.allocator);
++        try expectArtifactExitCode(artifact, 42);
++    };
+ }
+ 
+ test "machine symbolic positions resolve after register and spill encoding" {
+--- a/tests/converter_test.zig
++++ b/tests/converter_test.zig
+@@ -2277,9 +2277,12 @@
+         \\func absent(mut count: int) unit | none
+         \\    count += 1
+         \\    return none
+-        \\func outcome(init value: unit | none) bool -> value is unit
++        \\func outcome(init value: unit | none) bool
++        \\    const constructed = value
++        \\    return constructed is unit
+         \\func queried(init value: bool) int
+-        \\    if value -> return 2
++        \\    const constructed = value
++        \\    if constructed -> return 2
+         \\    return 1
+         \\func run() int
+         \\    var count = 0
+--- a/tests/flow_typing_test.zig
++++ b/tests/flow_typing_test.zig
+@@ -370,3 +370,30 @@
+     try source.writer.writeAll("  return total - 258\n");
+     try Fixture.expectParity(source.written(), 42);
+ }
++
++test "successive guarded loops preserve proofs and references across real backedges" {
++    var source: std.Io.Writer.Allocating = .init(std.testing.allocator);
++    defer source.deinit();
++    try source.writer.writeAll("func run() int\n  var total = 0\n");
++    for (0..24) |index| try source.writer.print("  var v{d}: int | none = {d}\n", .{ index, index });
++    for (0..24) |index| try source.writer.print(
++        "  const selected{d} = v{d} is int\n  if selected{d}\n    ref alias{d} = v{d}\n    loop\n      alias{d} += 1\n      if alias{d} >= {d} -> break\n    total += v{d}\n",
++        .{ index, index, index, index, index, index, index, index + 2, index },
++    );
++    try source.writer.writeAll("  return total - 282\n");
++    try Fixture.expectParity(source.written(), 42);
++}
++
++test "single pass loops retain writes that invalidate an incoming proof" {
++    try Fixture.expectSourceDiagnostic(
++        \\func run() int
++        \\    var value: int | none = 42
++        \\    if value is int
++        \\        loop
++        \\            value = none
++        \\            break
++        \\        return value + 1
++        \\    return 0
++        \\exit(run())
++    , .missing_operation);
++}
+--- a/tests/query_test.zig
++++ b/tests/query_test.zig
+@@ -3039,8 +3039,8 @@
+                 const start = std.mem.lastIndexOf(u8, case.source, "Pair").?;
+                 try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + "Pair".len }, diagnostics[0].span.?);
+                 const missing = diagnostics[0].kind.missing_struct_initializer_field;
+-                const types: queries.AnalysisContext(*Database) = .{ .ctx = db };
+-                const definition = (try types.structDefinition(missing.type_id)).?;
++                const facts: queries.TypeFacts(*Database) = .{ .ctx = db };
++                const definition = (try facts.structDefinition(missing.type_id)).?;
+                 try testing.expectEqualStrings("right", definition.fields[missing.field_index].name);
+             },
+             else => {},
+@@ -6202,6 +6202,10 @@
+     const sources = [_][]const u8{
+         "static bad = func(v: int) int -> return if v -> 1 else 2\nbad(1)",
+         "static bad = func(v: int | none) int -> return if v -> 1 else 2\nbad(1)",
++        "static bad = func(v: int) int -> return if not v -> 1 else 2\nbad(1)",
++        "static bad = func(v: int) int -> return if true and v -> 1 else 2\nbad(1)",
++        "static bad = func(v: int) int -> return if false or v -> 1 else 2\nbad(1)",
++        "static bad = func(v: int) int -> return match 0\n  _ and v -> 1\n  _ -> 2\nbad(1)",
+     };
+     for (sources) |source| {
+         const db = try testDatabase(2);
+@@ -6209,7 +6213,7 @@
+         try addSource(db, 1, source);
+         try testing.expect((try db.get(queries.ParseFile, 1)).* != null);
+         try testing.expect((try db.get(queries.BuildExecutable, 1)).* == null);
+-        const marker_start = std.mem.indexOf(u8, source, "if v").? + "if ".len;
++        const marker_start = std.mem.indexOf(u8, source, "v ->").?;
+         const span: structures.SourceSpan = .{ .start = marker_start, .end = marker_start + 1 };
+         const bad = (try db.get(queries.BuildModuleScope, 1)).*.?.resolve("bad").?;
+         const signature = (try db.get(queries.FunctionSignature, bad)).*.?;
+@@ -6597,8 +6601,8 @@
+     const answer_id = scope.resolve("answer").?;
+     const leaf_id = scope.resolve("leaf").?;
+     const reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
+-    try testing.expectEqual(@as(usize, 4), reachable.instances.len);
+-    try testing.expectEqual(leaf_id, reachable.instances[3].item);
++    try testing.expectEqual(@as(usize, 3), reachable.instances.len);
++    try testing.expectEqual(leaf_id, reachable.instances[2].item);
+ 
+     try setSource(db, 1,
+         \\static leaf = func() int -> 42
+@@ -6608,9 +6612,9 @@
+         \\answer(1)
+     );
+     const updated = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = answer_id })).*.?;
+-    try testing.expectEqual(@as(usize, 2), updated.call_arguments.len);
++    for (updated.instructions) |instruction| try testing.expect(instruction != .call);
+     const updated_reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
+-    try testing.expectEqual(@as(usize, 3), updated_reachable.instances.len);
++    try testing.expectEqual(@as(usize, 2), updated_reachable.instances.len);
+     try testing.expectEqual(answer_id, updated_reachable.instances[1].item);
+ }
+ 
+@@ -10143,6 +10147,15 @@
+     defer freeDiagnostics(diagnostics);
+     try testing.expectEqual(@as(usize, 1), diagnostics.len);
+     try testing.expectEqual(DiagnosticKind.invalid_struct_property_value, std.meta.activeTag(diagnostics[0].kind));
++    try setSource(db, 1,
++        \\struct S
++        \\  copy = trivial
++        \\const value = S{}
++    );
++    try testing.expect((try db.get(queries.BuildExecutable, 1)).* != null);
++    const recovered = try db.transitiveAccumulatorValues(queries.BuildExecutable, 1, structures.Diagnostic, testing.allocator);
++    defer freeDiagnostics(recovered);
++    try testing.expectEqual(@as(usize, 0), recovered.len);
+ }
+ 
+ test "static aggregate parameters dominate every specialized branch" {

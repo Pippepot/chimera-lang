@@ -13,13 +13,13 @@ pub fn hoist(function: *Function) !bool {
     const scratch = function.scratch;
     const graph = (try function.controlFlow()).*;
     const found = try loops.find(scratch, function, graph);
+    var changed = try snapshotAllocationReads(function, found);
     const memory = try effects.Memory.init(function);
     const owner = try scratch.alloc(u32, function.instructions.items.len);
     @memset(owner, std.math.maxInt(u32));
     for (function.blocks.items, 0..) |block, index| for (block.instructions.items) |instruction| {
         owner[instruction] = @intCast(index);
     };
-    var changed = false;
     for (found) |loop| {
         const preheader = loops.preheader(function, graph, loop) orelse continue;
         var writes: effects.Writes = .{};
@@ -46,6 +46,30 @@ pub fn hoist(function: *Function) !bool {
             instructions.shrinkRetainingCapacity(kept);
         }
     }
+    return changed;
+}
+
+/// Element addressing reads the descriptor at this point, independently of the
+/// element index. Explicit reads let ordinary memory analysis move that load.
+fn snapshotAllocationReads(function: *Function, found: []const loops.Loop) !bool {
+    var changed = false;
+    for (found) |loop| for (loop.blocks) |block| {
+        var position: usize = 0;
+        while (position < function.blocks.items[block].instructions.items.len) : (position += 1) {
+            const index = function.blocks.items[block].instructions.items[position];
+            const instruction = function.instructions.items[index];
+            if (function.removed.items[index] or instruction != .allocation_element) continue;
+            const allocation = function.find(instruction.allocation_element.allocation);
+            if (function.plainValue(allocation)) continue;
+            const snapshot = try function.insertInstruction(block, position, .{ .value_copy = .{
+                .source = allocation,
+                .type_id = function.valueType(allocation),
+            } }, function.instructionSpan(index), function.instructionFrame(index));
+            function.instructions.items[index].allocation_element.allocation = snapshot;
+            position += 1;
+            changed = true;
+        }
+    };
     return changed;
 }
 

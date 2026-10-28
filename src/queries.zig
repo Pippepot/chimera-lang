@@ -628,11 +628,14 @@ pub fn TypeFacts(comptime Context: type) type {
         }
 
         pub fn structDefinition(self: @This(), type_id: structures.TypeId) !?*const structures.StructDefinition {
-            return switch ((try typeData(self.ctx, type_id)) orelse return null) {
-                .structure => |identity| getStructDefinition(self.ctx, identity),
-                .tuple => if ((try self.ctx.get(TupleDefinition, type_id)).*) |*definition| definition else null,
-                .reference, .variant, .callable, .array => null,
-            };
+            switch ((try typeData(self.ctx, type_id)) orelse return null) {
+                .structure => |identity| return (try getStructDefinition(self.ctx, identity)) orelse error.Unavailable,
+                .tuple => {
+                    const definition = try self.ctx.get(TupleDefinition, type_id);
+                    return if (definition.*) |*value| value else error.Unavailable;
+                },
+                .reference, .variant, .callable, .array => return null,
+            }
         }
 
         pub fn components(self: @This(), type_id: structures.TypeId) !structures.TypeComponents {
@@ -666,7 +669,8 @@ pub fn TypeFacts(comptime Context: type) type {
         }
 
         pub fn staticStringBytes(self: @This(), type_id: structures.TypeId) !?structures.TypeId {
-            const definition = (try self.structDefinition(type_id)) orelse return null;
+            const identity = (try self.structIdentity(type_id)) orelse return null;
+            const definition = (try getStructDefinition(self.ctx, identity)) orelse return null;
             return if (try intrinsics.validStaticString(self, definition)) definition.fields[0].type_id else null;
         }
 

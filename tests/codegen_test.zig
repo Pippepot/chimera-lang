@@ -84,6 +84,26 @@ test "loop allocation bases preserve checked element reads and writes" {
     , 42);
 }
 
+test "loop allocation snapshots follow descriptor replacement through variant aliases" {
+    try test_sources.SourceFixture.expectParity(
+        \\func run() int
+        \\    var values = List(int).new(1)
+        \\    if not (values is List(int)) -> return 90
+        \\    ref selected = values
+        \\    var index = 0
+        \\    loop
+        \\        if index == 8 -> break
+        \\        const appended = selected.append(index + 1)
+        \\        if not (appended is unit) -> return 91
+        \\        selected[0] += 1
+        \\        index += 1
+        \\    var total = 0
+        \\    for position in 0..8
+        \\        total += selected[position]
+        \\    return total - 2
+    , 42);
+}
+
 test "conditional counting preserves wrapping and both predicate outcomes" {
     try test_sources.SourceFixture.expectParity(
         \\func run() int
@@ -96,6 +116,35 @@ test "conditional counting preserves wrapping and both predicate outcomes" {
         \\    if wrapping <> -2147483648 -> return 0
         \\    return count
     , 42);
+}
+
+test "conditional increments preserve both instruction orders and comparison dependencies" {
+    for (0..3) |order| for ([_]bool{ false, true }) |matched| {
+        const comparison_index: u32 = if (order == 0) 4 else 5;
+        const addition_index: u32 = if (order == 0) 5 else 4;
+        var instructions = [_]structures.FunctionInstruction{
+            .{ .const_int = if (matched) 41 else 42 },
+            .{ .const_int = 1 },
+            .{ .const_int = 7 },
+            .{ .const_int = if (order == 2) 42 else if (matched) 7 else 9 },
+            .const_unit,
+            .const_unit,
+            .{ .select = .{ .condition = @fromBackingInt(comparison_index), .then_value = @fromBackingInt(addition_index), .else_value = @fromBackingInt(0), .type_id = .int } },
+            .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
+        };
+        instructions[addition_index] = .{ .addi = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1) } };
+        instructions[comparison_index] = .{ .compare = .{ .operation = .eqi, .operands = .{ .lhs = @fromBackingInt(if (order == 2) addition_index else 2), .rhs = @fromBackingInt(3) } } };
+        const body: structures.FunctionBodyAnalysis = .{
+            .return_type = .unit,
+            .call_arguments = &.{.{ .prepared = .{ .value = @fromBackingInt(6) } }},
+            .instructions = &instructions,
+            .blocks = &.{.{ .argument_start = 0, .argument_end = 0, .instruction_start = 0, .instruction_end = instructions.len, .terminator = .diverge }},
+            .entry = @fromBackingInt(0),
+        };
+        var artifact = try codegen.compileFunction(&body, TestTypes{}, std.testing.allocator);
+        defer artifact.deinit(std.testing.allocator);
+        try expectArtifactExitCode(artifact, 42);
+    };
 }
 
 test "machine symbolic positions resolve after register and spill encoding" {

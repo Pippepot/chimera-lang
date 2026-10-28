@@ -306,13 +306,17 @@ source/target pairs. `first` includes index construction and first match;
 `consumers` requests 256 distinct consuming queries; `total` adds database setup
 and discovery, excluding teardown. It does not compile a complete program.
 
-The flow driver covers scalar, owning, and narrowing functions with 8, 32, 128,
-256, and 512 branches. Narrowing cases combine saved bool proofs, reference aliases,
-and loop backedges. Each row is the median of five fresh one-worker databases.
+The flow driver covers scalar, owning, narrowing, and backedge functions with 8,
+32, 128, 256, and 512 branches. Both refinement cases combine saved bool proofs
+and reference aliases. `narrowing` uses loops that break after one pass;
+`backedges` uses conditional breaks and retains real loop backedges. Each row is
+the median of five fresh one-worker databases.
 Signatures and semantic construction precede the timer; typing includes workspace
 compaction/release, ownership lowering, and lifetime planning, but not codegen or
 published-body teardown. A separate sixth database measures retained storage.
 Owning fixtures keep generations live to expose branch/generation scaling.
+Refinement fixtures keep all mutable carriers live across every loop, exposing
+the cost of loop-carried values as both carrier and loop counts grow.
 
 Snapshot bytes count saved handles and each unique pointer-table root and
 16-slot page once, including flags and padding, across independent value,
@@ -324,6 +328,9 @@ and inference-key columns separately count retained table payloads. Predicate an
 inference environments count additional unique snapshot pages, sharing the same
 visited-page set as ordinary snapshots. Table payload counts exclude hash bucket
 metadata, spare capacity, and arena allocation overhead.
+Binding identity graphs, reference-provenance tables, and other workspace scratch
+are outside these columns. Snapshots and flow facts are body-local construction
+state, released with the workspace; they do not become cached IR.
 
 For CLI worker scaling and warm/edited disk reuse:
 

@@ -240,6 +240,11 @@ Address-taken instruction results and block parameters are mutable roots too;
 being produced by a plain-value instruction does not make their storage immutable.
 Hoisting moves invariant pure instructions and reads whose resource no loop
 instruction may write; a read that could fault moves only from the header.
+Allocation-element operations inside loops first snapshot storage-based
+descriptors with `value_copy`. This makes the descriptor read independent of
+the varying element index. Ordinary alias and write analysis governs movement,
+and descriptor replacement keeps the read inside the loop. Codegen can retain
+the backing address from an immutable snapshot in a register.
 
 Value numbering stores the first dominance candidate inline with each expression
 key. Additional candidates share one overflow buffer, preserving candidate order
@@ -340,7 +345,11 @@ The encoder reuses its selected encoding for operand offsets and byte emission,
 and collects branch patches during emission instead of rescanning every
 instruction afterwards.
 Comparisons produce canonical boolean values;
-scalar selections use conditional moves. Fills use `rep stosb` or `rep stosd`,
+scalar selections use conditional moves. A comparison and a one-unit integer
+increment feeding a select can emit a boolean addition when both intermediate
+results are used only by that select. Both adjacent instruction orders are
+recognized, with comparison dependencies and wrapping arithmetic preserved.
+Fills use `rep stosb` or `rep stosd`,
 and directed copies use `rep movsb`, clearing the direction flag after a
 descending copy. Aggregate construction copies each field to its layout offset.
 

@@ -885,7 +885,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     var branch_arguments = [_]structures.FunctionValueUse{.{ .value = @fromBackingInt(@intCast(0)) }};
     var call_arguments: [0]structures.FunctionCallArgument = .{};
     var instructions = [_]structures.FunctionInstruction{.{ .value_copy = .{
-        .destination = @fromBackingInt(1),
+        .destination = @fromBackingInt(2),
         .source = @fromBackingInt(@intCast(0)),
         .type_id = .int,
     } }};
@@ -921,7 +921,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     block_arguments[0].representation = .value;
     body.instructions = instructions[0..0];
     blocks[0].instruction_end = 0;
-    instructions[0] = .{ .value_copy = .{ .destination = @fromBackingInt(1), .source = @fromBackingInt(0), .type_id = .int } };
+    instructions[0] = .{ .value_copy = .{ .destination = @fromBackingInt(2), .source = @fromBackingInt(0), .type_id = .int } };
 
     blocks[0].terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(0)), .arguments = .{ .start = 0, .end = 0 } } };
     try std.testing.expect(!validFunctionBody(body));
