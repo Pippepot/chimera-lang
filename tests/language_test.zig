@@ -8706,13 +8706,13 @@ test "invalid external signatures recover after runtime input mode changes" {
     defer fixture.deinit();
     const memory_module = try fixture.db.intern(queries.ModulePaths, .{ .path = "std.memory" });
     const declarations = (try fixture.db.get(queries.ModuleDeclarations, memory_module)).*.?;
-    const resolved = (try fixture.db.get(queries.ResolveItem, declarations.resolveFunction("borrow").?)).*.?;
+    const resolved = (try fixture.db.get(queries.ResolveItem, declarations.resolveFunction("unsafe_borrow").?)).*.?;
     const modified = try std.mem.replaceOwned(
         u8,
         testing.allocator,
         standard_library.source("memory/allocation.chi"),
-        "pub extern func borrow(static T: type, ref owner: Box(T)) ref T",
-        "pub extern func borrow(static T: type, mut owner: Box(T)) ref T",
+        "pub extern func unsafe_borrow(static T: type, ref allocation: Allocation(T), index: int) ref T",
+        "pub extern func unsafe_borrow(static T: type, mut allocation: Allocation(T), index: int) ref T",
     );
     defer testing.allocator.free(modified);
     try fixture.db.setInput(queries.SourceText, resolved.file_id, modified);

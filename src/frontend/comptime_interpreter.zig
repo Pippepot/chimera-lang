@@ -460,11 +460,10 @@ fn ExecutionFrame(comptime Executor: type) type {
                 .borrow_read => |operation| return self.borrowRead(operation, span),
                 .borrow_write => |operation| return self.borrowWrite(operation, span),
                 .allocation_element => |operation| return self.allocationElement(operation),
-                .borrow_box => |operation| return .{ .returned = try referenceValue(operation.type_id, try allocationRecord(slots[@backingInt(operation.source)]).element(0), self.storage) },
                 .value_copy => |operation| return self.copyValue(operation),
                 .field_access => |operation| return self.accessField(slots[@backingInt(operation.operand)], operation),
-                .initializer_capture_write => |operation| return self.writeCapture(operation),
-                .compare, .select, .aggregate, .fill, .move => unreachable,
+                .compare => |comparison| return .{ .returned = .{ .runtime = .{ .bool = predicateValue(slots, comparison.operation, comparison.operands) } } },
+                .select, .aggregate, .fill, .move => unreachable,
             }
         }
 
@@ -543,7 +542,6 @@ fn ExecutionFrame(comptime Executor: type) type {
                     }
                     return .{ .returned = .{ .place = cell.contents.variant_payload } };
                 },
-                .box_element => return .{ .returned = .{ .place = try allocationRecord(.{ .place = cell }).element(0) } },
                 .allocation_array => {
                     const allocation = allocationRecord(.{ .place = cell });
                     const array = (try self.executor.arrayType(operation.type_id)) orelse return .unavailable;
@@ -671,15 +669,6 @@ fn ExecutionFrame(comptime Executor: type) type {
             if (copied == .runtime and copied.runtime == .storage_cursor) copied.runtime.storage_cursor.type_id = operation.type_id;
             if (operation.destination == null) copied = try copyStoredValue(copied, operation.type_id, self.executor, self.storage);
             return .{ .returned = copied };
-        }
-
-        fn writeCapture(self: *const Self, operation: structures.InitializerCaptureWrite) !Result {
-            std.debug.assert(self.body.is_initializer_region);
-            std.debug.assert(operation.parameter_index < self.arguments.len);
-            const updated = (try self.read(operation.value)) orelse return .unavailable;
-            const argument = &self.arguments[operation.parameter_index];
-            if (argument.* == .place) try assignCell(argument.place, updated, self.executor) else argument.* = updated;
-            return .{ .returned = .{ .runtime = .unit } };
         }
 
         fn executeCall(self: *const Self, call: structures.FunctionCall, call_span: ?structures.SourceSpan) anyerror!Result {
@@ -1115,11 +1104,4 @@ pub fn releaseAllocation(value: Value) void {
 
 pub fn allocationCount(value: Value) i32 {
     return @intCast(allocationRecord(value).capacity);
-}
-
-pub fn ownAllocation(type_id: structures.TypeId, field_type: structures.TypeId, allocation: Value, storage: std.mem.Allocator) !Value {
-    const fields = try storage.alloc(Cell, 1);
-    errdefer storage.free(fields);
-    fields[0] = .{ .type_id = field_type, .storage = storage, .contents = .{ .allocation = allocationRecord(allocation) } };
-    return .{ .place = try Cell.create(storage, type_id, .{ .fields = fields }) };
 }

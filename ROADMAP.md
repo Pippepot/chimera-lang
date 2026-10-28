@@ -38,35 +38,27 @@ Accept changes only with matched uninstrumented cold, leaf-edit, and generated
 runtime measurements under the [benchmark protocol](benchmarks/README.md#measurement-protocol).
 Keep backend and workload changes separate so frontend gains remain attributable.
 
-## Immediate design priorities
+## Compiler simplification
 
-Investigate these before the remaining implementation milestones, in this order.
+Reduce compiler code to at most 34,000 lines under the existing `loc.sh` code
+policy. Preserve language behavior, diagnostics, ownership, incremental queries,
+and cache validation. Consolidate repeated lifecycle and traversal logic; keep
+tests and line-count rules intact. This is the current requested engineering
+work; performance acceptance above remains a separate unfinished requirement.
 
-1. **Static comprehensions.** Fixed-size Array construction with compile-time
-  iteration shape and runtime element evaluation. Prefer `static if` and
-  `static for` ordering; determine when filtering preserves a static count.
-2. **Collection spreading and comprehensions.** `[1, ..values, 5]` and
-  `[x * 2 for x in values if x > 0]`. Preserve fixed-size Array literal
-  semantics and favor List for potentially runtime-sized results; settle mixed
-  static/runtime sizes, evaluation order, ownership, and partial failure cleanup.
-3. precompile-std build step is extremely slow - investigate.
-4. the codebase has grown substantially, it is time for a refactoring pass, reducing LOC and simplifying the compiler
+Investigate the slow precompile-std build as part of subsequent frontend
+performance work.
 
 ## Ordered milestones
 
-### 4. List mutation
+### Collection mutation provenance
 
-- Removal, append, and relocation of reference-containing elements, with
-  per-element provenance and failure cleanup. Borrowed get/index results and
-  replacement through tracked reference slots use the existing place semantics.
-- Structural mutation during iteration and explicit consuming traversal, with
-  stable backing references distinguished from content-dependent views.
-
-### 5. Structural tuples
-
-- Tuple identity, type spelling, access, destructuring, layout, and elementwise
-  ownership, including `const (x, y) = point`. Resolve grouping/singletons;
-  support multiple results and Map items.
+- Preserve per-element provenance and failure cleanup through removal, append,
+  and relocation of reference-containing elements. Borrowed get/index results,
+  reference append/relocation, checked replacement, and explicit consuming
+  traversal already have implementations and regression coverage.
+- Settle structural mutation during iteration, distinguishing references into
+  stable backing from views that depend on contents.
 
 ### 7. Basic collection algorithms
 
@@ -117,18 +109,19 @@ not gate collections or basic algorithms.
   insufficient; preserve item ownership, lending lifetimes, and failure effects.
 - Publication of compile-time allocations into static/runtime storage: define
   serialization, relocation, mutability, and ownership before allowing escape.
-- Local `static` bindings. Remove `comptime` only after verified equivalence
+- Local `static` declarations. Remove `comptime` only after verified equivalence
   across lexical scope, type-valued results, specialization, effects, and caching.
 - Temporary-projection borrowing and lifetime extension.
 - Shared ownership: atomic reference counts, access synchronization guarantees,
   and cycle policy. No upgradeable weak-reference API is proposed.
-- General overloading, function literals/closures, `sizeof`, and return inference.
+- Capturing closures, local function literals, `sizeof`, and return inference.
+  Explicit named overload sets and noncapturing static function values exist.
 - Additional targets only for concrete use cases: target/location-specific
   layouts, allocation, access, and zero-byte behavior. Start with scalar device
   buffers; defer raw addresses and foreign memory.
 - Finer-grained invalidation only after measurements; decide unused-declaration
   validation separately from demand-driven compilation.
-**Enum-indexed arrays.** Dense, type-safe arrays indexed directly by enum
+- **Enum-indexed arrays.** Dense, type-safe arrays indexed directly by enum
   values; define domain coverage, storage order, and initialization.
-**Value-producing blocks.** Blocks and labeled `break` carrying values;
+- **Value-producing blocks.** Blocks and labeled `break` carrying values;
   define result typing, ownership, cleanup, and interaction with failure.

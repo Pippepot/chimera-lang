@@ -129,10 +129,7 @@ fn renderBranchTarget(db: *query.Database, ssa: *const structures.FunctionBodyAn
 
 fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAnalysis, instruction_index: usize, writer: *std.Io.Writer) !void {
     const instruction = ssa.instructions[instruction_index];
-    if (instruction == .initializer_capture_write)
-        try writer.writeAll("    initializer_capture_write")
-    else
-        try writer.print("    %{d} = {s}", .{ @backingInt(ssa.instructionValue(instruction_index)), @tagName(instruction) });
+    try writer.print("    %{d} = {s}", .{ @backingInt(ssa.instructionValue(instruction_index)), @tagName(instruction) });
     switch (instruction) {
         inline .const_int, .const_byte, .const_int_literal => |value| try writer.print(" {d}", .{value}),
         .const_string_literal => |value| try writer.print(" @{d}", .{@backingInt(value)}),
@@ -141,7 +138,7 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
             try renderType(db, constant.type_id, writer);
         },
         .const_storage_cursor => |cursor| try writer.print(" {any}", .{cursor}),
-        .storage_cursor, .borrow_box, .borrow_read => |operation| try writer.print(" %{d}", .{@backingInt(operation.source)}),
+        .storage_cursor, .borrow_read => |operation| try writer.print(" %{d}", .{@backingInt(operation.source)}),
         .cursor_offset, .cursor_element => |operation| try writer.print(" %{d}, %{d}", .{ @backingInt(operation.cursor), @backingInt(operation.index) }),
         .byte_to_int, .variant_tag, .negi => |value| try writer.print(" %{d}", .{@backingInt(value)}),
         .const_bool => |value| try writer.print(" {s}", .{if (value) "true" else "false"}),
@@ -170,7 +167,6 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
         .borrow_write => |operation| try writer.print(" %{d}, %{d}", .{ @backingInt(operation.reference), @backingInt(operation.value) }),
         .value_copy => |operation| try writer.print(" %{d}", .{@backingInt(operation.source)}),
         .field_access => |operation| try writer.print(" %{d}, {d}", .{ @backingInt(operation.operand), operation.field_index }),
-        .initializer_capture_write => |operation| try writer.print(" {d}, %{d}", .{ operation.parameter_index, @backingInt(operation.value) }),
         .call => |call| try renderCall(db, ssa, call, writer),
         .addi, .subi, .muli, .divsi => |operands| try writer.print(" %{d}, %{d}", .{ @backingInt(operands.lhs), @backingInt(operands.rhs) }),
         .compare => |operation| try writer.print(" {s} %{d}, %{d}", .{ @tagName(operation.operation), @backingInt(operation.operands.lhs), @backingInt(operation.operands.rhs) }),
@@ -199,7 +195,6 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
 fn renderStorageProjection(operation: structures.StorageProjection, writer: *std.Io.Writer) !void {
     try writer.print(" %{d}", .{@backingInt(operation.owner)});
     switch (operation.projection) {
-        .box_element => try writer.writeAll(".element"),
         .field => |index| try writer.print(".{d}", .{index}),
         .variant => try writer.writeAll(".payload"),
         .allocation_array => try writer.writeAll(".elements"),

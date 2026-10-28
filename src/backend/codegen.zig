@@ -53,21 +53,6 @@ const CopyDestination = union(enum) {
 
 const CopyAddress = union(enum) { stack: u32, pointer };
 
-fn inversePredicate(operation: structures.PredicateOperation) structures.PredicateOperation {
-    return switch (operation) {
-        .lti => .gei,
-        .gti => .lei,
-        .lei => .gti,
-        .gei => .lti,
-        .eqi => .nei,
-        .nei => .eqi,
-        .eqb => .neb,
-        .neb => .eqb,
-        .eqt => .net,
-        .net => .eqt,
-    };
-}
-
 const indirect_layout: structures.TypeLayout = .{ .byte_size = @sizeOf(u64), .byte_alignment = @alignOf(u64) };
 const initializer_layout: structures.TypeLayout = .{ .byte_size = 16, .byte_alignment = 8 };
 const zero_sized_address_layout: structures.TypeLayout = .{ .byte_size = 1, .byte_alignment = 1 };
@@ -259,7 +244,7 @@ const LocationPlan = struct {
             const offset: ?u32 = switch (operation.projection) {
                 .field => |index| ((try types.structLayout(value_types[owner])) orelse return error.Unavailable).field_offsets[index],
                 .variant => (try types.variantLayout(value_types[owner])).payload_offset,
-                .box_element, .allocation_array => null,
+                .allocation_array => null,
             };
             if (offset) |bytes| return .{ .stack = std.math.add(u32, locations[owner].stack, bytes) catch return error.FunctionTooLarge };
         }
@@ -293,12 +278,7 @@ const LocationPlan = struct {
                     }
                 },
                 .local_storage => addressable[value_index] = true,
-                .initializer_capture_write => |operation| if (ssa.is_initializer_region) {
-                    markUsed(&needed[operation.parameter_index]);
-                },
-                .storage_projection => |operation| if (operation.projection != .box_element) {
-                    addressable[@backingInt(operation.owner)] = true;
-                },
+                .storage_projection => |operation| addressable[@backingInt(operation.owner)] = true,
                 .storage_cursor => |operation| addressable[@backingInt(operation.source)] = true,
                 .array_element => |operation| addressable[@backingInt(operation.array)] = true,
                 .borrow_address => |operation| if (!operation.base_is_reference) {
@@ -756,7 +736,6 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                     try self.emitElementAddress(self.valueLocation(operation.array), true, operation.index, operation.type_id);
                     try self.bindIndirect(destination);
                 },
-                .borrow_box => |operation| try self.emitBorrowBox(operation, destination),
                 .borrow_address => |operation| try self.emitBorrowAddress(operation, destination),
                 .borrow_read => |operation| if (destination != .discarded) {
                     try self.loadAddress(self.valueLocation(operation.source));
@@ -764,7 +743,6 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                 },
                 .borrow_write => |operation| try self.emitBorrowWrite(operation),
                 .field_access => |operation| try self.emitFieldAccess(operation, destination),
-                .initializer_capture_write => |operation| try self.emitInitializerCaptureWrite(operation),
                 .call => |call| try self.emitCall(call, destination),
                 .compare => |operation| try self.emitCompare(operation, destination),
                 .select => |operation| try self.emitSelect(operation, destination),
@@ -884,9 +862,9 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             const final_is_then = fallthrough == predicate.then_branch.target or fallthrough != predicate.else_branch.target;
             const final = if (final_is_then) predicate.then_branch else predicate.else_branch;
             const early = if (final_is_then) predicate.else_branch else predicate.then_branch;
-            const operation = if (final_is_then) predicate.operation else inversePredicate(predicate.operation);
+            const operation = if (final_is_then) predicate.operation else predicate.operation.negated();
             if (early.arguments.start == early.arguments.end) {
-                try self.emitConditionalJump(inversePredicate(operation), early.target);
+                try self.emitConditionalJump(operation.negated(), early.target);
             } else {
                 const final_field = try self.encoder.conditionalJump(operation);
                 try self.emitBranchCopies(early);
@@ -1382,7 +1360,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             if (destination == .discarded or destination == .stack) return;
             const source = self.valueLocation(operation.owner);
             switch (operation.projection) {
-                .box_element, .allocation_array => try self.loadAddress(source),
+                .allocation_array => try self.loadAddress(source),
                 .field => |index| {
                     const layout = (try self.types.structLayout(self.valueType(operation.owner))) orelse return error.Unavailable;
                     try self.loadValueAddress(source);
@@ -1418,12 +1396,6 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             return offset;
         }
 
-        fn emitBorrowBox(self: *Self, operation: structures.BorrowOperation, destination: ValueLocation) !void {
-            if (destination == .discarded) return;
-            std.debug.assert((try self.types.layout(operation.type_id)).byte_size == @sizeOf(u64));
-            try self.copyRange(self.valueLocation(operation.source), 0, .{ .value = destination }, 0, @sizeOf(u64));
-        }
-
         fn emitBorrowAddress(self: *Self, operation: structures.BorrowAddressOperation, destination: ValueLocation) !void {
             if (destination == .discarded) return;
             const source = self.valueLocation(operation.source);
@@ -1449,13 +1421,6 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                 0,
                 field_layout.byte_size,
             );
-        }
-
-        fn emitInitializerCaptureWrite(self: *Self, operation: structures.InitializerCaptureWrite) !void {
-            std.debug.assert(self.ssa.is_initializer_region);
-            const entry = self.ssa.blocks[@backingInt(self.ssa.entry)];
-            std.debug.assert(operation.parameter_index < entry.argument_end - entry.argument_start);
-            try self.copyValue(operation.type_id, self.valueLocation(operation.value), self.plan.locations[operation.parameter_index]);
         }
 
         fn copyRange(self: *Self, source: ValueLocation, source_start: u32, destination: CopyDestination, destination_start: u32, byte_size: u32) !void {

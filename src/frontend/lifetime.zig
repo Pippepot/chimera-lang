@@ -264,32 +264,26 @@ pub const Solver = struct {
     fn edgeSource(self: *const Solver, edge: *const OwnershipEdge, generation: GenerationId) ?GenerationId {
         var source = generation;
         var mappings = std.mem.reverseIterator(self.ownership_forwards[edge.mappings.start..edge.mappings.end]);
-        while (mappings.next()) |mapping| switch (mapping) {
-            .forward => |forward| {
-                if (source == forward.source) return null;
-                if (source == forward.destination) source = forward.source;
-            },
-            .produce, .unowned => |destination| if (source == destination) return null,
-        };
+        while (mappings.next()) |mapping| {
+            if (source == mapping.source) return null;
+            if (source == mapping.destination) source = mapping.source orelse return null;
+        }
         return source;
     }
 
     /// With planned endings, a source ended on the edge does not reach its destination.
     fn remapEdgeAvailability(self: *const Solver, available: []u64, edge: *const OwnershipEdge, endings: ?[]const PlannedEnding) void {
         const mappings = self.ownership_forwards[edge.mappings.start..edge.mappings.end];
-        for (mappings) |mapping| switch (mapping) {
-            .forward => |forward| {
-                if (endings) |planned| if (hasEnding(forward.source, edgeLocation(edge), planned)) {
-                    GenerationBits.remove(available, forward.destination);
-                    continue;
-                };
-                const source_available = GenerationBits.contains(available, forward.source);
-                GenerationBits.remove(available, forward.source);
-                if (source_available) GenerationBits.insert(available, forward.destination) else GenerationBits.remove(available, forward.destination);
-            },
-            .produce => |destination| GenerationBits.insert(available, destination),
-            .unowned => |destination| GenerationBits.remove(available, destination),
-        };
+        for (mappings) |mapping| {
+            const source = mapping.source orelse {
+                GenerationBits.remove(available, mapping.destination);
+                continue;
+            };
+            const ended = if (endings) |planned| hasEnding(source, edgeLocation(edge), planned) else false;
+            const source_available = GenerationBits.contains(available, source) and !ended;
+            if (!ended) GenerationBits.remove(available, source);
+            if (source_available) GenerationBits.insert(available, mapping.destination) else GenerationBits.remove(available, mapping.destination);
+        }
     }
 
     fn scanEffectsForward(_: *const Solver, available: []u64, effects: []const Effect) void {
@@ -307,17 +301,14 @@ pub const Solver = struct {
         require_unused_sources: bool,
     ) void {
         const mappings = self.ownership_forwards[edge.mappings.start..edge.mappings.end];
-        for (mappings) |mapping| switch (mapping) {
-            .forward => |forward| {
-                if (GenerationBits.contains(demand, forward.destination)) {
-                    GenerationBits.remove(demand, forward.destination);
-                    GenerationBits.insert(demand, forward.source);
-                } else if (require_unused_sources) {
-                    GenerationBits.insert(demand, forward.source);
-                }
-            },
-            .produce, .unowned => |destination| GenerationBits.remove(demand, destination),
-        };
+        for (mappings) |mapping| {
+            if (mapping.source) |source| {
+                if (GenerationBits.contains(demand, mapping.destination)) {
+                    GenerationBits.remove(demand, mapping.destination);
+                    GenerationBits.insert(demand, source);
+                } else if (require_unused_sources) GenerationBits.insert(demand, source);
+            } else GenerationBits.remove(demand, mapping.destination);
+        }
     }
 
     fn planEndings(
@@ -370,17 +361,6 @@ pub const Solver = struct {
                     ending_word &= ending_word - 1;
                 }
             }
-            for (self.ownership_forwards[edge.mappings.start..edge.mappings.end]) |mapping| switch (mapping) {
-                .produce => |destination| {
-                    if (GenerationBits.contains(self.blockSet(self.live_in, edge.successor), destination)) continue;
-                    try self.recordEnding(endings, .{
-                        .generation = destination,
-                        .cleanup_value = self.blockArgumentValue(self.blocks[@backingInt(edge.successor)], destination) orelse unreachable,
-                        .location = .{ .block_entry = edge.successor },
-                    });
-                },
-                .forward, .unowned => {},
-            };
         }
     }
 
@@ -465,7 +445,6 @@ pub const Solver = struct {
             .boundary => |boundary| std.math.order(@backingInt(boundary), @backingInt(right.boundary)),
             .edge => |edge| std.math.order(@backingInt(edge.predecessor), @backingInt(right.edge.predecessor)).differ() orelse
                 std.math.order(edge.successor_ordinal, right.edge.successor_ordinal),
-            .block_entry => |block| std.math.order(@backingInt(block), @backingInt(right.block_entry)),
         };
     }
 
@@ -506,12 +485,11 @@ pub const Solver = struct {
         }
     }
 
-    /// Follows an edge's ownership mappings, then applies the endings planned on it and at its successor.
+    /// Follows an edge's ownership mappings, then applies the endings planned on it.
     fn crossOpenEdge(self: *const Solver, open: []u64, edge: *const OwnershipEdge, endings: ?[]const PlannedEnding, validate_existing: bool) void {
         self.remapEdgeAvailability(open, edge, endings);
         if (endings) |planned| {
             self.applyEndings(open, edgeLocation(edge), planned, validate_existing);
-            self.applyEndings(open, .{ .block_entry = edge.successor }, planned, validate_existing);
         }
     }
 
@@ -787,8 +765,8 @@ fn testExpectOwnershipJoinPlan(gpa: std.mem.Allocator) !void {
         .{ .boundaries = &.{2}, .terminator = .return_unit, .argument_start = 0, .argument_end = 1 },
     };
     const forwards = [_]OwnershipForward{
-        .{ .forward = .{ .source = @fromBackingInt(@intCast(0)), .destination = @fromBackingInt(@intCast(2)) } },
-        .{ .forward = .{ .source = @fromBackingInt(@intCast(1)), .destination = @fromBackingInt(@intCast(2)) } },
+        .{ .source = @fromBackingInt(@intCast(0)), .destination = @fromBackingInt(@intCast(2)) },
+        .{ .source = @fromBackingInt(@intCast(1)), .destination = @fromBackingInt(@intCast(2)) },
     };
     const edges = [_]OwnershipEdge{
         .{ .predecessor = @fromBackingInt(@intCast(2)), .successor_ordinal = 0, .successor = @fromBackingInt(@intCast(3)), .mappings = .{ .start = 1, .end = 2 } },
@@ -861,10 +839,10 @@ test "lifetime solver propagates through reordered blocks and ignores unreachabl
         .{ .boundaries = &.{2}, .terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(2)), .arguments = .{ .start = 0, .end = 0 } } } },
         .{ .terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(2)), .arguments = .{ .start = 0, .end = 0 } } } },
     };
-    const forwards = [_]OwnershipForward{.{ .forward = .{
+    const forwards = [_]OwnershipForward{.{
         .source = @fromBackingInt(@intCast(0)),
         .destination = @fromBackingInt(@intCast(1)),
-    } }};
+    }};
     const edges = [_]OwnershipEdge{
         .{ .predecessor = @fromBackingInt(@intCast(0)), .successor_ordinal = 0, .successor = @fromBackingInt(@intCast(4)), .mappings = .{ .start = 0, .end = 0 } },
         .{ .predecessor = @fromBackingInt(@intCast(2)), .successor_ordinal = 0, .successor = @fromBackingInt(@intCast(1)), .mappings = .{ .start = 0, .end = 1 } },
@@ -900,27 +878,6 @@ test "lifetime solver handles terminal consumes divergence and branch production
         .terminator = .diverge,
     }};
     try testExpectLifetimePlan(std.testing.allocator, &consumed_generation, &.{}, &diverging_blocks, &.{}, &.{}, &.{}, .{});
-
-    const produced_blocks = [_]TestSolverBlock{
-        .{ .terminator = .{ .predicate_branch = .{
-            .operation = .eqi,
-            .operands = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(0) },
-            .then_branch = .{ .target = @fromBackingInt(1), .arguments = .{ .start = 0, .end = 0 } },
-            .else_branch = .{ .target = @fromBackingInt(2), .arguments = .{ .start = 0, .end = 0 } },
-        } } },
-        .{ .terminator = .return_unit, .argument_start = 0, .argument_end = 1 },
-        .{ .terminator = .return_unit, .argument_start = 1, .argument_end = 1 },
-    };
-    const produced_forwards = [_]OwnershipForward{.{ .produce = @fromBackingInt(@intCast(0)) }};
-    const produced_edges = [_]OwnershipEdge{
-        .{ .predecessor = @fromBackingInt(@intCast(0)), .successor_ordinal = 0, .successor = @fromBackingInt(@intCast(1)), .mappings = .{ .start = 0, .end = 1 } },
-        .{ .predecessor = @fromBackingInt(@intCast(0)), .successor_ordinal = 1, .successor = @fromBackingInt(@intCast(2)), .mappings = .{ .start = 1, .end = 1 } },
-    };
-    try testExpectLifetimePlan(std.testing.allocator, &consumed_generation, &.{}, &produced_blocks, &.{@fromBackingInt(@intCast(0))}, &produced_forwards, &produced_edges, .{ .cleanups = &.{.{
-        .generation = @fromBackingInt(@intCast(0)),
-        .cleanup_value = @fromBackingInt(@intCast(0)),
-        .location = .{ .block_entry = @fromBackingInt(@intCast(1)) },
-    }} });
 }
 
 test "lifetime solver reports explicit abandonment on only one branch" {
@@ -996,7 +953,7 @@ fn testEndingDeduplication(gpa: std.mem.Allocator) !void {
             .{ .generation = @fromBackingInt(@intCast(0)), .location = .{ .boundary = @fromBackingInt(@intCast(1)) } },
             .{ .generation = @fromBackingInt(@intCast(0)), .location = .{ .edge = .{ .predecessor = @fromBackingInt(@intCast(0)), .successor_ordinal = 0 } } },
             .{ .generation = @fromBackingInt(@intCast(0)), .location = .{ .edge = .{ .predecessor = @fromBackingInt(@intCast(0)), .successor_ordinal = 1 } } },
-            .{ .generation = @fromBackingInt(@intCast(0)), .location = .{ .block_entry = @fromBackingInt(@intCast(1)) } },
+            .{ .generation = @fromBackingInt(@intCast(0)), .location = .{ .edge = .{ .predecessor = @fromBackingInt(1), .successor_ordinal = 0 } } },
         };
         for ([_]usize{ 4, 1, 3, 0, 4, 5, 2, 5, 1, 0, 2, 3 }) |index| {
             const ending = expected[index];
@@ -1036,9 +993,9 @@ fn testEndingDeduplication(gpa: std.mem.Allocator) !void {
         }
         const absent_locations = [_]CleanupLocation{
             .{ .boundary = @fromBackingInt(2) },
-            .{ .edge = .{ .predecessor = @fromBackingInt(1), .successor_ordinal = 0 } },
-            .{ .block_entry = @fromBackingInt(0) },
-            .{ .block_entry = @fromBackingInt(2) },
+            .{ .edge = .{ .predecessor = @fromBackingInt(2), .successor_ordinal = 0 } },
+            .{ .boundary = @fromBackingInt(3) },
+            .{ .boundary = @fromBackingInt(4) },
         };
         for (absent_locations) |location| {
             try std.testing.expectEqual(0, Solver.endingsAtLocation(location, endings.items).len);

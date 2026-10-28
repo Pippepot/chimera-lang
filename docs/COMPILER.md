@@ -127,6 +127,19 @@ run their ordinary case. The shared failure allocator disables in-place growth
 to make allocation indices repeatable. Do not run builds or measurements
 concurrently in the shared workspace.
 
+Compiler size uses the repository's existing policy:
+
+```sh
+./loc.sh
+./loc.sh --json
+```
+
+The `code` count covers compiler Zig sources. Tests are counted separately;
+comments, blank lines, build and benchmark drivers, and standard-library source
+are excluded. Compiler simplification must preserve behavioral coverage and use
+matched cold, incremental, and runtime measurements from the
+[benchmark protocol](../benchmarks/README.md#measurement-protocol).
+
 ## Test Ownership
 
 - [tests/query_engine_test.zig](../tests/query_engine_test.zig): generic scheduling,

@@ -2,6 +2,9 @@
 # Source of truth for the language, but incomplete. ROADMAP.md tracks planned work.
 # Unspecified behavior remains open; parser or legacy behavior does not define it.
 # Examples are independent; undeclared names stand for surrounding context.
+# Sections marked planned and examples using float describe future behavior;
+# float types and literals are currently rejected. Other implementation gaps
+# are called out where relevant; ROADMAP.md owns priorities.
 # Everything after '#' to the end of a line is a comment.
 # Delimited argument, parameter, element, and initializer lists may span lines.
 # Indentation at list boundaries is continuation whitespace; commas separate
@@ -29,7 +32,7 @@
 # range are source errors. std converts int_literal to byte for values 0
 # through 255; other values are source errors. No converter relates int and
 # byte values in either direction.
-# float: floating-point number.
+# float (planned): floating-point number; representation and operations are open.
 # bool: true or false.
 # type: the type of compile-time type values.
 # unit: single-valued type; its value is unit, also written ().
@@ -102,7 +105,8 @@ const subtract: func(imm int, imm int) int = int.-
 # Receivers, indices, and eager replacements evaluate once in source order.
 # Standard [] bounds checks and panics on invalid access. get returns an explicit
 # optional reference instead; slice returns an optional view. To handle absence,
-# bind the optional result with a typed pattern before reading or replacing it.
+# guard the optional result with is or a match type pattern before reading or
+# replacing its payload.
 # Standard checked reference replacement requires directly movable elements,
 # automatic drop, and no contained borrowed references. Immovable elements may
 # still construct in containers and be accessed through get. Readonly Span
@@ -110,7 +114,7 @@ const subtract: func(imm int, imm int) int = int.-
 # Assignment remains ownership-aware replacement; compound assignments combine
 # the corresponding binary operation and assignment. and/or remain short-
 # circuit control flow; is tests type membership. Transfer ^, field access,
-# typed binding patterns, and initialization retain their dedicated
+# structural binding patterns, and initialization retain their dedicated
 # semantics and are not eager operation functions. Predicates over explicitly
 # typed compile-time-only int_literal values remain intrinsic and preserve their
 # wide literal range. Equality of compile-time type metadata remains compiler
@@ -138,7 +142,7 @@ if not (value in collection) -> missing()
 # Ordinary value converters are infallible. Conversions between numeric runtime
 # types that wrap, truncate, round, saturate, or widen are named functions instead.
 # Their names, overflow and failure behavior, other numeric widths, and float
-# literal typing remain open. Existing variant widening and typed patterns do
+# literal typing remain open. Existing variant widening and type tests do
 # not define numeric conversion behavior.
 
 
@@ -259,7 +263,7 @@ const singleton: (int,) = (42,)
 # number of elements; there is no implicit prefix or rest match. Tuple and Array
 # length mismatches are source errors. List and Span check their lengths at
 # runtime before extracting elements; mismatch follows the explicit handler.
-# A conditional binding tests length and type patterns and exposes
+# A conditional binding tests structural length and exposes
 # names only to its successful branch. Conditional patterns permit const/ref
 # bindings; mutable conditional bindings remain unsupported.
 #
@@ -419,8 +423,9 @@ static result = compute()
 # 'comptime' currently evaluates its body at compile time. Once local static
 # bindings and ordinary function-call initializers cover every comptime use
 # case with the same semantics, remove the comptime keyword from the language.
-# Until that coverage is verified, retain it; local static bindings above are
-# required language behavior, not a claim of current compiler support.
+# Until that coverage is verified, retain it. Ordinary local static declarations
+# remain unsupported; static comprehension bindings have their own implemented
+# expansion rules and do not imply support for local static declarations.
 const computed = comptime -> 40 + 2
 const computed_block = comptime
     const value = 40
@@ -581,9 +586,8 @@ func stack_example() int
 
 func heap_example() int | none
     const offset = 10
-    const boxed: Box(func(int) int) = Box.new(
-        func(value: int) int -> value + offset
-    ) else return none
+    const boxed = Box.new(func(value: int) int -> value + offset)
+    if not (boxed is Box(func(int) int)) -> return none
     ref add = boxed.borrow()
     return add(32)
 
@@ -681,7 +685,7 @@ func invalid_state() never -> panic "invalid state"
 # Runtime callable parameter types retain these modes, for example
 # func(imm T) T, func(deinit T) T, and func(init T) Box(T) | none. Taking a function
 # value, aliasing it, or calling it indirectly does not erase its modes or
-# deferred effects. Implementation support is tracked in ROADMAP.md.
+# deferred effects.
 # Callable compatibility requires identical parameter modes, parameter types,
 # return types, and result access modes.
 #
@@ -710,9 +714,9 @@ func invalid_state() never -> panic "invalid state"
 # parameter and return types may refer to static type parameters. Static
 # arguments are available as constants in the instantiated body but are not
 # evaluated or passed at runtime. An unspecialized function with static
-# parameters is not a value; partial application, indirect generic calls,
-# arbitrary compile-time expressions, and compile-time-returning functions
-# remain open.
+# parameters is not a value; partial application and indirect generic calls
+# remain open. Static arguments can be arbitrary
+# publishable compile-time expressions; ordinary functions may return type values.
 func identity(static T: type, static N: int, value: T) T
     _ = N
     return value

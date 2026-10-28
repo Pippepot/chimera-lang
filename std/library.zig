@@ -56,15 +56,9 @@ pub const External = enum {
     unsafe_take,
     unsafe_destroy,
     unsafe_borrow,
-    borrow,
-    unsafe_own_box,
-    unsafe_take_box,
-    unsafe_destroy_box,
-    deallocate_box,
     copy_value,
     move_value,
     array_filled,
-    array_from,
     array_borrow,
     literal_byte,
     initialize_collection,
@@ -89,10 +83,10 @@ pub const External = enum {
             .io_read => .memory_allocation,
             .io_write => .text,
             .copy_value, .move_value => .ownership,
-            .array_filled, .array_from, .array_borrow => .array,
+            .array_filled, .array_borrow => .array,
             .allocate_host_storage, .deallocate_host_storage => .memory_host,
             .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => .memory_allocation,
-            .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow, .borrow, .unsafe_own_box, .unsafe_take_box, .unsafe_destroy_box, .deallocate_box, .initialize_collection, .initialize_collection_element, .static_iteration_item => .memory_allocation,
+            .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow, .initialize_collection, .initialize_collection_element, .static_iteration_item => .memory_allocation,
         };
     }
 };

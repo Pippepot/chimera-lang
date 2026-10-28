@@ -92,10 +92,6 @@ pub fn compact(scratch: std.mem.Allocator, function: *Function) !Body {
         .aggregate_fields = rebuilt.aggregate_fields.items,
     };
     view.visitValueReferences(value_map, remapValue);
-    for (instructions.items) |*instruction| if (instruction.* == .initializer_capture_write) {
-        const write = &instruction.initializer_capture_write;
-        write.parameter_index = value_map[write.parameter_index].?;
-    };
 
     const framed = rebuilt.inline_frames.items.len != 0;
     return .{
@@ -336,7 +332,7 @@ fn liveValues(scratch: std.mem.Allocator, function: *Function, reachable: []cons
 
 pub fn removableWhenUnused(function: *const Function, instruction: Instruction) bool {
     return switch (instruction) {
-        .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .variant_tag, .field_access, .borrow_address, .borrow_read, .borrow_box, .storage_projection, .allocation_element, .array_element, .storage_cursor, .cursor_offset, .cursor_element => true,
+        .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .variant_tag, .field_access, .borrow_address, .borrow_read, .storage_projection, .allocation_element, .array_element, .storage_cursor, .cursor_offset, .cursor_element => true,
         .divsi => |operands| if (function.definition(operands.rhs)) |divisor| divisor == .const_int and divisor.const_int != 0 else false,
         inline .value_copy, .variant_coerce, .variant_extract => |operation| operation.destination == null,
         else => false,

@@ -42,7 +42,7 @@ pub fn typeAt(context: anytype, root: structures.TypeId, path: []const structure
     var current = root;
     for (path) |step| switch (step) {
         .field => |index| {
-            const definition = (try context.structDefinition(current)) orelse return null;
+            const definition = (try context.facts().structDefinition(current)) orelse return null;
             if (index >= definition.fields.len) return null;
             const field = definition.fields[index];
             if (field.kind == .reference) return null;
@@ -62,33 +62,53 @@ pub fn typeAt(context: anytype, root: structures.TypeId, path: []const structure
     return current;
 }
 
-pub fn requiresExplicit(allocator: std.mem.Allocator, context: anytype, type_id: structures.TypeId, selections: []const Selection, missing: []const []const structures.ReferencePathStep, fields_only: bool) anyerror!bool {
+pub const Obligations = struct {
+    automatic: bool = false,
+    explicit: bool = false,
+
+    pub fn any(self: Obligations) bool {
+        return self.automatic or self.explicit;
+    }
+
+    fn include(self: *Obligations, child: Obligations) void {
+        self.automatic = self.automatic or child.automatic;
+        self.explicit = self.explicit or child.explicit;
+    }
+};
+
+/// A missing whole child has no obligations. Nested paths remain relative to it.
+pub fn missingChildren(allocator: std.mem.Allocator, paths: []const []const structures.ReferencePathStep, step: structures.ReferencePathStep) !?[]const []const structures.ReferencePathStep {
+    var result: std.ArrayList([]const structures.ReferencePathStep) = .empty;
+    for (paths) |path| {
+        std.debug.assert(path.len != 0);
+        if (!std.meta.eql(path[0], step)) continue;
+        if (path.len == 1) return null;
+        try result.append(allocator, path[1..]);
+    }
+    return try result.toOwnedSlice(allocator);
+}
+
+pub fn obligations(allocator: std.mem.Allocator, context: anytype, type_id: structures.TypeId, selections: []const Selection, missing: []const []const structures.ReferencePathStep, fields_only: bool) anyerror!Obligations {
     const capabilities = (try context.facts().ownershipCapabilities(type_id)) orelse return error.Unavailable;
-    if (!fields_only and (capabilities.drop != .fieldwise or (selections.len == 0 and missing.len == 0))) return capabilities.requires_explicit_drop;
+    if (!fields_only and (capabilities.drop != .fieldwise or (selections.len == 0 and missing.len == 0)))
+        return .{ .automatic = capabilities.needs_automatic_drop, .explicit = capabilities.requires_explicit_drop };
+    var result: Obligations = .{};
     if (try context.facts().variantMembers(type_id)) |all| {
         for (membersAt(selections, &.{}) orelse all) |member| {
             const specification = try context.facts().memberSpec(member);
             if (specification.kind == .reference) continue;
-            const nested = try children(allocator, selections, .{ .variant = member });
-            var nested_missing: std.ArrayList([]const structures.ReferencePathStep) = .empty;
-            for (missing) |path| if (path.len != 0 and path[0] == .variant and path[0].variant == member)
-                try nested_missing.append(allocator, path[1..]);
-            if (try requiresExplicit(allocator, context, specification.type_id, nested, nested_missing.items, false)) return true;
+            const step: structures.ReferencePathStep = .{ .variant = member };
+            const nested_missing = (try missingChildren(allocator, missing, step)) orelse continue;
+            result.include(try obligations(allocator, context, specification.type_id, try children(allocator, selections, step), nested_missing, false));
         }
-        return false;
+        return result;
     }
-    const definition = (try context.structDefinition(type_id)) orelse return capabilities.requires_explicit_drop;
-    fields: for (definition.fields, 0..) |field, index| {
+    const definition = (try context.facts().structDefinition(type_id)) orelse return .{ .automatic = capabilities.needs_automatic_drop, .explicit = capabilities.requires_explicit_drop };
+    for (definition.fields, 0..) |field, index| {
         if (field.kind == .reference) continue;
-        var nested_missing: std.ArrayList([]const structures.ReferencePathStep) = .empty;
-        for (missing) |path| {
-            std.debug.assert(path.len != 0);
-            if (path[0] != .field or path[0].field != index) continue;
-            if (path.len == 1) continue :fields;
-            try nested_missing.append(allocator, path[1..]);
-        }
-        const nested = try children(allocator, selections, .{ .field = @intCast(index) });
-        if (try requiresExplicit(allocator, context, field.type_id, nested, nested_missing.items, false)) return true;
+        const step: structures.ReferencePathStep = .{ .field = @intCast(index) };
+        const nested_missing = (try missingChildren(allocator, missing, step)) orelse continue;
+        result.include(try obligations(allocator, context, field.type_id, try children(allocator, selections, step), nested_missing, false));
     }
-    return false;
+    return result;
 }

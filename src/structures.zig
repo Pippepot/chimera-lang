@@ -1261,7 +1261,7 @@ pub const VariantOperation = struct {
 pub const StorageProjection = struct {
     owner: FunctionValueId,
     type_id: TypeId,
-    projection: union(enum) { box_element, field: u32, variant, allocation_array },
+    projection: union(enum) { field: u32, variant, allocation_array },
 };
 
 pub const AllocationElement = struct {
@@ -1346,12 +1346,6 @@ pub const AggregateOperation = struct {
     type_id: TypeId,
 };
 
-pub const InitializerCaptureWrite = struct {
-    parameter_index: u32,
-    value: FunctionValueId,
-    type_id: TypeId,
-};
-
 pub const FunctionInstruction = union(enum) {
     const_int: i32,
     const_int_literal: i64,
@@ -1377,13 +1371,11 @@ pub const FunctionInstruction = union(enum) {
     storage_projection: StorageProjection,
     allocation_element: AllocationElement,
     array_element: ArrayElement,
-    borrow_box: BorrowOperation,
     borrow_address: BorrowAddressOperation,
     borrow_read: BorrowOperation,
     borrow_write: BorrowWriteOperation,
     value_copy: ValueCopy,
     field_access: FieldAccessOperation,
-    initializer_capture_write: InitializerCaptureWrite,
     call: FunctionCall,
     static_conversion: struct { operand: FunctionValueId, type_id: TypeId, destination: ?FunctionValueId = null },
     negi: FunctionValueId,
@@ -1405,12 +1397,11 @@ pub const FunctionInstruction = union(enum) {
             .storage_projection => |*operation| .{ &operation.owner, null, null },
             .allocation_element => |*operation| .{ &operation.allocation, &operation.index, null },
             .array_element => |*operation| .{ &operation.array, &operation.index, null },
-            inline .borrow_box, .borrow_read, .storage_cursor, .borrow_address => |*operation| .{ &operation.source, null, null },
+            inline .borrow_read, .storage_cursor, .borrow_address => |*operation| .{ &operation.source, null, null },
             .cursor_offset, .cursor_element => |*operation| .{ &operation.cursor, &operation.index, null },
             .borrow_write => |*operation| .{ &operation.reference, &operation.value, null },
             .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null, null },
             .field_access => |*operation| .{ &operation.operand, null, null },
-            .initializer_capture_write => |*operation| .{ &operation.value, null, null },
             .call => |*call| call.operands() ++ .{null},
             .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs, null },
             .compare => |*operation| .{ &operation.operands.lhs, &operation.operands.rhs, null },
@@ -1435,12 +1426,12 @@ pub const FunctionInstruction = union(enum) {
             // Each primitive constant is named after the type of its value.
             inline .const_int, .const_int_literal, .const_string_literal, .const_byte, .const_bool, .const_type, .const_unit, .const_none => |_, tag| @field(TypeId, @tagName(tag)["const_".len..]),
             .variant_tag, .negi, .addi, .subi, .muli, .divsi, .byte_to_int => .int,
-            .borrow_write, .initializer_capture_write, .fill, .move => .unit,
+            .borrow_write, .fill, .move => .unit,
             .compare => .bool,
             inline .select, .aggregate => |operation| operation.type_id,
             .local_storage, .result_storage => |type_id| type_id,
             .field_access => |operation| operation.field_type,
-            inline .const_static_string, .const_storage_cursor, .storage_cursor, .cursor_offset, .cursor_element, .function_ref, .initializer_ref, .storage_projection, .allocation_element, .array_element, .borrow_box, .borrow_read, .borrow_address => |operation| operation.type_id,
+            inline .const_static_string, .const_storage_cursor, .storage_cursor, .cursor_offset, .cursor_element, .function_ref, .initializer_ref, .storage_projection, .allocation_element, .array_element, .borrow_read, .borrow_address => |operation| operation.type_id,
             // Results written to a destination leave only unit in their own value.
             .variant_coerce, .variant_extract => |operation| if (operation.destination == null) operation.target_type else .unit,
             inline .value_copy, .static_conversion => |operation| if (operation.destination == null) operation.type_id else .unit,

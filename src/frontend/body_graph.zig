@@ -30,10 +30,9 @@ pub const LifetimeEffect = union(enum) {
     };
 };
 
-pub const OwnershipForward = union(enum) {
-    forward: struct { source: GenerationId, destination: GenerationId },
-    produce: GenerationId,
-    unowned: GenerationId,
+pub const OwnershipForward = struct {
+    source: ?GenerationId,
+    destination: GenerationId,
 };
 
 pub const OwnershipEdge = struct {
@@ -46,7 +45,6 @@ pub const OwnershipEdge = struct {
 pub const CleanupLocation = union(enum) {
     boundary: BoundaryId,
     edge: struct { predecessor: structures.FunctionBlockId, successor_ordinal: u2 },
-    block_entry: structures.FunctionBlockId,
 };
 
 pub const PlannedEnding = struct {

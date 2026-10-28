@@ -42,7 +42,6 @@ pub struct Array(T: type, N: int)
         ref element = self[index]
         element = value^
 
+pub converter(static T: type, static N: int, init value: collection_literal(T, N)) Array(T, N) -> value
 extern func array_filled(static T: type, static N: int, imm value: T) Array(T, N)
-extern func array_from(static T: type, static N: int, init value: collection_literal(T, N)) Array(T, N)
-pub converter(static T: type, static N: int, init value: collection_literal(T, N)) Array(T, N) -> array_from(T, N, value)
 extern func array_borrow(static T: type, static N: int, ref value: Array(T, N), index: int) ref T

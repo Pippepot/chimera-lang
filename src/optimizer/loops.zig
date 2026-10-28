@@ -66,15 +66,6 @@ fn deeperFirst(_: void, left: Loop, right: Loop) bool {
     return left.depth > right.depth;
 }
 
-pub fn depths(scratch: std.mem.Allocator, function: *Function, loops: []const Loop) ![]u32 {
-    const result = try scratch.alloc(u32, function.blocks.items.len);
-    @memset(result, 0);
-    for (loops) |loop| for (loop.blocks) |block| {
-        result[block] = @max(result[block], loop.depth);
-    };
-    return result;
-}
-
 pub fn canonicalize(function: *Function) !bool {
     const scratch = function.scratch;
     const graph = (try function.controlFlow()).*;

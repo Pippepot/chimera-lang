@@ -293,10 +293,6 @@ const Splice = struct {
         for (body.blocks, 0..) |block, block_index| {
             for (block.instruction_start..block.instruction_end) |index| {
                 var instruction = body.instructions[index];
-                if (instruction == .initializer_capture_write) {
-                    const write = instruction.initializer_capture_write;
-                    instruction = .{ .value_copy = .{ .source = write.value, .type_id = write.type_id, .destination = @fromBackingInt(write.parameter_index) } };
-                }
                 if (instruction == .result_storage) {
                     if (exit.destination) |destination| {
                         self.values[@backingInt(body.instructionValue(index))] = destination;
@@ -337,7 +333,6 @@ const Splice = struct {
                 try function.borrow_fields.appendSlice(scratch, self.callee.borrow_fields[operation.fields.start..operation.fields.end]);
                 operation.fields = .{ .start = start, .end = @intCast(function.borrow_fields.items.len) };
             },
-            .initializer_capture_write => unreachable,
             else => {},
         }
     }

@@ -57,7 +57,7 @@ pub const Roots = struct {
                     .result_storage => return .parameter,
                     .storage_projection => |projection| switch (projection.projection) {
                         .field, .variant => current = projection.owner,
-                        .box_element, .allocation_array => return .heap,
+                        .allocation_array => return .heap,
                     },
                     .array_element => |element| current = element.array,
                     .allocation_element => return .heap,
@@ -153,7 +153,6 @@ pub const Writes = struct {
             .borrow_write => |write| try self.add(scratch, memory.roots.referent(write.reference)),
             .fill => |fill| try self.add(scratch, memory.roots.root(fill.first)),
             .move => |move| try self.add(scratch, memory.roots.root(move.destination)),
-            .initializer_capture_write => self.unknown = true,
             .call => |call| {
                 self.call = true;
                 if (call.destination) |destination| try self.add(scratch, memory.roots.root(destination));

@@ -612,7 +612,6 @@ pub const UnresolvedBody = struct {
     parameter_spans: []structures.SourceSpan = &.{},
     local_count: u32,
     expressions: []Expression = &.{},
-    conditions: []Condition = &.{},
     blocks: []Block = &.{},
     statements: []Statement = &.{},
     call_arguments: []ValueUse = &.{},
@@ -628,7 +627,6 @@ pub const UnresolvedBody = struct {
 
     pub const ValueId = enum(u32) { _ };
     pub const LocalId = enum(u32) { _ };
-    pub const ConditionId = enum(u32) { _ };
     pub const BlockId = enum(u32) { _ };
     pub const ValueUse = struct { value: ValueId, span: structures.SourceSpan };
     pub const BinaryOperands = struct { lhs: ValueUse, rhs: ValueUse };
@@ -685,7 +683,7 @@ pub const UnresolvedBody = struct {
     };
     pub const MatchArm = struct {
         pattern: u32,
-        condition: ?ConditionId = null,
+        condition: ?ValueId = null,
         body: BlockId,
         span: structures.SourceSpan,
     };
@@ -704,9 +702,8 @@ pub const UnresolvedBody = struct {
         continue_loop: structures.SourceSpan,
         return_nothing: structures.SourceSpan,
         return_value: struct { value: ValueUse, implicit: bool },
-        bind_conditional: struct { condition: ConditionId, otherwise: BlockId, span: structures.SourceSpan },
+        bind_conditional: struct { condition: ValueId, otherwise: BlockId, span: structures.SourceSpan },
     };
-    pub const PredicateOperation = enum { lt, gt, le, ge, eq, ne };
     pub const Call = struct {
         target: Target,
         arguments: structures.FunctionValueRange,
@@ -716,7 +713,7 @@ pub const UnresolvedBody = struct {
             direct: structures.InstanceId,
             inferred: structures.InstanceId,
             overloaded: structures.FunctionOverloadId,
-            operation: []const u8,
+            operation: structures.Operation,
             unknown_function,
             value: ValueUse,
             member: MemberCall,
@@ -727,28 +724,6 @@ pub const UnresolvedBody = struct {
         receiver: ValueUse,
         name: []const u8,
     };
-    pub const Condition = union(enum) {
-        comparison: struct {
-            span: structures.SourceSpan,
-            operation: PredicateOperation,
-            operands: BinaryOperands,
-        },
-        static_membership: struct {
-            operand: structures.Node.Index,
-            target_type: structures.TypeId,
-        },
-        variant_membership: struct {
-            operand: ValueUse,
-            target_type: structures.TypeId,
-        },
-        iterator_membership: struct { operand: ValueUse, end_type: structures.TypeId },
-        conjunction: struct { lhs: ConditionId, rhs: ConditionId, temporary: ?LocalId = null },
-        disjunction: struct { lhs: ConditionId, rhs: ConditionId },
-        negation: ConditionId,
-        call: Call,
-        initialization: struct { value: ValueUse },
-        pattern: PatternBinding,
-    };
     pub const StructInitTarget = union(enum) { concrete: structures.TypeId, inferred: structures.InstanceId };
     pub const Expression = struct {
         operation: Operation,
@@ -756,6 +731,23 @@ pub const UnresolvedBody = struct {
         source_node: structures.Node.Index = .null,
 
         pub const Operation = union(enum) {
+            comparison: struct {
+                operation: structures.Operation,
+                operands: BinaryOperands,
+            },
+            static_membership: struct {
+                operand: structures.Node.Index,
+                target_type: structures.TypeId,
+            },
+            variant_membership: struct {
+                operand: ValueUse,
+                target_type: structures.TypeId,
+            },
+            iterator_membership: struct { operand: ValueUse, end_type: structures.TypeId },
+            conjunction: struct { lhs: ValueId, rhs: ValueId },
+            disjunction: struct { lhs: ValueId, rhs: ValueId },
+            negation: ValueId,
+            pattern_test: PatternBinding,
             integer_literal: i64,
             int_literal_value: i64,
             string_literal: structures.ByteStringId,
@@ -786,7 +778,6 @@ pub const UnresolvedBody = struct {
             collection_iteration: struct { source: ValueUse, body: ValueUse },
             tuple_literal: structures.FunctionValueRange,
             field_access: struct { operand: ValueUse, name: []const u8 },
-            dereference: ValueUse,
             index_snapshot: ValueUse,
             assignment: struct {
                 target: LocalId,
@@ -799,9 +790,8 @@ pub const UnresolvedBody = struct {
             discard: ValueUse,
             sequence: BinaryOperands,
             call: Call,
-            predicate: ConditionId,
             if_else: struct {
-                condition: ConditionId,
+                condition: ValueId,
                 then_block: BlockId,
                 else_block: BlockId,
             },
@@ -873,7 +863,6 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         local_names: std.ArrayList([]const u8) = .empty,
         parameter_spans: std.ArrayList(structures.SourceSpan) = .empty,
         expressions: std.ArrayList(UnresolvedBody.Expression) = .empty,
-        conditions: std.ArrayList(UnresolvedBody.Condition) = .empty,
         blocks: std.ArrayList(UnresolvedBody.Block) = .empty,
         statements: std.ArrayList(UnresolvedBody.Statement) = .empty,
         call_arguments: std.ArrayList(UnresolvedBody.ValueUse) = .empty,
@@ -958,7 +947,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         fn buildWhereCondition(self: *Self, expression: structures.Node.Index) !void {
             self.where_condition = true;
             const span = nodeFocusSpan(self.ast, expression);
-            const value = try self.appendExpression(expression, .{ .predicate = try self.buildCondition(expression) });
+            const value = try self.append(expression, false);
             self.root_block = try self.finishBlock(&.{.{ .return_value = .{ .value = .{ .value = value, .span = span }, .implicit = true } }}, null, span);
         }
 
@@ -1179,7 +1168,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .unit => self.appendExpression(index, .unit),
                 .none => self.appendExpression(index, .none),
                 .function_ref => |reference| self.appendExpression(index, .{ .function_ref = reference }),
-                .structure => |tuple_id| if (try self.analysis_context.arrayType(runtime.type_id)) |array|
+                .structure => |tuple_id| if (try self.analysis_context.facts().arrayType(runtime.type_id)) |array|
                     self.appendCompileTimeArray(index, runtime.type_id, array, tuple_id)
                 else
                     self.appendCompileTimeStruct(index, runtime.type_id, tuple_id),
@@ -1203,7 +1192,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         }
 
         fn appendCompileTimeStruct(self: *Self, index: structures.Node.Index, type_id: structures.TypeId, tuple_id: structures.CompileTimeValueTupleId) anyerror!ValueId {
-            const definition = (try self.analysis_context.structDefinition(type_id)) orelse return error.Unavailable;
+            const definition = (try self.analysis_context.facts().structDefinition(type_id)) orelse return error.Unavailable;
             const values = try self.analysis_context.lookupCompileTimeTuple(tuple_id);
             std.debug.assert(values.len == definition.fields.len);
             var fields: std.ArrayList(UnresolvedBody.StructFieldValue) = .empty;
@@ -1426,7 +1415,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .from_end => return self.appendFromEnd(index),
                 .add, .sub, .mul, .div, .rem => return self.appendBinary(index),
                 .range, .range_inclusive => return self.appendRange(index),
-                .eq, .ne, .lt, .gt, .le, .ge, .not, .@"and", .@"or", .is, .membership => return self.appendExpression(index, .{ .predicate = try self.buildCondition(index) }),
+                .eq, .ne, .lt, .gt, .le, .ge, .not, .@"and", .@"or", .is, .membership => return self.appendPredicate(index),
                 .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => return self.appendAssignment(index),
                 .@"if", .if_else => return self.appendIf(index, result_is_type),
                 .match_expr => return self.appendMatch(index, result_is_type),
@@ -1450,7 +1439,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         fn appendNegation(self: *Self, index: structures.Node.Index) !ValueId {
             const operand = self.ast.nodes[index.index()].data.node;
             if (self.ast.nodes[operand.index()].tag == .number_literal) return self.appendInteger(index, operand, true);
-            return self.appendOperationCall(index, "-", &.{try self.appendUse(operand, false)});
+            return self.appendOperationCall(index, .unary_minus, &.{try self.appendUse(operand, false)});
         }
 
         fn appendIdentifier(self: *Self, index: structures.Node.Index, result_is_type: bool) !ValueId {
@@ -1636,7 +1625,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             const next_local = self.newLocal();
             const next_read = try self.appendExpression(index, .{ .local_read = next_local });
             const poll: UnresolvedBody.ValueUse = .{ .value = next_read, .span = span };
-            const condition = try self.appendCondition(.{ .iterator_membership = .{ .operand = poll, .end_type = end_type } });
+            const condition = try self.appendExpression(index, .{ .iterator_membership = .{ .operand = poll, .end_type = end_type } });
             const item_local = self.newLocal();
             const item_mode: UnresolvedBody.BindingMode = if (mode == .keyword_ref) .reference else if (mode == null) .inferred else .owned;
             var item = try self.appendExpression(index, .{ .iterator_item = .{
@@ -1801,7 +1790,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             } });
         }
 
-        fn appendOperationCall(self: *Self, index: structures.Node.Index, name: []const u8, operands: []const UnresolvedBody.ValueUse) !ValueId {
+        fn appendOperationCall(self: *Self, index: structures.Node.Index, name: structures.Operation, operands: []const UnresolvedBody.ValueUse) !ValueId {
             return self.appendExpression(index, .{ .call = .{
                 .target = .{ .operation = name },
                 .arguments = try self.appendArguments(operands),
@@ -1813,7 +1802,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             const node = self.ast.nodes[index.index()];
             const receiver = try self.appendUse(node.data.node_node.a, false);
             const offset = try self.appendIndexOffset(node.data.node_node.b);
-            return .{ .target = .{ .operation = "[]" }, .arguments = try self.appendArguments(&.{ receiver, offset }), .span = nodeFocusSpan(self.ast, index) };
+            return .{ .target = .{ .operation = .@"[]" }, .arguments = try self.appendArguments(&.{ receiver, offset }), .span = nodeFocusSpan(self.ast, index) };
         }
 
         fn appendIndexOffset(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueUse {
@@ -1831,10 +1820,10 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 var value = try self.appendUse(node.data.node_node.b, false);
                 var old: ?UnresolvedBody.ValueUse = null;
                 if (node.tag != .assign) {
-                    old = .{ .value = try self.appendOperationCall(index, "[]", &.{ receiver, offset }), .span = nodeFocusSpan(self.ast, index) };
+                    old = .{ .value = try self.appendOperationCall(index, .@"[]", &.{ receiver, offset }), .span = nodeFocusSpan(self.ast, index) };
                     value.value = try self.appendOperationCall(index, arithmeticOperation(node.tag), &.{ old.?, value });
                 }
-                const setter = try self.appendOperationCall(index, "[]=", &.{ receiver, offset, value });
+                const setter = try self.appendOperationCall(index, .@"[]=", &.{ receiver, offset, value });
                 return if (old) |previous| self.appendExpression(index, .{ .sequence = .{
                     .lhs = previous,
                     .rhs = .{ .value = setter, .span = nodeFocusSpan(self.ast, index) },
@@ -1879,13 +1868,13 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             } });
         }
 
-        fn arithmeticOperation(tag: structures.Node.Tag) []const u8 {
+        fn arithmeticOperation(tag: structures.Node.Tag) structures.Operation {
             return switch (tag) {
-                .add, .add_assign => "+",
-                .sub, .sub_assign => "-",
-                .mul, .mul_assign => "*",
-                .div, .div_assign => "/",
-                .rem, .rem_assign => "%",
+                .add, .add_assign => .@"+",
+                .sub, .sub_assign => .@"-",
+                .mul, .mul_assign => .@"*",
+                .div, .div_assign => .@"/",
+                .rem, .rem_assign => .@"%",
                 else => unreachable,
             };
         }
@@ -1934,11 +1923,11 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             return .{ .bind_conditional = .{ .condition = condition, .otherwise = otherwise, .span = nodeFocusSpan(self.ast, index) } };
         }
 
-        fn buildIfCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ConditionId {
+        fn buildIfCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueId {
             return self.buildBindingCondition(index, false);
         }
 
-        fn buildBindingCondition(self: *Self, index: structures.Node.Index, allow_mutable: bool) !UnresolvedBody.ConditionId {
+        fn buildBindingCondition(self: *Self, index: structures.Node.Index, allow_mutable: bool) !UnresolvedBody.ValueId {
             const node = self.ast.nodes[index.index()];
             if (node.tag == .destructure_binding) {
                 const first_pattern = self.binding_patterns.items.len;
@@ -1946,9 +1935,9 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 for (self.binding_patterns.items[first_pattern..]) |pattern| {
                     if (!allow_mutable and pattern.shape == .name and pattern.shape.name.mutable) return self.reject(index, .condition_binding_must_be_immutable);
                 }
-                return self.appendCondition(.{ .pattern = statement.bind_pattern });
+                return self.appendExpression(index, .{ .pattern_test = statement.bind_pattern });
             }
-            return self.buildCondition(index);
+            return self.append(index, false);
         }
 
         fn appendMatch(self: *Self, index: structures.Node.Index, result_is_type: bool) !ValueId {
@@ -1972,7 +1961,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 }
                 const pattern = try self.buildMatchPattern(pattern_index);
                 try self.declareMatchCaptures(pattern);
-                const condition = if (condition_index) |guard| try self.buildCondition(guard) else null;
+                const condition = if (condition_index) |guard| try self.append(guard, false) else null;
                 try arms.append(self.gpa, .{
                     .pattern = pattern,
                     .condition = condition,
@@ -2102,18 +2091,17 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             return .{ .start = start, .end = @intCast(self.match_pattern_children.items.len) };
         }
 
-        fn buildCondition(self: *Self, index: structures.Node.Index) !UnresolvedBody.ConditionId {
+        fn appendPredicate(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueId {
             const node = self.ast.nodes[index.index()];
             return switch (node.tag) {
-                .lt, .gt, .le, .ge, .eq, .ne => self.appendCondition(.{ .comparison = .{
-                    .span = nodeFocusSpan(self.ast, index),
+                .lt, .gt, .le, .ge, .eq, .ne => self.appendExpression(index, .{ .comparison = .{
                     .operation = comparisonOperation(node.tag),
                     .operands = .{
                         .lhs = try self.appendUse(node.data.node_node.a, false),
                         .rhs = try self.appendUse(node.data.node_node.b, false),
                     },
                 } }),
-                .membership => self.appendCondition(.{ .call = .{
+                .membership => self.appendExpression(index, .{ .call = .{
                     .target = .{ .membership = .{
                         .lhs = try self.appendUse(node.data.node_node.a, false),
                         .rhs = try self.appendUse(node.data.node_node.b, false),
@@ -2121,43 +2109,43 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                     .arguments = .{ .start = 0, .end = 0 },
                     .span = nodeFocusSpan(self.ast, index),
                 } }),
-                .is => self.buildVariantMembership(node),
+                .is => self.buildVariantMembership(index),
                 .@"and", .@"or" => {
-                    const lhs = try self.buildCondition(node.data.node_node.a);
-                    const rhs = try self.buildCondition(node.data.node_node.b);
-                    return self.appendCondition(if (node.tag == .@"and")
+                    const lhs = try self.append(node.data.node_node.a, false);
+                    const rhs = try self.append(node.data.node_node.b, false);
+                    return self.appendExpression(index, if (node.tag == .@"and")
                         .{ .conjunction = .{ .lhs = lhs, .rhs = rhs } }
                     else
                         .{ .disjunction = .{ .lhs = lhs, .rhs = rhs } });
                 },
-                .not => self.appendCondition(.{ .negation = try self.buildCondition(node.data.node) }),
-                else => self.appendCondition(.{ .initialization = .{ .value = try self.appendUse(index, false) } }),
+                .not => self.appendExpression(index, .{ .negation = try self.append(node.data.node, false) }),
+                else => unreachable,
             };
         }
 
-        fn buildVariantMembership(self: *Self, node: structures.Node) !UnresolvedBody.ConditionId {
+        fn buildVariantMembership(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueId {
+            const node = self.ast.nodes[index.index()];
             const target_type = try self.analyzeTypeOrReject(node.data.node_node.b, .inspection_type_not_supported);
-            if (self.where_condition and node.tag == .is) return self.appendCondition(.{ .static_membership = .{
+            if (self.where_condition and node.tag == .is) return self.appendExpression(index, .{ .static_membership = .{
                 .operand = node.data.node_node.a,
                 .target_type = target_type,
             } });
-            return self.appendCondition(.{ .variant_membership = .{
+            return self.appendExpression(index, .{ .variant_membership = .{
                 .operand = try self.appendUse(node.data.node_node.a, false),
                 .target_type = target_type,
             } });
         }
 
-        fn comparisonOperation(tag: structures.Node.Tag) UnresolvedBody.PredicateOperation {
+        fn comparisonOperation(tag: structures.Node.Tag) structures.Operation {
             return switch (tag) {
-                inline .lt, .gt, .le, .ge, .eq, .ne => |comparison| @field(UnresolvedBody.PredicateOperation, @tagName(comparison)),
+                .eq => .@"==",
+                .ne => .@"<>",
+                .lt => .@"<",
+                .gt => .@">",
+                .le => .@"<=",
+                .ge => .@">=",
                 else => unreachable,
             };
-        }
-
-        fn appendCondition(self: *Self, condition: UnresolvedBody.Condition) !UnresolvedBody.ConditionId {
-            const id: UnresolvedBody.ConditionId = @fromBackingInt(@intCast(self.conditions.items.len));
-            try self.conditions.append(self.gpa, condition);
-            return id;
         }
 
         fn buildBranch(self: *Self, index: structures.Node.Index, result_is_type: bool) !UnresolvedBody.BlockId {
@@ -3471,9 +3459,6 @@ const TestAnalysisContext = struct {
     }
     pub fn isPublicFieldType(_: @This(), type_id: structures.TypeId) !bool {
         return type_id.isPrimitive();
-    }
-    pub fn resolveMember(_: @This(), _: structures.NameReference, _: []const u8, _: structures.SourceSpan) !?structures.NameReference {
-        return null;
     }
     pub fn resolveMemberWithOperands(_: @This(), _: structures.NameReference, _: []const u8, _: structures.SourceSpan, _: ?usize) !?structures.NameReference {
         return null;

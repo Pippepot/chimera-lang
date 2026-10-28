@@ -220,13 +220,13 @@ func append_collection_optional(static T: type, mut result: List(T), init item: 
 pub struct Box(T: type)
     allocation: Allocation(T)
     drop = func(deinit self: Box(T))
-        unsafe_destroy_box(T, self)
-        deallocate_box(T, self^)
+        unsafe_destroy(T, self.allocation, 0)
+        deallocate(T, self.allocation^)
     pub func new(init item: T) Box(T) | none
         var storage = allocate(T, 1)
         if not (storage is Allocation(T)) -> return none
         unsafe_initialize(T, storage, 0, item)
-        return unsafe_own_box(T, storage^)
+        return Box(T){allocation = storage^}
     pub func borrow(ref self: Box(T)) ref T -> std.memory.borrow(T, self)
     pub func take(deinit self: Box(T)) T -> std.memory.take(T, self^)
 
@@ -296,13 +296,9 @@ pub struct Ref(T: type)
     copy = trivial
     pub ref value: T
     pub func from(ref item: T) Ref(T) -> Ref(T){value = item}
-pub extern func borrow(static T: type, ref owner: Box(T)) ref T
+pub func borrow(static T: type, ref owner: Box(T)) ref T -> unsafe_borrow(T, owner.allocation, 0)
 pub func take(static T: type, deinit owner: Box(T)) T
-    const result = unsafe_take_box(T, owner)
-    deallocate_box(T, owner^)
+    const result = unsafe_take(T, owner.allocation, 0)
+    deallocate(T, owner.allocation^)
     return result^
-extern func unsafe_own_box(static T: type, deinit allocation: Allocation(T)) Box(T)
-extern func unsafe_take_box(static T: type, mut owner: Box(T)) T
-extern func unsafe_destroy_box(static T: type, mut owner: Box(T))
-extern func deallocate_box(static T: type, deinit owner: Box(T))
 extern func io_read(descriptor: int, imm allocation: Allocation(byte), start: int, count: int) int | none

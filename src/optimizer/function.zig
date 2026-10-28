@@ -498,13 +498,12 @@ pub fn readOperands(function: *Function, instruction: *Instruction, context: any
             visit(context, &operation.cursor);
             visit(context, &operation.index);
         },
-        .borrow_read, .borrow_box => |*operation| visit(context, &operation.source),
+        .borrow_read => |*operation| visit(context, &operation.source),
         .borrow_address => |*operation| if (operation.base_is_reference) visit(context, &operation.source),
         .borrow_write => |*operation| {
             visit(context, &operation.reference);
             visit(context, &operation.value);
         },
-        .initializer_capture_write => |*operation| visit(context, &operation.value),
         .fill => |*operation| {
             visit(context, &operation.count);
             visit(context, &operation.value);
@@ -541,59 +540,6 @@ pub fn terminatorReadOperands(function: *Function, terminator: *Terminator, cont
             if (data.representation == .value and function.direct(data.type_id)) visit(context, &argument.value);
         }
     };
-}
-
-pub fn visitReads(tables: anytype, instruction: *const Instruction, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    switch (instruction.*) {
-        .addi, .subi, .muli, .divsi => |operands| {
-            visit(context, operands.lhs);
-            visit(context, operands.rhs);
-        },
-        .compare => |operation| {
-            visit(context, operation.operands.lhs);
-            visit(context, operation.operands.rhs);
-        },
-        .select => |operation| {
-            visit(context, operation.condition);
-            visit(context, operation.then_value);
-            visit(context, operation.else_value);
-        },
-        .negi, .byte_to_int, .variant_tag => |operand| visit(context, operand),
-        .value_copy => |operation| visit(context, operation.source),
-        inline .variant_coerce, .variant_extract => |operation| visit(context, operation.operand),
-        .field_access => |operation| visit(context, operation.operand),
-        .allocation_element => |operation| {
-            visit(context, operation.allocation);
-            visit(context, operation.index);
-        },
-        .array_element => |operation| visit(context, operation.index),
-        .cursor_offset, .cursor_element => |operation| {
-            visit(context, operation.cursor);
-            visit(context, operation.index);
-        },
-        .borrow_read, .borrow_box => |operation| visit(context, operation.source),
-        .borrow_address => |operation| if (operation.base_is_reference) visit(context, operation.source),
-        .borrow_write => |operation| {
-            visit(context, operation.reference);
-            visit(context, operation.value);
-        },
-        .initializer_capture_write => |operation| visit(context, operation.value),
-        .fill => |operation| {
-            visit(context, operation.count);
-            visit(context, operation.value);
-        },
-        .move => |operation| visit(context, operation.count),
-        .aggregate => |aggregate| for (tables.aggregate_fields[aggregate.fields.start..aggregate.fields.end]) |field| visit(context, field),
-        .call => |call| visitCallReads(tables, call, context, visit),
-        else => {},
-    }
-}
-
-pub fn visitCallReads(tables: anytype, call: structures.FunctionCall, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    if (call.target == .indirect) visit(context, call.target.indirect);
-    for (tables.call_arguments[call.arguments.start..call.arguments.end]) |argument| {
-        if (argument == .prepared) visit(context, argument.prepared.value);
-    }
 }
 
 pub fn visitTerminatorOperands(_: anytype, terminator: *const Terminator, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {

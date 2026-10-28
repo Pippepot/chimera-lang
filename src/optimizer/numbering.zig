@@ -169,8 +169,7 @@ fn kind(roots: *const effects.Roots, instruction: Instruction) Kind {
         inline .variant_extract, .variant_coerce => |operation| if (operation.destination == null) read(roots, operation.operand) else .write,
         .allocation_element => |element| read(roots, element.allocation),
         .local_storage, .result_storage, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_type, .initializer_ref, .aggregate, .storage_cursor => .none,
-        .borrow_box => .none,
-        .borrow_write, .initializer_capture_write, .call, .static_conversion, .fill, .move => .write,
+        .borrow_write, .call, .static_conversion, .fill, .move => .write,
     };
 }
 

@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIMERAQRY45";
+const format = "CHIMERAQRY46";
 const max_records = 1_000_000;
 // Snapshot records name their interner, input, or query boundary by type name.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
@@ -341,7 +341,7 @@ fn referencePathElement(db: *query.Database, types: anytype, type_id: structures
     if (try types.allocationElement(type_id)) |element| return element;
     if (try types.storageAccess(type_id)) |element_type| return element_type;
     const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
-    if (try analysis.collectionLiteralType(type_id)) |collection| return collection.element_type;
+    if (try analysis.facts().collectionLiteralType(type_id)) |collection| return collection.element_type;
     return null;
 }
 
@@ -455,7 +455,7 @@ fn validInitializerResult(db: *query.Database, types: anytype, body: structures.
         const construction = (try analysis.collectionSequenceConstruction(reference.type_id, element)) orelse return false;
         return construction.type_id == result;
     }
-    const collection = (try analysis.collectionLiteralType(reference.type_id)) orelse return false;
+    const collection = (try analysis.facts().collectionLiteralType(reference.type_id)) orelse return false;
     const array = (try types.arrayType(result)) orelse return false;
     return std.meta.eql(collection, array);
 }
@@ -463,7 +463,6 @@ fn validInitializerResult(db: *query.Database, types: anytype, body: structures.
 fn validStorageProjection(types: anytype, body: structures.FunctionBodyAnalysis, operation: structures.StorageProjection) !bool {
     const type_id = body.valueType(operation.owner);
     switch (operation.projection) {
-        .box_element => return operation.type_id == ((try types.boxElement(type_id)) orelse return false),
         .allocation_array => {
             const element = (try types.allocationElement(type_id)) orelse return false;
             const array = (try types.arrayType(operation.type_id)) orelse return false;
@@ -627,10 +626,8 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
             .variant_extract => |operation| validTagMapping(operation.tag_mapping, body),
             .result_storage => |type_id| type_id == body.return_type,
             .borrow_address => |operation| validRange(operation.fields, body.borrow_fields.len),
-            .initializer_capture_write => |operation| body.is_initializer_region and
-                operation.parameter_index < body.parameter_modes.len and body.parameter_modes[operation.parameter_index] == .mut,
             .call => |call| validCall(call, body),
-            .compare, .select, .aggregate, .fill, .move => false,
+            .select, .aggregate, .fill, .move => false,
             else => true,
         };
         if (!valid) return false;
@@ -887,9 +884,9 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     var parameter_modes = [_]structures.ParameterMode{.imm};
     var branch_arguments = [_]structures.FunctionValueUse{.{ .value = @fromBackingInt(@intCast(0)) }};
     var call_arguments: [0]structures.FunctionCallArgument = .{};
-    var instructions = [_]structures.FunctionInstruction{.{ .initializer_capture_write = .{
-        .parameter_index = 1,
-        .value = @fromBackingInt(@intCast(0)),
+    var instructions = [_]structures.FunctionInstruction{.{ .value_copy = .{
+        .destination = @fromBackingInt(1),
+        .source = @fromBackingInt(@intCast(0)),
         .type_id = .int,
     } }};
     var blocks = [_]structures.FunctionBlock{.{
@@ -924,7 +921,7 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     block_arguments[0].representation = .value;
     body.instructions = instructions[0..0];
     blocks[0].instruction_end = 0;
-    instructions[0] = .{ .initializer_capture_write = .{ .parameter_index = 1, .value = @fromBackingInt(0), .type_id = .int } };
+    instructions[0] = .{ .value_copy = .{ .destination = @fromBackingInt(1), .source = @fromBackingInt(0), .type_id = .int } };
 
     blocks[0].terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(0)), .arguments = .{ .start = 0, .end = 0 } } };
     try std.testing.expect(!validFunctionBody(body));
@@ -992,13 +989,11 @@ test "cached body validation rejects invalid control flow and argument indexes" 
     const box_item = (try db.get(queries.ModuleDeclarations, module)).*.?.resolveStatic("IntBox").?;
     const box_value = (try db.get(queries.ResolveStatic, box_item)).*.?;
     block_arguments[0].type_id = (try db.lookupInterned(queries.CompileTimeValues, box_value)).type;
-    instructions[0].storage_projection.projection = .box_element;
-    instructions[0].storage_projection.type_id = .int;
+    const box_definition = (try (queries.TypeFacts(*query.Database){ .ctx = db }).structDefinition(block_arguments[0].type_id)).?;
+    instructions[0].storage_projection.projection = .{ .field = 0 };
+    instructions[0].storage_projection.type_id = box_definition.fields[0].type_id;
     try std.testing.expect(try validStorageOperations(db, body));
-    instructions[0].storage_projection.type_id = .bool;
-    try std.testing.expect(!(try validStorageOperations(db, body)));
     instructions[0].storage_projection.type_id = .int;
-    block_arguments[0].type_id = pair_type;
     try std.testing.expect(!(try validStorageOperations(db, body)));
 
     const allocation_item = (try db.get(queries.ModuleDeclarations, module)).*.?.resolveStatic("IntSlots").?;
@@ -1514,7 +1509,7 @@ test "cached initializer handles stay out of ordinary operands and mutable write
 
     var writes = [_]structures.FunctionInstruction{
         .{ .const_int = 42 },
-        .{ .initializer_capture_write = .{ .parameter_index = 0, .value = @fromBackingInt(@intCast(1)), .type_id = .int } },
+        .{ .value_copy = .{ .destination = @fromBackingInt(0), .source = @fromBackingInt(@intCast(1)), .type_id = .int } },
     };
     body.instructions = &writes;
     blocks[0].instruction_end = 2;

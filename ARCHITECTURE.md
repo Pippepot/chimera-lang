@@ -644,7 +644,9 @@ shared ownership. The allocation retains the resolved request and provider
 authority directly or through lifetime dependencies. Layout and location
 accessors remain sketches. Host low-level operations stay under `std.memory`,
 with matching `Allocation` methods; `Box` and `Ref` are prelude exports.
-`unsafe_own_box` is internal ownership transfer, not a public constructor.
+`Box` construction, borrowing, extraction, and destruction use ordinary library
+field projections and the existing `Allocation` primitives; they have no separate
+compiler-owned storage operations.
 Consuming `take(T, owner)` uses deinit access without preliminary owner
 relocation; `get_value` would obscure borrowing versus copying versus transfer.
 Copying `Ref(T)` copies only the handle; owning a read of `.value` requires
@@ -763,7 +765,7 @@ Allocation-backed cursors compare the allocation's logical identity and frozen
 contents across copied descriptors; inline backing retains its original cell identity.
 Literal-backed readonly byte cursors and references instead publish symbolic
 interner IDs and checked offsets. Copying and permission attenuation retain the
-typed destination's cursor identity before publication. Snapshot format CHIMERAQRY45
+typed destination's cursor identity before publication. Snapshot format CHIMERAQRY46
 validates their nominal standard identity, permission, bounds, and operation types, including source-free
 intern restoration; transient storage addresses are never persisted.
 
@@ -817,7 +819,7 @@ Chimera uses unique ownership and rejects ambient compile-time I/O.
   without evaluating values or specialization constraints. Function diagnostics
   retain the owning instance, including compile-time callers, so errors in
   different specializations remain distinguishable at the same source span.
-- Standard calls are classified by registered declaration identity at the analysis boundary; lowering retains the resolved behavior instead of rediscovering names. Box, List, and reference-write type eligibility is checked when a signature is demanded, including acquisition as a function value. These capability constraints remain compiler-owned until the language can express them. Reference-write eligibility is shared with assignment typing. `Box.new` is an ordinary library init receiver returning Box(T) | none. The compiler-owned ordinary raw slot initializer publishes a typed body that selects an allocation element and invokes its init parameter into that destination; backend calls use the general init protocol.
+- Standard calls are classified by registered declaration identity at the analysis boundary; lowering retains the canonical external identity and primitive operation spelling instead of translating through another builtin-kind inventory. Box, List, and reference-write type eligibility is checked when a signature is demanded, including acquisition as a function value. These capability constraints remain compiler-owned until the language can express them. Reference-write eligibility is shared with assignment typing. `Box.new` is an ordinary library init receiver returning Box(T) | none. The compiler-owned ordinary raw slot initializer publishes a typed body that selects an allocation element and invokes its init parameter into that destination; backend calls use the general init protocol.
 - Standard memory structs retain nominal identity and specialization lookup over existing queries. Arrays instead retain canonical structural identity with a separate standard-source namespace association; representation and ownership checks remain type-specific.
 
 ## Persistence
