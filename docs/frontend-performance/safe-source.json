@@ -1,0 +1,18 @@
+{
+  "command": "zig build test --seed=0 -Doptimize=safe -j1 --summary all",
+  "log": "/tmp/chimera-loop-ranges-tLpA6E/full-suite.log",
+  "source_sha256": {
+    "src/frontend/typing.zig": "6b59e441931148a04fa79b2ffe1920f35ffd1578b545ebf326a68633b9b94feb",
+    "src/frontend/reference_origins.zig": "421444751ca51db8473fb4a1f024b4c9afb995cf9e5d9596ade040df9ce3fedf",
+    "src/frontend/flow_snapshot.zig": "4ccdf9edd0eac6d2f664fe7a134815aef301b77360de58a680c336f67d7d8560",
+    "src/backend/codegen.zig": "1cfdd93366da2ae46f5733c6987c60572eefbafed7e6903ea2a21fc560307ac0",
+    "src/backend/machine.zig": "35d2a3f1cb7be46fb4c1b689709074a706806939a6e0c3bc03bdfde3928a828f",
+    "src/backend/registers.zig": "6ffb213eab86e1f5e2b95d794bbf019962305c45241e92305022326c528c305c",
+    "src/backend/x86_encoding.zig": "96a79d37519e98857aa151f131552b347f51ee06e0d86037f7d0ab5638db197e",
+    "tests/codegen_test.zig": "0723ec5265af420559374460d8f936008c6049a9f0b99a21baa8eadabcb13119",
+    "test_sources.zig": "1f12a660e05246c1f508f5fe67ea28c708d1be7ac03a08d724cae4c9a5b2695e",
+    "src/optimizer/idioms.zig": "832280c90b27f8bb261f1767a2230e0afb1b4ca7948415e8d980997b0e6af26f",
+    "tests/optimizer_test.zig": "1809099d985db2e08d608aece4a32934bab0d3eae6afc326066d7be34194a421"
+  },
+  "scope": "Shared combined checkout. Frozen frontend hashes verified against the pre-run manifest; other source hashes recorded after this run."
+}

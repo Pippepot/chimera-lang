@@ -287,17 +287,41 @@ exhausted iterator paths without inventing payload values or skipping cleanup.
 
 Loops come from back edges in the dominator tree and are canonicalized with a
 dedicated preheader and a single latch. Induction variables are header
-parameters stepped by a constant. The idioms are:
+parameters stepped by a constant. `loops.zig` owns their read-only analysis;
+`idioms.zig` owns transformations. The analysis indexes instruction ownership
+once per unchanged CFG and shares immutable-value, counter, normalized-exit,
+and range facts across existing rewrites. Functions without loops skip it.
+
+Counter matching does not imply monotonicity or termination. An iteration-range
+query separately proves that the latch update cannot wrap, including the final
+update. Dead-loop removal separately requires an acyclic iteration body before
+using a wrapping equality counter to prove termination. A nested loop that may
+not finish must not disappear with its containing loop. Address-taken values
+cannot supply immutable counter, constant, or range facts.
+
+The rewrite driver invalidates control-flow and operand facts after every
+successful transformation and restarts analysis before trying another rule.
+Rules retain their own effect, escape, and shape requirements; there is no
+persistent analysis cache, extra IR, or generic rewrite framework. The idioms are:
 
 - removal of a loop with no effects whose exit test compares a ±1 induction
   variable for equality, which always terminates under wrapping arithmetic;
-- removal of `i >= c` and `i < n` checks dominated by an exit test `i >= n`
-  when `i` starts at a constant at least `c` and steps by one;
+- removal of proven integer comparisons in a loop body using constant or
+  guarded dynamic starts, nonzero constant strides, and an invariant exit bound.
+  Ascending and descending loops support strict or inclusive limits and reversed
+  operands. Each proof bounds the latch update in widened arithmetic before
+  assuming monotonicity; wrapping counterexamples retain their checks;
 - `fill` and descending `move` for element loops, guarded by
   `0 <= start <= end` so the original loop still runs when indices would wrap.
 
 Preheaders forward a common immutable incoming value directly rather than
 introducing a redundant parameter that would hide an induction start constant.
+Entry ranges intersect constant-bound predicates on dominating branches, using
+only a single-predecessor successor that dominates the preheader. Guards on just
+one path through a join do not establish a range. Body comparisons use both the
+counter's numeric interval and its relation to the same invariant exit limit.
+These are local proofs, not a general range solver: no runtime guards, unchecked
+fallbacks, pointer induction, or vectorization are introduced.
 
 ### Backend
 
@@ -305,29 +329,39 @@ Functions with allocatable scalar values lower to the query-local x86 instructio
 stream in `src/backend/machine.zig` before allocation or byte encoding. Fixed-only
 functions stream operations directly to encoding, avoiding a buffered stage with
 no allocation work. The buffered stream contains
-fixed-register operations, virtual scalar reads and writes, symbolic branches,
-labels, preservation operations, and explicit scratch-dead boundaries. Constants
+fixed-register operations, virtual scalar reads and writes, parameter definitions,
+symbolic branches, labels, preservation operations, and explicit scratch-dead boundaries. Constants
 remain immediates; scalar computation initially uses `eax`, with fixed scratch
-registers for division, addressing, calls, and bulk copies. These registers are
-outside the six preserved registers available to virtual values. External
+registers for division, addressing, calls, and bulk copies. Virtual values can use
+four caller-saved registers (`r8`-`r11`) and six preserved registers
+(`rbx`, `rbp`, `r12`-`r15`). Fixed operands reserve conflicting registers, and
+direct and indirect calls exclude caller-saved registers from crossing live ranges. External
 runtime helpers retain the same direct encoding path and calling convention.
 Local targets are nonzero positions after labels; zero represents no local
 target, keeping fixed operands compact without optional-target padding.
 
-In functions containing loops, eligible integer and boolean values become
-virtual registers with stack spill homes. Addressed values, incoming parameters,
-and initializer environments retain storage. The weighted live-range allocator
+Eligible integer and boolean locals become virtual registers with stack spill
+homes under the existing backward-positioned-edge gate. Repeated, unaddressed
+by-value scalar parameters are candidates independently of that gate. They retain
+their incoming ABI slots as spill homes; an unallocated parameter emits no entry
+load. Temporaries allocate first, then parameters cache only in spare caller-saved
+registers, avoiding temporary spills and additional preservation work. Addressed
+values and initializer environments retain storage. The weighted live-range allocator
 derives its CFG and eligible-value liveness from the expanded machine stream,
 including division branches and the actual edge-copy reads and writes. This CFG
 is a temporary analysis, not a second authoritative graph. Separate definitions
 retain separate live ranges rather than extending one interval across dead gaps.
-Operand reads precede definitions, allowing last-use reuse. Frames currently reserve preservation
-capacity for all six registers before allocation; emitted saves and restores
-include only registers actually used.
+Operand reads precede definitions, allowing last-use reuse. Disjoint definitions
+can reuse caller-saved registers on either side of calls; there is no general
+call-site live-range splitting or spill/reload insertion. Frames currently reserve
+preservation capacity for all six preserved registers before allocation; emitted
+saves and restores include only preserved registers actually used.
 
 After allocation, arithmetic updates a register directly when it can reuse a
 legal operand location and scratch results are dead; subtraction only reuses its
-left operand. Label boundaries prevent such combining across jump targets.
+left operand. Register and stack operands use direct two-operand instructions,
+avoiding intermediate copies through `eax`; fixed and spilled stack operands retain compact
+displacements. Label boundaries prevent such combining across jump targets.
 Encoding retains compact immediates and store-to-load forwarding. Scalar edge
 copies bypass scratch storage when forward or reverse order preserves every
 virtual source. Cycles and unsupported copy shapes stage every source before
@@ -380,13 +414,15 @@ descending copy. Aggregate construction copies each field to its layout offset.
 - `InlineLimit` set to zero keeps calls out of line for tests about call
   structure and native artifact reuse.
 - Machine tests cover symbolic byte offsets with register and spilled operands,
-  scratch-dead combining boundaries, expanded-branch register pressure, and
+  scratch-dead combining boundaries, call clobbers, fixed-register conflicts,
+  parameter-cache pressure and load omission, expanded-branch register pressure, and
   signed division inside loops. Existing execution tests cover edge-copy cycles,
   calls, initializer regions, relocations, and panic provenance.
 
-The 2026-10-26 machine-stage run of `zig build test --seed=0 -Doptimize=safe -j1`
-completed all 50 build steps: 2,112 tests passed and 24 skipped, without
-allocation-failure sweeps. Formatting checks and `git diff --check` also passed.
+The 2026-10-29 parameter-residency run of `zig build test --seed=0 -Doptimize=safe -j1`
+completed all 52 build steps: 2,101 tests passed and 19 skipped, without
+allocation-failure sweeps. The codegen suite was cached after a focused run with
+54 passing tests and five skips. Formatting checks and `git diff --check` also passed.
 
 ## Measurements
 
@@ -543,6 +579,168 @@ remaining-gap estimate or a claim of C parity. All three executables passed
 from 19,102 to 19,004 bytes. Frozen sources, hashes, executable copies, and raw
 samples are under `/tmp/chimera-scalar-loops-20261026`.
 
+### Scalar Arithmetic Selection
+
+The 2026-10-29 comparison retained baseline and candidate ReleaseFast binaries
+with identical frontend sources on an Intel Core Ultra 7 265K, using Zig 0.17.
+Two out-of-line kernels each made 120 million calls. C used GCC `-O3 -fwrapv`
+and `noinline` to retain wrapping arithmetic and the call boundary. Every output
+matched. CPU-4 measurements used one warm-up, alternating order, and adaptive
+sampling; all rows met the 2% range criterion after two samples.
+
+| Kernel | Baseline | Direct Register/Stack Arithmetic | C | Change |
+| --- | ---: | ---: | ---: | ---: |
+| Scalar arithmetic | 0.672 s | 0.637 s | 0.591 s | -5.2% |
+| Eight-parameter arithmetic | 0.820 s | 0.742 s | 0.678 s | -9.5% |
+
+These are kernel results, not a general application speedup. Removing the
+location planner's backward-edge gate produced byte-identical executables for
+both kernels and was discarded; block numbering is not topological, so that
+gate does not exclude every loop-free body. Direct register arithmetic alone
+regressed the parameter kernel; selecting stack operands directly was also
+necessary. Inputs, assembly, retained binaries, and raw samples are preserved
+under `.history/backend-arithmetic-20261029/`.
+
+Full-size acceptance used the existing million-line cold/leaf-edit and sieve
+workloads, with serial compilation and runtime on CPU 4 and eight workers on
+CPUs 4-11. Each retained binary used its ordinary bundled std and the adaptive
+benchmark protocol. The initial eight-worker cold comparison suggested a 3%
+slowdown, so that lane was repeated in the opposite order:
+
+| Measurement | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Serial cold | 20.027 s | 19.964 s | -0.3% |
+| Serial leaf edit | 148.9 ms | 146.4 ms | -1.7% |
+| Eight-worker cold, candidate first | 11.877 s | 12.234 s | +3.0% |
+| Eight-worker leaf edit, candidate first | 173.6 ms | 178.5 ms | +2.8% |
+| Eight-worker cold, baseline first | 12.636 s | 12.098 s | -4.3% |
+| Eight-worker leaf edit, baseline first | 182.6 ms | 182.2 ms | -0.2% |
+| Sieve runtime | 0.622 s | 0.623 s | +0.01% |
+
+The serial baseline, both initial parallel leaf-edit results, and the reversed
+parallel baseline reached the compilation sample cap without stability.
+The sign reversal does not establish a compilation speedup or a repeatable
+regression. Sieve samples were stable after two runs; its C `-O3` reference was
+0.575 s. All generated outputs and statuses passed. These checks support no
+detected repeatable end-to-end regression, not exact performance equivalence.
+
+### Parameter Residency and Call Constraints
+
+The next 2026-10-29 comparison keeps the arithmetic-selection implementation as
+its baseline. Retained ReleaseFast binaries have identical frontend and std
+sources, including a concurrent frontend change rebuilt into the baseline.
+The same CPU-4 kernels, wrapping C reference, output checks, warm-up, alternating
+order, and adaptive sampling produced:
+
+| Kernel | Baseline | Candidate | C | Change |
+| --- | ---: | ---: | ---: | ---: |
+| Scalar arithmetic | 0.637 s | 0.621 s | 0.590 s | -2.5% |
+| Eight-parameter arithmetic | 0.749 s | 0.739 s | 0.679 s | -1.3% |
+
+All three implementations met the 2% range criterion after two samples in each
+kernel. These small isolated gains do not establish an application-wide speedup.
+The candidate combines optional parameter caching, four additional registers with
+call constraints, and direct arithmetic on spilled virtual operands.
+
+Eager parameter allocation was rejected: long-lived parameters displaced
+temporaries and more than doubled the parameter kernel's runtime. A live-range
+density heuristic also regressed. The accepted policy allocates temporaries
+first and caches parameters only in remaining caller-saved registers, retaining
+the incoming ABI home otherwise. This also avoids extra callee-save traffic.
+
+Full-size acceptance used the same million-line and sieve workloads and affinity
+as the arithmetic-selection comparison. The initial eight-worker run suggested a
+slowdown, so that lane was repeated in reverse order:
+
+| Measurement | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Serial cold | 19.965 s | 19.767 s | -1.0% |
+| Serial leaf edit | 150.0 ms | 149.4 ms | -0.4% |
+| Eight-worker cold, candidate first | 11.878 s | 12.434 s | +4.7% |
+| Eight-worker leaf edit, candidate first | 180.6 ms | 194.2 ms | +7.6% |
+| Eight-worker cold, baseline first | 12.107 s | 12.006 s | -0.8% |
+| Eight-worker leaf edit, baseline first | 184.4 ms | 173.8 ms | -5.8% |
+| Sieve runtime | 0.625 s | 0.623 s | -0.3% |
+
+The serial baseline leaf edits, initial parallel candidate cold samples, both
+initial parallel leaf-edit results, and reversed candidate leaf edits remained
+unstable at their sample caps. The sign reversal does not establish a compilation
+speedup or a repeatable regression. Sieve was stable after two samples; its C
+`-O3` reference was 0.579 s. All outputs and statuses passed. The million-line
+executable shrank from 121,025,902 to 119,544,702 bytes. Retained binaries, source
+patches and hashes, inputs, assembly, and raw samples are preserved under
+`.history/backend-parameters-20261029/`.
+
+### Guarded Loop Ranges
+
+The next 2026-10-29 comparison keeps the parameter-residency compiler as its
+baseline, with only `src/optimizer/idioms.zig` changed among production sources.
+A runtime-input kernel performs sixteen scans with varied dynamic starts and a
+stride of three. An entry guard bounds the limit, making the latch update safe;
+the baseline retains redundant lower- and upper-bound tests inside the loop.
+The candidate removes both tests while retaining the entry guards and exit test.
+
+CPU-4 runs used retained ReleaseFast compilers, one warm-up, alternating order,
+and adaptive sampling. Matched C used GCC `-O3 -fwrapv`; every output agreed.
+All three implementations met the 2% range criterion after two samples:
+
+| Workload | Baseline | Candidate | C | Change |
+| --- | ---: | ---: | ---: | ---: |
+| Guarded stride-three scans | 1.469 s | 0.933 s | 0.240 s | -36.5% |
+
+This is an isolated check-heavy kernel result, not a general application speedup
+or C parity. Earlier short runs were noisy and remain separate raw samples.
+
+Full-size acceptance used the same million-line and sieve workloads and affinity
+as the preceding comparisons:
+
+| Measurement | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Serial cold | 19.892 s | 19.659 s | -1.2% |
+| Serial leaf edit | 141.0 ms | 140.2 ms | -0.6% |
+| Eight-worker cold, candidate first | 11.887 s | 11.883 s | -0.03% |
+| Eight-worker leaf edit, candidate first | 172.0 ms | 182.1 ms | +5.8% |
+| Eight-worker cold, baseline first | 12.288 s | 11.961 s | -2.7% |
+| Eight-worker leaf edit, baseline first | 181.5 ms | 169.5 ms | -6.6% |
+| Sieve runtime, baseline first | 0.620 s | 0.629 s | +1.4% |
+| Sieve runtime, candidate first | 0.630 s | 0.623 s | -1.2% |
+
+The initial parallel baseline leaf edits, reversed parallel baseline cold runs,
+and reversed candidate leaf edits remained unstable. The leaf-edit and sieve
+sign reversals do not establish a general speedup or a repeatable regression.
+Both snapshots emitted 119,544,702-byte compilation workloads and 18,699-byte
+sieves. Raw samples, inputs, assembly, retained binaries, and source snapshots
+are preserved under `.history/backend-loop-ranges-20261029/`.
+
+### Shared Loop Analysis
+
+The following 2026-10-29 comparison consolidates loop facts rather than adding
+an optimization. Dead-loop removal, fill/move, and check elimination consume
+shared counter and exit matching; range construction no longer belongs to the
+check-elimination rewrite. Regression tests cover nested rewrite composition,
+proof invalidation after source edits, signed boundaries, and preservation of
+potentially nonterminating inner loops.
+
+Retained ReleaseFast compilers have identical frontend and std sources. The
+million-line workload used the ordinary adaptive protocol, CPU 4 for serial
+compilation and CPUs 4-11 for eight workers, with both run orders:
+
+| Measurement | Baseline First | Candidate First |
+| --- | ---: | ---: |
+| Serial cold | -0.08% | -0.44% |
+| Serial leaf edit | +0.81% | -1.42% |
+| Eight-worker cold | -2.96% | +2.00% |
+| Eight-worker leaf edit | -6.19% | +2.01% |
+
+Cold samples met the stability criterion in both orders. Initial serial baseline
+leaf edits and reversed parallel candidate leaf edits reached their caps without
+stability. No repeatable compilation regression was detected; the parallel sign
+reversals do not establish a speedup or exact performance equivalence.
+Executable sizes were unchanged. The loop-range kernel was byte-identical;
+paired sieve medians were 0.634 s baseline and 0.637 s candidate. Raw measurements,
+retained compilers, and source snapshots are preserved under
+`.history/loop-analysis-20261029/`; intermediate probes are labelled separately.
+
 ### Assembly Dump Scope
 
 The earlier Chimera dump treated its flat ELF as raw x86 bytes, including
@@ -569,6 +767,6 @@ and aggregate copies are real remaining costs, distinct from that dump artifact.
   not required by the measured near-parity experiment. Preserve wrapping
   arithmetic and panic behavior; do not special-case the sieve or weaken checks.
 - Reduce machine-stage analysis and encoding cost where profiles justify it.
-  Register classes, frame compaction, scheduling, and additional targets remain
+  Call-site live-range splitting, frame compaction, scheduling, and additional targets remain
   follow-up work, not part of this first boundary. Compilation throughput and
   leaf-edit times remain non-regression checks, not outstanding regressions.

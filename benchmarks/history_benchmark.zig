@@ -79,7 +79,7 @@ fn validateRuntimeOutput(allocator: std.mem.Allocator, result: std.process.RunRe
     if (result.stderr.len != 0) return error.UnexpectedProgramOutput;
 }
 
-fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usize, samples: ?usize, workers: usize) !void {
+fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usize, samples: ?usize, workers: usize, profile: bool) !void {
     var workload = try workload_generator.generate(init.gpa, lines);
     defer workload.deinit();
     const allocator = init.arena.allocator();
@@ -98,24 +98,28 @@ fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usi
     var registry: compiler.modules.SourceRegistry = .{};
     defer registry.deinit(init.gpa);
     var leaf_value: u8 = 41;
-    var warmup = true;
+    var collector: compiler.profiling.Collector = .{ .io = init.io };
+    var warmup = !profile;
     while (true) {
+        const before_cold: compiler.profiling.Snapshot = if (profile) collector.snapshot() else .{};
         if (warmup or !cold.complete()) {
             if (database) |db| db.deinit();
             database = null;
             registry.deinit(init.gpa);
             registry = .{};
             const started = std.Io.Clock.awake.now(init.io);
-            const db = try compiler.query.Database.init(init.gpa, .{ .worker_count = workers });
+            const db = try compiler.query.Database.init(init.gpa, .{ .worker_count = workers, .profile = if (profile) &collector else null });
             database = db;
             try registry.update(db, init.gpa, workload.entry, files, &.{});
             if (has_standard_bundle) _ = try compiler.standard_bundle.install(db, standard_bundle);
             const bytes = try executable(db, init.gpa);
             const ended = std.Io.Clock.awake.now(init.io);
             if (!warmup) try cold.add(started.durationTo(ended).toNanoseconds(), bytes.len);
+            if (profile) printProfile("cold", started.durationTo(ended).toNanoseconds(), collector.snapshot().since(before_cold));
             try validate(init, bytes, 42);
             leaf_value = 41;
         }
+        const before_edit: compiler.profiling.Snapshot = if (profile) collector.snapshot() else .{};
         if (warmup or !edit.complete()) {
             const db = database.?;
             leaf_value += 1;
@@ -126,14 +130,24 @@ fn measureCompilation(init: std.process.Init, writer: *std.Io.Writer, lines: usi
             const bytes = try executable(db, init.gpa);
             const ended = std.Io.Clock.awake.now(init.io);
             if (!warmup) try edit.add(started.durationTo(ended).toNanoseconds(), bytes.len);
+            if (profile) printProfile("leaf-edit", started.durationTo(ended).toNanoseconds(), collector.snapshot().since(before_edit));
             try validate(init, bytes, leaf_value + 1);
         }
         warmup = false;
         if (cold.complete() and edit.complete()) break;
     }
+    if (profile) return;
     try cold.write(writer, name, lane, "cold");
     try edit.write(writer, name, lane, "leaf-edit");
     try writer.flush();
+}
+
+fn printProfile(phase: []const u8, wall_ns: i96, snapshot: compiler.profiling.Snapshot) void {
+    std.debug.print("profile: {s}: wall {d:.3} ms; exclusive elapsed ms, invocations\n", .{ phase, @as(f64, @floatFromInt(wall_ns)) / 1e6 });
+    inline for (@typeInfo(compiler.profiling.Category).@"enum".field_names) |name| {
+        const counter = snapshot.get(@field(compiler.profiling.Category, name));
+        if (counter.runs != 0) std.debug.print("  {s}: {d:.3}, {d}\n", .{ name, @as(f64, @floatFromInt(counter.nanoseconds)) / 1e6, counter.runs });
+    }
 }
 
 fn measureRuntime(init: std.process.Init, writer: *std.Io.Writer, skip_c: bool, samples: ?usize) !void {
@@ -223,12 +237,15 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.arena.allocator();
     const args = try init.minimal.args.toSlice(allocator);
     var skip_c = false;
+    var profile = false;
     var selected: ?[]const u8 = null;
     var lines: usize = 1_000_000;
     var samples: ?usize = null;
     var workers: usize = 0;
     for (args[1..]) |argument| {
-        if (std.mem.eql(u8, argument, "--skip-c")) {
+        if (std.mem.eql(u8, argument, "--profile")) {
+            profile = true;
+        } else if (std.mem.eql(u8, argument, "--skip-c")) {
             skip_c = true;
         } else if (std.mem.startsWith(u8, argument, "--case=")) {
             selected = argument["--case=".len..];
@@ -246,12 +263,16 @@ pub fn main(init: std.process.Init) !void {
         if (!std.mem.eql(u8, name, compilation_case) and
             !std.mem.eql(u8, name, runtime_case)) return error.InvalidArgument;
     }
+    if (profile) {
+        if (samples != null or selected == null or !std.mem.eql(u8, selected.?, compilation_case)) return error.InvalidArgument;
+        samples = 1;
+    }
     var buffer: [4096]u8 = undefined;
     var output = std.Io.File.stdout().writer(init.io, &buffer);
     const writer = &output.interface;
-    try writer.writeAll("case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable\n");
+    if (!profile) try writer.writeAll("case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable\n");
     if (selected == null or std.mem.eql(u8, selected.?, compilation_case))
-        try measureCompilation(init, writer, lines, samples, workers);
+        try measureCompilation(init, writer, lines, samples, workers, profile);
     if (selected == null or std.mem.eql(u8, selected.?, runtime_case))
         try measureRuntime(init, writer, skip_c, samples);
     try writer.flush();

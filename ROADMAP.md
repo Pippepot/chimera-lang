@@ -10,29 +10,27 @@ is not a goal.
 
 ## Flow typing acceptance
 
-The implementation and source migration are in place. Complete Safe verification
-of the final identity traversal, investigate measured typing/memory overhead, and
-finish matched cold, incremental, and runtime measurements before acceptance.
+The implementation, source migration, and routine Safe verification are complete.
+Investigate measured typing/memory overhead and finish matched cold, incremental,
+and runtime comparisons against the pre-flow parent before acceptance.
 See the [current status and remaining work](docs/FLOW_TYPING_HANDOFF.md).
 
 ## Immediate engineering priority
 
-Reduce frontend compilation time before further runtime or machine-stage
-optimization. This takes precedence over the design investigations and feature
-milestones below; it does not change their relative order.
+Continue reducing frontend compilation time before further runtime or machine-stage
+optimization. Use the [frontend measurements](docs/FRONTEND_PERFORMANCE.md) to
+choose the next change; this takes precedence over the milestones below without
+changing their relative order.
 
-1. Attribute cold compilation and fresh leaf edits with the existing phase
-  profiler, separating frontend work from optimization, code generation, and
-  dependency waits. Use serial measurements first, then correctly affined
-  eight-worker measurements to distinguish work from contention.
-2. Start with body construction and typing: repeated flow/reference-state work,
-  name and call resolution, and repeated type-fact queries. Choose the first
-  change from measured exclusive cost and a focused behavioral check, not file
-  size. Preserve diagnostics, ownership, and source evaluation order.
-3. Investigate scratch allocation, copying, and result publication within the
-  dominant frontend path. Reuse existing facts at their owning boundary before
-  introducing another cache. Prioritize parsing or invalidation changes only
-  when their measured contribution warrants them.
+1. Investigate remaining operation/member/call resolution costs: repeated
+   namespace and signature demands, type-only argument discovery, and type-fact
+   access. Reuse facts at their owning boundary before introducing another cache.
+2. Review refinement-heavy snapshot retention and remaining branch/join work.
+   Preserve the simple scalar, owning, narrowing, and real-backedge cases alongside
+   broad compilation throughput, diagnostics, ownership, and evaluation order.
+3. Keep fresh leaf edits proportional to the changed body. Attribute dependency
+   validation and executable linking separately from frontend reanalysis; prioritize
+   parsing or invalidation changes only when their measured contribution warrants it.
 
 Accept changes only with matched uninstrumented cold, leaf-edit, and generated
 runtime measurements under the [benchmark protocol](benchmarks/README.md#measurement-protocol).
@@ -43,8 +41,8 @@ Keep backend and workload changes separate so frontend gains remain attributable
 Reduce compiler code to at most 34,000 lines under the existing `loc.sh` code
 policy. Preserve language behavior, diagnostics, ownership, incremental queries,
 and cache validation. Consolidate repeated lifecycle and traversal logic; keep
-tests and line-count rules intact. This is the current requested engineering
-work; performance acceptance above remains a separate unfinished requirement.
+tests and line-count rules intact. Apply the same performance acceptance protocol
+to simplification changes.
 
 Investigate the slow precompile-std build as part of subsequent frontend
 performance work.

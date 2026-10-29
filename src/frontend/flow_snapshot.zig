@@ -81,6 +81,8 @@ pub fn Buffer(comptime Element: type, comptime initial: Element) type {
 
         /// The first index from `start` whose page `other` does not share.
         fn nextUnshared(self: Self, other: Self, start: usize) usize {
+            // Equality and merge have already established equal lengths.
+            if (self.root == other.root) return self.len;
             var index = start;
             while (index < self.len and self.sharesPage(other, index)) index = self.pageEnd(index);
             return index;
@@ -177,6 +179,8 @@ test "growing a snapshot preserves its earlier pages and independent lengths" {
     try state.set(allocator, 0, 7);
     const before = state.snapshot();
     state.grow(100);
+    try std.testing.expect(!before.eql(state));
+    try std.testing.expect(!state.eql(before));
     try std.testing.expectEqual(0, state.get(99));
     try state.set(allocator, 99, 23);
     try std.testing.expectEqual(1, before.len);

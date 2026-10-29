@@ -6,7 +6,7 @@ Chimera brings native code and checked ownership to a small, expressive syntax.
 Describe optional values and errors with variants, bind their alternatives
 explicitly, and run ordinary functions at compile time.
 
-Flow typing is implemented; final verification and performance acceptance remain.
+Flow typing is implemented and Safe verification passes; performance acceptance remains.
 See the [status and remaining work](docs/FLOW_TYPING_HANDOFF.md).
 
 ## A first look

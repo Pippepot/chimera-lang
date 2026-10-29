@@ -23,22 +23,12 @@ fn once(function: *Function, filled: *std.AutoHashMapUnmanaged(u32, void)) !bool
     function.resolveReferences();
     const graph = (try function.controlFlow()).*;
     const found = try loops.find(function.scratch, function, graph);
+    if (found.len == 0) return false;
+    const analysis = try loops.Analysis.init(function, graph);
     for (found) |loop| {
         const preheader = loops.preheader(function, graph, loop) orelse continue;
         if (loop.latches.len != 1) continue;
-        if (try rotateCarriedExit(function, graph, loop)) {
-            function.invalidateControlFlow();
-            return true;
-        }
-        if (try removeDeadLoop(function, graph, loop, preheader)) {
-            function.invalidateControlFlow();
-            return true;
-        }
-        if (!filled.contains(loop.latches[0]) and (try fill(function, graph, loop, preheader) or try move(function, graph, loop, preheader))) {
-            try filled.put(function.scratch, loop.latches[0], {});
-            return true;
-        }
-        if (try boundsChecks(function, graph, loop, preheader)) {
+        if (try rewriteLoop(function, &analysis, loop, preheader, filled)) {
             function.invalidateControlFlow();
             return true;
         }
@@ -46,11 +36,15 @@ fn once(function: *Function, filled: *std.AutoHashMapUnmanaged(u32, void)) !bool
     return false;
 }
 
-const Induction = struct {
-    parameter: ValueId,
-    start: ValueId,
-    step: i32,
-};
+fn rewriteLoop(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32, filled: *std.AutoHashMapUnmanaged(u32, void)) !bool {
+    if (try rotateCarriedExit(function, analysis.graph, loop)) return true;
+    if (removeDeadLoop(function, analysis, loop, preheader)) return true;
+    if (!filled.contains(loop.latches[0]) and (try fill(function, analysis, loop, preheader) or try move(function, analysis, loop, preheader))) {
+        try filled.put(function.scratch, loop.latches[0], {});
+        return true;
+    }
+    return boundsChecks(function, analysis, loop, preheader);
+}
 
 fn boolean(function: *const Function, value: ValueId) ?bool {
     const definition = function.definition(function.find(value)) orelse return null;
@@ -81,7 +75,7 @@ fn selectArm(function: *const Function, value: ValueId, condition: ValueId, take
 fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
     const header = function.blocks.items[loop.header];
     if (header.instructions.items.len != 0) return false;
-    const test_result = exitTest(function, loop) orelse return false;
+    const test_result = loops.exitTest(function, loop) orelse return false;
     if (test_result.operation != .eqb or boolean(function, test_result.operands.rhs) != true) return false;
     const flag = function.find(test_result.operands.lhs);
     const flag_position = std.mem.indexOfScalar(ValueId, header.parameters.items, flag) orelse return false;
@@ -162,72 +156,6 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
     return true;
 }
 
-fn constant(function: *const Function, value: ValueId) ?i32 {
-    const definition = function.definition(function.find(value)) orelse return null;
-    return if (definition == .const_int) definition.const_int else null;
-}
-
-fn entering(function: *Function, loop: Loop, preheader: u32) structures.FunctionBranch {
-    _ = loop;
-    return function.blocks.items[preheader].terminator.branch;
-}
-
-fn latchBranch(function: *Function, loop: Loop) ?structures.FunctionBranch {
-    for (Function.edges(&function.blocks.items[loop.latches[0]].terminator)) |maybe_edge| if (maybe_edge) |edge| {
-        if (@backingInt(edge.target) == loop.header) return edge.*;
-    };
-    return null;
-}
-
-fn induction(function: *Function, loop: Loop, preheader: u32, parameter: ValueId) ?Induction {
-    const header = &function.blocks.items[loop.header];
-    const position = std.mem.indexOfScalar(ValueId, header.parameters.items, parameter) orelse return null;
-    if (function.valueType(parameter) != .int) return null;
-    const start = function.branchArguments(entering(function, loop, preheader))[position];
-    const back = function.branchArguments(latchBranch(function, loop) orelse return null)[position];
-    if (start.coerce_to != null or back.coerce_to != null) return null;
-    const next = function.definition(function.find(back.value)) orelse return null;
-    const step: i32 = switch (next) {
-        .addi => |operands| if (function.find(operands.lhs) == parameter) constant(function, operands.rhs) orelse return null else if (function.find(operands.rhs) == parameter) constant(function, operands.lhs) orelse return null else return null,
-        .subi => |operands| if (function.find(operands.lhs) == parameter) -%(constant(function, operands.rhs) orelse return null) else return null,
-        else => return null,
-    };
-    if (step == 0) return null;
-    return .{ .parameter = parameter, .start = function.find(start.value), .step = step };
-}
-
-fn definedOutside(function: *const Function, loop: Loop, owner: []const u32, value: ValueId) bool {
-    return switch (function.definitions.items[@backingInt(function.find(value))]) {
-        .argument => |argument| !loop.contains(argument.block),
-        .instruction => |index| !loop.contains(owner[index]),
-    };
-}
-
-fn owners(function: *Function) ![]u32 {
-    const owner = try function.scratch.alloc(u32, function.instructions.items.len);
-    @memset(owner, std.math.maxInt(u32));
-    for (function.blocks.items, 0..) |block, index| for (block.instructions.items) |instruction| {
-        owner[instruction] = @intCast(index);
-    };
-    return owner;
-}
-
-const Exit = struct { block: u32, target: u32, stays: bool };
-
-fn exitTest(function: *Function, loop: Loop) ?struct { operation: structures.PredicateOperation, operands: structures.BinaryOperands, exit: u32, stay: u32 } {
-    const terminator = function.blocks.items[loop.header].terminator;
-    if (terminator != .predicate_branch) return null;
-    const predicate = terminator.predicate_branch;
-    const then_target = @backingInt(predicate.then_branch.target);
-    const else_target = @backingInt(predicate.else_branch.target);
-    if (loop.contains(then_target) == loop.contains(else_target)) return null;
-    const exit = if (loop.contains(then_target)) predicate.else_branch else predicate.then_branch;
-    if (exit.arguments.start != exit.arguments.end) return null;
-    const stay = if (loop.contains(then_target)) predicate.then_branch else predicate.else_branch;
-    const operation = if (loop.contains(then_target)) predicate.operation.negated() else predicate.operation;
-    return .{ .operation = operation, .operands = predicate.operands, .exit = @backingInt(exit.target), .stay = @backingInt(stay.target) };
-}
-
 fn soleExit(function: *Function, loop: Loop, header_exit: u32) bool {
     for (loop.blocks) |block| for (function.successors(block)) |successor| if (successor) |target| {
         if (!loop.contains(target) and (block != loop.header or target != header_exit)) return false;
@@ -235,20 +163,18 @@ fn soleExit(function: *Function, loop: Loop, header_exit: u32) bool {
     return true;
 }
 
-fn removeDeadLoop(function: *Function, graph: Graph, loop: Loop, preheader: u32) !bool {
-    _ = graph;
-    const test_result = exitTest(function, loop) orelse return false;
+fn removeDeadLoop(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32) bool {
+    const test_result = loops.exitTest(function, loop) orelse return false;
     if (!soleExit(function, loop, test_result.exit)) return false;
     if (test_result.operation != .eqi) return false;
-    const owner = try owners(function);
-    var counter: ?Induction = null;
-    for ([_]ValueId{ test_result.operands.lhs, test_result.operands.rhs }, [_]ValueId{ test_result.operands.rhs, test_result.operands.lhs }) |candidate, bound| {
-        const found = induction(function, loop, preheader, function.find(candidate)) orelse continue;
-        if (found.step != 1 and found.step != -1) continue;
-        if (!definedOutside(function, loop, owner, bound)) continue;
-        counter = found;
+    var controlled = false;
+    for ([_]ValueId{ test_result.operands.lhs, test_result.operands.rhs }) |candidate| {
+        const found = analysis.inductionExit(loop, preheader, test_result, function.find(candidate)) orelse continue;
+        if (found.induction.step != 1 and found.induction.step != -1) continue;
+        controlled = true;
+        break;
     }
-    if (counter == null) return false;
+    if (!controlled) return false;
     for (loop.blocks) |block| {
         for (function.blocks.items[block].instructions.items) |index| {
             if (function.removed.items[index]) continue;
@@ -257,7 +183,8 @@ fn removeDeadLoop(function: *Function, graph: Graph, loop: Loop, preheader: u32)
         const terminator = function.blocks.items[block].terminator;
         if (terminator != .branch and terminator != .predicate_branch) return false;
     }
-    var escape: Escape = .{ .function = function, .loop = loop, .owner = owner };
+    if (!analysis.iterationAcyclic(loop)) return false;
+    var escape: Escape = .{ .analysis = analysis, .loop = loop };
     for (function.blocks.items, 0..) |*block, index| {
         if (loop.contains(@intCast(index))) continue;
         for (block.instructions.items) |instruction| if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &escape, Escape.check);
@@ -269,13 +196,12 @@ fn removeDeadLoop(function: *Function, graph: Graph, loop: Loop, preheader: u32)
 }
 
 const Escape = struct {
-    function: *Function,
+    analysis: *const loops.Analysis,
     loop: Loop,
-    owner: []const u32,
     escapes: bool = false,
 
     fn check(self: *Escape, operand: *ValueId) void {
-        if (!definedOutside(self.function, self.loop, self.owner, operand.*)) self.escapes = true;
+        if (!self.analysis.definedOutside(self.loop, operand.*)) self.escapes = true;
     }
 };
 
@@ -288,19 +214,18 @@ fn pure(function: *const Function, instruction: Instruction) bool {
     };
 }
 
-fn fill(function: *Function, graph: Graph, loop: Loop, preheader: u32) !bool {
+fn fill(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32) !bool {
     if (loop.blocks.len != 2) return false;
     const header = &function.blocks.items[loop.header];
     if (header.parameters.items.len != 1) return false;
     for (header.instructions.items) |index| if (!function.removed.items[index]) return false;
-    const test_result = exitTest(function, loop) orelse return false;
+    const test_result = loops.exitTest(function, loop) orelse return false;
     if (test_result.operation != .eqi) return false;
     const parameter = header.parameters.items[0];
-    const counter = induction(function, loop, preheader, parameter) orelse return false;
+    const matched = analysis.inductionExit(loop, preheader, test_result, parameter) orelse return false;
+    const counter = matched.induction;
     if (counter.step != 1) return false;
-    const owner = try owners(function);
-    const bound = if (function.find(test_result.operands.lhs) == parameter) function.find(test_result.operands.rhs) else if (function.find(test_result.operands.rhs) == parameter) function.find(test_result.operands.lhs) else return false;
-    if (!definedOutside(function, loop, owner, bound)) return false;
+    const bound = matched.comparison.other;
     const body = test_result.stay;
     if (body != loop.latches[0] or function.blocks.items[body].terminator != .branch) return false;
     var element: ?structures.AllocationElement = null;
@@ -327,12 +252,12 @@ fn fill(function: *Function, graph: Graph, loop: Loop, preheader: u32) !bool {
     const store = stored orelse return false;
     if (function.find(store.destination.?) != element_value.? or store.type_id != target.type_id) return false;
     if (target.type_id != .int and target.type_id != .bool and target.type_id != .byte) return false;
-    if (!definedOutside(function, loop, owner, target.allocation) or !definedOutside(function, loop, owner, store.source)) return false;
+    if (!analysis.definedOutside(loop, target.allocation) or !analysis.definedOutside(loop, store.source)) return false;
     var users: Users = .{ .function = function, .value = element_value.? };
     for (function.blocks.items[body].instructions.items) |index| if (!function.removed.items[index]) function_ir.allOperands(function, &function.instructions.items[index], &users, Users.count);
     if (users.count_value != 1) return false;
 
-    if (guarded(function, graph, preheader, counter.start, bound)) return false;
+    if (guarded(function, analysis, preheader, counter.start, bound)) return false;
     const span = header.span;
     const frame = header.frame;
     const start = counter.start;
@@ -375,22 +300,21 @@ fn guard(function: *Function, preheader: u32, low: ValueId, high: ValueId, exit:
     return block;
 }
 
-fn move(function: *Function, graph: Graph, loop: Loop, preheader: u32) !bool {
+fn move(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32) !bool {
     if (loop.blocks.len != 2) return false;
     const header = &function.blocks.items[loop.header];
     if (header.parameters.items.len != 1) return false;
     for (header.instructions.items) |index| if (!function.removed.items[index]) return false;
-    const test_result = exitTest(function, loop) orelse return false;
+    const test_result = loops.exitTest(function, loop) orelse return false;
     if (test_result.operation != .eqi) return false;
     const parameter = header.parameters.items[0];
-    const counter = induction(function, loop, preheader, parameter) orelse return false;
+    const matched = analysis.inductionExit(loop, preheader, test_result, parameter) orelse return false;
+    const counter = matched.induction;
     if (counter.step != -1) return false;
-    const owner = try owners(function);
-    const bound = if (function.find(test_result.operands.lhs) == parameter) function.find(test_result.operands.rhs) else if (function.find(test_result.operands.rhs) == parameter) function.find(test_result.operands.lhs) else return false;
-    if (!definedOutside(function, loop, owner, bound)) return false;
+    const bound = matched.comparison.other;
     const body = test_result.stay;
     if (body != loop.latches[0] or function.blocks.items[body].terminator != .branch) return false;
-    const next = function.find(function.branchArguments(latchBranch(function, loop).?)[0].value);
+    const next = function.find(function.branchArguments(function.blocks.items[body].terminator.branch)[0].value);
     var source: ?structures.AllocationElement = null;
     var source_value: ?ValueId = null;
     var destination: ?structures.AllocationElement = null;
@@ -428,7 +352,7 @@ fn move(function: *Function, graph: Graph, loop: Loop, preheader: u32) !bool {
     const store = stored orelse return false;
     if (loaded == null or function.find(store.source) != loaded.? or function.find(store.destination.?) != destination_value.?) return false;
     if (from.type_id != to.type_id or store.type_id != to.type_id) return false;
-    if (!definedOutside(function, loop, owner, from.allocation) or !definedOutside(function, loop, owner, to.allocation)) return false;
+    if (!analysis.definedOutside(loop, from.allocation) or !analysis.definedOutside(loop, to.allocation)) return false;
     var users: Users = .{ .function = function, .value = source_value.? };
     for (function.blocks.items[body].instructions.items) |index| if (!function.removed.items[index]) function_ir.allOperands(function, &function.instructions.items[index], &users, Users.count);
     if (users.count_value != 1) return false;
@@ -436,7 +360,7 @@ fn move(function: *Function, graph: Graph, loop: Loop, preheader: u32) !bool {
     for (function.blocks.items[body].instructions.items) |index| if (!function.removed.items[index]) function_ir.allOperands(function, &function.instructions.items[index], &users, Users.count);
     if (users.count_value != 1) return false;
 
-    if (guarded(function, graph, preheader, bound, counter.start)) return false;
+    if (guarded(function, analysis, preheader, bound, counter.start)) return false;
     const span = header.span;
     const frame = header.frame;
     const moved = try guard(function, preheader, bound, counter.start, test_result.exit, span, frame);
@@ -448,12 +372,12 @@ fn move(function: *Function, graph: Graph, loop: Loop, preheader: u32) !bool {
     return true;
 }
 
-fn guarded(function: *Function, graph: Graph, preheader: u32, low: ValueId, high: ValueId) bool {
+fn guarded(function: *Function, analysis: *const loops.Analysis, preheader: u32, low: ValueId, high: ValueId) bool {
     var block = preheader;
     var lower = low;
     var upper = high;
     for (0..4) |_| {
-        const incoming = graph.incoming[block].items;
+        const incoming = analysis.graph.incoming[block].items;
         for (incoming) |edge| {
             const terminator = function.blocks.items[edge.block].terminator;
             if (terminator != .predicate_branch) continue;
@@ -462,7 +386,7 @@ fn guarded(function: *Function, graph: Graph, preheader: u32, low: ValueId, high
             const entered = through(function, block, edge, lower);
             const lhs = function.find(predicate.operands.lhs);
             const rhs = function.find(predicate.operands.rhs);
-            if (predicate.operation == .gei and lhs == entered and constant(function, rhs) == 0) return true;
+            if (predicate.operation == .gei and lhs == entered and analysis.integerConstant(rhs) == 0) return true;
             if (predicate.operation == .lei and lhs == entered and rhs == through(function, block, edge, upper)) return true;
         }
         if (incoming.len != 1) return false;
@@ -498,32 +422,23 @@ const Replace = struct {
     }
 };
 
-fn boundsChecks(function: *Function, graph: Graph, loop: Loop, preheader: u32) !bool {
-    const test_result = exitTest(function, loop) orelse return false;
-    const owner = try owners(function);
+fn boundsChecks(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32) bool {
+    const test_result = loops.exitTest(function, loop) orelse return false;
     var changed = false;
     for (function.blocks.items[loop.header].parameters.items) |parameter| {
-        const counter = induction(function, loop, preheader, parameter) orelse continue;
-        if (counter.step != 1) continue;
-        const start = constant(function, counter.start) orelse continue;
-        if (start < 0) continue;
-        const lhs = function.find(test_result.operands.lhs);
-        const rhs = function.find(test_result.operands.rhs);
-        const bounded = (test_result.operation == .gei and lhs == parameter and definedOutside(function, loop, owner, rhs)) or
-            (test_result.operation == .lei and rhs == parameter and definedOutside(function, loop, owner, lhs));
-        if (!bounded) continue;
-        const limit = if (lhs == parameter) rhs else lhs;
+        const counter = analysis.inductionExit(loop, preheader, test_result, parameter) orelse continue;
+        const range = analysis.iterationRange(preheader, counter) orelse continue;
+        const limit = counter.comparison.other;
         for (loop.blocks) |block| {
-            if (!graph.dominates(test_result.stay, block)) continue;
+            if (!analysis.graph.dominates(test_result.stay, block)) continue;
             const terminator = &function.blocks.items[block].terminator;
             if (terminator.* != .predicate_branch) continue;
             const predicate = terminator.predicate_branch;
-            const left = function.find(predicate.operands.lhs);
-            const right = function.find(predicate.operands.rhs);
-            const holds: ?bool = if (left == parameter and constant(function, right) != null and constant(function, right).? <= start and (predicate.operation == .gei or predicate.operation == .lti))
-                predicate.operation == .gei
-            else if (left == parameter and right == limit and (predicate.operation == .lti or predicate.operation == .gei))
-                predicate.operation == .lti
+            const comparison = loops.IntegerComparison.init(function, predicate.operation, predicate.operands, counter.induction.parameter) orelse continue;
+            const holds = if (analysis.integerConstant(comparison.other)) |number|
+                range.absolute.known(comparison.operation, number)
+            else if (comparison.other == limit)
+                range.relative.known(comparison.operation, 0)
             else
                 null;
             if (holds) |taken| {

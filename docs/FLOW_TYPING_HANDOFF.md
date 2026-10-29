@@ -1,8 +1,10 @@
 # Flow typing: implementation status and remaining acceptance
 
 The compiler and source migration are implemented. **Final acceptance remains
-unfinished.** Work was wrapped up at the user's request after the last typing
-measurements. No builds, tests, or benchmarks remain running.
+unfinished.** Routine Safe verification is complete. The historical pre-flow
+performance comparison below still needs a matched follow-up; the separate
+[frontend compilation experiment](FRONTEND_PERFORMANCE.md) compares the current
+engineering change against its immediate baseline.
 
 ## Implemented
 
@@ -40,26 +42,20 @@ patterns remain. The [specification](../syntax&semantics.txt) and
 
 ## Verification evidence
 
-- Broad aggregate regression run: passed with no crashes, before the final
-  performance change. The temporary aggregate test root was removed.
-- Latest routine command:
-  `zig build test --seed=0 -Doptimize=safe -j1 --summary all`.
-  **2,139 passed, 24 skipped, one failing fixture (2,164 total).** Its sole failure
-  was an annotation fixture that tested one static materialization and read
-  another. It now uses a named guarded match capture, preserving name shadowing;
-  the focused annotation-visibility rerun passed **2/2** tests.
-- A subsequent narrowing benchmark exposed exponential traversal of shared
-  binding-identity ancestors. Resolution now visits each join once per lookup
-  using an iterative worklist, preserving cycle detection. The flow suite passed
-  **20/20**, including a new native/interpreter regression with successive guarded
-  loops, after that fix. A final refinement avoids allocating traversal storage
-  for simple identity chains; this form compiled and completed all three Fast
-  typing trials, but still needs Safe tests.
-- Modified Zig files pass formatting checks and `git diff --check` passes.
-  Exhaustive allocation-failure sweeps were not requested or run.
+The routine command
+`zig build test --seed=0 -Doptimize=safe -j1 --summary all` passes on the frontend
+follow-up source: **52/52 steps successful: 2,158 tests passed, 24 skipped**. This includes the
+final identity traversal, native/interpreter flow regressions, ownership,
+diagnostics, incremental recomputation, and cache restoration. The previous
+annotation fixture failure is resolved. The traversal visits each shared join
+once and avoids allocating traversal storage for simple identity chains.
 
-There is no successful full routine run for the final source state yet. Do not
-interpret the passing component checks as final acceptance.
+The focused concrete-origin/loop-summary storage regression also passes.
+Modified Zig files pass formatting checks and `git diff --check` passes.
+Exhaustive allocation-failure sweeps were not requested or run.
+
+This completes Safe verification; it does not replace the pre-flow performance
+acceptance comparison described below.
 
 ## Completed typing measurements
 
@@ -98,18 +94,12 @@ lines **46,908 → 51,268**. Raw counts:
 
 ## Remaining work, in order
 
-1. **Verify the final identity traversal.** Run the flow suite and the full routine
-   Safe suite on the final source state. Resolve any failures, then repeat only
-   checks affected by subsequent changes:
-   ```sh
-   zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/flow_typing_test.zig -j1
-   zig build test --seed=0 -Doptimize=safe -j1 --summary all
-   ```
-2. **Review performance acceptance.** Investigate the measured scalar/owning
+1. **Review performance acceptance.** Investigate the measured scalar/owning
    regressions and refinement-heavy snapshot growth. The exponential shared-join
-   traversal was fixed; no final cold/incremental/runtime comparison was completed.
-   Do not claim performance acceptance from the typing table alone.
-3. **Complete matched compilation and runtime measurements.** Use temporary source
+   traversal was fixed. The frontend experiment compares against the immediate
+   baseline, not the historical pre-flow parent. Recheck that parent under matched
+   settings before accepting the original regressions or snapshot growth.
+2. **Complete matched compilation and runtime measurements.** Use temporary source
    copies of the parent and current tree. Copy the current
    `benchmarks/history_workload.zig` into both, then apply
    [the common-workload patch](flow-typing/common-workload.patch) in both copies.
@@ -123,7 +113,7 @@ lines **46,908 → 51,268**. Raw counts:
    syntax migration between revisions. Preserve that distinction in the report.
    Reproduce typing with three serial runs of
    `taskset -c 2 zig build flow-benchmark --seed=0 -Doptimize=fast -j1` per tree.
-4. **Close the status documents only after acceptance.** Replace this pending
+3. **Close the status documents only after acceptance.** Replace this pending
    acceptance status in README and ROADMAP after checks and measurements pass.
 
 Optional local copies remain at `/tmp/chimera-flow-baseline` and

@@ -21,6 +21,11 @@ pub fn Store(comptime Origin: type, comptime Projection: type, comptime Transfor
                 if (sameOrigin(existing, &origin)) return head;
                 cursor = existing.next;
             }
+            return try self.prependAssumeUnique(allocator, head, origin);
+        }
+
+        /// The caller has established that this origin is absent from the set.
+        pub inline fn prependAssumeUnique(self: *@This(), allocator: std.mem.Allocator, head: ?u32, origin: Origin) !u32 {
             const index: u32 = @intCast(self.origins.items.len);
             var added = origin;
             added.next = head;

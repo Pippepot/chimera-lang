@@ -20,6 +20,240 @@ pub const Loop = struct {
     }
 };
 
+pub const Analysis = struct {
+    function: *const Function,
+    graph: Graph,
+    instruction_blocks: []const u32,
+    address_taken: []const bool,
+
+    pub fn init(function: *Function, graph: Graph) !Analysis {
+        const instruction_blocks = try function.scratch.alloc(u32, function.instructions.items.len);
+        @memset(instruction_blocks, std.math.maxInt(u32));
+        for (function.blocks.items, 0..) |block, index| for (block.instructions.items) |instruction| {
+            instruction_blocks[instruction] = @intCast(index);
+        };
+        return .{
+            .function = function,
+            .graph = graph,
+            .instruction_blocks = instruction_blocks,
+            .address_taken = try value_rules.addressTaken(function),
+        };
+    }
+
+    pub fn definedOutside(self: Analysis, loop: Loop, value: ValueId) bool {
+        const block = switch (self.function.definitions.items[@backingInt(self.function.find(value))]) {
+            .argument => |argument| argument.block,
+            .instruction => |index| self.instruction_blocks[index],
+        };
+        return !loop.contains(block);
+    }
+
+    pub fn iterationAcyclic(self: Analysis, loop: Loop) bool {
+        for (loop.blocks) |block| for (Function.edges(&self.function.blocks.items[block].terminator)) |maybe_edge| if (maybe_edge) |edge| {
+            const target = @backingInt(edge.target);
+            if (target == loop.header or !loop.contains(target)) continue;
+            if (self.graph.rank[target] <= self.graph.rank[block]) return false;
+        };
+        return true;
+    }
+
+    pub fn inductionExit(self: Analysis, loop: Loop, preheader_block: u32, exit: ExitTest, parameter: ValueId) ?InductionExit {
+        const counter = self.induction(loop, preheader_block, parameter) orelse return null;
+        const comparison = IntegerComparison.init(self.function, exit.operation, exit.operands, parameter) orelse return null;
+        if (!self.definedOutside(loop, comparison.other)) return null;
+        return .{ .induction = counter, .comparison = comparison };
+    }
+
+    pub fn iterationRange(self: Analysis, preheader_block: u32, counter: InductionExit) ?IterationRange {
+        if (!self.immutable(counter.comparison.other)) return null;
+        return IterationRange.init(
+            counter.induction.step,
+            counter.comparison.operation,
+            self.rangeAt(counter.induction.start, preheader_block),
+            self.rangeAt(counter.comparison.other, preheader_block),
+        );
+    }
+
+    fn immutable(self: Analysis, value: ValueId) bool {
+        const resolved = self.function.find(value);
+        return self.function.plainValue(resolved) and !self.address_taken[@backingInt(resolved)];
+    }
+
+    pub fn integerConstant(self: Analysis, value: ValueId) ?i32 {
+        if (!self.immutable(value)) return null;
+        const definition = self.function.definition(self.function.find(value)) orelse return null;
+        return if (definition == .const_int) definition.const_int else null;
+    }
+
+    fn induction(self: Analysis, loop: Loop, preheader_block: u32, parameter: ValueId) ?Induction {
+        if (loop.latches.len != 1) return null;
+        const function = self.function;
+        const position = std.mem.indexOfScalar(ValueId, function.blocks.items[loop.header].parameters.items, parameter) orelse return null;
+        if (function.valueType(parameter) != .int or !self.immutable(parameter)) return null;
+        const start = function.branchArguments(function.blocks.items[preheader_block].terminator.branch)[position];
+        const back = function.branchArguments(latchBranch(function, loop) orelse return null)[position];
+        if (start.coerce_to != null or back.coerce_to != null) return null;
+        const next = function.definition(function.find(back.value)) orelse return null;
+        var step: i32 = undefined;
+        switch (next) {
+            .addi => |operands| {
+                const operand = if (function.find(operands.lhs) == parameter) operands.rhs else if (function.find(operands.rhs) == parameter) operands.lhs else return null;
+                step = self.integerConstant(operand) orelse return null;
+            },
+            .subi => |operands| {
+                if (function.find(operands.lhs) != parameter) return null;
+                step = -%(self.integerConstant(operands.rhs) orelse return null);
+            },
+            else => return null,
+        }
+        if (step == 0) return null;
+        return .{ .parameter = parameter, .start = function.find(start.value), .step = step };
+    }
+
+    fn rangeAt(self: Analysis, value: ValueId, at: u32) IntegerRange {
+        if (!self.immutable(value)) return .{};
+        if (self.integerConstant(value)) |number| return .{ .lower = number, .upper = number };
+        var range: IntegerRange = .{};
+        var block = at;
+        while (block != self.function.entry) {
+            block = self.graph.dominator[block];
+            const terminator = self.function.blocks.items[block].terminator;
+            if (terminator != .predicate_branch) continue;
+            const predicate = terminator.predicate_branch;
+            const comparison = IntegerComparison.init(self.function, predicate.operation, predicate.operands, value) orelse continue;
+            const bound = self.integerConstant(comparison.other) orelse continue;
+            const then_target = @backingInt(predicate.then_branch.target);
+            const else_target = @backingInt(predicate.else_branch.target);
+            const taken = if (self.graph.incoming[then_target].items.len == 1 and self.graph.dominates(then_target, at))
+                true
+            else if (self.graph.incoming[else_target].items.len == 1 and self.graph.dominates(else_target, at))
+                false
+            else
+                continue;
+            range.refine(if (taken) comparison.operation else comparison.operation.negated(), bound);
+        }
+        return range;
+    }
+};
+
+const Induction = struct {
+    parameter: ValueId,
+    start: ValueId,
+    step: i32,
+};
+
+const InductionExit = struct {
+    induction: Induction,
+    comparison: IntegerComparison,
+};
+
+pub const ExitTest = struct {
+    operation: structures.PredicateOperation,
+    operands: structures.BinaryOperands,
+    exit: u32,
+    stay: u32,
+};
+
+pub fn exitTest(function: *const Function, loop: Loop) ?ExitTest {
+    const terminator = function.blocks.items[loop.header].terminator;
+    if (terminator != .predicate_branch) return null;
+    const predicate = terminator.predicate_branch;
+    const then_target = @backingInt(predicate.then_branch.target);
+    const else_target = @backingInt(predicate.else_branch.target);
+    if (loop.contains(then_target) == loop.contains(else_target)) return null;
+    const exit = if (loop.contains(then_target)) predicate.else_branch else predicate.then_branch;
+    if (exit.arguments.start != exit.arguments.end) return null;
+    const stay = if (loop.contains(then_target)) predicate.then_branch else predicate.else_branch;
+    const operation = if (loop.contains(then_target)) predicate.operation.negated() else predicate.operation;
+    return .{ .operation = operation, .operands = predicate.operands, .exit = @backingInt(exit.target), .stay = @backingInt(stay.target) };
+}
+
+fn latchBranch(function: *const Function, loop: Loop) ?structures.FunctionBranch {
+    for (Function.edges(&function.blocks.items[loop.latches[0]].terminator)) |maybe_edge| if (maybe_edge) |edge| {
+        if (@backingInt(edge.target) == loop.header) return edge.*;
+    };
+    return null;
+}
+
+pub const IntegerComparison = struct {
+    operation: structures.PredicateOperation,
+    other: ValueId,
+
+    pub fn init(function: *const Function, operation: structures.PredicateOperation, operands: structures.BinaryOperands, value: ValueId) ?IntegerComparison {
+        const left = function.find(operands.lhs);
+        const right = function.find(operands.rhs);
+        const queried = function.find(value);
+        const normalized: structures.PredicateOperation = if (left == queried) operation else if (right == queried) switch (operation) {
+            .lti => .gti,
+            .gti => .lti,
+            .lei => .gei,
+            .gei => .lei,
+            .eqi, .nei => operation,
+            else => return null,
+        } else return null;
+        return switch (normalized) {
+            .lti, .gti, .lei, .gei, .eqi, .nei => .{ .operation = normalized, .other = if (left == queried) right else left },
+            else => null,
+        };
+    }
+};
+
+const IntegerRange = struct {
+    lower: i64 = std.math.minInt(i32),
+    upper: i64 = std.math.maxInt(i32),
+
+    fn refine(self: *IntegerRange, operation: structures.PredicateOperation, bound: i64) void {
+        switch (operation) {
+            .lti => self.upper = @min(self.upper, bound - 1),
+            .lei => self.upper = @min(self.upper, bound),
+            .gti => self.lower = @max(self.lower, bound + 1),
+            .gei => self.lower = @max(self.lower, bound),
+            .eqi => {
+                self.lower = @max(self.lower, bound);
+                self.upper = @min(self.upper, bound);
+            },
+            .nei => {
+                if (self.lower == bound) self.lower += 1;
+                if (self.upper == bound) self.upper -= 1;
+            },
+            else => unreachable,
+        }
+    }
+
+    pub fn known(self: IntegerRange, operation: structures.PredicateOperation, bound: i64) ?bool {
+        return switch (operation) {
+            .lti => if (self.upper < bound) true else if (self.lower >= bound) false else null,
+            .lei => if (self.upper <= bound) true else if (self.lower > bound) false else null,
+            .gti => if (self.lower > bound) true else if (self.upper <= bound) false else null,
+            .gei => if (self.lower >= bound) true else if (self.upper < bound) false else null,
+            .eqi => if (self.lower == bound and self.upper == bound) true else if (bound < self.lower or bound > self.upper) false else null,
+            .nei => if (self.lower == bound and self.upper == bound) false else if (bound < self.lower or bound > self.upper) true else null,
+            else => unreachable,
+        };
+    }
+};
+
+const IterationRange = struct {
+    absolute: IntegerRange,
+    relative: IntegerRange,
+
+    fn init(step: i32, operation: structures.PredicateOperation, start: IntegerRange, bound: IntegerRange) ?IterationRange {
+        var range = start;
+        if (step > 0) {
+            if (operation != .gei and operation != .gti) return null;
+            range.upper = bound.upper - @as(i64, @intFromBool(operation == .gei));
+            if (range.upper + step > std.math.maxInt(i32)) return null;
+        } else if (step < 0) {
+            if (operation != .lei and operation != .lti) return null;
+            range.lower = bound.lower + @as(i64, @intFromBool(operation == .lei));
+            if (range.lower + step < std.math.minInt(i32)) return null;
+        } else return null;
+        var relative: IntegerRange = .{ .lower = range.lower - bound.upper, .upper = range.upper - bound.lower };
+        relative.refine(operation.negated(), 0);
+        return .{ .absolute = range, .relative = relative };
+    }
+};
+
 pub fn find(scratch: std.mem.Allocator, function: *Function, graph: Graph) ![]Loop {
     const count = function.blocks.items.len;
     var loops: std.ArrayList(Loop) = .empty;
@@ -244,4 +478,31 @@ fn expectBranch(function: *const Function, branch: structures.FunctionBranch, ta
     const actual = function.branchArguments(branch);
     try std.testing.expectEqual(arguments.len, actual.len);
     for (arguments, actual) |expected, found| try std.testing.expectEqualDeep(expected, found);
+}
+
+test "iteration ranges agree with wrapping executions at signed boundaries" {
+    const numbers = [_]i32{ std.math.minInt(i32), std.math.minInt(i32) + 1, -3, -1, 0, 1, 3, std.math.maxInt(i32) - 1, std.math.maxInt(i32) };
+    const steps = [_]i32{ std.math.minInt(i32), -3, -1, 1, 3, std.math.maxInt(i32) };
+    const exits = [_]structures.PredicateOperation{ .gei, .gti, .lei, .lti };
+    const comparisons = [_]structures.PredicateOperation{ .lti, .lei, .gti, .gei, .eqi, .nei };
+    var proven: usize = 0;
+    for (numbers) |first| for (numbers) |limit| for (steps) |step| for (exits) |exit| {
+        const range = IterationRange.init(step, exit, .{ .lower = first, .upper = first }, .{ .lower = limit, .upper = limit }) orelse continue;
+        proven += 1;
+        var index = first;
+        for (0..8) |_| {
+            if (exit.holds(std.math.order(index, limit))) break;
+            try std.testing.expect(range.absolute.lower <= index and index <= range.absolute.upper);
+            for (comparisons) |operation| {
+                if (range.absolute.known(operation, limit)) |known| try std.testing.expectEqual(operation.holds(std.math.order(index, limit)), known);
+                if (range.relative.known(operation, 0)) |known| try std.testing.expectEqual(operation.holds(std.math.order(index, limit)), known);
+            }
+            const next = index +% step;
+            try std.testing.expectEqual(@as(i64, index) + step, @as(i64, next));
+            index = next;
+        }
+    };
+    try std.testing.expect(proven != 0);
+    try std.testing.expect(IterationRange.init(2, .gei, .{ .lower = std.math.maxInt(i32) - 1 }, .{}) == null);
+    try std.testing.expect(IterationRange.init(-2, .lei, .{ .upper = std.math.minInt(i32) + 1 }, .{}) == null);
 }

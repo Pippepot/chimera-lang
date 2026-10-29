@@ -1,0 +1,12 @@
+--- a/benchmarks/flow_benchmark.zig
++++ b/benchmarks/flow_benchmark.zig
+@@ -130,8 +130,6 @@
+     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buffer);
+     const writer = &stdout.interface;
+     try writer.writeAll("kind,branches,typing_ns,snapshots,snapshot_bytes,blocks,generations,lifetime_bytes,flow_fact_bytes,flow_place_bytes,flow_predicate_bytes,inference_key_bytes\n");
+-    for ([_]Kind{ .scalar, .owning, .narrowing, .backedges }) |kind| {
+-        for ([_]u32{ 8, 32, 128, 256, 512 }) |count| try benchmark(init, writer, count, kind);
+-    }
++    for (0..32) |_| try benchmark(init, writer, 256, .owning);
+     try writer.flush();
+ }

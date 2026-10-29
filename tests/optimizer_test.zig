@@ -39,6 +39,195 @@ fn hasConstant(body: structures.FunctionBodyAnalysis, value: i32) bool {
 
 const arithmetic = [_]Tag{ .addi, .subi, .muli, .divsi, .negi };
 
+test "guarded dynamic loop ranges remove redundant checks for ascending strides" {
+    for ([_]i32{ 1, 2, 3 }) |step| for ([_]bool{ false, true }) |inclusive| for ([_]bool{ false, true }) |reversed| {
+        const sum: i32 = switch (step) {
+            1 => if (inclusive) 28 else 21,
+            2 => if (inclusive) 16 else 9,
+            3 => if (inclusive) 12 else 5,
+            else => unreachable,
+        };
+        const exit = if (reversed)
+            (if (inclusive) "limit < index" else "limit <= index")
+        else
+            (if (inclusive) "index > limit" else "index >= limit");
+        const boundary = std.math.maxInt(i32) - step;
+        const program = try testing.allocator.print(
+            \\func scan(first: int, limit: int) int
+            \\    if {s} -> return 0
+            \\    if limit > {d} -> return 0
+            \\    var index = first
+            \\    var sum = 0
+            \\    loop
+            \\        if {s} -> break
+            \\        if {s} -> return -100
+            \\        if {s} -> return -200
+            \\        sum += index
+            \\        index += {d}
+            \\    return sum
+            \\func run() int -> scan(1, 7) + scan(-1, 7) + scan(8, 7) + scan(9, 7) + {d} + scan({d}, {d}) - {d}
+        , .{
+            if (reversed) "0 > first" else "first < 0",
+            std.math.maxInt(i32) - step + @intFromBool(!inclusive),
+            exit,
+            if (reversed) "0 > index" else "index < 0",
+            exit,
+            step,
+            42 - sum,
+            boundary,
+            boundary + @intFromBool(!inclusive),
+            boundary,
+        });
+        defer testing.allocator.free(program);
+        try Fixture.expectParity(program, 42);
+        const fixture = try Fixture.init(program);
+        defer fixture.deinit();
+        const body = (try optimizedBody(fixture, "scan")).*.?;
+        try testing.expectEqual(@as(usize, 3), countPredicates(body));
+    };
+}
+
+test "guarded dynamic loop ranges remove redundant checks for descending strides" {
+    for ([_]i32{ 1, 2, 3 }) |step| for ([_]bool{ false, true }) |inclusive| for ([_]bool{ false, true }) |reversed| {
+        const sum: i32 = switch (step) {
+            1 => if (inclusive) 28 else 27,
+            2 => if (inclusive) 16 else 15,
+            3 => if (inclusive) 12 else 11,
+            else => unreachable,
+        };
+        const exit = if (reversed)
+            (if (inclusive) "limit > index" else "limit >= index")
+        else
+            (if (inclusive) "index < limit" else "index <= limit");
+        const program = try testing.allocator.print(
+            \\func scan(first: int, limit: int) int
+            \\    if {s} -> return 0
+            \\    if limit < 0 -> return 0
+            \\    var index = first
+            \\    var sum = 0
+            \\    loop
+            \\        if {s} -> break
+            \\        if index < 0 -> return -100
+            \\        if {s} -> return -200
+            \\        if {s} -> return -300
+            \\        sum += index
+            \\        index -= {d}
+            \\    return sum
+            \\func run() int -> scan(7, 1) + scan(13, 1) + scan(0, 1) + scan(7, -1) + {d}
+        , .{
+            if (reversed) "12 < first" else "first > 12",
+            exit,
+            if (reversed) "12 < index" else "index > 12",
+            exit,
+            step,
+            42 - sum,
+        });
+        defer testing.allocator.free(program);
+        try Fixture.expectParity(program, 42);
+        const fixture = try Fixture.init(program);
+        defer fixture.deinit();
+        const body = (try optimizedBody(fixture, "scan")).*.?;
+        try testing.expectEqual(@as(usize, 3), countPredicates(body));
+    };
+}
+
+test "loop ranges retain checks across wrapping and non-dominating guards" {
+    const program =
+        \\func ascending() int
+        \\    var index = 2147483646
+        \\    var visited = 0
+        \\    loop
+        \\        if index >= 2147483647 -> break
+        \\        if index < 0 -> return 21
+        \\        if visited == 2 -> return -100
+        \\        visited += 1
+        \\        index += 2
+        \\    return -200
+        \\func descending() int
+        \\    var index = -2147483647
+        \\    var visited = 0
+        \\    loop
+        \\        if index <= -2147483648 -> break
+        \\        if index > 0 -> return 21
+        \\        if visited == 2 -> return -100
+        \\        visited += 1
+        \\        index -= 2
+        \\    return -200
+        \\func partial(first: int, limit: int, guarded: bool) int
+        \\    if guarded
+        \\        if first < 0 -> return 0
+        \\    var index = first
+        \\    loop
+        \\        if index >= limit -> break
+        \\        if index < 0 -> return 21
+        \\        index += 1
+        \\    return 0
+        \\func run() int -> ascending() + descending() + partial(-1, 1, false) - 21
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program ++ "\nexit(run())");
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+    for ([_][]const u8{ "ascending", "descending", "partial" }, [_]usize{ 3, 3, 4 }) |name, expected| {
+        const body = (try optimizedBody(fixture, name)).*.?;
+        try testing.expectEqual(expected, countPredicates(body));
+    }
+}
+
+test "dead loop removal preserves potentially nonterminating nested iterations" {
+    const fixture = try Fixture.init(
+        \\func spin(start: int, waiting: bool) int
+        \\    var index = start
+        \\    loop
+        \\        if index == 0 -> break
+        \\        loop
+        \\            if not waiting -> break
+        \\        index -= 1
+        \\    return 42
+    );
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "spin")).*.?;
+    try testing.expect(countPredicates(body) != 0);
+}
+
+test "loop rewrites compose and recompute range proofs after source edits" {
+    const program =
+        \\func scan(first: int, limit: int) int
+        \\    if first < 0 -> return 0
+        \\    if limit > 100 -> return 0
+        \\    var index = first
+        \\    var sum = 0
+        \\    loop
+        \\        if index >= limit -> break
+        \\        var discarded = index
+        \\        loop
+        \\            if discarded == 0 -> break
+        \\            discarded -= 1
+        \\        if index < 0 -> return -100
+        \\        if index >= limit -> return -200
+        \\        sum += index
+        \\        index += 3
+        \\    return sum
+        \\func run() int -> scan(1, 8) + scan(9, 8) + 30
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program ++ "\nexit(run())");
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+    const original = try optimizedBody(fixture, "scan");
+    try testing.expectEqual(@as(usize, 3), countPredicates(original.*.?));
+
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, program ++ "\nexit(run())", "limit > 100", "limit > 2147483647");
+    defer testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(0, 42);
+    const recomputed = try optimizedBody(fixture, "scan");
+    try testing.expect(original != recomputed);
+    try testing.expectEqual(@as(usize, 5), countPredicates(recomputed.*.?));
+}
+
 test "carried exit rotation preserves empty and final range iterations" {
     const program =
         \\func calculate(first: int, limit: int) int

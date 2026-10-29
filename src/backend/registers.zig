@@ -22,17 +22,24 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
     const registers = try gpa.alloc(?Register, value_count);
     errdefer gpa.free(registers);
     @memset(registers, null);
+    var fixed: x86.RegisterSet = .empty;
+    for (function.instructions.items) |instruction| if (instruction == .fixed) {
+        fixed.setUnion(x86.fixedRegisters(instruction.fixed.operation));
+    };
     var single_value: ?machine.ValueId = null;
     for (function.instructions.items) |instruction| {
+        if (instruction == .parameter) break;
         if (instruction != .register) continue;
         if (single_value) |value| {
             if (instruction.register.value != value) break;
         } else single_value = instruction.register.value;
     } else {
         if (single_value) |value| {
-            const selected = std.enums.values(Register)[0];
-            registers[@backingInt(value)] = selected;
-            return .{ .registers = registers, .used = try gpa.dupe(Register, &.{selected}) };
+            for (std.enums.values(Register)) |selected| {
+                if (!selected.calleeSaved() or fixed.contains(selected)) continue;
+                registers[@backingInt(value)] = selected;
+                return .{ .registers = registers, .used = try gpa.dupe(Register, &.{selected}) };
+            }
         }
         return .{ .registers = registers, .used = &.{} };
     }
@@ -60,13 +67,19 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
     const mapping = try scratch.alloc(?u32, value_count);
     @memset(mapping, null);
     var values: std.ArrayList(u32) = .empty;
-    for (instructions) |instruction| if (instruction == .register) {
-        const value = @backingInt(instruction.register.value);
+    for (instructions) |instruction| {
+        const access = instruction.registerAccess() orelse continue;
+        const value = @backingInt(access.value);
         if (mapping[value] != null) continue;
         mapping[value] = @intCast(values.items.len);
         try values.append(scratch, value);
-    };
+    }
     const candidate_count = values.items.len;
+    const parameters = try scratch.alloc(bool, candidate_count);
+    @memset(parameters, false);
+    for (instructions) |instruction| if (instruction == .parameter) {
+        parameters[mapping[@backingInt(instruction.parameter.value)].?] = true;
+    };
     const depth = try scratch.alloc(u32, instructions.len);
     @memset(depth, 0);
     for (instructions, 0..) |instruction, index| {
@@ -87,9 +100,9 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
         defined.* = try BitSet.initEmpty(scratch, candidate_count);
         for (starts.items[block]..starts.items[block + 1]) |index| {
             const instruction = instructions[index];
-            if (instruction != .register) continue;
-            const value = mapping[@backingInt(instruction.register.value)].?;
-            if (instruction.register.operation == .store_eax or instruction.register.operation == .store_rax) {
+            const access = instruction.registerAccess() orelse continue;
+            const value = mapping[@backingInt(access.value)].?;
+            if (access.write) {
                 defined.set(value);
             } else {
                 if (!defined.isSet(value)) used.set(value);
@@ -148,10 +161,10 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
         while (index > starts.items[block]) {
             index -= 1;
             const instruction = instructions[index];
-            if (instruction != .register) continue;
-            const value = mapping[@backingInt(instruction.register.value)].?;
+            const access = instruction.registerAccess() orelse continue;
+            const value = mapping[@backingInt(access.value)].?;
             const position: u32 = @intCast(index * 2);
-            if (instruction.register.operation == .store_eax or instruction.register.operation == .store_rax) {
+            if (access.write) {
                 const end = if (next.isSet(value)) range_ends[value] else position + 1;
                 try ranges[value].append(scratch, .{ .start = position + 1, .end = end });
                 next.unset(value);
@@ -169,22 +182,36 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
         normalizeRanges(value_ranges);
         if (value_ranges.items.len != 0) try order.append(scratch, @intCast(value));
     }
-    std.mem.sort(u32, order.items, weights, heavierFirst);
+    std.mem.sort(u32, order.items, Priority{ .weights = weights, .parameters = parameters }, heavierFirst);
     const available = std.enums.values(Register);
     const assigned = try scratch.alloc(std.ArrayList(Interval), available.len);
     @memset(assigned, .empty);
-    for (order.items) |value| {
+    for (instructions, 0..) |instruction, index| {
+        if (instruction != .fixed) continue;
+        const clobbered = x86.clobberedRegisters(instruction.fixed.operation);
         for (available, assigned) |register, *taken| {
+            if (!clobbered.contains(register)) continue;
+            const position: u32 = @intCast(index * 2);
+            try taken.append(scratch, .{ .start = position, .end = position + 1 });
+        }
+    }
+    const allocated = try scratch.alloc(bool, available.len);
+    @memset(allocated, false);
+    for (order.items) |value| {
+        for (available, assigned, allocated) |register, *taken, *used_register| {
+            if (parameters[value] and register.calleeSaved()) continue;
+            if (fixed.contains(register)) continue;
             if (overlap(ranges[value].items, taken.items)) continue;
             try taken.appendSlice(scratch, ranges[value].items);
             normalizeRanges(taken);
             registers[values.items[value]] = register;
+            used_register.* = true;
             break;
         }
     }
     var used: std.ArrayList(Register) = .empty;
     defer used.deinit(gpa);
-    for (available, assigned) |register, taken| if (taken.items.len != 0) try used.append(gpa, register);
+    for (available, allocated) |register, taken| if (taken) try used.append(gpa, register);
     return .{ .registers = registers, .used = try used.toOwnedSlice(gpa) };
 }
 
@@ -234,7 +261,10 @@ fn loopWeight(depth: u32) u64 {
     return @as(u64, 1) << (exponent * 3);
 }
 
-fn heavierFirst(weights: []const u64, left: u32, right: u32) bool {
-    if (weights[left] != weights[right]) return weights[left] > weights[right];
+const Priority = struct { weights: []const u64, parameters: []const bool };
+
+fn heavierFirst(priority: Priority, left: u32, right: u32) bool {
+    if (priority.parameters[left] != priority.parameters[right]) return !priority.parameters[left];
+    if (priority.weights[left] != priority.weights[right]) return priority.weights[left] > priority.weights[right];
     return left < right;
 }

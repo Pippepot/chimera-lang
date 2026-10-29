@@ -401,7 +401,7 @@ const LocationPlan = struct {
                 if (needed[index] != .unused) locations[index] = .{ .indirect = try reserveStack(&local_end, indirect_layout) };
             }
         }
-        const spills = try promoteRegisters(ssa, gpa, locations, value_types, addressable);
+        const spills = try promoteRegisters(ssa, gpa, locations, value_types, addressable, needed);
         errdefer gpa.free(spills);
         var allocation_bases: []bool = &.{};
         errdefer gpa.free(allocation_bases);
@@ -419,7 +419,8 @@ const LocationPlan = struct {
             spills[index] = locations[index].stack;
         };
         const saved_register_offset = local_end;
-        if (spills.len != 0) for (std.enums.values(x86.Register)) |_| {
+        if (spills.len != 0) for (std.enums.values(x86.Register)) |register| {
+            if (!register.calleeSaved()) continue;
             _ = try reserveStack(&local_end, indirect_layout);
         };
         const stack_size = local_end;
@@ -448,7 +449,9 @@ const LocationPlan = struct {
             const offset = std.math.add(u32, caller_stack_offset, argument_stack_offset) catch return error.FunctionTooLarge;
             try ensureAddressableStackRange(offset, layout.storage.byte_size);
             if (needed[argument_index] != .unused and layout.storage.byte_size != 0) {
-                locations[argument_index] = if (layout.indirect) .{ .indirect = offset } else .{ .incoming_argument = offset };
+                if (locations[argument_index] == .register) {
+                    spills[argument_index] = offset;
+                } else locations[argument_index] = if (layout.indirect) .{ .indirect = offset } else .{ .incoming_argument = offset };
             }
         };
         return .{
@@ -465,20 +468,23 @@ const LocationPlan = struct {
         };
     }
 
-    fn promoteRegisters(ssa: *const structures.FunctionBodyAnalysis, gpa: std.mem.Allocator, locations: []ValueLocation, types: []const structures.TypeId, addressable: []const bool) ![]u32 {
-        for (ssa.blocks, 0..) |block, index| {
+    fn promoteRegisters(ssa: *const structures.FunctionBodyAnalysis, gpa: std.mem.Allocator, locations: []ValueLocation, types: []const structures.TypeId, addressable: []const bool, uses: []const Usage) ![]u32 {
+        const promote_locals = for (ssa.blocks, 0..) |block, index| {
             var terminator = block.terminator;
             for (terminator.successors()) |successor| if (successor) |target| {
                 if (@backingInt(target.*) <= index) break;
             } else continue;
-            break;
-        } else return &.{};
+            break true;
+        } else false;
         const entry = ssa.blocks[@backingInt(ssa.entry)];
         var spills: []u32 = &.{};
         errdefer gpa.free(spills);
         for (locations, types, addressable, 0..) |*location, type_id, taken, index| {
-            if (location.* != .stack or taken or (type_id != .int and type_id != .bool)) continue;
-            if (index >= entry.argument_start and index < entry.argument_end) continue;
+            if (taken or (type_id != .int and type_id != .bool)) continue;
+            const parameter = index >= entry.argument_start and index < entry.argument_end;
+            if (parameter) {
+                if (ssa.is_initializer_region or uses[index] != .shared) continue;
+            } else if (!promote_locals or location.* != .stack) continue;
             if (index < ssa.block_arguments.len) {
                 if (ssa.block_arguments[index].representation != .value) continue;
             } else {
@@ -489,7 +495,7 @@ const LocationPlan = struct {
                 spills = try gpa.alloc(u32, locations.len);
                 @memset(spills, 0);
             }
-            spills[index] = location.stack;
+            spills[index] = if (parameter) 0 else location.stack;
             location.* = .{ .register = @fromBackingInt(@intCast(index)) };
         }
         return spills;
@@ -576,12 +582,18 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             const ssa = self.ssa;
             if (self.plan.stack_size != 0) try self.encoder.offset(.sub_rsp, self.plan.stack_size);
             try self.saveRegisters(.save);
+            const entry = ssa.blocks[@backingInt(ssa.entry)];
             if (ssa.is_initializer_region) {
-                const entry = ssa.blocks[@backingInt(ssa.entry)];
                 for (self.plan.locations[entry.argument_start..entry.argument_end], 0..) |location, capture| {
                     if (location == .discarded) continue;
                     try self.encoder.offset(.mov_rax_rdi, @intCast(capture * 8));
                     try self.bindIndirect(location);
+                }
+            } else if (buffered) {
+                for (entry.argument_start..entry.argument_end) |index| {
+                    const location = self.plan.locations[index];
+                    if (location != .register) continue;
+                    try self.encoder.stream.instructions.append(self.gpa, .{ .parameter = .{ .value = location.register, .offset = self.plan.spills[index] } });
                 }
             }
             for (0..ssa.blocks.len) |position| {

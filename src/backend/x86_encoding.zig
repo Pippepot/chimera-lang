@@ -194,12 +194,23 @@ const forms = blk: {
 };
 
 pub const Register = enum(u4) {
+    r8 = 8,
+    r9 = 9,
+    r10 = 10,
+    r11 = 11,
     rbx = 3,
     rbp = 5,
     r12 = 12,
     r13 = 13,
     r14 = 14,
     r15 = 15,
+
+    pub fn calleeSaved(self: Register) bool {
+        return switch (self) {
+            .rbx, .rbp, .r12, .r13, .r14, .r15 => true,
+            .r8, .r9, .r10, .r11 => false,
+        };
+    }
 
     fn low(self: Register) u8 {
         return @as(u8, @backingInt(self)) & 7;
@@ -217,11 +228,40 @@ pub const Register = enum(u4) {
             .r13 => "r13d",
             .r14 => "r14d",
             .r15 => "r15d",
+            .r8 => "r8d",
+            .r9 => "r9d",
+            .r10 => "r10d",
+            .r11 => "r11d",
         };
     }
 };
 
-pub const RegisterOperation = enum { load_eax, store_eax, load_rax, store_rax, store_indexed_i32, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, add_immediate, sub_immediate, imul_immediate, add_from_eax, sub_from_eax, imul_from_eax, save, restore };
+pub const RegisterSet = std.enums.EnumSet(Register);
+
+pub fn fixedRegisters(operation: Operation) RegisterSet {
+    return switch (operation) {
+        .mov_r12_rsp, .add_r12_8, .add_r12_rax => .initOne(.r12),
+        .mov_r13_r12 => .initMany(&.{ .r12, .r13 }),
+        .cmp_rax_r13 => .initOne(.r13),
+        .mov_r14, .mov_rax_r14, .add_r14_32, .mov_rax_r14_offset, .mov_rsi_r14_offset, .mov_edx_r14_offset => .initOne(.r14),
+        .mov_r15d, .dec_r15d => .initOne(.r15),
+        .mov_r8d => .initOne(.r8),
+        .zero_r9d => .initOne(.r9),
+        .mov_r10d => .initOne(.r10),
+        .syscall => .initMany(&.{ .r8, .r9, .r10, .r11 }),
+        else => .empty,
+    };
+}
+
+pub fn clobberedRegisters(operation: Operation) RegisterSet {
+    return switch (operation) {
+        .call_relative, .call_rax => .initMany(&.{ .r8, .r9, .r10, .r11 }),
+        .syscall => .initOne(.r11),
+        else => .empty,
+    };
+}
+
+pub const RegisterOperation = enum { load_eax, store_eax, load_rax, store_rax, store_indexed_i32, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, add_immediate, sub_immediate, imul_immediate, add_from_eax, sub_from_eax, imul_from_eax, load_stack, add_stack, sub_stack, imul_stack, save, restore };
 
 fn registerEncoding(comptime operation: RegisterOperation, comptime register: Register) Encoding {
     const r = register.low();
@@ -248,6 +288,10 @@ fn registerEncoding(comptime operation: RegisterOperation, comptime register: Re
         .add_from_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x01, 0xC0 | r }, .asm_prefix = "add " ++ name ++ ", eax" },
         .sub_from_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x29, 0xC0 | r }, .asm_prefix = "sub " ++ name ++ ", eax" },
         .imul_from_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x0F, 0xAF, 0xC0 | (r << 3) }, .asm_prefix = "imul " ++ name ++ ", eax" },
+        .load_stack => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x8B, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "mov " ++ name ++ ", [rsp+", .asm_suffix = "]" },
+        .add_stack => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x03, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "add " ++ name ++ ", [rsp+", .asm_suffix = "]" },
+        .sub_stack => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x2B, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "sub " ++ name ++ ", [rsp+", .asm_suffix = "]" },
+        .imul_stack => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x0F, 0xAF, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "imul " ++ name ++ ", [rsp+", .asm_suffix = "]" },
         .save => .{ .prefix = &[_]u8{ if (extended) 0x4C else 0x48, 0x89, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "mov [rsp+", .asm_suffix = "], " ++ @tagName(register) },
         .restore => .{ .prefix = &[_]u8{ if (extended) 0x4C else 0x48, 0x8B, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "mov " ++ @tagName(register) ++ ", [rsp+", .asm_suffix = "]" },
     };
@@ -292,17 +336,52 @@ pub fn appendRegister(code: *std.ArrayList(u8), allocator: std.mem.Allocator, op
     try appendPattern(code, allocator, registerSelectedEncoding(operation, register, bits), bits);
 }
 
+const binary_operations = [_]RegisterOperation{ .add_eax, .sub_eax, .imul_eax };
+
+const binary_register_patterns = blk: {
+    @setEvalBranchQuota(20000);
+    const registers = std.enums.values(Register);
+    var result: [binary_operations.len][registers.len][registers.len]Encoding = undefined;
+    for (binary_operations, 0..) |operation, operation_index| for (registers, 0..) |destination, destination_index| for (registers, 0..) |source, source_index| {
+        const selected: struct { opcode: []const u8, name: []const u8 } = switch (operation) {
+            .add_eax => .{ .opcode = &.{0x03}, .name = "add " },
+            .sub_eax => .{ .opcode = &.{0x2B}, .name = "sub " },
+            .imul_eax => .{ .opcode = &.{ 0x0F, 0xAF }, .name = "imul " },
+            else => unreachable,
+        };
+        const rex: u8 = 0x40 | (if (destination.extended()) @as(u8, 4) else 0) | (if (source.extended()) @as(u8, 1) else 0);
+        result[operation_index][destination_index][source_index] = .{
+            .prefix = (if (rex == 0x40) &[_]u8{} else &[_]u8{rex}) ++ selected.opcode ++ &[_]u8{0xC0 | (destination.low() << 3) | source.low()},
+            .asm_prefix = selected.name ++ destination.name32() ++ ", " ++ source.name32(),
+        };
+    };
+    break :blk result;
+};
+
+pub fn appendRegisterBinary(code: *std.ArrayList(u8), allocator: std.mem.Allocator, operation: RegisterOperation, destination: Register, source: Register) !void {
+    const operation_index = std.mem.indexOfScalar(RegisterOperation, &binary_operations, operation) orelse unreachable;
+    const registers = std.enums.values(Register);
+    const destination_index = std.mem.indexOfScalar(Register, registers, destination).?;
+    const source_index = std.mem.indexOfScalar(Register, registers, source).?;
+    try appendPattern(code, allocator, binary_register_patterns[operation_index][destination_index][source_index], 0);
+}
+
 /// Every encodable form, each operation's forms in order full, small, zero.
 pub const patterns = blk: {
     @setEvalBranchQuota(20000);
     const register_count = std.enums.values(RegisterOperation).len * std.enums.values(Register).len;
-    var result: [3 * (forms.len + register_count)]Encoding = undefined;
+    const binary_count = binary_operations.len * std.enums.values(Register).len * std.enums.values(Register).len;
+    var result: [3 * (forms.len + register_count) + binary_count]Encoding = undefined;
     var count: usize = 0;
     for (forms) |form| for ([_]?Encoding{ form.full, form.small, form.zero }) |maybe_pattern| if (maybe_pattern) |pattern| {
         result[count] = pattern;
         count += 1;
     };
     for (register_forms) |row| for (row) |form| for ([_]?Encoding{ form.full, form.small, form.zero }) |maybe_pattern| if (maybe_pattern) |pattern| {
+        result[count] = pattern;
+        count += 1;
+    };
+    for (binary_register_patterns) |row| for (row) |destinations| for (destinations) |pattern| {
         result[count] = pattern;
         count += 1;
     };

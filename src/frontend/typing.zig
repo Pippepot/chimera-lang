@@ -5348,13 +5348,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                         const storage_depth = if (origin.stable and !origin.variant_guard) origin.storage_depth else null;
                         const expected = try self.resolveBindingIdentityAtDepth(origin.binding_identity, storage_depth);
                         const actual_identity = referenceIdentity(state.values.get(slot).?, origin);
-                        const actual = try self.resolveBindingIdentityAtDepth(actual_identity, storage_depth);
+                        const same_identity = (origin.stable or origin.deferred_capture or origin.read != null) and std.meta.eql(origin.binding_identity, actual_identity);
+                        const actual = if (same_identity) expected else try self.resolveBindingIdentityAtDepth(actual_identity, storage_depth);
                         if (expected.incomplete or actual.incomplete) {
                             incomplete.* = true;
                             continue;
                         }
-                        const current_read = origin.read != null;
-                        if (!((origin.stable or origin.deferred_capture or current_read) and std.meta.eql(origin.binding_identity, actual_identity)) and
+                        if (!same_identity and
                             (expected.conflicting or actual.conflicting or expected.value == null or expected.value != actual.value))
                         {
                             return self.reject(span, if (origin.deferred_capture) .initializer_capture_conflict else .borrow_outlives_source);
@@ -7392,15 +7392,22 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             else
                 null;
             var place_fields: std.ArrayList(PlaceField) = .empty;
-            const argument_places = try self.gpa.alloc(?ArgumentPlace, raw_arguments.len);
-
-            const argument_reference_origins = try self.gpa.alloc(?u32, raw_arguments.len);
-            const argument_sources = try self.gpa.alloc(CallOriginSource, raw_arguments.len);
-
+            var prepared_arguments: std.MultiArrayList(struct {
+                place: ?ArgumentPlace,
+                reference_origins: ?u32,
+                source: CallOriginSource,
+                instruction: structures.FunctionCallArgument,
+            }) = .empty;
+            try prepared_arguments.setCapacity(self.gpa, raw_arguments.len);
+            prepared_arguments.len = raw_arguments.len;
+            const prepared = prepared_arguments.slice();
+            const argument_places = prepared.items(.place);
+            const argument_reference_origins = prepared.items(.reference_origins);
+            const argument_sources = prepared.items(.source);
+            const arguments_to_publish = prepared.items(.instruction);
             var mut_origin_sources: std.ArrayList(CallOriginSource) = .empty;
             var writable_references: std.ArrayList(Value) = .empty;
 
-            const arguments_to_publish = try self.gpa.alloc(structures.FunctionCallArgument, raw_arguments.len);
             var arguments_to_consume: std.ArrayList(Value) = .empty;
 
             var borrowed_arguments: std.ArrayList(Value) = .empty;
@@ -8446,35 +8453,42 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn resolveReferenceOrigins(self: *Self, origins: ?u32, incomplete: *bool) !?u32 {
             var visiting: std.ArrayList(u32) = .empty;
-            var resolved: ?u32 = null;
-            try self.expandReferenceOrigins(origins, &resolved, &visiting, incomplete);
-            return resolved;
+            return self.expandReferenceOrigins(origins, &visiting, incomplete);
         }
 
         fn expandReferenceOrigins(
             self: *Self,
             origins: ?u32,
-            resolved: *?u32,
             visiting: *std.ArrayList(u32),
             incomplete: *bool,
-        ) !void {
-            var current = self.originList(origins);
-            while (current.next()) |origin| {
+        ) !?u32 {
+            var resolved: ?u32 = null;
+            var expanded_loop = false;
+            var current = origins;
+            while (current) |index| {
+                const origin = self.reference_storage.origins.items[index];
+                current = origin.next;
                 if (origin.loop) |loop_index| {
+                    expanded_loop = true;
                     if (std.mem.indexOfScalar(u32, visiting.items, loop_index) == null) {
                         try visiting.append(self.gpa, loop_index);
                         const loop_origins = self.loop_reference_origins.items[loop_index];
                         if (!loop_origins.complete) incomplete.* = true;
-                        var expanded: ?u32 = null;
-                        try self.expandReferenceOrigins(loop_origins.origins, &expanded, visiting, incomplete);
+                        var expanded = try self.expandReferenceOrigins(loop_origins.origins, visiting, incomplete);
                         expanded = try self.rebaseLoopReadOrigins(expanded, loop_origins.read_checkpoint.?);
-                        resolved.* = try self.mergeReferenceOrigins(resolved.*, try self.applyReferenceTransforms(expanded, origin.transform));
+                        resolved = try self.mergeReferenceOrigins(resolved, try self.applyReferenceTransforms(expanded, origin.transform));
                         _ = visiting.pop();
                     }
+                } else if (resolved == null and current == null) {
+                    resolved = index;
+                } else if (expanded_loop) {
+                    resolved = try self.addReferenceOrigin(resolved, origin);
                 } else {
-                    resolved.* = try self.addReferenceOrigin(resolved.*, origin);
+                    // Input origins form a set. Only loop expansion can introduce duplicates.
+                    resolved = try self.reference_storage.prependAssumeUnique(self.gpa, resolved, origin);
                 }
             }
+            return resolved;
         }
 
         fn rebaseLoopReadOrigins(self: *Self, origins: ?u32, checkpoint: u31) !?u32 {
@@ -12179,6 +12193,64 @@ test "expression boundaries omit empty markers and retain effect checkpoints" {
     try std.testing.expectEqual(boundary, builder.blocks.items[@backingInt(entry)].items.items[0].boundary);
     try std.testing.expectEqual(checkpoint, builder.boundaries.items[@backingInt(boundary)].effects.items[0].id);
     try std.testing.expectEqual(entry, builder.findBoundary(boundary).block);
+}
+
+test "reference resolution shares concrete singletons and follows changing loop summaries" {
+    var context: TestMaterializerContext = .{ .gpa = std.testing.allocator };
+    defer context.deinit();
+    var builder = testInitMaterializerBuilder(&context);
+    const first = try builder.addReferenceOrigin(null, .{ .parameter = 0, .readonly = true });
+    const concrete = try builder.addReferenceOrigin(first, .{ .parameter = 1 });
+    const stored = builder.reference_storage.origins.items.len;
+    for (0..4) |_| {
+        var incomplete = false;
+        try std.testing.expectEqual(first, try builder.resolveReferenceOrigins(first, &incomplete));
+        try std.testing.expect(!incomplete);
+    }
+    try std.testing.expectEqual(stored, builder.reference_storage.origins.items.len);
+    var incomplete = true;
+    try std.testing.expectEqual(first, try builder.resolveReferenceOrigins(first, &incomplete));
+    try std.testing.expect(incomplete);
+    try std.testing.expectEqual(@as(?u32, null), try builder.resolveReferenceOrigins(null, &incomplete));
+    try std.testing.expect(incomplete);
+    var ordered = builder.originList(try builder.completeReferenceOrigins(concrete));
+    try std.testing.expectEqual(@as(?u32, 0), ordered.next().?.parameter);
+    try std.testing.expectEqual(@as(?u32, 1), ordered.next().?.parameter);
+    try std.testing.expect(ordered.next() == null);
+
+    try builder.loop_reference_origins.append(builder.gpa, .{ .slot = 0, .origins = first, .read_checkpoint = 0 });
+    const deferred = try builder.addReferenceOrigin(null, .{ .loop = 0 });
+    const mixed = try builder.addReferenceOrigin(deferred, .{ .parameter = 1 });
+    // A cyclic summary still expands each concrete dependency once.
+    builder.loop_reference_origins.items[0].origins = try builder.addReferenceOrigin(first, .{ .loop = 0 });
+    incomplete = false;
+    var origins = builder.originList(try builder.resolveReferenceOrigins(mixed, &incomplete));
+    try std.testing.expect(incomplete);
+    var parameters: u8 = 0;
+    while (origins.next()) |origin| {
+        try std.testing.expect(origin.loop == null);
+        parameters |= @as(u8, 1) << @intCast(origin.parameter.?);
+        if (origin.parameter == 0) try std.testing.expect(origin.readonly);
+    }
+    try std.testing.expectEqual(@as(u8, 0b011), parameters);
+    const overlapping = try builder.addReferenceOrigin(deferred, .{ .parameter = 0, .readonly = true });
+    incomplete = false;
+    origins = builder.originList(try builder.resolveReferenceOrigins(overlapping, &incomplete));
+    try std.testing.expect(incomplete);
+    try std.testing.expectEqual(@as(?u32, 0), origins.next().?.parameter);
+    try std.testing.expect(origins.next() == null);
+
+    builder.loop_reference_origins.items[0].origins = try builder.addReferenceOrigin(null, .{ .parameter = 2 });
+    builder.loop_reference_origins.items[0].complete = true;
+    incomplete = false;
+    origins = builder.originList(try builder.resolveReferenceOrigins(mixed, &incomplete));
+    try std.testing.expect(!incomplete);
+    parameters = 0;
+    while (origins.next()) |origin| {
+        try std.testing.expect(origin.loop == null);
+        parameters |= @as(u8, 1) << @intCast(origin.parameter.?);
+    }
+    try std.testing.expectEqual(@as(u8, 0b110), parameters);
 }
 
 test "cleanup materializer preserves effect identities across moves and repeated splits" {

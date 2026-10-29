@@ -35,6 +35,54 @@ test "machine pointer operands preserve register and spill width" {
     }
 }
 
+test "machine parameter loads disappear when the ABI home is retained" {
+    for (0..3) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.instructions.append(std.testing.allocator, .{ .parameter = .{ .value = @fromBackingInt(0), .offset = 128 } });
+        try function.emit(.ret);
+        function.verify(1);
+        var encoded = try function.encode(&.{switch (mode) {
+            0 => .r8,
+            1 => .r11,
+            else => null,
+        }}, &.{128}, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const expected: []const u8 = switch (mode) {
+            0 => &.{ 0x44, 0x8B, 0x84, 0x24, 128, 0, 0, 0, 0xC3 },
+            1 => &.{ 0x44, 0x8B, 0x9C, 0x24, 128, 0, 0, 0, 0xC3 },
+            else => &.{0xC3},
+        };
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items);
+    }
+}
+
+test "machine parameter caching does not displace local values" {
+    for ([_]usize{ 4, 10 }) |local_count| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.instructions.append(std.testing.allocator, .{ .parameter = .{ .value = @fromBackingInt(0), .offset = 0 } });
+        for (1..local_count + 1) |index| try function.register(.store_eax, @fromBackingInt(@intCast(index)), 0);
+        for (0..20) |_| try function.register(.load_eax, @fromBackingInt(0), 0);
+        for (1..local_count + 1) |index| try function.register(.load_eax, @fromBackingInt(@intCast(index)), 0);
+        var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, local_count + 1);
+        defer allocation.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(?test_sources.x86_encoding.Register, null), allocation.registers[0]);
+        try std.testing.expectEqual(local_count, allocation.used.len);
+        for (allocation.registers[1..]) |register| try std.testing.expect(register != null);
+    }
+}
+
+test "machine preservation excludes caller-saved registers" {
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    try function.preserve(false, 0);
+    try function.preserve(true, 0);
+    var encoded = try function.encode(&.{}, &.{}, &.{ .r8, .rbx, .r11 });
+    defer encoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x89, 0x1C, 0x24, 0x48, 0x8B, 0x1C, 0x24 }, encoded.code.items);
+}
+
 test "machine indexed constant stores preserve base encoding and spill fallback" {
     for (0..3) |mode| {
         var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
@@ -169,25 +217,83 @@ test "machine symbolic positions resolve after register and spill encoding" {
 }
 
 test "machine in-place arithmetic requires dead scratch and respects labels" {
-    for (0..3) |mode| {
+    for (0..3) |mode| for ([_]bool{ false, true }) |register_operand| {
         var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
         defer function.deinit();
         try function.register(.load_eax, @fromBackingInt(0), 0);
         if (mode == 2) _ = try function.position();
-        try function.immediate(.sub_eax, 7);
-        try function.register(.store_eax, @fromBackingInt(1), 0);
+        if (register_operand)
+            try function.register(.sub_eax, @fromBackingInt(1), 0)
+        else
+            try function.immediate(.sub_eax, 7);
+        try function.register(.store_eax, @fromBackingInt(2), 0);
         if (mode != 1) try function.instructions.append(std.testing.allocator, .scratch_dead);
-        var encoded = try function.encode(&.{ .rbx, .rbx }, &.{ 0, 4 }, &.{});
+        var encoded = try function.encode(&.{ .rbx, .r12, .rbx }, &.{ 0, 4, 8 }, &.{});
         defer encoded.deinit(std.testing.allocator);
-        const expected: []const u8 = if (mode == 0) &.{ 0x83, 0xeb, 7 } else &.{ 0x89, 0xd8, 0x83, 0xe8, 7, 0x89, 0xc3 };
+        const expected: []const u8 = if (register_operand)
+            (if (mode == 0) &.{ 0x41, 0x2B, 0xDC } else &.{ 0x89, 0xD8, 0x44, 0x29, 0xE0, 0x89, 0xC3 })
+        else
+            (if (mode == 0) &.{ 0x83, 0xeb, 7 } else &.{ 0x89, 0xd8, 0x83, 0xe8, 7, 0x89, 0xc3 });
         try std.testing.expectEqualSlices(u8, expected, encoded.code.items);
-    }
+    };
+}
+
+test "machine in-place register arithmetic avoids scratch copies" {
+    const cases = [_]struct { destination: test_sources.x86_encoding.Register, source: test_sources.x86_encoding.Register, expected: [3][]const u8 }{
+        .{ .destination = .rbx, .source = .rbp, .expected = .{ &.{ 0x03, 0xDD }, &.{ 0x2B, 0xDD }, &.{ 0x0F, 0xAF, 0xDD } } },
+        .{ .destination = .rbx, .source = .r12, .expected = .{ &.{ 0x41, 0x03, 0xDC }, &.{ 0x41, 0x2B, 0xDC }, &.{ 0x41, 0x0F, 0xAF, 0xDC } } },
+        .{ .destination = .r12, .source = .rbx, .expected = .{ &.{ 0x44, 0x03, 0xE3 }, &.{ 0x44, 0x2B, 0xE3 }, &.{ 0x44, 0x0F, 0xAF, 0xE3 } } },
+        .{ .destination = .r12, .source = .r13, .expected = .{ &.{ 0x45, 0x03, 0xE5 }, &.{ 0x45, 0x2B, 0xE5 }, &.{ 0x45, 0x0F, 0xAF, 0xE5 } } },
+        .{ .destination = .r13, .source = .r13, .expected = .{ &.{ 0x45, 0x03, 0xED }, &.{ 0x45, 0x2B, 0xED }, &.{ 0x45, 0x0F, 0xAF, 0xED } } },
+    };
+    for (cases) |case| for ([_]test_sources.x86_encoding.RegisterOperation{ .add_eax, .sub_eax, .imul_eax }, case.expected) |operation, expected| for ([_]bool{ false, true }) |reuse_rhs| {
+        if (reuse_rhs and operation == .sub_eax) continue;
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        try function.register(operation, @fromBackingInt(1), 0);
+        try function.register(.store_eax, @fromBackingInt(2), 0);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        const registers = if (reuse_rhs)
+            [_]?test_sources.x86_encoding.Register{ case.source, case.destination, case.destination }
+        else
+            [_]?test_sources.x86_encoding.Register{ case.destination, case.source, case.destination };
+        var encoded = try function.encode(&registers, &.{ 0, 4, 8 }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items);
+    };
+}
+
+test "machine in-place stack arithmetic preserves compact offsets" {
+    const cases = [_]struct { destination: test_sources.x86_encoding.Register, offset: u32, expected: [3][]const u8 }{
+        .{ .destination = .rbx, .offset = 0, .expected = .{ &.{ 0x03, 0x1C, 0x24 }, &.{ 0x2B, 0x1C, 0x24 }, &.{ 0x0F, 0xAF, 0x1C, 0x24 } } },
+        .{ .destination = .r12, .offset = 127, .expected = .{ &.{ 0x44, 0x03, 0x64, 0x24, 127 }, &.{ 0x44, 0x2B, 0x64, 0x24, 127 }, &.{ 0x44, 0x0F, 0xAF, 0x64, 0x24, 127 } } },
+        .{ .destination = .r13, .offset = 128, .expected = .{ &.{ 0x44, 0x03, 0xAC, 0x24, 128, 0, 0, 0 }, &.{ 0x44, 0x2B, 0xAC, 0x24, 128, 0, 0, 0 }, &.{ 0x44, 0x0F, 0xAF, 0xAC, 0x24, 128, 0, 0, 0 } } },
+    };
+    for (cases) |case| for ([_]test_sources.x86_encoding.Operation{ .add_eax_rsp, .sub_eax_rsp, .imul_eax_rsp }, case.expected) |operation, expected| for ([_]bool{ false, true }) |spilled_operand| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        if (spilled_operand) {
+            try function.register(switch (operation) {
+                .add_eax_rsp => .add_eax,
+                .sub_eax_rsp => .sub_eax,
+                .imul_eax_rsp => .imul_eax,
+                else => unreachable,
+            }, @fromBackingInt(1), 0);
+        } else try function.offset(operation, case.offset);
+        try function.register(.store_eax, @fromBackingInt(2), 0);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{ case.destination, null, case.destination }, &.{ 0, case.offset, 4 }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items);
+    };
 }
 
 test "machine liveness retains expanded branch uses under register pressure" {
     var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
     defer function.deinit();
-    for (0..8) |index| {
+    for (0..12) |index| {
         try function.immediate(.mov_eax, @intCast(index));
         try function.register(.store_eax, @fromBackingInt(@intCast(index)), 0);
     }
@@ -195,12 +301,12 @@ test "machine liveness retains expanded branch uses under register pressure" {
     const skip = try function.patchable(.je);
     try function.register(.load_eax, @fromBackingInt(7), 0);
     try function.patchHere(skip);
-    for (0..8) |index| try function.register(.load_eax, @fromBackingInt(@intCast(index)), 0);
+    for (0..12) |index| try function.register(.load_eax, @fromBackingInt(@intCast(index)), 0);
     try function.emit(.ret);
-    function.verify(8);
-    var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 8);
+    function.verify(12);
+    var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 12);
     defer allocation.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(usize, 6), allocation.used.len);
+    try std.testing.expectEqual(@as(usize, 10), allocation.used.len);
     try std.testing.expectEqual(@as(usize, 2), std.mem.count(@TypeOf(allocation.registers[0]), allocation.registers, &.{null}));
     for (allocation.registers, 0..) |selected, index| {
         if (selected == null) continue;
@@ -210,11 +316,54 @@ test "machine liveness retains expanded branch uses under register pressure" {
     }
 }
 
+test "machine call clobbers exclude caller-saved live ranges" {
+    for ([_]bool{ false, true }) |indirect| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        for (0..8) |index| {
+            try function.immediate(.mov_eax, @intCast(index));
+            try function.register(.store_eax, @fromBackingInt(@intCast(index)), 0);
+        }
+        if (indirect) {
+            try function.emit(.call_rax);
+        } else _ = try function.patchable(.call_relative);
+        for (0..8) |index| try function.register(.load_eax, @fromBackingInt(@intCast(index)), 0);
+        try function.emit(.ret);
+        var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 8);
+        defer allocation.deinit(std.testing.allocator);
+        try std.testing.expectEqual(@as(usize, 6), allocation.used.len);
+        for (allocation.registers) |selected| if (selected) |register| {
+            try std.testing.expect(register.calleeSaved());
+        };
+    }
+}
+
+test "machine fixed register operands remain reserved" {
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    try function.immediate(.mov_r8d, 7);
+    try function.emit(.zero_r9d);
+    for (0..10) |index| {
+        try function.immediate(.mov_eax, @intCast(index));
+        try function.register(.store_eax, @fromBackingInt(@intCast(index)), 0);
+    }
+    for (0..10) |index| try function.register(.load_eax, @fromBackingInt(@intCast(index)), 0);
+    try function.emit(.ret);
+    var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 10);
+    defer allocation.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 8), allocation.used.len);
+    for (allocation.registers) |selected| if (selected) |register| {
+        try std.testing.expect(register != .r8);
+        try std.testing.expect(register != .r9);
+    };
+}
+
 test "machine live ranges reuse registers between separate definitions" {
     var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
     defer function.deinit();
     try function.register(.store_eax, @fromBackingInt(0), 0);
     try function.register(.load_eax, @fromBackingInt(0), 0);
+    try function.emit(.call_rax);
     try function.register(.store_eax, @fromBackingInt(1), 0);
     try function.register(.load_eax, @fromBackingInt(1), 0);
     try function.register(.store_eax, @fromBackingInt(0), 0);
@@ -224,6 +373,7 @@ test "machine live ranges reuse registers between separate definitions" {
     defer allocation.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), allocation.used.len);
     try std.testing.expectEqual(allocation.registers[0], allocation.registers[1]);
+    try std.testing.expect(!allocation.registers[0].?.calleeSaved());
 }
 
 test "machine division branches preserve live loop values and signed overflow" {
@@ -256,6 +406,55 @@ test "in-place loop arithmetic preserves wrapping and operand order" {
         \\    return value
         \\func run() int -> calculate(1) + calculate(2147483647) - calculate(2147483647) + 15
     , 42);
+}
+
+test "straight-line registers preserve branches spills and values across calls" {
+    const source =
+        \\func calculate(seed: int) int
+        \\    const a = seed + 1
+        \\    const b = seed + 2
+        \\    const c = seed + 3
+        \\    const d = seed + 4
+        \\    const e = seed + 5
+        \\    const f = seed + 6
+        \\    const g = seed + 7
+        \\    const h = seed + 8
+        \\    var selected = a
+        \\    if seed > 0 -> selected = b
+        \\    const called = adjust(seed)
+        \\    return selected + a + b + c + d + e + f + g + h + called
+        \\func adjust(value: int) int -> value * 3
+        \\func run() int -> calculate(1) + calculate(-1) - 33
+    ;
+    try test_sources.SourceFixture.expectParity(source, 42);
+    const fixture = try test_sources.SourceFixture.init(source ++ "\nexit(run())");
+    defer fixture.deinit();
+    try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+}
+
+test "scalar parameters preserve repeated reads calls and borrowed mutation" {
+    const source =
+        \\func adjust(mut value: int) unit -> value += 1
+        \\func called(value: int) int -> value * 3
+        \\func calculate(seed: int, enabled: bool, mut target: int) int
+        \\    var total = seed + called(seed)
+        \\    adjust(target)
+        \\    if enabled -> total += seed
+        \\    if not enabled -> total -= seed
+        \\    total += seed + target
+        \\    return total
+        \\func run() int
+        \\    var target = 2
+        \\    const first = calculate(3, true, target)
+        \\    const second = calculate(3, false, target)
+        \\    return first + second + target + 1
+    ;
+    try test_sources.SourceFixture.expectParity(source, 42);
+    const fixture = try test_sources.SourceFixture.init(source ++ "\nexit(run())");
+    defer fixture.deinit();
+    try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
 }
 
 test "loop registers preserve parallel copies spills and values across calls" {

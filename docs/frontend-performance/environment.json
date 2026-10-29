@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-29",
+  "baseline_commit": "b6c86c322bf6d23c53f6ecf37a29f2cb43347e3c",
+  "scope": "baseline archive plus frontend files and common benchmark driver; concurrent backend, optimizer, and test edits excluded",
+  "compiler_source_sha256": {
+    "before": "8c789f8a948d463e792e6acf6bd3dcef757c08a1ff3e54d218bb1f3fcb289673",
+    "after": "3b5b87af52d549cadec4a9818adf4e31f2d809c9fef58e3918921ed5472f39c4"
+  },
+  "driver_sha256": {
+    "benchmarks/history_benchmark.zig": "9bf62ccf84001be87735d716bc01393d7797996706dffc096b6a66c15b3e1362",
+    "benchmarks/history_sampling.zig": "e6fa44ed277958060a5cff8794659c632d6b1b0cd8ef985b5b7272de4866f7e2",
+    "benchmarks/history_workload.zig": "aabcf0c675cd16e090623377e6ae5258ecbafbd8750066c3698e539f9519327c",
+    "benchmarks/flow_benchmark.zig": "01191551ea8e50587eb03d9fcb562224d8bc76c8e821b40b10e860586b6a109d"
+  },
+  "zig": "0.17.0",
+  "mode": "fast/LLVM",
+  "cpu": "Intel Core Ultra 7 265K",
+  "whole_program_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "flow_affinity": [
+    2
+  ],
+  "workers": [
+    0,
+    8
+  ],
+  "flow_workers": 1,
+  "flow_pairs": 6,
+  "kernel": "7.2.9-arch1-1",
+  "sampling_protocol": "one-warmup-range-2pct-min2-compile3-runtime5-v1",
+  "compilation_protocol": "core-million-modules-one-line-leaf-v2",
+  "runtime_protocol": "sieve-88000000-i32-wall-v1",
+  "allocation_failures": false,
+  "owning_confirmation": {
+    "case": "owning / 256",
+    "rows_per_process": 32,
+    "fresh_timed_databases_per_row": 5,
+    "pairs": 6,
+    "affinity": [
+      2
+    ],
+    "driver_sha256": "ba39b80d51d9166ed203186852bdba906c5b84115f7e9a4b96b0237da5f1c282",
+    "patch": "owning-confirmation.patch"
+  }
+}

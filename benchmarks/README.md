@@ -284,6 +284,26 @@ external store avoids artifact expiration. Dedicated runners are preferable for
 performance; hosted runners are too variable for small timing differences.
 No automatic hook or workflow is installed.
 
+## Frontend attribution
+
+The compilation driver can profile one cold build and one fresh leaf edit with
+its ordinary workload and the compiler's phase collector:
+
+```sh
+taskset -c 0-7 zig build history-benchmark --seed=0 -Doptimize=fast -j1 -- --case=core-1000000 --profile
+taskset -c 0-7 zig build history-benchmark --seed=0 -Doptimize=fast -j1 -- --case=core-1000000 --workers=8 --profile
+```
+
+Use an affinity set available on the measurement host. Run serial first, then
+eight workers on the same eight physical cores. Each phase reports wall time; counters report exclusive
+worker elapsed milliseconds and invocations, separating dependency waits from
+body construction, typing, lifetime work, publication overhead, optimization, and
+code generation. Parallel totals are summed worker time, not wall time.
+`--profile` requires the compilation case and excludes `--samples`; it prints
+attribution to stderr without timing CSV, so the recorder cannot accept
+instrumented samples. Both resulting programs still pass the ordinary correctness
+checks. Use the uninstrumented measurement protocol above for acceptance.
+
 ## Focused Drivers
 
 | Command | Measures |

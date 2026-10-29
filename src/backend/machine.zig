@@ -8,7 +8,16 @@ pub const Instruction = union(enum) {
     scratch_dead,
     fixed: struct { bits: u64 = 0, target: u32 = 0, operation: x86.Operation },
     register: struct { operation: x86.RegisterOperation, value: ValueId },
+    parameter: struct { value: ValueId, offset: u32 },
     preserve: struct { restore: bool, offset: u32 },
+
+    pub fn registerAccess(self: Instruction) ?struct { value: ValueId, write: bool } {
+        return switch (self) {
+            .register => |operation| .{ .value = operation.value, .write = operation.operation == .store_eax or operation.operation == .store_rax },
+            .parameter => |parameter| .{ .value = parameter.value, .write = true },
+            .label, .scratch_dead, .fixed, .preserve => null,
+        };
+    }
 };
 
 pub const Encoded = struct {
@@ -99,6 +108,7 @@ pub const Function = struct {
                     std.debug.assert(self.instructions.items[target - 1] == .label);
                 },
                 .register => |operation| std.debug.assert(@backingInt(operation.value) < value_count),
+                .parameter => |parameter| std.debug.assert(@backingInt(parameter.value) < value_count),
                 .label, .scratch_dead, .preserve => {},
             }
         }
@@ -159,9 +169,13 @@ pub const Function = struct {
                     }
                 },
                 .register => |operation| try self.encodeRegister(&encoded.code, operation, registers, spills),
+                .parameter => |parameter| if (registers[@backingInt(parameter.value)]) |selected| {
+                    try x86.appendRegister(&encoded.code, self.gpa, .load_stack, selected, parameter.offset);
+                },
                 .preserve => |operation| {
                     var offset_value = operation.offset;
                     for (used) |selected| {
+                        if (!selected.calleeSaved()) continue;
                         offset_value = std.mem.alignForward(u32, offset_value, @alignOf(u64));
                         try x86.appendRegister(&encoded.code, self.gpa, if (operation.restore) .restore else .save, selected, offset_value);
                         offset_value += @sizeOf(u64);
@@ -215,6 +229,9 @@ pub const Function = struct {
                 .add_eax => .add_immediate,
                 .sub_eax => .sub_immediate,
                 .imul_eax => .imul_immediate,
+                .add_eax_rsp => .add_stack,
+                .sub_eax_rsp => .sub_stack,
+                .imul_eax_rsp => .imul_stack,
                 else => return false,
             };
             try x86.appendRegister(code, self.gpa, update, destination, operation.fixed.bits);
@@ -222,19 +239,19 @@ pub const Function = struct {
         }
         if (operation != .register) return false;
         const update: x86.RegisterOperation = switch (operation.register.operation) {
-            .add_eax => .add_from_eax,
-            .sub_eax => .sub_from_eax,
-            .imul_eax => .imul_from_eax,
+            .add_eax => .add_stack,
+            .sub_eax => .sub_stack,
+            .imul_eax => .imul_stack,
             else => return false,
         };
-        if (reuse_lhs) {
-            try self.encodeRegister(code, .{ .operation = .load_eax, .value = operation.register.value }, registers, spills);
-        } else {
-            if (operation.register.operation == .sub_eax) return false;
-            if (registers[@backingInt(operation.register.value)] != destination) return false;
-            try self.encodeRegister(code, instructions[0].register, registers, spills);
+        if (!reuse_lhs and operation.register.operation == .sub_eax) return false;
+        if (!reuse_lhs and registers[@backingInt(operation.register.value)] != destination) return false;
+        const source = if (reuse_lhs) operation.register.value else instructions[0].register.value;
+        if (registers[@backingInt(source)]) |selected| {
+            try x86.appendRegisterBinary(code, self.gpa, operation.register.operation, destination, selected);
+            return true;
         }
-        try x86.appendRegister(code, self.gpa, update, destination, 0);
+        try x86.appendRegister(code, self.gpa, update, destination, spills[@backingInt(source)]);
         return true;
     }
 
