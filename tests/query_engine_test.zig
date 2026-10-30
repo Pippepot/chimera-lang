@@ -365,6 +365,184 @@ test "typed queries memoize and spawned dependencies can overlap" {
     try testing.expectEqual(@as(i32, 25), (try db.get(SumSquares, .{ .a = 3, .b = 4 })).*);
 }
 
+test "prefetches settle owned results without observing diagnostics or stale memos" {
+    const Child = struct {
+        pub const Input = u32;
+        pub const Output = OwnedOutput;
+        var executions: Counter = .{};
+
+        pub fn run(ctx: *Context, key: Input) !Output {
+            executions.increment();
+            const value = (try ctx.input(NumberInput, key)).*;
+            try ctx.emit(u32, value);
+            const bytes = try ctx.allocator().alloc(u8, 1);
+            bytes[0] = @intCast(value);
+            return .{ .bytes = bytes };
+        }
+    };
+    const Parent = struct {
+        pub const Input = u32;
+        pub const Output = u32;
+        var executions: Counter = .{};
+
+        pub fn run(ctx: *Context, key: Input) !Output {
+            executions.increment();
+            const selector = (try ctx.input(NumberInput, key)).*;
+            try ctx.prefetch(Child, key + 1);
+            try ctx.prefetch(Child, key + 1);
+            if (selector == 1) return (try ctx.get(Child, key + 1)).bytes[0];
+            return selector + 42;
+        }
+    };
+    for ([_]usize{ 0, 1, 4 }) |workers| {
+        const db = try testDatabase(workers);
+        defer db.deinit();
+        Child.executions.reset();
+        Parent.executions.reset();
+        try db.addInput(NumberInput, 0, 0);
+        try db.addInput(NumberInput, 1, 7);
+        const first = try db.get(Parent, 0);
+        try testing.expectEqual(@as(u32, 42), first.*);
+        try Child.executions.expect(1);
+        const ignored = try db.transitiveAccumulatorValues(Parent, 0, u32, testing.allocator);
+        defer testing.allocator.free(ignored);
+        try testing.expectEqual(@as(usize, 0), ignored.len);
+
+        try db.setInput(NumberInput, 1, 8);
+        try testing.expectEqual(first, try db.get(Parent, 0));
+        try Parent.executions.expect(1);
+        try Child.executions.expect(1);
+        try db.setInput(NumberInput, 0, 2);
+        try testing.expectEqual(@as(u32, 44), (try db.get(Parent, 0)).*);
+        try Parent.executions.expect(2);
+        try Child.executions.expect(1);
+
+        try db.setInput(NumberInput, 0, 1);
+        try testing.expectEqual(@as(u32, 8), (try db.get(Parent, 0)).*);
+        try Child.executions.expect(2);
+        const observed = try db.transitiveAccumulatorValues(Parent, 0, u32, testing.allocator);
+        defer testing.allocator.free(observed);
+        try testing.expectEqualSlices(u32, &.{8}, observed);
+        try db.setInput(NumberInput, 1, 9);
+        try testing.expectEqual(@as(u32, 9), (try db.get(Parent, 0)).*);
+        try Child.executions.expect(3);
+    }
+}
+
+test "independent prefetches overlap without waiting for an ordinary demand" {
+    const Child = struct {
+        pub const Input = u32;
+        pub const Output = u32;
+        var started: std.atomic.Value(u32) = .init(0);
+        var released: std.atomic.Value(bool) = .init(false);
+
+        pub fn run(_: *Context, key: Input) !Output {
+            _ = started.fetchOr(key, .release);
+            while (!released.load(.acquire)) std.atomic.spinLoopHint();
+            return key;
+        }
+    };
+    const Parent = struct {
+        pub const Input = u32;
+        pub const Output = u32;
+
+        pub fn run(ctx: *Context, _: Input) !Output {
+            try ctx.prefetch(Child, 1);
+            errdefer Child.released.store(true, .release);
+            try ctx.prefetch(Child, 2);
+            while (Child.started.load(.acquire) != 3) std.atomic.spinLoopHint();
+            Child.released.store(true, .release);
+            return 42;
+        }
+    };
+    const db = try testDatabase(2);
+    defer db.deinit();
+    Child.started.store(0, .monotonic);
+    Child.released.store(false, .monotonic);
+    try testing.expectEqual(@as(u32, 42), (try db.get(Parent, 0)).*);
+    try db.addInput(NumberInput, 0, 1);
+}
+
+test "failed requesters settle prefetches and retain their original error" {
+    const Parent = struct {
+        pub const Input = u32;
+        pub const Output = u32;
+
+        pub fn run(ctx: *Context, key: Input) !Output {
+            try ctx.prefetch(ReadNumber, key);
+            return error.TestInfrastructureFailure;
+        }
+    };
+    for ([_]usize{ 0, 1, 4 }) |workers| {
+        const db = try testDatabase(workers);
+        defer db.deinit();
+        try db.addInput(NumberInput, 0, 7);
+        try testing.expectError(error.TestInfrastructureFailure, db.get(Parent, 0));
+        try db.setInput(NumberInput, 0, 8);
+        try testing.expectEqual(@as(u32, 8), (try db.get(ReadNumber, 0)).*);
+        // The missing child's error must not replace the requester's error.
+        try testing.expectError(error.TestInfrastructureFailure, db.get(Parent, 1));
+        try db.addInput(NumberInput, 1, 9);
+        try testing.expectEqual(@as(u32, 9), (try db.get(ReadNumber, 1)).*);
+    }
+}
+
+test "prefetch allocation failure rolls back an unpublished query" {
+    const Parent = struct {
+        pub const Input = u32;
+        pub const Output = u32;
+
+        pub fn run(ctx: *Context, key: Input) !Output {
+            const scratch = ctx.scratch_allocator;
+            var failing = testing.FailingAllocator.init(scratch, .{ .fail_index = 0 });
+            ctx.scratch_allocator = failing.allocator();
+            defer ctx.scratch_allocator = scratch;
+            try testing.expectError(error.OutOfMemory, ctx.prefetch(ReadNumber, key));
+            try testing.expect(failing.has_induced_failure);
+            ctx.scratch_allocator = scratch;
+            try ctx.prefetch(ReadNumber, key);
+            return (try ctx.get(ReadNumber, key)).*;
+        }
+    };
+    const db = try testDatabase(2);
+    defer db.deinit();
+    try db.addInput(NumberInput, 0, 42);
+    try testing.expectEqual(@as(u32, 42), (try db.get(Parent, 0)).*);
+    try db.setInput(NumberInput, 0, 43);
+    try testing.expectEqual(@as(u32, 43), (try db.get(ReadNumber, 0)).*);
+}
+
+test "prefetch wait cycles reject real dependencies and unused hints can recover" {
+    const Queries = struct {
+        const Parent = struct {
+            pub const Input = u32;
+            pub const Output = u32;
+
+            pub fn run(ctx: *Context, key: Input) anyerror!Output {
+                try ctx.prefetch(Child, key);
+                if (key == 1) return (try ctx.get(Child, key)).*;
+                return 42;
+            }
+        };
+        const Child = struct {
+            pub const Input = u32;
+            pub const Output = u32;
+
+            pub fn run(ctx: *Context, key: Input) anyerror!Output {
+                return (try ctx.get(Parent, key)).*;
+            }
+        };
+    };
+    for ([_]usize{ 0, 1, 4 }) |workers| {
+        const db = try testDatabase(workers);
+        defer db.deinit();
+        try testing.expectEqual(@as(u32, 42), (try db.get(Queries.Parent, 0)).*);
+        try testing.expectEqual(@as(u32, 42), (try db.get(Queries.Child, 0)).*);
+        try testing.expectError(error.QueryCycle, db.get(Queries.Parent, 1));
+        try db.addInput(NumberInput, 0, 1);
+    }
+}
+
 test "append-only inputs can be read by queries" {
     const db = try testDatabase(2);
     defer db.deinit();

@@ -94,14 +94,26 @@ reads of missing inputs. `ctx.emit` records accumulators. Requests share queued
 or running work; parents settle spawned dependencies before publication, even
 when their handles were discarded.
 
+`ctx.prefetch` schedules only queries that have never been requested. Callers
+select work independent of the requester; optimization establishes this through
+the prepared call graph and the inliner's recursive-component exclusion. A hint
+does not observe a result or its diagnostics, and existing queries retain lazy
+validation. Its temporary wait edge participates in cycle detection and settles
+before the requester returns, including on failure; it never enters the memo.
+An ordinary `get` or `spawn` observes the result through the usual dependency
+path. Function optimization takes callee identities directly from prepared
+bodies for these hints, leaving incremental validation to ordinary reads.
+
 Idle workers steal general work. A waiting worker executes only its awaited
 queued dependency, avoiding spurious cycles through unrelated work. With zero
 workers, spawned work stays queued until demanded. Cycle detection distinguishes
 currently verified edges from stale dependencies.
 
-An idle input update advances the revision only when its value changes. Each
-completed query summarizes its transitive input dependencies with a conservative
-fingerprint. A bounded journal of changed input hashes lets unrelated revisions
+An idle input update advances the revision only when its value changes. Live
+revisions are nonzero; zero denotes that a query has never failed, without an
+extra optional tag in every memo node. Each completed query summarizes its
+transitive input dependencies with a conservative fingerprint. A bounded journal
+of changed input hashes lets unrelated revisions
 verify whole subgraphs without walking their edges. Possible fingerprint matches,
 expired history, and failed subtrees use ordinary dependency verification.
 Summaries refresh even when a recomputation returns an equal result, preserving

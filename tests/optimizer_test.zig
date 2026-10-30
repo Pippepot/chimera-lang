@@ -876,6 +876,52 @@ test "inlined callers recompute with their callees and keep recursive callees ou
     try testing.expect(run != try optimizedBody(fixture, "run"));
 }
 
+test "parallel callee optimization keeps fresh leaf edits to one typed body" {
+    const entry =
+        \\import stable
+        \\import leaf
+        \\func left() int -> stable.value()
+        \\func right() int -> leaf.value()
+        \\exit(left() + right())
+    ;
+    for ([_]usize{ 0, 4 }) |workers| {
+        var collector: test_sources.profiling.Collector = .{ .io = testing.io };
+        const db = try test_sources.query.Database.init(testing.allocator, .{ .worker_count = workers, .profile = &collector });
+        const fixture: Fixture = .{ .db = db };
+        defer fixture.deinit();
+        var registry: test_sources.modules.SourceRegistry = .{};
+        defer registry.deinit(testing.allocator);
+        try registry.update(db, testing.allocator, entry, &.{
+            .{ .path = "stable.chi", .module_path = "stable", .source = "pub func value() int -> 40\n" },
+            .{ .path = "leaf.chi", .module_path = "leaf", .source = "pub func value() int -> 2\n" },
+        }, &.{});
+        try fixture.expectExit(0, 42);
+        const scope = (try db.get(queries.BuildModuleScope, registry.fileId("stable.chi").?)).*.?;
+        const stable: structures.InstanceId = .{ .item = scope.resolveFunction("value").? };
+        const stable_body = try db.get(queries.OptimizeFunctionInstance, stable);
+        for (3..6) |value| {
+            const replacement = try testing.allocator.print("pub func value() int -> {d}\n", .{value});
+            defer testing.allocator.free(replacement);
+            const before = collector.snapshot();
+            try db.setInput(queries.SourceText, registry.fileId("leaf.chi").?, replacement);
+            try fixture.expectExit(0, @intCast(40 + value));
+            const work = collector.snapshot().since(before);
+            try testing.expectEqual(@as(usize, 1), work.get(.body_build).runs);
+            try testing.expectEqual(@as(usize, 1), work.get(.body_typing).runs);
+            try testing.expectEqual(stable_body, try db.get(queries.OptimizeFunctionInstance, stable));
+        }
+        // Removing a call must also remove its dependency and diagnostics.
+        try db.setInput(queries.SourceText, 0, "import stable\nimport leaf\nexit(stable.value())\n");
+        try fixture.expectExit(0, 40);
+        const without_leaf = try db.get(queries.BuildExecutable, 0);
+        try db.setInput(queries.SourceText, registry.fileId("leaf.chi").?, "pub func value() int -> true\n");
+        const before = collector.snapshot();
+        try fixture.expectExit(0, 40);
+        try testing.expectEqual(without_leaf, try db.get(queries.BuildExecutable, 0));
+        try testing.expectEqual(@as(usize, 0), collector.snapshot().since(before).get(.body_typing).runs);
+    }
+}
+
 test "a zero inline limit keeps calls out of line" {
     const program = try testing.allocator.print("{s}\nexit(run())", .{pipeline_source});
     defer testing.allocator.free(program);

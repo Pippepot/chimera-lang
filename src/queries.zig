@@ -4172,7 +4172,16 @@ fn optimizeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyer
     const body = (try ctx.get(PrepareFunctionInstance, instance)).* orelse return null;
     const component = (try ctx.get(CallComponent, instance)).* orelse return null;
     const context: OptimizationContext(@TypeOf(ctx)) = .{ .ctx = ctx, .instance = instance, .component = component.members };
+    if (ctx.hasParallelWorkers()) try prefetchOptimizationCallees(ctx, &body);
     return try optimizer.optimize(ctx.allocator(), &body, context);
+}
+
+fn prefetchOptimizationCallees(ctx: anytype, body: *const structures.FunctionBodyAnalysis) anyerror!void {
+    for (body.instructions) |instruction| {
+        if (instruction == .call and instruction.call.target == .direct)
+            try ctx.prefetch(OptimizeFunctionInstance, instruction.call.target.direct);
+    }
+    for (body.initializer_regions) |*region| try prefetchOptimizationCallees(ctx, region);
 }
 
 fn OptimizationContext(comptime Context: type) type {

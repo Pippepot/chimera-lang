@@ -1,0 +1,142 @@
+test
++- run test w
+panic: List literal allocation failed
+  at allocate_literal(Array(int, 262144)) ($std/memory/allocation.chi:178:42)
+  at $converter(Array(int, 262144), 1) ($std/memory/allocation.chi:182:36)
+  at run (main.chi:4:46)
+  at <entry> (main.chi:6:6)
+failed command: cd .zig-cache/o/7de65b500371d300b71596172b302e2b && ./test --cache-dir=./../.. --seed=0x0 --listen=-
+
+test
++- run test w
+panic: List literal allocation failed
+  at allocate_literal(Array(int, 262144)) ($std/memory/allocation.chi:178:42)
+  at new_collection_list(Array(int, 262144), 1) ($std/memory/allocation.chi:196:30)
+  at run (main.chi:3:46)
+  at <entry> (main.chi:5:6)
+failed command: cd .zig-cache/o/50a2c74f846f875fe63a34dd0bd2cd9e && ./test --cache-dir=./../.. --seed=0x0 --listen=-
+
+Build Summary: 52/52 steps succeeded; 2167/2191 tests passed (24 skipped)
+test success
++- run test 261 pass, 7 skip (268 total) 2m MaxRSS:47M
+|  +- compile test safe native success 4s MaxRSS:402M
+|  |  +- options cached
+|  |  +- run exe precompile-std (std.chimera-artifact) cached
+|  |  |  +- compile exe precompile-std safe native cached 3ms MaxRSS:38M
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+3 more reused dependencies)
++- run test 33 pass (33 total) 40ms MaxRSS:13M
+|  +- compile test safe native success 277ms MaxRSS:188M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 356 pass, 6 skip (362 total) 967ms MaxRSS:110M
+|  +- compile test safe native success 4s MaxRSS:385M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 54 pass, 5 skip (59 total) 953ms MaxRSS:46M
+|  +- compile test safe native success 3s MaxRSS:402M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 609 pass, 5 skip (614 total) 9s MaxRSS:38M
+|  +- compile test safe native success 4s MaxRSS:390M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 29 pass (29 total) 680ms MaxRSS:29M
+|  +- compile test safe native success 3s MaxRSS:389M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 27 pass (27 total) 982ms MaxRSS:30M
+|  +- compile test safe native success 3s MaxRSS:385M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 66 pass (66 total) 1s MaxRSS:72M
+|  +- compile test safe native success 4s MaxRSS:382M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 11 pass (11 total) 260ms MaxRSS:30M
+|  +- compile test safe native success 4s MaxRSS:387M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 20 pass (20 total) 546ms MaxRSS:28M
+|  +- compile test safe native success 4s MaxRSS:388M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 22 pass (22 total) 450ms MaxRSS:28M
+|  +- compile test safe native success 4s MaxRSS:388M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 38 pass (38 total) 662ms MaxRSS:32M
+|  +- compile test safe native success 4s MaxRSS:386M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 65 pass (65 total) 11m MaxRSS:50M
+|  +- compile test safe native success 3s MaxRSS:378M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 16 pass (16 total) 173ms MaxRSS:36M
+|  +- compile test safe native success 4s MaxRSS:388M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 62 pass (62 total) 1s MaxRSS:28M
+|  +- compile test safe native success 4s MaxRSS:392M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 41 pass (41 total) 1s MaxRSS:31M
+|  +- compile test safe native success 3s MaxRSS:383M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 81 pass (81 total) 3s MaxRSS:67M
+|  +- compile test safe native success 3s MaxRSS:386M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 29 pass (29 total) 1s MaxRSS:31M
+|  +- compile test safe native success 3s MaxRSS:385M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 22 pass (22 total) 649ms MaxRSS:31M
+|  +- compile test safe native success 3s MaxRSS:392M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 83 pass (83 total) 2s MaxRSS:34M
+|  +- compile test safe native success 4s MaxRSS:385M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 79 pass (79 total) 3s MaxRSS:50M
+|  +- compile test safe native success 3s MaxRSS:381M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 16 pass (16 total) 419ms MaxRSS:31M
+|  +- compile test safe native success 3s MaxRSS:349M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 124 pass (124 total) 2s MaxRSS:33M
+|  +- compile test safe native success 3s MaxRSS:384M
+|  |  +- options (reused)
+|  |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+|  +- compile test safe native (+2 more reused dependencies)
++- run test 23 pass, 1 skip (24 total) 366ms MaxRSS:35M
+   +- compile test safe native success 3s MaxRSS:343M
+   |  +- options (reused)
+   |  +- run exe precompile-std (std.chimera-artifact) (+1 more reused dependencies)
+   +- compile test safe native (+2 more reused dependencies)

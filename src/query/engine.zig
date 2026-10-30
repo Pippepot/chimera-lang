@@ -300,6 +300,7 @@ pub const Context = struct {
     worker_index: ?usize,
     scratch_allocator: std.mem.Allocator,
     result_allocator: ?std.mem.Allocator = null,
+    prefetches: std.ArrayList(*Entry) = .empty,
 
     pub fn input(ctx: *Context, comptime I: type, key: I.Key) anyerror!*const I.Value {
         validateInput(I);
@@ -325,6 +326,41 @@ pub const Context = struct {
 
     pub fn spawn(ctx: *Context, comptime Q: type, input_value: Q.Input) anyerror!Handle(Q) {
         return ctx.db.scheduleInternal(Q, input_value, ctx, .immediate);
+    }
+
+    /// Schedule a new query without observing its result. Existing queries keep
+    /// ordinary lazy validation; only get/spawn records a persistent dependency.
+    /// Callers select work independent of the requesting query.
+    /// Hints settle before this computation returns, including on failure.
+    pub fn prefetch(ctx: *Context, comptime Q: type, input_value: Q.Input) anyerror!void {
+        validateQuery(Q);
+        const input_copy = input_value;
+        const key = queryKey(Q, &input_copy);
+        const db = ctx.db;
+        db.lock();
+        defer db.unlock();
+        if (db.stopping) return error.SchedulerStopped;
+        if (db.entries.contains(key)) return;
+
+        const entry = try db.insertEntryLocked(Q, key);
+        errdefer {
+            _ = db.entries.remove(key);
+            db.destroyEntry(entry);
+        }
+        try ctx.prefetches.append(ctx.allocator(), entry);
+        ctx.current.prefetches = &ctx.prefetches;
+        db.enqueueLocked(entry, .immediate);
+    }
+
+    fn settlePrefetches(ctx: *Context) void {
+        if (ctx.prefetches.items.len == 0) return;
+        // A hint alone observes neither errors nor accumulator values. A later
+        // ordinary demand records those through the usual dependency path.
+        for (ctx.prefetches.items) |entry| ctx.db.waitForEntry(entry, ctx.worker_index) catch {};
+        ctx.db.lock();
+        ctx.current.prefetches = null;
+        ctx.db.unlock();
+        ctx.prefetches.deinit(ctx.allocator());
     }
 
     pub fn emit(ctx: *Context, comptime A: type, value: A) anyerror!void {
@@ -376,7 +412,8 @@ pub fn Handle(comptime Q: type) type {
 pub const Database = struct {
     allocator: std.mem.Allocator,
     profile: ?*profiling.Collector,
-    revision: Revision = 0,
+    // Live revisions are nonzero; zero denotes that a query has never failed.
+    revision: Revision = 1,
     io_runtime: std.Io.Threaded,
     mutex: std.Io.Mutex = .init,
     work_available: std.Io.Condition = .init,
@@ -1084,6 +1121,7 @@ pub const Database = struct {
 
     fn finishEntry(db: *Database, entry: *Entry, result: EntryResult) void {
         db.lock();
+        std.debug.assert(entry.prefetches == null);
         switch (result) {
             .verified => {},
             .success => |output| db.commitComputationLocked(entry, output),
@@ -1130,7 +1168,7 @@ pub const Database = struct {
                     if (!settledLocked(db, dep)) break;
                     // A recovered child can equal its old memo while the parent still
                     // holds a fallback computed during that child's failure.
-                    if (dep.last_failed_at) |failed_at| if (failed_at >= verified_at) return true;
+                    if (dep.last_failed_at >= verified_at) return true;
                     if (dep.changed_at > verified_at) return true;
                 }
             }
@@ -1497,7 +1535,7 @@ const Entry = struct {
     state: EntryState = .queued,
     verified_at: Revision,
     changed_at: Revision,
-    last_failed_at: ?Revision = null,
+    last_failed_at: Revision = 0,
     compute_fn: ComputeFn,
     destroy_input_fn: DestroyValueFn,
     destroy_output_fn: DestroyValueFn,
@@ -1510,6 +1548,8 @@ const Entry = struct {
     // Set at commit so accumulator collection can skip clean subtrees.
     accums_in_subtree: bool = false,
     computation: ?Computation = null,
+    // Temporary scheduling edges participate in cycle detection, not memos.
+    prefetches: ?*const std.ArrayList(*Entry) = null,
     verification_dependency: ?*Entry = null,
     finished: std.atomic.Value(u32) = .init(0),
     waiters: std.atomic.Value(u32) = .init(0),
@@ -1697,6 +1737,9 @@ fn reachesVisit(db: *Database, entry: *Entry, target: *Entry, token: usize) bool
     for (deps) |dependency| {
         if (reachesVisit(db, dependency.entry, target, token)) return true;
     }
+    if (entry.prefetches) |prefetches| for (prefetches.items) |prefetched| {
+        if (reachesVisit(db, prefetched, target, token)) return true;
+    };
 
     return false;
 }
@@ -1913,6 +1956,7 @@ fn computeFn(comptime Q: type) ComputeFn {
                 .scratch_allocator = recycler.allocator(),
                 .result_allocator = if (direct_result) result_arena.allocator() else null,
             };
+            defer ctx.settlePrefetches();
 
             // Every successful return transfers the output into entry storage.
             var output_value: Q.Output = undefined;

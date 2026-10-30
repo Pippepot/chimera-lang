@@ -208,6 +208,16 @@ calls retain the ordinary instruction cost. The caller's growth budget still
 counts every inserted instruction, including constants. This exposes small
 aggregate factories without speculative specialization or standard-library identities.
 
+With parallel workers, optimization hints start callees from prepared bodies,
+including initializer regions, before the inliner requests their bodies. The
+engine schedules only previously unrequested queries and retains no memo
+dependency for a hint.
+Ordinary inliner reads still own result dependencies and runtime validation;
+existing optimized bodies keep lazy validation after edits. Temporary hint
+edges settle before the requester returns, including when optimization fails.
+Collecting hints reads the existing IR without adding metadata dependencies.
+Recursive calls retain the ordinary component-based inlining exclusion.
+
 Within an inline pass, repeated calls reuse callee resolution and per-body
 eligibility and entry-address facts. `InlineFunctionFacts` shares immutable
 callee analysis between callers and depends on `OptimizeFunctionInstance`, so
@@ -494,6 +504,67 @@ its older recorded cold median was 19.650 s. The old compiler also slows under
 current conditions, and these checks do not reproduce a new eight-worker
 source regression. The latest commit's 24.940 s versus the control's 25.638 s
 is a single-order comparison, not an established compiler speedup.
+
+### Parallel Function Optimization
+
+The 2026-10-30 comparison against `9dae8945ba15a45748dbe368c92d8dbb6e4a1507`
+changes only query scheduling and private query state. Callee hints read prepared
+IR, including initializer regions, without introducing observed dependencies.
+Existing queries keep lazy validation. Hint buffers belong to the active
+computation, and live revisions start at one so zero can represent "never
+failed" without an optional tag. The added temporary-wait pointer therefore
+keeps memo nodes at the original **480 bytes** on this target.
+
+Both variants use Zig 0.17.0, ReleaseFast/LLVM, their embedded std bundle, the
+identical history driver and workloads, and affinity `0-7` on an Intel Core Ultra
+7 265K. Builds, tests, and measurements run separately, with default caches and
+seed zero. Each process discards one warm-up and uses the ordinary adaptive
+protocol: two or three cold/edit samples, and up to five runtime samples. The
+second block reverses variant order. Every exit status and sieve output passes.
+
+Times below are **milliseconds**, before → after (percentage change), using each
+block's retained-sample median. Absolute times rose in the second block, so
+comparisons stay within their matched block rather than pooling different
+sample counts and conditions.
+
+| Measurement | Baseline first | Candidate first |
+| --- | ---: | ---: |
+| Cold, zero workers | 19482.003 → 19655.278 (+0.89%) | 20194.398 → 19707.316 (-2.41%) |
+| Fresh leaf edit, zero workers | 130.473 → 133.564 (+2.37%) | 149.285 → 135.100 (-9.50%) |
+| Cold, eight workers | 11636.248 → 4301.129 (-63.04%) | 12060.186 → 4508.236 (-62.62%) |
+| Fresh leaf edit, eight workers | 164.483 → 163.237 (-0.76%) | 191.505 → 193.864 (+1.23%) |
+| Generated sieve runtime | 619.401 → 616.070 (-0.54%) | 699.560 → 681.180 (-2.63%) |
+
+Eight-worker cold compilation improves by **62.6–63.0%**, approximately **2.7×**.
+Eight-worker leaf differences reverse sign (-0.8% and +1.2%); serial leaf
+differences also reverse sign. Several leaf and runtime rows reach the protocol
+cap and remain unstable. These checks establish no repeatable leaf-edit or
+runtime regression; they do not establish an exact timing equality or a serial
+speedup. Both variants produce 119,544,702-byte million-line executables.
+
+The [complete raw samples](optimizer-parallelism/samples.csv) retain every
+sample, range flag, and executable size. The [block summaries](optimizer-parallelism/summary.json)
+and [environment/source manifest](optimizer-parallelism/environment.json)
+identify both source states, frozen binaries, common drivers, order, and
+verification scope. Reproduce each variant with the ordinary commands:
+
+```sh
+taskset -c 0-7 zig build history-benchmark --seed=0 -Doptimize=fast -j1 -- --case=core-1000000 --workers=0
+taskset -c 0-7 zig build history-benchmark --seed=0 -Doptimize=fast -j1 -- --case=core-1000000 --workers=8
+taskset -c 0-7 zig build history-benchmark --seed=0 -Doptimize=fast -j1 -- --case=sieve-88000000 --skip-c
+```
+
+The scheduling implementation passes the [routine Safe suite](optimizer-parallelism/safe-tests.txt):
+**52/52 steps, 2,167 tests passed, 24 skipped**. The final isolated failure-revision
+compaction then passes all **33 engine tests**; it changes no serialized revision
+or compiler IR. All final measurements use that compacted source. Engine tests
+cover overlap, owned results, unobserved diagnostics, lazy edit validation,
+failed requesters, allocation rollback, and cycle recovery. The compiler
+regression checks three fresh leaf values with zero and four workers: each edit
+builds and types exactly one body, reuses unrelated optimized bodies, and drops
+an unreachable leaf's dependency and diagnostics. Modified Zig files pass
+formatting, and `git diff --check` passes. Exhaustive allocation-failure sweeps
+were not requested or run.
 
 ### Sieve Runtime Attribution
 

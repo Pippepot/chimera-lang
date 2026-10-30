@@ -1,0 +1,87 @@
+{
+  "baseline_commit": "9dae8945ba15a45748dbe368c92d8dbb6e4a1507",
+  "source_sha256": {
+    "baseline": "b956b0feebd372eba30bcd59abbede8fe2179507f8d3c33696cd19ad73ce423a",
+    "candidate": "bda4d9cba800e8b2edda6149a2ce4feb314e8e63877869fbd3dd626721530e7b"
+  },
+  "benchmark_sha256": {
+    "baseline": "34180cc9d987046d424594f99531a6c44bb7a02d0344a08e2a2a5941780a98ff",
+    "candidate": "97cc9f01ffc9768ef4f2b84aa01602425182c7bb888cb86f01994245079d70ac"
+  },
+  "driver_sha256": {
+    "benchmarks/history_benchmark.zig": "9bf62ccf84001be87735d716bc01393d7797996706dffc096b6a66c15b3e1362",
+    "benchmarks/history_workload.zig": "aabcf0c675cd16e090623377e6ae5258ecbafbd8750066c3698e539f9519327c",
+    "benchmarks/history_sampling.zig": "e6fa44ed277958060a5cff8794659c632d6b1b0cd8ef985b5b7272de4866f7e2"
+  },
+  "zig": "0.17.0",
+  "host": "pth",
+  "kernel": "7.2.9-arch1-1",
+  "cpu": "Intel(R) Core(TM) Ultra 7 265K",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "settings": "ReleaseFast/LLVM, seed=0, default caches, embedded std, no disk cache, no profiling",
+  "protocol": "One warmup; adaptive 2-3 cold/edit samples and 2-5 runtime samples; all samples retained; order reversed in block 1.",
+  "source_changes": [
+    "src/queries.zig",
+    "src/query/engine.zig"
+  ],
+  "node_storage": "480-byte memo nodes in both variants; live revisions start at 1 and zero denotes no failure.",
+  "verification": {
+    "routine_safe": {
+      "command": "zig build test --seed=0 -Doptimize=safe -j1 --summary all",
+      "source_sha256": "3e14f1e9cf9272187cc6c5ddedc45444f49cf8b135106fb9afd54167d750d7dd",
+      "files_sha256": {
+        "src/query/engine.zig": "c53d5b79a5cd7b530d9409cdde2e970e2f00fba5cdfe7bebcba92f9ed2b87174",
+        "src/queries.zig": "d61a3c4d92b9c7724c5ce3115f06035c6bc83a022430320cd8f9f28bd00902ec",
+        "tests/query_engine_test.zig": "a2455a9336d941b6a815fb330b0741a0a5dc391b6881909c4a7e1e1364e42b9e",
+        "tests/optimizer_test.zig": "2abc0e0b2e4d277c3d65b8d83a4b699c967297ae61bfa929ccf4dcbee567347c"
+      },
+      "steps_succeeded": 52,
+      "tests_passed": 2167,
+      "tests_skipped": 24,
+      "scope": "Scheduling implementation before the final isolated failure-revision compaction."
+    },
+    "final_engine": {
+      "command": "zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/query_engine_test.zig -j1 --summary all",
+      "source_sha256": "bda4d9cba800e8b2edda6149a2ce4feb314e8e63877869fbd3dd626721530e7b",
+      "files_sha256": {
+        "src/query/engine.zig": "0bc624c4469049a5268d68088cae3b858fd43484e6345a9c4ae8fd60643b1fe2",
+        "src/queries.zig": "d61a3c4d92b9c7724c5ce3115f06035c6bc83a022430320cd8f9f28bd00902ec",
+        "tests/query_engine_test.zig": "a2455a9336d941b6a815fb330b0741a0a5dc391b6881909c4a7e1e1364e42b9e",
+        "tests/optimizer_test.zig": "2abc0e0b2e4d277c3d65b8d83a4b699c967297ae61bfa929ccf4dcbee567347c"
+      },
+      "steps_succeeded": 6,
+      "tests_passed": 33,
+      "scope": "Final nonzero-revision representation, including failure recovery and invalidation."
+    }
+  },
+  "measurement_order": [
+    {
+      "block": 0,
+      "variants": [
+        "baseline",
+        "candidate"
+      ]
+    },
+    {
+      "block": 1,
+      "variants": [
+        "candidate",
+        "baseline"
+      ]
+    }
+  ],
+  "lane_order": [
+    "0 workers",
+    "8 workers",
+    "runtime"
+  ]
+}
