@@ -357,7 +357,7 @@ fn liveValues(scratch: std.mem.Allocator, function: *Function, reachable: []cons
 pub fn removableWhenUnused(function: *const Function, instruction: Instruction) bool {
     return switch (instruction) {
         .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .variant_tag, .field_access, .borrow_address, .borrow_read, .storage_projection, .allocation_element, .array_element, .storage_cursor, .cursor_offset, .cursor_element => true,
-        .divsi => |operands| if (function.definition(operands.rhs)) |divisor| divisor == .const_int and divisor.const_int != 0 else false,
+        .divsi, .shli, .shrsi => |operands| if (function.definition(operands.rhs)) |rhs| rhs == .const_int and instruction.integerRhsIsValid(rhs.const_int) else false,
         inline .value_copy, .variant_coerce, .variant_extract => |operation| operation.destination == null,
         else => false,
     };

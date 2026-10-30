@@ -232,8 +232,10 @@ class HistoryTests(unittest.TestCase):
         self.assertEqual(cached[-1]["nanoseconds"], 999_999_999)
 
     def test_measure_reuses_c_samples_and_refresh_forces_remeasurement(self):
-        for saved, refresh, affinity in ((False, False, [4]), (False, False, list(range(4, 12))),
-                                         (True, False, [4]), (True, True, [4])):
+        for saved, refresh, affinity, worker_affinity in (
+            (False, False, [4], None), (False, False, list(range(4, 12)), None),
+            (True, False, [4], None), (True, True, [4], None),
+            (True, False, [4], list(range(4, 12)))):
             with self.subTest(saved=saved, refresh=refresh, affinity=affinity), tempfile.TemporaryDirectory() as directory:
                 snapshot = Path(directory)
                 (snapshot / "benchmarks").mkdir()
@@ -250,6 +252,11 @@ class HistoryTests(unittest.TestCase):
                 if saved:
                     history.save(data, previous)
                 hit = saved and not refresh
+                active_affinity = list(affinity)
+
+                def set_affinity(pid, cpus):
+                    self.assertEqual(pid, 0)
+                    active_affinity[:] = cpus
 
                 def command(arguments, cwd=history.ROOT):
                     if arguments == ["cc", "--version"]:
@@ -259,6 +266,8 @@ class HistoryTests(unittest.TestCase):
                     self.assertEqual(arguments[:2], ["zig", "build"])
                     self.assertEqual("--skip-c" in arguments, hit)
                     self.assertEqual(cwd, snapshot)
+                    expected_affinity = (worker_affinity or affinity) if "--workers=8" in arguments else affinity
+                    self.assertEqual(active_affinity, expected_affinity)
                     case = next(argument.removeprefix("--case=") for argument in arguments if argument.startswith("--case="))
                     rows = [row for row in samples(include_runtime=True, include_c=not hit) if row["case"] == case]
                     if "--workers=8" in arguments:
@@ -270,17 +279,55 @@ class HistoryTests(unittest.TestCase):
                     patch.object(history, "prepare", return_value=True), \
                         patch.object(history, "loc", return_value=previous["loc"]), \
                         patch.object(history, "runner", return_value=previous["runner"]), \
+                        patch.object(history.os, "sched_setaffinity", side_effect=set_affinity), \
                         patch.object(history.shutil, "which", return_value="/usr/bin/cc"), \
                         patch.object(history.sys, "stderr", new_callable=io.StringIO) as stderr:
-                    measured = history.measure(snapshot, "abc", previous["commit_date"], "new-tree", True, False, data, refresh)
-                self.assertEqual("this measures oversubscription" in stderr.getvalue(), len(affinity) < 8)
+                    measured = history.measure(snapshot, "abc", previous["commit_date"], "new-tree", True, False, data,
+                                               refresh, worker_affinity=worker_affinity)
+                self.assertEqual("this measures oversubscription" in stderr.getvalue(), len(worker_affinity or affinity) < 8)
                 self.assertEqual(measured["runner"]["affinity"], affinity)
+                self.assertEqual(measured["worker_affinity"], worker_affinity or affinity)
+                self.assertEqual(active_affinity, affinity)
                 expected = samples() + [dict(sample, lane="workers-8") for sample in samples()]
                 expected.extend(sample for sample in samples(include_c=True) if sample["case"] == history.RUNTIME_CASE)
                 self.assertEqual(measured["benchmarks"][0]["samples"], expected)
                 self.assertEqual(measured["c_reference"]["snapshot"], "tree" if hit else "new-tree")
                 if saved:
                     self.assertEqual(history.read_records(data), [previous])
+
+    def test_worker_failure_restores_serial_affinity_before_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            current = record()
+            current["runner"]["affinity"] = [4]
+            worker_affinity = list(range(4, 12))
+            active_affinity = [4]
+
+            def set_affinity(pid, cpus):
+                self.assertEqual(pid, 0)
+                active_affinity[:] = cpus
+
+            def command(arguments, cwd=history.ROOT):
+                case = next(argument.removeprefix("--case=") for argument in arguments if argument.startswith("--case="))
+                if "--workers=8" in arguments:
+                    self.assertEqual(active_affinity, worker_affinity)
+                    raise subprocess.CalledProcessError(1, arguments, "", "worker failed")
+                self.assertEqual(active_affinity, [4])
+                return encode([sample for sample in samples(include_c=True) if sample["case"] == case])
+
+            environment = {key: current[key] for key in ("suite", "protocol", "runtime_suite", "zig", "runner")}
+            with patch.object(history, "environment", return_value=environment), \
+                    patch.object(history, "prepare", return_value=True), \
+                    patch.object(history, "loc", return_value=current["loc"]), \
+                    patch.object(history, "command", side_effect=command), \
+                    patch.object(history.os, "sched_setaffinity", side_effect=set_affinity):
+                measured = history.measure(data, "abc", current["commit_date"], "tree", False, False, data,
+                                           worker_affinity=worker_affinity)
+            self.assertEqual(active_affinity, [4])
+            self.assertEqual(len(measured["failures"]), 1)
+            self.assertEqual(measured["failures"][0]["workers"], 8)
+            self.assertEqual({sample["lane"] for sample in measured["benchmarks"][0]["samples"]},
+                             {"normal", *history.C_LANES})
 
     def test_rejects_incomplete_duplicate_or_changed_suite(self):
         original = samples()
@@ -476,6 +523,7 @@ class HistoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             current = record()
+            current["runner"]["affinity"] = list(range(8))
             current["benchmarks"][0]["samples"] = samples(include_runtime=True)
             current["benchmarks"][0]["samples"].extend(
                 dict(sample, lane="workers-8", nanoseconds=sample["nanoseconds"] // 2) for sample in samples())
@@ -536,6 +584,42 @@ class HistoryTests(unittest.TestCase):
                 elif "Runtime" in series:
                     self.assertEqual([point[0] for point in series["Runtime"]], [0, 0.35])
             self.assertEqual(history.read_records(data), [previous, current])
+
+    def test_oversubscribed_workers_preserve_latest_eligible_series_and_c_reference(self):
+        for allowed_cpus in (1, 7, 8):
+            for separate_affinity in (False, True):
+                with self.subTest(allowed_cpus=allowed_cpus, separate_affinity=separate_affinity), \
+                        tempfile.TemporaryDirectory() as directory:
+                    data = Path(directory)
+                    previous = record()
+                    previous["runner"]["affinity"] = list(range(8))
+                    previous["benchmarks"][0]["samples"] = samples(include_c=True)
+                    previous["benchmarks"][0]["samples"].extend(
+                        dict(sample, lane="workers-8", nanoseconds=sample["nanoseconds"] // 2) for sample in samples())
+                    current = copy.deepcopy(previous)
+                    current["recorded_at"] = "2026-10-23T12:00:00Z"
+                    current["runner"]["affinity"] = list(range(allowed_cpus))
+                    if separate_affinity:
+                        current["runner"]["affinity"] = [4]
+                        current["worker_affinity"] = list(range(allowed_cpus))
+                    for sample in current["benchmarks"][0]["samples"]:
+                        sample["nanoseconds"] *= 10
+                    for entry in (previous, current):
+                        history.save(data, entry)
+                    with patch.object(history, "graph_artifact", return_value="") as graph, \
+                            patch.object(history, "benchmark_overview"):
+                        history.render(data, [(previous["commit"], previous["commit_date"])])
+                    self.assertEqual(graph.call_count, 4)
+                    for call in graph.call_args_list:
+                        series = call.args[2]
+                        if "Compile" in series:
+                            self.assertEqual([point[1] for point in series["Compile"]], [0.02])
+                            expected = 0.01 if allowed_cpus >= 8 else 0.001
+                            self.assertEqual([point[1] for point in series["Compile (8 workers)"]], [expected])
+                        elif "Runtime" in series:
+                            self.assertEqual([point[1] for point in series["Runtime"]], [1.0])
+                            self.assertAlmostEqual(call.kwargs["references"]["C -O3"][0], 16.01)
+                    self.assertEqual(history.read_records(data), [previous, current])
 
     def test_runtime_report_uses_latest_medians_in_legend(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -670,6 +754,7 @@ class HistoryTests(unittest.TestCase):
             current = record()
             current["commit"] = "new"
             current["recorded_at"] = "2026-10-23T12:00:00Z"
+            current["runner"]["affinity"] = list(range(8))
             current["benchmarks"][0]["samples"].extend(
                 dict(sample, lane="workers-8") for sample in samples())
             for entry in (previous, current):
@@ -739,6 +824,22 @@ class HistoryTests(unittest.TestCase):
                     render.assert_called_once()
                 self.assertEqual(history.read_records(data), [current])
 
+    def test_cpu_pin_preserves_original_worker_affinity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            current = record()
+            with patch.object(history.sys, "argv", ["history.py", "--cpu", "4", "--data-dir", directory]), \
+                    patch.object(history.os, "sched_getaffinity", return_value=set(range(4, 12))), \
+                    patch.object(history.os, "sched_setaffinity") as set_affinity, \
+                    patch.object(history, "command", return_value="abc"), \
+                    patch.object(history, "commits", return_value=[("abc", current["commit_date"])]), \
+                    patch.object(history, "unpack"), \
+                    patch.object(history, "measure", return_value=current) as measure, \
+                    patch.object(history, "render", return_value=data / "index.html"):
+                history.main()
+            set_affinity.assert_called_once_with(0, {4})
+            self.assertEqual(measure.call_args.kwargs["worker_affinity"], list(range(4, 12)))
+
     def test_backfill_resumes_matching_attempts_including_failures(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
@@ -750,6 +851,7 @@ class HistoryTests(unittest.TestCase):
                     patch.object(history, "command", return_value="abc"), \
                     patch.object(history, "commits", return_value=[("abc", previous["commit_date"])]), \
                     patch.object(history, "environment", return_value=current), \
+                    patch.object(history.os, "sched_getaffinity", return_value={0}), \
                     patch.object(history, "render", return_value=data / "index.html"), \
                     patch.object(history, "measure") as measure:
                 history.main()

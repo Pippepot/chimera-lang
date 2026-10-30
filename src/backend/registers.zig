@@ -251,7 +251,7 @@ fn overlap(left: []const Interval, right: []const Interval) bool {
 
 fn isBranch(operation: x86.Operation) bool {
     return switch (operation) {
-        .jmp, .jl, .jg, .jle, .jge, .je, .jne, .ret, .ud2 => true,
+        .jmp, .jl, .jg, .jle, .jge, .je, .jne, .ja, .ret, .ud2 => true,
         else => false,
     };
 }

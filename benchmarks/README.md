@@ -147,20 +147,23 @@ zig build history-benchmark --seed=0 -j1 -Doptimize=fast -- --case=core-1000000 
 Nonzero-worker samples use a `workers-N` lane. The history recorder runs the
 zero-worker and eight-worker lanes independently and plots both; other counts
 remain standalone probes. Both recorded lanes use the same adaptive policy.
-Compare worker counts on the same CPU affinity set, using physical
-cores where possible; do not pin a multiworker run to one CPU. `--cpu` restricts
-every lane to that one CPU. The recorder warns when the worker count exceeds
-the allowed CPU count: those samples measure oversubscription, not multicore
-scaling. It preserves the requested affinity and all samples. To record both
-lanes on an eight-core CPU set, omit `--cpu`:
+`--cpu` pins zero-worker compilation and generated runtime (including C) to
+that CPU. The eight-worker lane uses the invocation's original CPU set, before
+`--cpu` pinning, while respecting any outer `taskset` restriction. The recorder
+warns if that set has fewer than eight CPUs. Such samples remain in the raw
+records but are excluded from worker-count graphs; the latest eligible result
+for each lane is retained. Use physical cores where possible. To record both
+lanes on the same eight-core CPU set, omit `--cpu`:
 
 ```sh
 taskset -c 4-11 .venv/bin/python benchmarks/history.py --worktree
 ```
 
-Affinity remains part of the recorded environment for auditing and C-reference
-reuse, but these results overlay the existing graphs for the same machine and
-toolchain. Consult the raw records when comparing runs with different affinities.
+Serial/runtime affinity remains in `runner.affinity`; the worker CPU set is
+recorded separately as `worker_affinity`. C-reference reuse depends only on the
+serial/runtime affinity, not the worker set. These results overlay the existing
+graphs for the same machine and toolchain. Consult the raw records when comparing
+runs with different affinities.
 Keep the normal warm-up and cold/edit validation. The worker option does not
 change runtime sampling.
 

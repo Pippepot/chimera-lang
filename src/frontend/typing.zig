@@ -1009,7 +1009,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn buildPrimitiveOperation(self: *Self, operation: structures.Operation) !void {
             switch (operation) {
-                .@"+", .@"-", .@"*", .@"/" => return self.returnValue(try self.primitiveArithmetic(operation, .{ .lhs = self.values.get(0).?.id, .rhs = self.values.get(1).?.id }), .{ .start = 0, .end = 0 }),
+                .@"+", .@"-", .@"*", .@"/", .@"<<", .@">>" => return self.returnValue(try self.primitiveArithmetic(operation, .{ .lhs = self.values.get(0).?.id, .rhs = self.values.get(1).?.id }), .{ .start = 0, .end = 0 }),
                 .@"%" => return self.buildPrimitiveRemainder(),
                 .unary_minus => return self.returnValue(try self.appendInstruction(.{ .negi = self.values.get(0).?.id }), .{ .start = 0, .end = 0 }),
                 .@"==", .@"<>", .@"<", .@">", .@"<=", .@">=", .not => return self.buildPrimitivePredicate(operation),
@@ -1023,6 +1023,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .@"-" => .{ .subi = operands },
                 .@"*" => .{ .muli = operands },
                 .@"/" => .{ .divsi = operands },
+                .@"<<" => .{ .shli = operands },
+                .@">>" => .{ .shrsi = operands },
                 else => unreachable,
             };
             return self.appendInstruction(instruction);
@@ -7935,7 +7937,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (callable.operation.target == .direct) if (try self.analysis_context.inlineBuiltin(callable.operation.target.direct.item)) |builtin| {
                 switch (builtin.symbol) {
                     .primitive_operation => switch (builtin.operation.?) {
-                        .@"+", .@"-", .@"*", .@"/" => {
+                        .@"+", .@"-", .@"*", .@"/", .@"<<", .@">>" => {
                             const arguments = self.call_arguments.items[callable.operation.arguments.start..callable.operation.arguments.end];
                             const result = try self.primitiveArithmetic(builtin.operation.?, .{ .lhs = arguments[0].valueId(), .rhs = arguments[1].valueId() });
                             return self.defineOwnedValue(result, span, false);

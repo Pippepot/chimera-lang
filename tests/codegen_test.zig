@@ -2004,3 +2004,33 @@ test "data relocations own deduplicated bytes and preserve cursor offsets" {
     bytes[1] = 99;
     try expectArtifactExitCode(artifact, 84);
 }
+
+test "native shifts preserve variable counts incoming homes borrowed counts and loop registers" {
+    const source =
+        \\func left(value: int, count: int) int -> value << count
+        \\func right(value: int, count: int) int -> value >> count
+        \\func borrowed(value: int, ref count: int) int -> value >> count
+        \\func repeated(value: int, count: int) int
+        \\    var amount = count
+        \\    var total = 0
+        \\    var index = 0
+        \\    loop
+        \\        if index == 4 -> break
+        \\        total += (value << amount) >> amount
+        \\        amount += 1
+        \\        index += 1
+        \\    return total
+        \\func run() int
+        \\    var count = 3
+        \\    if left(1, 31) <> -2147483648 -> return 90
+        \\    if right(-9, count) <> -2 -> return 91
+        \\    if borrowed(-2147483648, count) <> -268435456 -> return 92
+        \\    if repeated(7, 1) <> 28 -> return 93
+        \\    return right(left(21, 2), 1)
+        \\exit(run())
+    ;
+    const fixture = try test_sources.SourceFixture.init(source);
+    defer fixture.deinit();
+    try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+}

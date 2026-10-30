@@ -267,7 +267,8 @@ def environment() -> dict:
 
 
 def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: bool,
-            only_loc: bool, data: Path, refresh_c: bool = False) -> dict:
+            only_loc: bool, data: Path, refresh_c: bool = False,
+            worker_affinity: list[int] | None = None) -> dict:
     record = {"schema": 1, "commit": commit, "commit_date": date, "snapshot": identity,
               "worktree": worktree, "recorded_at": datetime.now(timezone.utc).isoformat(),
               "loc_policy": loc_policy(),
@@ -275,6 +276,7 @@ def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: boo
     if only_loc:
         return record
     record.update(environment())
+    record["worker_affinity"] = worker_affinity if worker_affinity is not None else record["runner"]["affinity"]
     bundled = prepare(snapshot)
     record["standard_library"] = "bundled" if bundled else "source"
     record["failures"] = []
@@ -287,12 +289,15 @@ def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: boo
     print(f"Benchmarking {identity[:12]} (ReleaseFast)", flush=True)
     measured = []
     for case, workers in ((COMPILATION_CASE, 0), (COMPILATION_CASE, 8), (RUNTIME_CASE, 0)):
-        if workers > len(record["runner"]["affinity"]):
-            print(f"Warning: {workers} workers share only {len(record['runner']['affinity'])} allowed CPU(s); "
+        affinity = record["worker_affinity"] if workers else record["runner"]["affinity"]
+        if workers > len(affinity):
+            print(f"Warning: {workers} workers share only {len(affinity)} allowed CPU(s); "
                   "this measures oversubscription, not multicore scaling. "
-                  "Use taskset with at least 8 CPUs and omit --cpu for worker comparisons.",
+                  "Use taskset with at least 8 CPUs for worker comparisons.",
                   file=sys.stderr, flush=True)
         try:
+            if workers and affinity != record["runner"]["affinity"]:
+                os.sched_setaffinity(0, affinity)
             worker_arguments = ["--workers=8"] if workers else []
             rows = parse_samples(command([*arguments, f"--case={case}", *worker_arguments], snapshot), case)
             if case == COMPILATION_CASE:
@@ -311,6 +316,9 @@ def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: boo
             (logs / filename).write_text(details + "\n")
             record["failures"].append({"case": case, "workers": workers, "log": f"failures/{filename}"})
             print(f"  {case}{suffix}: unavailable (see failures/{filename})", flush=True)
+        finally:
+            if workers and affinity != record["runner"]["affinity"]:
+                os.sched_setaffinity(0, record["runner"]["affinity"])
     if cached is not None:
         if any(sample["lane"] in C_LANES for sample in measured):
             raise ValueError("benchmark did not skip cached C measurements")
@@ -501,7 +509,9 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
                     continue
                 selected = [sample for sample in benchmark["samples"]
                             if (sample["phase"] == "runtime") == runtime
-                            and sample["phase"] in CORE_CASES.get(sample["case"], ())]
+                           and sample["phase"] in CORE_CASES.get(sample["case"], ())
+                           and (sample["lane"] != "workers-8"
+                               or len(record.get("worker_affinity", record["runner"]["affinity"])) >= 8)]
                 lanes = ("normal",) if runtime else COMPILATION_LANES
                 if not any(sample["lane"] in lanes for sample in selected):
                     continue
@@ -513,8 +523,13 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
                         provenance["c_compiler"] = record["c_compiler"]
                 configuration = json.dumps(provenance, sort_keys=True)
                 key = (configuration, benchmark["mode"])
-                point = (record["commit"], "worktree" if record["worktree"] else "commit")
-                groups[key][point] = (record, {"mode": benchmark["mode"], "samples": selected})
+                for lane in lanes:
+                    lane_samples = [sample for sample in selected
+                                    if sample["lane"] == lane or (runtime and sample["lane"] in C_LANES)]
+                    if not any(sample["lane"] == lane for sample in lane_samples):
+                        continue
+                    point = (record["commit"], "worktree" if record["worktree"] else "commit", lane)
+                    groups[key][point] = (record, {"mode": benchmark["mode"], "samples": lane_samples})
     benchmark_sections = []
     benchmark_images = []
     for (configuration, mode), entries in groups.items():
@@ -585,7 +600,7 @@ def main() -> None:
     parser.add_argument("--loc-only", action="store_true", help="record LOC without building the compiler")
     parser.add_argument("--backfill-loc", action="store_true", help="record missing LOC for every first-parent ancestor")
     parser.add_argument("--backfill-benchmarks", action="store_true", help="measure missing first-parent revisions, newest first; retain per-workload failure logs")
-    parser.add_argument("--cpu", type=int, help="pin this run to a Linux CPU")
+    parser.add_argument("--cpu", type=int, help="pin serial compilation and runtime to a Linux CPU; workers use the original CPU set")
     parser.add_argument("--refresh-c", action="store_true", help="remeasure C reference timings instead of reusing matching records")
     parser.add_argument("--data-dir", type=Path, default=ROOT / ".history", help="result directory, default .history")
     parser.add_argument("--render-only", action="store_true", help="regenerate graphs without measuring")
@@ -595,6 +610,7 @@ def main() -> None:
         parser.error("--worktree cannot be combined with a commit or backfill")
     if args.backfill_benchmarks and (args.backfill_loc or args.loc_only):
         parser.error("--backfill-benchmarks cannot be combined with LOC-only recording")
+    worker_affinity = sorted(os.sched_getaffinity(0))
     if args.cpu is not None:
         os.sched_setaffinity(0, {args.cpu})
     data = args.data_dir.resolve()
@@ -613,7 +629,8 @@ def main() -> None:
             existing = {(record["commit"], record["loc_policy"]) for record in previous}
             current = environment() if args.backfill_benchmarks else {}
             attempted = {record["commit"] for record in previous
-                         if "failures" in record and all(record.get(key) == value for key, value in current.items())}
+                         if "failures" in record and all(record.get(key) == value for key, value in current.items())
+                         and record.get("worker_affinity", record["runner"]["affinity"]) == worker_affinity}
             for commit, date in selected:
                 if args.backfill_loc and (commit, policy) in existing:
                     continue
@@ -628,12 +645,14 @@ def main() -> None:
                         identity = command(["git", "rev-parse", commit + "^{tree}"])
                     try:
                         record = measure(snapshot, commit, date, identity, args.worktree,
-                                         args.loc_only or args.backfill_loc, data, args.refresh_c)
+                                         args.loc_only or args.backfill_loc, data, args.refresh_c,
+                                         worker_affinity=worker_affinity)
                     except OSError as error:
                         if not args.backfill_benchmarks:
                             raise
                         record = measure(snapshot, commit, date, identity, False, True, data)
                         record.update(current)
+                        record["worker_affinity"] = worker_affinity
                         record["failures"] = [{"case": case, "error": str(error)} for case in CORE_CASES]
                     save(data, record)
                     if record.get("failures") and not args.backfill_benchmarks:

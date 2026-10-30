@@ -118,9 +118,9 @@ const Motion = struct {
         const roots = &self.memory.roots;
         switch (instruction) {
             .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => return .pure,
-            .divsi => |operands| {
-                const divisor = self.function.definition(operands.rhs) orelse return null;
-                return if (divisor == .const_int and divisor.const_int != 0) .pure else null;
+            .divsi, .shli, .shrsi => |operands| {
+                const rhs = self.function.definition(operands.rhs) orelse return null;
+                return if (rhs == .const_int and instruction.integerRhsIsValid(rhs.const_int)) .pure else null;
             },
             .field_access => |operation| return .{ .read = roots.root(operation.operand) },
             .value_copy => |copy| return if (copy.destination == null) .{ .read = roots.root(copy.source) } else null,

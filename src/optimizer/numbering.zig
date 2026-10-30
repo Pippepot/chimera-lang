@@ -162,7 +162,7 @@ fn canonical(function: *const Function, instruction: Instruction) Instruction {
 
 fn kind(roots: *const effects.Roots, instruction: Instruction) Kind {
     return switch (instruction) {
-        .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .divsi, .negi, .byte_to_int, .compare, .select, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => .pure,
+        .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .compare, .select, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => .pure,
         .field_access => |operation| read(roots, operation.operand),
         .variant_tag => |operand| read(roots, operand),
         .value_copy => |copy| if (copy.destination == null) read(roots, copy.source) else .write,

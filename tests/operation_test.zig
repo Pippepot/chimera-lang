@@ -347,6 +347,16 @@ test "minimum integer division by negative one wraps for every divisor location 
 test "operation functions primitive signatures invalidate and recover every call form" {
     const cases = [_]struct { valid: []const u8, invalid: []const u8, calls: []const []const u8 }{
         .{
+            .valid = "pub extern func int.<<(imm left: int, imm right: int) int",
+            .invalid = "pub extern func int.<<(imm left: int, imm right: bool) int",
+            .calls = &.{ "return 21 << 1", "return int.<<(21, 1)", "const operation = int.<<\n    return operation(21, 1)" },
+        },
+        .{
+            .valid = "pub extern func int.>>(imm left: int, imm right: int) int",
+            .invalid = "pub extern func int.>>(mut left: int, imm right: int) int",
+            .calls = &.{ "return 84 >> 1", "return int.>>(84, 1)", "const operation = int.>>\n    return operation(84, 1)" },
+        },
+        .{
             .valid = "pub extern func int.+(imm left: int, imm right: int) int",
             .invalid = "pub extern func int.+(imm left: int, imm right: int) ref int",
             .calls = &.{ "return 19 + 23", "return int.+(19, 23)", "const operation = int.+\n    return operation(19, 23)" },
@@ -641,4 +651,109 @@ test "operation functions reject comparison unary and indexer signature mismatch
         defer testing.allocator.free(source);
         try Fixture.expectSourceDiagnostic(source, .invalid_operation_signature);
     }
+}
+
+test "shifts preserve signed boundaries precedence and callable syntax in both engines" {
+    try Fixture.expectParity(
+        \\func shift(left: int, count: int) int -> (left << count) >> count
+        \\func shift_borrowed(left: int, ref count: int) int -> left >> count
+        \\func run() int
+        \\    const left_shift = int.<<
+        \\    const right_shift: func(imm int, imm int) int = int.>>
+        \\    var count = 3
+        \\    if 1 << 31 <> -2147483648 -> return 90
+        \\    if -2147483648 << 1 <> 0 -> return 91
+        \\    if -9 >> 3 <> -2 -> return 92
+        \\    if -2147483648 >> 31 <> -1 -> return 93
+        \\    if 2147483647 >> 31 <> 0 -> return 94
+        \\    if 7 << 0 <> 7 or -7 >> 0 <> -7 -> return 95
+        \\    if 1 << 1 + 2 <> 8 -> return 96
+        \\    if 64 >> 1 >> 2 <> 8 -> return 97
+        \\    if int.<<(3, 2) <> 12 or left_shift(3, 2) <> 12 -> return 98
+        \\    if int.>>(-9, count) <> -2 or right_shift(-9, count) <> -2 -> return 99
+        \\    if shift(5, count) <> 5 or shift_borrowed(-9, count) <> -2 -> return 100
+        \\    var value = 21
+        \\    value <<= 2
+        \\    value >>= 1
+        \\    return value
+    , 42);
+}
+
+test "custom shifts share arithmetic overloads references converters and compound assignment" {
+    try Fixture.expectParity(
+        \\struct Value
+        \\    pub number: int
+        \\    pub func <<(imm left: Value, imm right: Value) Value -> Value{number = left.number << right.number}
+        \\    pub func >>(imm left: Value, imm right: Value) Value -> Value{number = left.number >> right.number}
+        \\converter(value: int) Value -> Value{number = value}
+        \\func digit(mut order: int, value: int) Value
+        \\    order = order * 10 + value
+        \\    return Value{number = value}
+        \\func position(mut calls: int) int
+        \\    calls += 1
+        \\    return 0
+        \\func run() int
+        \\    var order = 0
+        \\    const shifted = digit(order, 1) << digit(order, 2)
+        \\    if order <> 12 or shifted.number <> 4 -> return 90
+        \\    const operation = Value.>>
+        \\    var value = Value{number = 21}
+        \\    value <<= 2
+        \\    value.number >>= 1
+        \\    if operation(value, 1).number <> 21 -> return 91
+        \\    var values = [value^]
+        \\    var calls = 0
+        \\    values[position(calls)] >>= 1
+        \\    values[0] <<= 1
+        \\    if calls <> 1 -> return 92
+        \\    return values[0].number
+    , 42);
+}
+
+test "invalid shift counts remain executed errors in direct and callable forms" {
+    for ([_][]const u8{ "<<", ">>" }) |operation| for ([_]i32{ -1, 32, 2147483647, -2147483648 }) |count_value| {
+        inline for ([_][]const u8{ "0 {s} {d}", "int.{s}(0, {d})" }) |template| {
+            const expression = try testing.allocator.print(template, .{ operation, count_value });
+            defer testing.allocator.free(expression);
+            const source = try testing.allocator.print("exit(comptime -> {s})", .{expression});
+            defer testing.allocator.free(source);
+            try Fixture.expectSourceDiagnostic(source, .compile_time_invalid_shift_count);
+        }
+        const source = try testing.allocator.print(
+            \\func fail(count: int) int
+            \\    const operation = int.{s}
+            \\    const ignored = operation(0, count)
+            \\    return 42
+            \\exit(fail({d}))
+        , .{ operation, count_value });
+        defer testing.allocator.free(source);
+        for ([_]u32{ 0, 48 }) |inline_limit| {
+            const fixture = try Fixture.init(source);
+            defer fixture.deinit();
+            try fixture.db.addInput(queries.InlineLimit, {}, inline_limit);
+            const result = try fixture.runIo("");
+            defer testing.allocator.free(result.stdout);
+            defer testing.allocator.free(result.stderr);
+            try testing.expect(result.term == .signal);
+        }
+    };
+    try Fixture.expectParity(
+        \\func run() int
+        \\    if false -> return 1 << -1
+        \\    if false -> return 1 >> 32
+        \\    return 42
+    , 42);
+}
+
+test "custom shifts construct immovable results directly in their destination" {
+    try Fixture.expectParity(
+        \\struct Value
+        \\    move = none
+        \\    copy = none
+        \\    number: int
+        \\    pub func <<(imm left: Value, imm right: Value) Value -> Value{number = left.number << right.number}
+        \\func run() int
+        \\    const shifted = Value{number = 21} << Value{number = 1}
+        \\    return shifted.number
+    , 42);
 }

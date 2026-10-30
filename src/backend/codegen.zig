@@ -731,7 +731,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                 .byte_to_int => |operand| try self.emitUnary(u8, operand, null, destination),
                 .variant_tag => |operand| try self.emitUnary(u32, operand, null, destination),
                 .negi => |operand| try self.emitUnary(u32, operand, .neg_eax, destination),
-                inline .addi, .subi, .muli, .divsi => |operands, operation| try self.emitIntegerBinary(operation, operands, destination),
+                inline .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands, operation| try self.emitIntegerBinary(operation, operands, destination),
                 .function_ref => |reference| try self.emitFunctionReference(reference, destination),
                 .initializer_ref => |reference| try self.emitInitializerReference(reference, destination),
                 .variant_coerce => |coercion| try self.emitUse(
@@ -2160,6 +2160,12 @@ fn Encoder(comptime virtual: bool, comptime buffered: bool) type {
             try x86.append(&self.code, self.gpa, operation, @as(u32, @bitCast(value)));
         }
 
+        fn byteImmediate(self: *Self, operation: x86.Operation, value: u8) !void {
+            if (buffered) return self.stream.byteImmediate(operation, value);
+            std.debug.assert(x86.encoding(operation).operand == .u8);
+            try x86.append(&self.code, self.gpa, operation, value);
+        }
+
         fn offset(self: *Self, operation: x86.Operation, value: u32) !void {
             if (buffered) return self.stream.offset(operation, value);
             std.debug.assert(x86.encoding(operation).operand == .u32);
@@ -2236,6 +2242,7 @@ fn Encoder(comptime virtual: bool, comptime buffered: bool) type {
 
         fn integerBinary(self: *Self, comptime operation: std.meta.Tag(structures.FunctionInstruction), rhs: ValueLocation) !void {
             if (operation == .divsi) return self.divide(rhs);
+            if (operation == .shli or operation == .shrsi) return self.shift(operation, rhs);
             const encoding: struct { immediate: x86.Operation, stack: x86.Operation, indirect: x86.Operation } = switch (operation) {
                 .addi => .{ .immediate = .add_eax, .stack = .add_eax_rsp, .indirect = .add_eax_rcx },
                 .subi => .{ .immediate = .sub_eax, .stack = .sub_eax_rsp, .indirect = .sub_eax_rcx },
@@ -2257,6 +2264,31 @@ fn Encoder(comptime virtual: bool, comptime buffered: bool) type {
                 },
                 .eax, .return_buffer, .discarded => unreachable,
             }
+        }
+
+        fn shift(self: *Self, comptime operation: std.meta.Tag(structures.FunctionInstruction), rhs: ValueLocation) !void {
+            const shift_immediate = if (operation == .shli) x86.Operation.shl_eax else x86.Operation.sar_eax;
+            if (rhs == .immediate) {
+                if (rhs.immediate < 0 or rhs.immediate >= 32) return self.emit(.ud2);
+                if (rhs.immediate != 0) try self.byteImmediate(shift_immediate, @intCast(rhs.immediate));
+                return;
+            }
+            switch (rhs) {
+                .register => |selected| try self.register(.load_ecx, selected, 0),
+                .stack, .incoming_argument => |offset_value| try self.offset(.mov_ecx_rsp, offset_value),
+                .indirect => |offset_value| {
+                    try self.offset(.mov_rcx_rsp, offset_value);
+                    try self.emit(.mov_ecx_rcx);
+                },
+                .immediate, .eax, .return_buffer, .discarded => unreachable,
+            }
+            try self.immediate(.cmp_ecx, 31);
+            const invalid = try self.patchable(.ja);
+            try self.emit(if (operation == .shli) .shl_eax_cl else .sar_eax_cl);
+            const done = try self.patchable(.jmp);
+            try self.patchHere(invalid);
+            try self.emit(.ud2);
+            try self.patchHere(done);
         }
 
         fn divide(self: *Self, rhs: ValueLocation) !void {

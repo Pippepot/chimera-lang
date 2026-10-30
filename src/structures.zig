@@ -166,6 +166,8 @@ pub const Node = struct {
         mul,
         div,
         rem,
+        shift_left,
+        shift_right,
         eq,
         ne,
         lt,
@@ -191,6 +193,8 @@ pub const Node = struct {
         mul_assign,
         div_assign,
         rem_assign,
+        shift_left_assign,
+        shift_right_assign,
         block,
         bool_literal,
         call,
@@ -287,7 +291,7 @@ pub const Node = struct {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
             .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .from_end, .reference_type, .move_expr, .propagate_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread => .node,
-            .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .membership, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .binding_else, .func, .type_func, .@"if", .collection_if, .match_arm, .match_guard => .node_node,
+            .add, .sub, .mul, .div, .rem, .shift_left, .shift_right, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .membership, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .shift_left_assign, .shift_right_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .binding_else, .func, .type_func, .@"if", .collection_if, .match_arm, .match_guard => .node_node,
             .param => .parameter,
             .struct_field => .field,
             .signature => .signature,
@@ -424,6 +428,8 @@ pub const Operation = enum {
     @"*",
     @"/",
     @"%",
+    @"<<",
+    @">>",
     unary_minus,
     @"==",
     @"<>",
@@ -1382,6 +1388,8 @@ pub const FunctionInstruction = union(enum) {
     subi: BinaryOperands,
     muli: BinaryOperands,
     divsi: BinaryOperands,
+    shli: BinaryOperands,
+    shrsi: BinaryOperands,
     compare: CompareOperation,
     select: SelectOperation,
     aggregate: AggregateOperation,
@@ -1402,7 +1410,7 @@ pub const FunctionInstruction = union(enum) {
             .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null, null },
             .field_access => |*operation| .{ &operation.operand, null, null },
             .call => |*call| call.operands() ++ .{null},
-            .addi, .subi, .muli, .divsi => |*binary| .{ &binary.lhs, &binary.rhs, null },
+            .addi, .subi, .muli, .divsi, .shli, .shrsi => |*binary| .{ &binary.lhs, &binary.rhs, null },
             .compare => |*operation| .{ &operation.operands.lhs, &operation.operands.rhs, null },
             .select => |*operation| .{ &operation.condition, &operation.then_value, &operation.else_value },
             .fill => |*operation| .{ &operation.first, &operation.count, &operation.value },
@@ -1410,12 +1418,24 @@ pub const FunctionInstruction = union(enum) {
         };
     }
 
+    pub fn integerRhsIsValid(self: FunctionInstruction, rhs: i32) bool {
+        return switch (self) {
+            .addi, .subi, .muli => true,
+            .divsi => rhs != 0,
+            .shli, .shrsi => rhs >= 0 and rhs < 32,
+            else => unreachable,
+        };
+    }
+
     pub fn integerResult(self: FunctionInstruction, lhs: i32, rhs: i32) ?i32 {
+        if (!self.integerRhsIsValid(rhs)) return null;
         return switch (self) {
             .addi => lhs +% rhs,
             .subi => lhs -% rhs,
             .muli => lhs *% rhs,
-            .divsi => if (rhs == 0) null else if (rhs == -1) -%lhs else @divTrunc(lhs, rhs),
+            .divsi => if (rhs == -1) -%lhs else @divTrunc(lhs, rhs),
+            .shli => lhs << @as(u5, @intCast(rhs)),
+            .shrsi => lhs >> @as(u5, @intCast(rhs)),
             else => unreachable,
         };
     }
@@ -1424,7 +1444,7 @@ pub const FunctionInstruction = union(enum) {
         return switch (self) {
             // Each primitive constant is named after the type of its value.
             inline .const_int, .const_int_literal, .const_string_literal, .const_byte, .const_bool, .const_type, .const_unit, .const_none => |_, tag| @field(TypeId, @tagName(tag)["const_".len..]),
-            .variant_tag, .negi, .addi, .subi, .muli, .divsi, .byte_to_int => .int,
+            .variant_tag, .negi, .addi, .subi, .muli, .divsi, .shli, .shrsi, .byte_to_int => .int,
             .borrow_write, .fill, .move => .unit,
             .compare => .bool,
             inline .select, .aggregate => |operation| operation.type_id,
@@ -1860,6 +1880,7 @@ pub const Diagnostic = struct {
         .static_initializer_not_supported = "this static initializer is not supported yet",
         .compile_time_call_cycle = "compile-time call recursively depends on the same function and arguments",
         .compile_time_division_by_zero = "division by zero during compile-time execution",
+        .compile_time_invalid_shift_count = "shift count must be between 0 and 31 during compile-time execution",
         .compile_time_unsupported_operation = "operation is not supported during compile-time execution",
         .compile_time_escaping_storage = "evaluation-owned storage cannot escape compile-time execution",
         .compile_time_panic = ByteStringId,

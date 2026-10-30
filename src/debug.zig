@@ -168,7 +168,7 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
         .value_copy => |operation| try writer.print(" %{d}", .{@backingInt(operation.source)}),
         .field_access => |operation| try writer.print(" %{d}, {d}", .{ @backingInt(operation.operand), operation.field_index }),
         .call => |call| try renderCall(db, ssa, call, writer),
-        .addi, .subi, .muli, .divsi => |operands| try writer.print(" %{d}, %{d}", .{ @backingInt(operands.lhs), @backingInt(operands.rhs) }),
+        .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands| try writer.print(" %{d}, %{d}", .{ @backingInt(operands.lhs), @backingInt(operands.rhs) }),
         .compare => |operation| try writer.print(" {s} %{d}, %{d}", .{ @tagName(operation.operation), @backingInt(operation.operands.lhs), @backingInt(operation.operands.rhs) }),
         .select => |operation| try writer.print(" %{d}, %{d}, %{d}", .{ @backingInt(operation.condition), @backingInt(operation.then_value), @backingInt(operation.else_value) }),
         .fill => |operation| try writer.print(" %{d}, %{d}, %{d}", .{ @backingInt(operation.first), @backingInt(operation.count), @backingInt(operation.value) }),

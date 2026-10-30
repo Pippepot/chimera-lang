@@ -1424,10 +1424,10 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .identifier => return self.appendIdentifier(index, result_is_type),
                 .neg => return self.appendNegation(index),
                 .from_end => return self.appendFromEnd(index),
-                .add, .sub, .mul, .div, .rem => return self.appendBinary(index),
+                .add, .sub, .mul, .div, .rem, .shift_left, .shift_right => return self.appendBinary(index),
                 .range, .range_inclusive => return self.appendRange(index),
                 .eq, .ne, .lt, .gt, .le, .ge, .not, .@"and", .@"or", .is, .membership => return self.appendPredicate(index),
-                .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => return self.appendAssignment(index),
+                .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .shift_left_assign, .shift_right_assign => return self.appendAssignment(index),
                 .@"if", .if_else => return self.appendIf(index, result_is_type),
                 .match_expr => return self.appendMatch(index, result_is_type),
                 .catch_expr, .propagate_expr => return self.appendErrorHandler(index, result_is_type),
@@ -1919,6 +1919,8 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .mul, .mul_assign => .@"*",
                 .div, .div_assign => .@"/",
                 .rem, .rem_assign => .@"%",
+                .shift_left, .shift_left_assign => .@"<<",
+                .shift_right, .shift_right_assign => .@">>",
                 else => unreachable,
             };
         }

@@ -21,7 +21,8 @@ Passes consume IR facts, never source syntax, typing state, `CallBehavior`, or
 standard-library names. Unknown address uses count as address-taking; unknown
 instructions are not removed, moved, or numbered. Preserve wrapping arithmetic,
 eager effects, conditional initialization, ownership hooks, storage identity,
-and panic behavior. Mutable references do not imply universal non-aliasing.
+and panic behavior. Shift counts outside 0 through 31 remain executed errors,
+even when their result is unused. Mutable references do not imply universal non-aliasing.
 
 ## IR and Local Passes
 
@@ -58,6 +59,16 @@ optimize: inline -> prepare passes again -> hoist -> loop idioms -> prepare pass
 | Hoisting | `hoisting.zig` | Loops, resource reads and writes |
 | Loop idioms | `idioms.zig` | Counters, exits, proven ranges |
 | Compaction | `compaction.zig` | Liveness from users |
+
+Canonicalization expands signed division by a constant power of two into a
+sign-dependent bias, wrapping addition, and arithmetic right shift, followed by
+negation for a negative divisor. The bias preserves truncation toward zero,
+including the minimum integer divisor. Mutable/address-exposed inputs retain
+ordinary division. Local rules share a pure scalar emitter that inherits the
+matched instruction's span and inline frame. The canonicalizer rebuilds only
+expanded block instruction lists, once in execution order. Existing address and
+memory facts stay conservative because emitted scalar values are private and
+introduce no writes or address exposure.
 
 Joins and canonicalization converge together. Repeat an earlier phase only when
 a later mutation changes facts it consumed. Removed storage uses or address
@@ -202,7 +213,9 @@ positions, and initializer references become byte offsets; outlined regions appe
 after their parent. Machine streams never publish or cache. Range/label invariants
 are checked at their boundary; displacement and size limits are recoverable errors.
 
-Comparisons produce canonical bools, selections use conditional moves, and
+Shifts use immediate counts or `cl`; dynamic counts are checked before the
+instruction, so x86 count masking cannot change language semantics. Invalid
+counts trap. Comparisons produce canonical bools, selections use conditional moves, and
 single-use compare/increment/select combinations can use wrapping boolean addition.
 Fills use `rep stosb`/`rep stosd`; directed copies use `rep movsb` and restore the
 direction flag after descending copies. Single-use element addresses and legal

@@ -23,6 +23,10 @@
 # wrapping: a nonzero remainder has the sign of its left operand, and
 # min-int % -1 is zero. Remainder by zero is an execution error, reported at
 # the executed operation at compile time.
+# int shifts: << discards high bits and wraps modulo 2^32; >> is arithmetic,
+# replicating the sign bit. Both take an int count in 0 through 31 inclusive.
+# A negative count or count >= 32 is an execution error, also at compile time
+# when the shift is executed. Both operands evaluate once, left to right.
 # byte: distinct unsigned 8-bit integer, values 0 through 255, size and
 # alignment 1. It has trivial move, copy, and drop, but no arithmetic or
 # comparison operations yet.
@@ -66,13 +70,13 @@ pub extern func int.+(imm left: int, imm right: int) int
 # Comparisons and logical operators return bool in every expression position.
 # and/or skip the right operand when the left bool determines their result.
 # The operation-function inventory is +, -, *, /, %, ==, <>, <, >, <=, >=, unary
-# negation and read/write indexing. Logical not is dedicated control flow.
+# negation, <<, >>, and read/write indexing. Logical not is dedicated control flow.
 # Unary and binary arithmetic minus
 # share the spelling -, distinguished only by runtime operand count. neg is an
 # ordinary identifier, with no compiler-defined meaning. Parentheses do not
 # change operator precedence.
 # For receiver type Self, the exact signatures are:
-# +, -, *, /, %: func (imm Self, imm Self) Self
+# +, -, *, /, %, <<, >>: func (imm Self, imm Self) Self
 # ==, <>, <, >, <=, >=: func (imm Self, imm Right) bool
 # unary -: func (imm Self) Self
 # []: func (imm Self, index: Index) Result; ref Self is also allowed
@@ -103,6 +107,11 @@ const subtract: func(imm int, imm int) int = int.-
 # Arithmetic and indexing are ordinary operations. Comparisons return bool.
 # Writable indexing calls []=; compound indexing reads before preparing its RHS.
 # Receivers, indices, and eager replacements evaluate once in source order.
+# Shift operations follow the same Self/Self arithmetic signature and ordinary
+# overload, visibility, converter, callable-reference, and compound-assignment
+# rules. <<= and >>= read the target and replace it with the operation result.
+# Shifts associate left to right, bind below + and -, and above ranges and
+# comparisons; e.g. x << 1 + 2 means x << (1 + 2).
 # Standard [] bounds checks and panics on invalid access. get returns an explicit
 # optional reference instead; slice returns an optional view. To handle absence,
 # guard the optional result with is or a match type pattern before reading or
@@ -119,8 +128,7 @@ const subtract: func(imm int, imm int) int = int.-
 # typed compile-time-only int_literal values remain intrinsic and preserve their
 # wide literal range. Equality of compile-time type metadata remains compiler
 # identity comparison. Tokens with no language semantics yet (such as
-# bitwise operators and shifts) are not added
-# by this contract. Later numeric types use the same operation signatures.
+# bitwise operators) are not added by this contract. Later numeric types use the same operation signatures.
 
 
 # Collection membership

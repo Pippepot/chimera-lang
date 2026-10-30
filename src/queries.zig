@@ -3843,6 +3843,7 @@ fn emitComptimeExecutionIssue(
             .panic => |message| .{ .compile_time_panic = message },
             .call_cycle => .compile_time_call_cycle,
             .division_by_zero => .compile_time_division_by_zero,
+            .invalid_shift_count => .compile_time_invalid_shift_count,
             .unsupported_operation => .compile_time_unsupported_operation,
             .escaping_storage => .compile_time_escaping_storage,
         },

@@ -203,7 +203,7 @@ pub const Function = struct {
         return switch (self.definitions.items[@backingInt(value)]) {
             .argument => |argument| argument.data.representation == .value and (argument.block == self.entry or self.direct(argument.data.type_id)),
             .instruction => |index| switch (self.instructions.items[index]) {
-                .const_int, .const_bool, .const_byte, .const_unit, .const_none, .addi, .subi, .muli, .divsi, .negi, .byte_to_int, .variant_tag, .field_access, .compare, .select, .aggregate, .function_ref, .borrow_address => true,
+                .const_int, .const_bool, .const_byte, .const_unit, .const_none, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .variant_tag, .field_access, .compare, .select, .aggregate, .function_ref, .borrow_address => true,
                 inline .value_copy, .call, .variant_coerce, .variant_extract => |operation| operation.destination == null,
                 else => false,
             },
@@ -485,7 +485,7 @@ pub fn terminatorAllOperands(function: *Function, terminator: *Terminator, conte
 
 pub fn readOperands(function: *Function, instruction: *Instruction, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
     switch (instruction.*) {
-        .addi, .subi, .muli, .divsi => |*operands| {
+        .addi, .subi, .muli, .divsi, .shli, .shrsi => |*operands| {
             visit(context, &operands.lhs);
             visit(context, &operands.rhs);
         },

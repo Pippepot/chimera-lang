@@ -552,7 +552,7 @@ fn parseDeclarationName(parser: *ParserState, allow_qualified: bool) !Declaratio
 
 fn isOperationName(tag: Token.Tag) bool {
     return switch (tag) {
-        .plus, .minus, .asterisk, .slash, .percent, .equal_equal, .angle_bracket_left_angle_bracket_right, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal, .keyword_not, .l_bracket => true,
+        .plus, .minus, .asterisk, .slash, .percent, .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .equal_equal, .angle_bracket_left_angle_bracket_right, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal, .keyword_not, .l_bracket => true,
         else => false,
     };
 }
@@ -628,6 +628,8 @@ fn assignmentTag(token: Token.Tag) ?Node.Tag {
         .asterisk_equal => .mul_assign,
         .slash_equal => .div_assign,
         .percent_equal => .rem_assign,
+        .angle_bracket_angle_bracket_left_equal => .shift_left_assign,
+        .angle_bracket_angle_bracket_right_equal => .shift_right_assign,
         else => null,
     };
 }
@@ -975,11 +977,13 @@ fn binaryOpInfo(token: Token.Tag) ?BinaryOpInfo {
         .keyword_in => .{ .tag = .membership, .precedence = 3 },
         .keyword_is => .{ .tag = .is, .precedence = 3 },
         .ellipsis2 => .{ .tag = .range, .precedence = 4 },
-        .plus => .{ .tag = .add, .precedence = 5 },
-        .minus => .{ .tag = .sub, .precedence = 5 },
-        .asterisk => .{ .tag = .mul, .precedence = 6 },
-        .slash => .{ .tag = .div, .precedence = 6 },
-        .percent => .{ .tag = .rem, .precedence = 6 },
+        .angle_bracket_angle_bracket_left => .{ .tag = .shift_left, .precedence = 5 },
+        .angle_bracket_angle_bracket_right => .{ .tag = .shift_right, .precedence = 5 },
+        .plus => .{ .tag = .add, .precedence = 6 },
+        .minus => .{ .tag = .sub, .precedence = 6 },
+        .asterisk => .{ .tag = .mul, .precedence = 7 },
+        .slash => .{ .tag = .div, .precedence = 7 },
+        .percent => .{ .tag = .rem, .precedence = 7 },
         else => null,
     };
 }

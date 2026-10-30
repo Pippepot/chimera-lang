@@ -4,6 +4,7 @@ const structures = @import("../structures.zig");
 pub const ExecutionErrorReason = union(enum) {
     call_cycle,
     division_by_zero,
+    invalid_shift_count,
     unsupported_operation,
     escaping_storage,
     panic: structures.ByteStringId,
@@ -446,8 +447,8 @@ fn ExecutionFrame(comptime Executor: type) type {
                 .byte_to_int => |source| return .{ .returned = .{ .runtime = .{ .int = scalar(slots, source).byte } } },
                 .static_conversion => |conversion| return self.staticConversion(conversion, span),
                 .negi => |operand| return .{ .returned = .{ .runtime = .{ .int = -%integer(slots, operand) } } },
-                .addi, .subi, .muli, .divsi => |operands| {
-                    const result = instruction.integerResult(integer(slots, operands.lhs), integer(slots, operands.rhs)) orelse return executionError(.division_by_zero, span);
+                .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands| {
+                    const result = instruction.integerResult(integer(slots, operands.lhs), integer(slots, operands.rhs)) orelse return executionError(if (instruction == .divsi) .division_by_zero else .invalid_shift_count, span);
                     return .{ .returned = .{ .runtime = .{ .int = result } } };
                 },
                 .call => |call| return self.executeCall(call, span),

@@ -972,3 +972,110 @@ test "a zero inline limit keeps calls out of line" {
     try testing.expectEqual(@as(usize, 0), run.inline_frames.len);
     try testing.expect(countCalls(run) >= 6);
 }
+
+test "power of two division rewrites to signed shifts and preserves truncation" {
+    for ([_]i32{ 2, -2, 4, -4, 8, -8, 1024, -1024, 1073741824, -1073741824, -2147483648 }) |divisor| {
+        const program = try testing.allocator.print(
+            \\func divide(value: int) int -> value / {d}
+            \\func check(value: int, divisor: int) int
+            \\    if divide(value) <> value / divisor -> return 1
+            \\    return 0
+            \\func run() int
+            \\    var failures = 0
+            \\    var value = -40
+            \\    loop
+            \\        if value > 40 -> break
+            \\        failures += check(value, {d})
+            \\        value += 1
+            \\    failures += check(-2147483648, {d})
+            \\    failures += check(-2147483647, {d})
+            \\    failures += check(2147483647, {d})
+            \\    return 42 + failures
+            \\exit(run())
+        , .{ divisor, divisor, divisor, divisor, divisor });
+        defer testing.allocator.free(program);
+        const fixture = try Fixture.init(program);
+        defer fixture.deinit();
+        try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
+        try fixture.expectExit(0, 42);
+        const body = (try optimizedBody(fixture, "divide")).*.?;
+        try testing.expectEqual(@as(usize, 0), count(body, &.{.divsi}));
+        try testing.expectEqual(@as(usize, 1), count(body, &.{.shrsi}));
+    }
+}
+
+test "division rewriting and source shifts recompute after count and divisor edits" {
+    const program =
+        \\func divide(value: int) int -> value / 8
+        \\func shifted(value: int) int -> value >> 1
+        \\exit(divide(336) + shifted(0))
+    ;
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+    const original = try optimizedBody(fixture, "divide");
+    try testing.expectEqual(@as(usize, 0), count(original.*.?, &.{.divsi}));
+    const changed = try std.mem.replaceOwned(u8, testing.allocator, program, "/ 8", "/ 3");
+    defer testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(0, 112);
+    const recomputed = try optimizedBody(fixture, "divide");
+    try testing.expect(original != recomputed);
+    try testing.expectEqual(@as(usize, 1), count(recomputed.*.?, &.{.divsi}));
+    const invalid = try std.mem.replaceOwned(u8, testing.allocator, changed, ">> 1", ">> 32");
+    defer testing.allocator.free(invalid);
+    const comptime_source = try std.mem.replaceOwned(u8, testing.allocator, invalid, "exit(divide(336) + shifted(0))", "exit(comptime -> shifted(0))");
+    defer testing.allocator.free(comptime_source);
+    try fixture.db.setInput(queries.SourceText, 0, comptime_source);
+    try fixture.expectDiagnostic(0, .compile_time_invalid_shift_count);
+    try fixture.db.setInput(queries.SourceText, 0, program);
+    try fixture.expectExit(0, 42);
+}
+
+test "invalid shifts are retained when unused and inside potentially skipped loops" {
+    const program =
+        \\func ignored(count: int) int
+        \\    const value = 0 << count
+        \\    return 42
+        \\func maybe(count: int, iterations: int) int
+        \\    var index = 0
+        \\    loop
+        \\        if index >= iterations -> break
+        \\        const value = 1 >> count
+        \\        index += 1
+        \\    return 42
+        \\exit(maybe(32, 0))
+    ;
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+    const ignored = (try optimizedBody(fixture, "ignored")).*.?;
+    const maybe = (try optimizedBody(fixture, "maybe")).*.?;
+    try testing.expectEqual(@as(usize, 1), count(ignored, &.{.shli}));
+    try testing.expectEqual(@as(usize, 1), count(maybe, &.{.shrsi}));
+}
+
+test "scalar expansion preserves repeated rewrites and aliases of newly emitted values" {
+    var program: std.ArrayList(u8) = .empty;
+    defer program.deinit(testing.allocator);
+    try program.appendSlice(testing.allocator, "func expanded(value: int) int\n    var total = 0\n");
+    for (0..64) |_| try program.appendSlice(testing.allocator, "    total += (value / -8) * -1\n");
+    try program.appendSlice(testing.allocator,
+        \\    if value < 0 -> return total + (value / -4) * -1
+        \\    return total + (value / -2) * -1
+        \\func run() int
+        \\    if expanded(-9) <> -66 -> return 90
+        \\    if expanded(9) <> 68 -> return 91
+        \\    return 42
+        \\exit(run())
+    );
+    const fixture = try Fixture.init(program.items);
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+    const body = (try optimizedBody(fixture, "expanded")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{ .divsi, .negi }));
+    try testing.expectEqual(@as(usize, 3), count(body, &.{.shrsi}));
+}

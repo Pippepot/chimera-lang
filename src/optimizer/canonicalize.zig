@@ -16,20 +16,30 @@ pub fn canonicalize(function: *Function) !function_ir.Changes {
     var changes: function_ir.Changes = .{};
     while (changed) {
         changed = false;
-        for (function.blocks.items) |block| for (block.instructions.items) |index| {
-            if (function.removed.items[index]) continue;
-            const instruction = &function.instructions.items[index];
-            function_ir.allOperands(function, instruction, function, Function.resolveOperand);
-            const result = function.results.items[index];
-            const original = instruction.*;
-            if (try rules.simplify(instruction, result)) {
-                changed = true;
-                changes.storage = changes.storage or switch (original) {
-                    .borrow_read, .borrow_write, .borrow_address => true,
-                    else => function_ir.usesStorage(function, &original) or function_ir.usesStorage(function, instruction),
-                };
+        for (function.blocks.items) |*block| {
+            rules.source = block.instructions.items;
+            rules.rewritten = .empty;
+            for (rules.source, 0..) |index, position| {
+                rules.position = position;
+                if (!function.removed.items[index]) {
+                    // Rules may append instructions and relocate the function's arrays.
+                    function_ir.allOperands(function, &function.instructions.items[index], function, Function.resolveOperand);
+                    const result = function.results.items[index];
+                    const original = function.instructions.items[index];
+                    var instruction = original;
+                    if (try rules.simplify(&instruction, result)) {
+                        function.instructions.items[index] = instruction;
+                        changed = true;
+                        changes.storage = changes.storage or switch (original) {
+                            .borrow_read, .borrow_write, .borrow_address => true,
+                            else => function_ir.usesStorage(function, &original) or function_ir.usesStorage(function, &instruction),
+                        };
+                    }
+                }
+                if (rules.rewritten.capacity != 0) try rules.rewritten.append(function.scratch, index);
             }
-        };
+            if (rules.rewritten.capacity != 0) block.instructions = rules.rewritten;
+        }
         for (function.blocks.items) |*block| {
             function_ir.terminatorAllOperands(function, &block.terminator, function, Function.resolveOperand);
             if (rules.simplifyTerminator(&block.terminator)) changed = true;
@@ -47,11 +57,35 @@ const Rules = struct {
     address_taken: []const bool,
     stable_values: ?[]const bool = null,
     graph_changed: bool = false,
+    source: []const u32 = &.{},
+    position: usize = 0,
+    rewritten: std.ArrayList(u32) = .empty,
+
+    /// Pure scalar expansion cannot expose storage or change existing memory facts.
+    fn emitScalar(self: *Rules, instruction: Instruction) !ValueId {
+        const function = self.function;
+        std.debug.assert(compaction.isScalar(instruction.resultType()));
+        std.debug.assert(compaction.removableWhenUnused(function, instruction));
+        if (self.rewritten.capacity == 0) try self.rewritten.appendSlice(function.scratch, self.source[0..self.position]);
+        const origin = self.source[self.position];
+        const index = try function.newInstruction(instruction, function.instructionSpan(origin), function.instructionFrame(origin));
+        const value = function.results.items[index];
+        std.debug.assert(function.plainValue(value));
+        try self.rewritten.append(function.scratch, index);
+        return value;
+    }
+
+    fn isAddressTaken(self: *const Rules, value: ValueId) bool {
+        // Newly emitted scalars are private; original facts remain conservative.
+        std.debug.assert(@backingInt(value) < self.function.valueCount());
+        return @backingInt(value) < self.address_taken.len and self.address_taken[@backingInt(value)];
+    }
 
     fn simplify(self: *Rules, instruction: *Instruction, result: ValueId) !bool {
         if (self.function.find(result) != result) return false;
         switch (instruction.*) {
-            .addi, .subi, .muli, .divsi => return self.simplifyBinary(instruction, result),
+            .addi, .subi, .muli, .shli, .shrsi => return self.simplifyBinary(instruction, result),
+            .divsi => return self.simplifyDivision(instruction, result),
             .negi => |operand| return self.simplifyNegation(instruction, result, operand),
             .byte_to_int => |operand| {
                 const folded = self.constant(operand) orelse return false;
@@ -103,6 +137,25 @@ const Rules = struct {
             return true;
         };
         return false;
+    }
+
+    fn simplifyDivision(self: *Rules, instruction: *Instruction, result: ValueId) !bool {
+        if (self.simplifyBinary(instruction, result)) return true;
+        const operands = instruction.divsi;
+        const divisor = self.constant(operands.rhs) orelse return false;
+        if (self.isAddressTaken(result) or self.isAddressTaken(operands.lhs) or self.isAddressTaken(operands.rhs)) return false;
+        if (!self.function.plainValue(operands.lhs)) return false;
+        const magnitude: u32 = @intCast(if (divisor < 0) -@as(i64, divisor) else divisor);
+        if (magnitude <= 1 or !std.math.isPowerOfTwo(magnitude)) return false;
+        const zero = try self.emitScalar(.{ .const_int = 0 });
+        const count = try self.emitScalar(.{ .const_int = @intCast(@ctz(magnitude)) });
+        const mask = try self.emitScalar(.{ .const_int = @intCast(magnitude - 1) });
+        const negative = try self.emitScalar(.{ .compare = .{ .operation = .lti, .operands = .{ .lhs = operands.lhs, .rhs = zero } } });
+        const bias = try self.emitScalar(.{ .select = .{ .condition = negative, .then_value = mask, .else_value = zero, .type_id = .int } });
+        const rounded = try self.emitScalar(.{ .addi = .{ .lhs = operands.lhs, .rhs = bias } });
+        const quotient: Instruction = .{ .shrsi = .{ .lhs = rounded, .rhs = count } };
+        instruction.* = if (divisor > 0) quotient else .{ .negi = try self.emitScalar(quotient) };
+        return true;
     }
 
     fn simplifyNegation(self: *Rules, instruction: *Instruction, result: ValueId, operand: ValueId) bool {
@@ -166,7 +219,7 @@ const Rules = struct {
             return self.alias(result, field);
         }
         const argument = function.definitions.items[@backingInt(operation.operand)].argument;
-        if (argument.block == function.entry or !function.plainValue(operation.operand) or self.address_taken[@backingInt(operation.operand)]) return false;
+        if (argument.block == function.entry or !function.plainValue(operation.operand) or self.isAddressTaken(operation.operand)) return false;
         const parameters = function.blocks.items[argument.block].parameters.items;
         const position = std.mem.indexOfScalar(ValueId, parameters, operation.operand).?;
         const incoming = (try function.controlFlowEdges()).incoming[argument.block].items;
@@ -215,7 +268,7 @@ const Rules = struct {
         const value = self.function.find(source orelse return false);
         if (self.function.valueType(value) != operation.type_id) return false;
         if (!self.function.plainValue(value)) return false;
-        if (self.address_taken[@backingInt(result)] or self.address_taken[@backingInt(value)]) {
+        if (self.isAddressTaken(result) or self.isAddressTaken(value)) {
             if (self.stable_values == null) self.stable_values = try effects.stableValues(self.function);
             const stable = self.stable_values.?;
             if (!stable[@backingInt(result)] or !stable[@backingInt(value)]) return false;
@@ -291,7 +344,7 @@ const Rules = struct {
     }
 
     fn alias(self: *Rules, result: ValueId, target: ValueId) bool {
-        if (self.address_taken[@backingInt(result)] or self.address_taken[@backingInt(target)] or !self.function.plainValue(target)) return false;
+        if (self.isAddressTaken(result) or self.isAddressTaken(target) or !self.function.plainValue(target)) return false;
         self.function.replace(result, target);
         return true;
     }
@@ -320,13 +373,14 @@ fn algebra(instruction: Instruction) Algebra {
         .subi => .{ .identity = 0, .self_result = 0 },
         .muli => .{ .commutative = true, .identity = 1, .absorbing = 0, .negating = -1 },
         .divsi => .{ .identity = 1, .negating = -1 },
+        .shli, .shrsi => .{ .identity = 0 },
         else => unreachable,
     };
 }
 
 fn binaryOperands(instruction: *Instruction) *structures.BinaryOperands {
     return switch (instruction.*) {
-        inline .addi, .subi, .muli, .divsi => |*operands| operands,
+        inline .addi, .subi, .muli, .divsi, .shli, .shrsi => |*operands| operands,
         else => unreachable,
     };
 }

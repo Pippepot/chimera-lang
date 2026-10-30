@@ -152,6 +152,10 @@ const instructions = .{
     .cld = Encoding{ .prefix = &.{0xFC}, .asm_prefix = "cld" },
     .rep_stosb = Encoding{ .prefix = &.{ 0xF3, 0xAA }, .asm_prefix = "rep stosb" },
     .test_ecx = Encoding{ .prefix = &.{ 0x85, 0xC9 }, .asm_prefix = "test ecx, ecx" },
+    .shl_eax = Encoding{ .prefix = &.{ 0xC1, 0xE0 }, .operand = .u8, .asm_prefix = "shl eax, " },
+    .sar_eax = Encoding{ .prefix = &.{ 0xC1, 0xF8 }, .operand = .u8, .asm_prefix = "sar eax, " },
+    .shl_eax_cl = Encoding{ .prefix = &.{ 0xD3, 0xE0 }, .asm_prefix = "shl eax, cl" },
+    .sar_eax_cl = Encoding{ .prefix = &.{ 0xD3, 0xF8 }, .asm_prefix = "sar eax, cl" },
     .mov_ecx_eax = Encoding{ .prefix = &.{ 0x89, 0xC1 }, .asm_prefix = "mov ecx, eax" },
 };
 

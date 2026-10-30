@@ -59,6 +59,11 @@ pub const Function = struct {
         try self.instructions.append(self.gpa, .{ .fixed = .{ .operation = operation, .bits = @as(u32, @bitCast(value)) } });
     }
 
+    pub fn byteImmediate(self: *Function, operation: x86.Operation, value: u8) !void {
+        std.debug.assert(x86.encoding(operation).operand == .u8);
+        try self.instructions.append(self.gpa, .{ .fixed = .{ .operation = operation, .bits = value } });
+    }
+
     pub fn offset(self: *Function, operation: x86.Operation, value: u32) !void {
         std.debug.assert(x86.encoding(operation).operand == .u32);
         try self.instructions.append(self.gpa, .{ .fixed = .{ .operation = operation, .bits = value } });
