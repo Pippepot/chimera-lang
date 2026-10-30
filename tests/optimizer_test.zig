@@ -39,6 +39,24 @@ fn hasConstant(body: structures.FunctionBodyAnalysis, value: i32) bool {
 
 const arithmetic = [_]Tag{ .addi, .subi, .muli, .divsi, .negi };
 
+test "numbering substitutions converge through branch folding" {
+    const program =
+        \\func same(value: int) int
+        \\    var first = value + 1
+        \\    var second = value + 1
+        \\    if first == second -> return 42
+        \\    return 0
+        \\func run() int -> same(7)
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "same")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &arithmetic));
+    try testing.expectEqual(@as(usize, 0), countPredicates(body));
+    try testing.expect(hasConstant(body, 42));
+}
+
 test "guarded dynamic loop ranges remove redundant checks for ascending strides" {
     for ([_]i32{ 1, 2, 3 }) |step| for ([_]bool{ false, true }) |inclusive| for ([_]bool{ false, true }) |reversed| {
         const sum: i32 = switch (step) {
@@ -496,6 +514,27 @@ test "scalar variant joins batch independent and dependent consumers" {
     defer fixture.deinit();
     const body = (try optimizedBody(fixture, "calculate")).*.?;
     try testing.expectEqual(@as(usize, 0), count(body, &.{ .variant_tag, .variant_extract }));
+}
+
+test "unused aggregate snapshots preserve variant payloads" {
+    const program =
+        \\struct Unused
+        \\    pub value: int | bool | none
+        \\func calculate(mode: int, number: int) int
+        \\    var value: int | bool | none = none
+        \\    if mode == 0 -> value = number
+        \\    if mode == 1 -> value = true
+        \\    const unused = Unused{value = value}
+        \\    _ = unused
+        \\    match value
+        \\        int -> return value
+        \\        bool ->
+        \\            if value -> return 22
+        \\            return 90
+        \\        none -> return 0
+        \\func run() int -> calculate(0, 20) + calculate(1, 99) + calculate(2, 99)
+    ;
+    try Fixture.expectParity(program, 42);
 }
 
 test "value numbering eliminates repeated expressions" {

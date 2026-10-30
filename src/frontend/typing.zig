@@ -29,6 +29,7 @@ const LifetimeSolver = lifetime.Solver;
 
 pub const BodyOptions = struct {
     infer_return_type: bool = false,
+    is_entry: bool = false,
     publish_instruction_spans: bool = false,
     allow_type_values: bool = false,
     expected_result_type: ?structures.TypeId = null,
@@ -138,6 +139,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             next: ?u32,
         };
         const PlaceReferenceMetadata = struct {
+            variant_guard: bool = false,
             storage_depth: u32,
             stable: bool,
             after_write: bool,
@@ -1225,6 +1227,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             access: enum { value, initialize, borrow, consume } = .value,
             fresh_destination: ?Value = null,
             allow_converters: bool = true,
+            allow_error_conversion: bool = false,
             refine: bool = true,
         };
 
@@ -1281,7 +1284,12 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const scope = try self.openBoundary(span);
             defer self.current_boundary = scope.parent;
             switch (statement) {
-                .discard, .lifetime_extend => |value_use| try self.discardValue(try self.discardedValue(value_use.value), value_use.span),
+                .discard => |value_use| {
+                    const result = try self.discardedValue(value_use.value);
+                    if (try self.hasErrorAlternatives(result.type_id)) return self.reject(value_use.span, .discarded_error);
+                    try self.discardValue(result, value_use.span);
+                },
+                .lifetime_extend => |value_use| try self.discardValue(try self.value(value_use.value), value_use.span),
                 .bind_conditional => |binding| try self.bindConditional(binding),
                 .bind_local => |binding| try self.bindLocal(binding),
                 .bind_pattern => |binding| try self.bindPatternStatement(binding),
@@ -1344,6 +1352,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn installLocal(self: *Self, local: semantic.UnresolvedBody.LocalId, source: Value, reference: bool, mutable: bool) !void {
             var bound_value = source;
+            if (reference) {
+                try self.recordUse(bound_value);
+                bound_value.borrowed_generation = null;
+                bound_value.borrowed_cleanup_value = null;
+            }
             bound_value.binding_identity = try self.newBindingIdentity();
             bound_value.explicit_transfer = false;
             const index = @backingInt(local);
@@ -2230,6 +2243,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const id = returned.value.value;
             const span = returned.value.span;
             if (self.initializerExitBoundary()) return self.reject(span, .initializer_exit_outside_boundary);
+            if (self.options.is_entry) return self.returnEntryValue(try self.valueWithContext(id, .{ .access = .initialize }), span);
             if (self.options.result_mode == .reference) return self.returnValue(try self.captureReference(.{ .value = id, .span = span }), span);
             if (returned.implicit and !self.options.infer_return_type and self.return_type == .unit) {
                 const result = try self.discardedValue(id);
@@ -2308,6 +2322,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn finishFunctionExit(self: *Self, span: structures.SourceSpan, terminator: structures.FunctionTerminator) !void {
+            if (self.current_boundary != null) try self.moveCurrentBoundaryEffectsToTerminator();
             if (self.is_initializer_region and (terminator == .return_value or terminator == .return_unit))
                 try self.ordinary_completion_states.append(self.gpa, try self.captureState());
             const boundary = try self.newBoundary(span);
@@ -2371,14 +2386,15 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn evaluateValue(self: *Self, id: semantic.UnresolvedBody.ValueId, request: ResultRequest) anyerror!Value {
             if (request.reference) {
                 const operation = self.expressionOperation(id);
-                if (operation == null or (operation.?.* != .if_else and operation.?.* != .match and operation.?.* != .loop and operation.?.* != .scope))
+                if (operation == null or (operation.?.* != .if_else and operation.?.* != .match and operation.?.* != .error_handler and operation.?.* != .loop and operation.?.* != .scope))
                     return self.captureReference(.{ .value = id, .span = self.valueSpan(id) });
             }
             return self.evaluateUncapturedValue(id, request);
         }
 
-        fn selectConversion(self: *Self, source_type: structures.TypeId, target: structures.TypeId, source_value: ?structures.CompileTimeValueId, span: structures.SourceSpan) !?structures.ConversionCandidate {
+        fn selectConversion(self: *Self, source_type: structures.TypeId, target: structures.TypeId, source_value: ?structures.CompileTimeValueId, span: structures.SourceSpan, allow_error_conversion: bool) !?structures.ConversionCandidate {
             if (source_type != .never and try semantic.canWidenTo(self.analysis_context, source_type, target)) return null;
+            if (!allow_error_conversion and try self.hasErrorAlternatives(source_type)) return null;
             const candidates = try self.analysis_context.conversionCandidates(if (source_type == .never) .none else source_type, target, source_value);
             var selected: ?structures.ConversionCandidate = null;
             for (candidates) |candidate| {
@@ -2399,13 +2415,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (source_type == .string_literal) return null;
             if (source_type != .never and try semantic.canWidenTo(self.analysis_context, source_type, target)) return null;
             const span = self.valueSpan(id);
-            if (try self.selectConversion(source_type, target, null, span)) |candidate| {
+            if (try self.selectConversion(source_type, target, null, span, context.allow_error_conversion)) |candidate| {
                 if (candidate.source_mode != .imm) return null;
                 const source = try self.valueWithContext(id, .{ .expected_type = candidate.input_type, .access = .initialize, .allow_converters = false });
                 if (source.type_id == .never) return source;
                 return try self.convertValue(source, candidate, context, span);
             }
-            const conversions = (try self.selectVariantConversions(source_type, target, span)) orelse return null;
+            const conversions = (try self.selectVariantConversions(source_type, target, span, context.allow_error_conversion)) orelse return null;
             const source = try self.valueWithContext(id, .{ .expected_type = source_type, .access = .initialize, .allow_converters = false });
             if (source.type_id == .never) return source;
             return try self.convertVariantValue(source, conversions, context, span);
@@ -2416,7 +2432,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             converter: structures.ConversionCandidate,
         };
 
-        fn selectVariantConversions(self: *Self, source_type: structures.TypeId, target: structures.TypeId, span: structures.SourceSpan) !?[]MemberConversion {
+        fn selectVariantConversions(self: *Self, source_type: structures.TypeId, target: structures.TypeId, span: structures.SourceSpan, allow_error_conversion: bool) !?[]MemberConversion {
             if (try semantic.canWidenTo(self.analysis_context, source_type, target)) return null;
             const members = (try self.analysis_context.facts().variantMembers(source_type)) orelse return null;
             const conversions = try self.gpa.alloc(MemberConversion, members.len);
@@ -2425,7 +2441,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 conversion.* = .widen;
                 if (try semantic.canWidenTo(self.analysis_context, member, target)) continue;
                 const logical_type = (try self.analysis_context.facts().memberSpec(member)).type_id;
-                if (try self.selectConversion(logical_type, target, null, span)) |candidate| {
+                if (try self.selectConversion(logical_type, target, null, span, allow_error_conversion)) |candidate| {
                     conversion.* = .{ .converter = candidate };
                 } else if (!try semantic.canWidenTo(self.analysis_context, logical_type, target)) return null;
             }
@@ -2534,7 +2550,12 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn evaluateUncapturedValue(self: *Self, id: semantic.UnresolvedBody.ValueId, request: ResultRequest) anyerror!Value {
             const index = @backingInt(id);
             const source_operation = self.expressionOperation(id);
-            var context: ValueContext = if (request.destination) |destination| .{ .expected_type = destination.storage.type_id, .access = .initialize, .fresh_destination = destination.storage } else request.value;
+            var context = request.value;
+            if (request.destination) |destination| {
+                context.expected_type = destination.storage.type_id;
+                context.access = .initialize;
+                context.fresh_destination = destination.storage;
+            }
             if (request.reference) context.allow_converters = false;
             if (context.expected_type == null) if (source_operation) |operation| {
                 if (operation.* == .annotation) context.expected_type = operation.annotation.type_id;
@@ -2581,6 +2602,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const expected_type = context.expected_type;
             var child_context = context;
             child_context.allow_converters = true;
+            child_context.allow_error_conversion = false;
             // Fresh argument storage receives a construction the caller did not place.
             const fresh: ?Destination = request.destination orelse if (context.fresh_destination) |storage| .{ .storage = storage, .site = .argument } else null;
             const scope = try self.openBoundary(expression.span);
@@ -2630,7 +2652,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .index_snapshot => |source| try self.snapshotIndex(source, expected_type),
                 .assignment => try self.assignment(expression),
                 .reference_assignment => |assignment_ref| try self.referenceAssignment(assignment_ref),
-                .discard => |discarded| try self.discardResult(try self.discardedValue(discarded.value), discarded.span),
+                .discard => |discarded| blk: {
+                    try self.discardValue(try self.value(discarded.value), discarded.span);
+                    break :blk try self.appendInstruction(.const_unit);
+                },
                 .sequence => |operands| blk: {
                     const first = try self.value(operands.lhs.value);
                     if (first.type_id == .never) break :blk first;
@@ -2641,6 +2666,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .static_membership, .variant_membership, .iterator_membership, .conjunction, .disjunction, .negation, .pattern_test => try self.predicateValue(id, expression.span),
                 .if_else => |expression_if| try self.conditional(expression_if, .{ .value = child_context, .destination = request.destination, .discard = request.discard, .reference = request.reference }),
                 .match => |expression_match| try self.matchValue(expression_match, .{ .value = child_context, .destination = request.destination, .discard = request.discard, .reference = request.reference }),
+                .error_handler => |handler| try self.errorHandler(handler, request),
                 .loop => |body| try self.loop(body, .{ .value = child_context, .destination = request.destination, .discard = request.discard, .reference = request.reference }),
                 .scope => |body| try self.scopeValue(body, request),
                 .iterator => |iteration| try self.iteratorValue(iteration.source, iteration.acquisition, iteration.structural_array, expression.span),
@@ -2690,9 +2716,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 return self.stageStaticValue(source, default_context, span);
             };
             if (context.allow_converters) if (context.expected_type) |target| {
-                if (try self.selectConversion(source.type_id, target, null, span)) |candidate|
+                if (try self.selectConversion(source.type_id, target, null, span, context.allow_error_conversion)) |candidate|
                     return self.convertValue(source, candidate, context, span);
-                if (try self.selectVariantConversions(source.type_id, target, span)) |conversions| {
+                if (try self.selectVariantConversions(source.type_id, target, span, context.allow_error_conversion)) |conversions| {
                     return self.convertVariantValue(source, conversions, context, span);
                 }
             };
@@ -2791,7 +2817,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (!is_literal and (self.options.allow_type_values or expression.operation == .local_read))
                 return try self.stageStaticConversion(id, source_type, context, expression.span);
             const source_value = (try self.analysis_context.executeComptimeWithType(expression.source_node, source_type)) orelse return error.Unavailable;
-            const candidate = (try self.selectConversion(source_type, target, source_value, expression.span)) orelse return null;
+            const candidate = (try self.selectConversion(source_type, target, source_value, expression.span, context.allow_error_conversion)) orelse return null;
             return try self.convertValue(null, candidate, context, expression.span);
         }
 
@@ -2806,11 +2832,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (try self.analysis_context.hasConverters(.string_literal, target)) {
                 if (self.type_check_only) return try self.stageStaticConversion(id, .string_literal, context, span);
                 const source_value = try self.analysis_context.internCompileTimeValue(.{ .runtime = .{ .type_id = .string_literal, .value = .{ .string_literal = data } } });
-                if (try self.selectConversion(.string_literal, target, source_value, span)) |candidate| return try self.convertValue(null, candidate, context, span);
+                if (try self.selectConversion(.string_literal, target, source_value, span, context.allow_error_conversion)) |candidate| return try self.convertValue(null, candidate, context, span);
             }
             const static_string = try self.analysis_context.staticStringType();
             if (try semantic.canWidenTo(self.analysis_context, static_string, target)) return null;
-            const candidate = (try self.selectConversion(static_string, target, null, span)) orelse return null;
+            const candidate = (try self.selectConversion(static_string, target, null, span, context.allow_error_conversion)) orelse return null;
             if (candidate.source_mode != .imm) return null;
             return try self.convertValue(try self.staticStringValue(data), candidate, context, span);
         }
@@ -3111,7 +3137,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (source_type != expected_type and source_type != .never and !try semantic.canWidenTo(self.analysis_context, source_type, expected_type)) return false;
             };
             return switch (operation.*) {
-                .struct_init, .array_init, .collection_literal, .tuple_literal, .call, .if_else, .match, .loop, .scope, .annotation, .local_transfer, .field_transfer => true,
+                .struct_init, .array_init, .collection_literal, .tuple_literal, .call, .if_else, .match, .error_handler, .loop, .scope, .annotation, .local_transfer, .field_transfer => true,
                 else => false,
             };
         }
@@ -3572,7 +3598,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn constructAnnotated(self: *Self, annotation: @FieldType(Expression.Operation, "annotation"), destination: Destination) !Value {
             const storage = try self.memberStorage(destination.storage, annotation.type_id) orelse
                 return self.placeValue(try self.annotate(annotation, .{ .access = .initialize }), annotation.value.span, destination);
-            const annotated = try self.construct(annotation.value.value, annotation.value.span, .{ .storage = storage, .site = .local });
+            const annotated = try self.evaluateValue(annotation.value.value, .{
+                .value = .{ .allow_error_conversion = annotation.explicit },
+                .destination = .{ .storage = storage, .site = .local },
+                .destination_span = annotation.value.span,
+            });
             return self.finishMemberStorage(annotated, destination.storage, annotation.value.span);
         }
 
@@ -3642,6 +3672,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn discardResult(self: *Self, result: Value, span: structures.SourceSpan) !Value {
+            if (try self.hasErrorAlternatives(result.type_id)) return self.reject(span, .discarded_error);
             const scope = try self.openBoundary(span);
             defer self.current_boundary = scope.parent;
             try self.discardValue(result, span);
@@ -3704,17 +3735,21 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn recordReplacementUses(self: *Self) !void {
             for (self.replacement_targets.items) |target| switch (target) {
                 .local => |local| try self.recordLocalReplacementUse(local),
-                .reference => |reference| try self.recordReferenceUses(reference, .retention),
+                .reference => |reference| try self.recordReplacementUse(reference),
             };
         }
 
         fn recordLocalReplacementUse(self: *Self, local: semantic.UnresolvedBody.LocalId) !void {
             const index = @backingInt(local);
             if (self.state.availability.get(index) != .available) return;
-            const owner = self.state.values.get(index).?;
-            try self.recordReferenceUses(owner, .retention);
-            const generation = owner.owned_generation orelse return;
-            try self.recordEffect(.{ .use = .{ .generation = generation, .cleanup_value = owner.id } });
+            try self.recordReplacementUse(self.state.values.get(index).?);
+        }
+
+        fn recordReplacementUse(self: *Self, source: Value) !void {
+            try self.recordReferenceUses(source, .retention);
+            const generation = source.owned_generation orelse source.borrowed_generation orelse return;
+            const cleanup_value = if (source.owned_generation != null) source.id else source.borrowed_cleanup_value orelse source.id;
+            try self.recordEffect(.{ .use = .{ .generation = generation, .cleanup_value = cleanup_value } });
         }
 
         fn finishReplacementUses(self: *Self, span: structures.SourceSpan) !void {
@@ -4132,6 +4167,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             var region = self.initializerRegion(if (initializer_boundary) expected_type orelse .unit else self.return_type);
             region.is_initializer_region = initializer_boundary;
             region.options.infer_return_type = initializer_boundary or self.options.infer_return_type;
+            region.options.is_entry = !initializer_boundary and self.options.is_entry;
+            if (!initializer_boundary) region.options.result_mode = self.options.result_mode;
             region.options.allow_type_values = self.options.allow_type_values;
             region.type_check_only = true;
             try self.bindInferenceCaptures(&region, raw.value);
@@ -5647,7 +5684,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     break :blk try self.inferArgumentType(.{ .value = id, .span = self.valueSpan(id) });
                 },
                 .assignment, .reference_assignment => .unit,
-                .loop, .scope, .iterator, .iterator_item => try self.inferArgumentType(.{ .value = id, .span = self.valueSpan(id) }),
+                .loop, .scope, .iterator, .iterator_item, .error_handler => try self.inferArgumentType(.{ .value = id, .span = self.valueSpan(id) }),
                 .type_value => .type,
             };
         }
@@ -5659,7 +5696,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (index < self.unresolved.parameter_count or self.values.get(index) != null) return null;
                 switch (self.unresolved.expressions[index - self.unresolved.parameter_count].operation) {
                     .annotation => |annotation| expression = annotation.value.value,
-                    .if_else, .match, .loop, .scope => break,
+                    .if_else, .match, .error_handler, .loop, .scope => break,
                     else => return null,
                 }
             }
@@ -6418,7 +6455,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn annotate(self: *Self, annotation: @FieldType(Expression.Operation, "annotation"), context: ValueContext) !Value {
             if (!self.type_check_only and try self.usesIndirectStorage(annotation.type_id))
                 return self.constructAnnotated(annotation, .{ .storage = try self.localStorage(annotation.type_id), .site = .local });
-            const operand = try self.valueWithContext(annotation.value.value, .{ .expected_type = annotation.type_id, .access = context.access });
+            const operand = try self.valueWithContext(annotation.value.value, .{ .expected_type = annotation.type_id, .access = context.access, .allow_error_conversion = annotation.explicit });
             if (operand.type_id == .never) return operand;
             const use = try self.coerceValue(operand.id, operand.type_id, annotation.type_id) orelse
                 return self.reject(annotation.value.span, .{ .local_type_mismatch = self.typeMismatch(annotation.type_id, operand.type_id) });
@@ -6685,6 +6722,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             try self.state.values.set(self.gpa, local_index, updated);
             try self.invalidateFlowTypes(written, expression.span);
             try self.state.availability.set(self.gpa, local_index, .available);
+            var assigned_place = self.borrowLocalValue(assignment_value.target);
+            for (fields.items) |field| assigned_place = try self.fieldView(assigned_place, field.index, field.type_id);
+            assigned_place.flow_origins = written;
+            if (assigned_place.type_id != operand.type_id)
+                try self.refineFlowType(assigned_place, operand.type_id, true, expression.span);
             if (replaces) {
                 for (self.field_places, 0..) |place, field_index| {
                     if (place.local == assignment_value.target and fieldPathContains(source_fields, place.fields))
@@ -6803,6 +6845,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 storage.reference_origins = origins;
                 storage.writable = writable;
             }
+            storage.borrowed_generation = root.owned_generation orelse root.borrowed_generation;
+            storage.borrowed_cleanup_value = if (root.owned_generation != null) root.id else root.borrowed_cleanup_value;
             return storage;
         }
 
@@ -6810,6 +6854,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             var reference = try self.fieldView(owner, field.index, try self.analysis_context.facts().referenceType(field.type_id));
             reference.place_origins = owner.place_origins;
             reference.reference_origins = try self.transformReferenceOrigins(owner.reference_origins, .{ .select = .{ .field = field.index } });
+            reference.borrowed_generation = owner.owned_generation orelse owner.borrowed_generation;
+            reference.borrowed_cleanup_value = if (owner.owned_generation != null) owner.id else owner.borrowed_cleanup_value;
             reference.writable = !try self.originsReadonly(reference.reference_origins);
             return reference;
         }
@@ -8016,6 +8062,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (entry.kind == .place) {
                 origins = try self.transformReferenceOrigins(origins, .{ .place = .{
                     .storage_depth = entry.storage_depth,
+                    .variant_guard = entry.variant_guard,
                     .stable = entry.stable,
                     .after_write = entry.after_write,
                 } });
@@ -8291,7 +8338,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn applyPlaceReferenceMetadata(self: *Self, origin: *ReferenceOrigin, metadata: PlaceReferenceMetadata) !void {
             const stable_source = origin.stable;
-            if (metadata.storage_depth != 0) origin.variant_guard = false;
+            origin.variant_guard = metadata.storage_depth == 0 and (origin.variant_guard or metadata.variant_guard);
             origin.storage_depth = std.math.add(u32, origin.storage_depth, metadata.storage_depth) catch return error.AnalysisTooLarge;
             if (origin.storage_depth != 0) self.promoteAllocatedParameterOrigin(origin);
             origin.stable = metadata.stable;
@@ -8537,7 +8584,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .binding_identity = source.binding_identity,
                 .source_kind = .place,
                 .parameter = if (source.borrow_root) |root| self.locals.items(.mut_parameter)[@backingInt(root)] orelse
-                    (if (self.is_initializer_region) self.captured_locals[@backingInt(root)] else null) else null,
+                    (if (self.flow_parent != null) self.captured_locals[@backingInt(root)] else null) else null,
             });
         }
 
@@ -8723,7 +8770,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn captureReference(self: *Self, raw: semantic.UnresolvedBody.ValueUse) anyerror!Value {
             if (self.expressionOperation(raw.value)) |operation| switch (operation.*) {
-                .if_else, .match, .loop, .scope => return self.evaluateValue(raw.value, .{ .reference = true }),
+                .if_else, .match, .error_handler, .loop, .scope => return self.evaluateValue(raw.value, .{ .reference = true }),
                 else => {},
             };
             var fields: std.ArrayList(PlaceField) = .empty;
@@ -8762,6 +8809,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 },
                 .reference => {
                     reference.writable = root.writable;
+                    reference.borrowed_generation = root.borrowed_generation;
+                    reference.borrowed_cleanup_value = root.borrowed_cleanup_value;
                     reference.reference_origins = root.reference_origins;
                     reference.flow_origins = try self.referenceFlowOrigins(root, (try self.analysis_context.facts().borrowElement(root.type_id)).?);
                     reference.local_reference = try self.extendLocalReference(root.local_reference, selected, null);
@@ -8803,6 +8852,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             while (origins.next()) |origin| borrow_root = laterBorrowRoot(borrow_root, origin.root);
             var result = try self.appendInstruction(.{ .borrow_read = .{ .source = reference.id, .type_id = element_type } });
             result.borrowed_type = element_type;
+            result.borrowed_generation = reference.borrowed_generation;
+            result.borrowed_cleanup_value = reference.borrowed_cleanup_value;
             result.writable = reference.writable and !try self.originsReadonly(reference.reference_origins);
             result.place_reference = reference.id;
             result.place_origins = reference.reference_origins;
@@ -9025,7 +9076,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             var updated_reference = reference;
             try self.advanceOwnedReferenceOrigins(reference, captured_handle, .{ .value = &updated_reference.reference_origins });
             try self.storeReferenceContents(updated_reference, operand.reference_origins);
-            return self.readReference(updated_reference, element_type);
+            const result = try self.readReference(updated_reference, element_type);
+            if (element_type != raw_value.type_id) try self.refineFlowType(result, raw_value.type_id, true, span);
+            return result;
         }
 
         fn replaceReference(self: *Self, reference: Value, reference_id: structures.FunctionValueId, item_id: structures.FunctionValueId, span: structures.SourceSpan) !Value {
@@ -10746,6 +10799,184 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             return merged.constructed.?;
         }
 
+        fn isErrorType(self: *Self, type_id: structures.TypeId) !bool {
+            const logical = (try self.analysis_context.facts().memberSpec(type_id)).type_id;
+            const definition = try self.analysis_context.facts().structDefinition(logical);
+            return definition != null and definition.?.is_error;
+        }
+
+        fn hasErrorAlternatives(self: *Self, type_id: structures.TypeId) !bool {
+            for (try self.matchInputMembers(type_id)) |member| if (try self.isErrorType(member)) return true;
+            return false;
+        }
+
+        fn errorHandler(self: *Self, source: @FieldType(Expression.Operation, "error_handler"), request: ResultRequest) anyerror!Value {
+            if (try self.unevaluatedType(source.operand.value, null)) |operand_type| {
+                if (!try self.hasErrorAlternatives(operand_type)) return self.evaluateValue(source.operand.value, request);
+            }
+            const baseline = try self.captureState();
+            try self.bindLocal(.{ .local = source.carrier, .value = source.operand.value, .span = source.operand.span, .mutable = true, .mode = .inferred });
+            if (self.current_block == null) return .{ .id = @fromBackingInt(0), .type_id = .never };
+            const operand = try self.readLocal(source.carrier, source.operand.span);
+            const members = try self.matchInputMembers(operand.type_id);
+            var errors: structures.TypeId = .never;
+            var successes: structures.TypeId = .never;
+            var error_types: structures.TypeId = .never;
+            for (members) |member| {
+                const specification = try self.analysis_context.facts().memberSpec(member);
+                if (try self.isErrorType(member)) {
+                    errors = try joinTypes(self.analysis_context, errors, member, self.gpa);
+                    error_types = try joinTypes(self.analysis_context, error_types, specification.type_id, self.gpa);
+                } else successes = try joinTypes(self.analysis_context, successes, member, self.gpa);
+            }
+            if (source.annotation) |annotation| {
+                if (!try semantic.canWidenTo(self.analysis_context, error_types, annotation))
+                    return self.reject(source.binding.?.span, .{ .local_type_mismatch = self.typeMismatch(annotation, error_types) });
+            }
+            const branch_state = try self.captureState();
+            const failure = if (errors != .never) try self.newEmptyBlock() else null;
+            const success = if (successes != .never) try self.newEmptyBlock() else null;
+            if (failure != null and success != null)
+                try self.branchOnMembers(operand, members, error_types, try self.analysis_context.facts().variantMembers(error_types), failure.?, success.?)
+            else {
+                try self.moveCurrentBoundaryEffectsToTerminator();
+                self.terminate(.{ .branch = self.emptyBranch(failure orelse success.?) });
+            }
+            const dispatch_values = self.values.snapshot();
+            var exits: std.ArrayList(FlowExit) = .empty;
+            if (failure) |block_id| {
+                self.enterBlock(block_id);
+                self.restoreState(branch_state);
+                const scope = try self.openBoundary(source.operand.span);
+                defer self.current_boundary = scope.parent;
+                const selected = try self.projectHandlerCarrier(source.carrier, errors, source.operand.span);
+                if (source.handler) |handler| {
+                    const binding = source.binding.?;
+                    const reference = try self.analysis_context.facts().borrowElement(selected.type_id) != null;
+                    try self.installLocal(binding.local, selected, reference, false);
+                    var result = try self.blockWithResult(handler, request);
+                    if (self.current_block != null) {
+                        if (result) |value_on_edge| result = try self.ownValueEscapingSince(value_on_edge, baseline, source.operand.span);
+                        try self.unbindLocal(@backingInt(binding.local));
+                        try self.unbindLocal(@backingInt(source.carrier));
+                        try self.closeBoundary(scope.boundary);
+                    }
+                    if (try self.valueExit(result)) |exit| try exits.append(self.gpa, exit);
+                } else {
+                    if (self.initializerExitBoundary()) return self.reject(source.operand.span, .initializer_exit_outside_boundary);
+                    if (self.options.is_entry) {
+                        try self.unhandledEntryError(selected, source.operand.span);
+                    } else {
+                        const returned = if (try self.analysis_context.facts().borrowElement(selected.type_id)) |element|
+                            if (try semantic.canWidenTo(self.analysis_context, selected.type_id, self.return_type)) selected else try self.readReference(selected, element)
+                        else
+                            selected;
+                        try self.returnValue(returned, source.operand.span);
+                    }
+                }
+            }
+            self.values = dispatch_values.snapshot();
+            if (success) |block_id| {
+                self.enterBlock(block_id);
+                self.restoreState(branch_state);
+                const scope = try self.openBoundary(source.operand.span);
+                defer self.current_boundary = scope.parent;
+                var result = try self.projectHandlerCarrier(source.carrier, successes, source.operand.span);
+                if (try self.analysis_context.facts().borrowElement(result.type_id)) |element| {
+                    if (!request.reference) result = try self.readReference(result, element);
+                }
+                if (request.destination) |destination| result = try self.placeValue(result, source.operand.span, destination);
+                if (request.discard) result = try self.discardResult(result, source.operand.span);
+                try self.unbindLocal(@backingInt(source.carrier));
+                try self.closeBoundary(scope.boundary);
+                if (try self.valueExit(result)) |exit| try exits.append(self.gpa, exit);
+            }
+            if (exits.items.len == 0) return .{ .id = @fromBackingInt(0), .type_id = .never };
+            const merged = try self.mergeExits(baseline, exits.items, request, .branch);
+            try self.enterFlowExit(merged);
+            return merged.constructed.?;
+        }
+
+        fn returnEntryValue(self: *Self, result: Value, span: structures.SourceSpan) !void {
+            if (result.type_id == .never) return;
+            const scope = try self.openBoundary(span);
+            defer self.current_boundary = scope.parent;
+            const members = try self.matchInputMembers(result.type_id);
+            var contains_unit = false;
+            var contains_error = false;
+            for (members) |member| {
+                if (member == .unit) contains_unit = true else if (try self.isErrorType(member)) contains_error = true else return self.reject(span, .invalid_entry_return);
+            }
+            if (!contains_error) return self.returnNothing(span);
+            if (!contains_unit) return self.unhandledEntryError(result, span);
+            const success = try self.newEmptyBlock();
+            const failure = try self.newEmptyBlock();
+            try self.branchOnMembers(result, members, .unit, null, success, failure);
+            const state = try self.captureState();
+            self.enterBlock(failure);
+            try self.unhandledEntryError(result, span);
+            self.enterBlock(success);
+            self.restoreState(state);
+            try self.returnNothing(span);
+        }
+
+        fn unhandledEntryError(self: *Self, value_to_report: Value, span: structures.SourceSpan) !void {
+            try self.recordUse(value_to_report);
+            const reporting = try self.newEmptyBlock();
+            try self.finishFunctionExit(span, .{ .branch = self.emptyBranch(reporting) });
+            self.enterBlock(reporting);
+            const function = (try self.analysis_context.unhandledErrorFunction()) orelse return error.Unavailable;
+            _ = (try self.analysis_context.functionSignature(function)) orelse return error.Unavailable;
+            const start: u32 = @intCast(self.call_arguments.items.len);
+            _ = try self.appendInstruction(.{ .call = .{
+                .target = .{ .direct = function },
+                .arguments = .{ .start = start, .end = start },
+                .return_type = .never,
+            } });
+            self.terminate(.diverge);
+        }
+
+        fn projectHandlerCarrier(self: *Self, local: semantic.UnresolvedBody.LocalId, target: structures.TypeId, span: structures.SourceSpan) !Value {
+            const borrowed = self.locals.items(.reference)[@backingInt(local)];
+            const carrier = if (borrowed) self.state.values.get(@backingInt(local)).? else try self.takeIteratorCarrier(local, span);
+            const source = if (borrowed) (try self.analysis_context.facts().borrowElement(carrier.type_id)).? else carrier.type_id;
+            if (source == target) return carrier;
+            const members = try self.analysis_context.facts().variantMembers(source) orelse return carrier;
+            if (!borrowed) {
+                const selected_members = try self.matchInputMembers(target);
+                const selected_owner = try self.refineVariantOwner(carrier, selected_members);
+                return self.extractLogicalBinding(selected_owner, source, target, .inferred, span);
+            }
+            const operand = try self.readReference(carrier, source);
+            const targets = try self.analysis_context.facts().variantMembers(target);
+            var selected: std.ArrayList(structures.TypeId) = .empty;
+            for (members) |member| if (member == target or (targets != null and std.mem.indexOfScalar(structures.TypeId, targets.?, member) != null)) {
+                try selected.append(self.gpa, member);
+            };
+            std.debug.assert(selected.items.len != 0);
+            if (selected.items.len == 1) {
+                const member = selected.items[0];
+                return self.extractReferenceMember(carrier, operand, member, (try self.analysis_context.facts().memberSpec(member)).type_id);
+            }
+            const baseline = try self.captureState();
+            const tag = try self.appendInstruction(.{ .variant_tag = operand.id });
+            var exits: std.ArrayList(FlowExit) = .empty;
+            for (selected.items, 0..) |member, index| {
+                const member_index = std.mem.indexOfScalar(structures.TypeId, members, member).?;
+                const next = try self.enterVariantCase(tag, member_index, index + 1 == selected.items.len);
+                const reference = try self.extractReferenceMember(carrier, operand, member, (try self.analysis_context.facts().memberSpec(member)).type_id);
+                try self.moveCurrentBoundaryEffectsToTerminator();
+                try exits.append(self.gpa, (try self.valueExit(reference)).?);
+                if (next) |unmatched| {
+                    self.enterBlock(unmatched);
+                    self.restoreState(baseline);
+                }
+            }
+            const merged = try self.mergeExits(baseline, exits.items, .{}, .condition);
+            try self.enterFlowExit(merged);
+            return merged.constructed.?;
+        }
+
         fn conditional(self: *Self, expression: @FieldType(Expression.Operation, "if_else"), mode: ResultRequest) anyerror!Value {
             const baseline = try self.captureAvailability();
             const flow = try self.condition(expression.condition);
@@ -11840,11 +12071,8 @@ fn joinTypes(analysis_context: anytype, left: structures.TypeId, right: structur
     var members: std.ArrayList(structures.TypeId) = .empty;
     defer members.deinit(gpa);
     try members.appendSlice(gpa, left_members);
-    // Shared members are one inferred alternative, not duplicate source syntax.
-    for (right_members) |member| {
-        if (!containsType(left_members, member)) try members.append(gpa, member);
-    }
-    return (try analysis_context.facts().internVariant(members.items)).type_id;
+    try members.appendSlice(gpa, right_members);
+    return analysis_context.facts().internVariant(members.items);
 }
 
 fn containsType(types: []const structures.TypeId, needle: structures.TypeId) bool {

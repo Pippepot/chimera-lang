@@ -11,6 +11,404 @@ const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 
 const Fixture = test_sources.SourceFixture;
 
+test "error handlers recover and propagate ordinary marked alternatives" {
+    try Fixture.expectParity(
+        \\struct Failure
+        \\    error = true
+        \\    code: int
+        \\func attempt(fail: bool) int | Failure
+        \\    if fail -> return Failure{code = 7}
+        \\    return 20
+        \\func doubled(fail: bool) int | Failure
+        \\    const value = attempt(fail)?
+        \\    return value * 2
+        \\func run() int
+        \\    const first = doubled(false) catch err: Failure -> 99
+        \\    const second = doubled(true) catch err -> err.code - 5
+        \\    return first + second
+    , 42);
+}
+
+test "error handlers require acknowledgment and complete annotations" {
+    try Fixture.expectSourceDiagnostic(
+        \\struct Failure
+        \\    error = true
+        \\func fail() Failure -> Failure{}
+        \\fail()
+    , .discarded_error);
+    try Fixture.expectSourceExit(
+        \\struct Failure
+        \\    error = true
+        \\func fail() Failure -> Failure{}
+        \\_ = fail()
+    , 0);
+    try Fixture.expectSourceDiagnostic(
+        \\struct First
+        \\    error = true
+        \\struct Second
+        \\    error = true
+        \\func attempt(flag: bool) int | First | Second
+        \\    if flag -> return First{}
+        \\    return Second{}
+        \\const value = attempt(false) catch err: First -> 0
+    , .local_type_mismatch);
+}
+
+test "error handlers cannot be bypassed by implicit error conversion" {
+    try Fixture.expectRejected(
+        \\struct Failure
+        \\    error = true
+        \\converter(value: Failure) int -> 42
+        \\const value: int = Failure{}
+        \\exit(value)
+    );
+    try Fixture.expectRejected(
+        \\struct Failure
+        \\    error = true
+        \\converter(value: Failure) int -> 42
+        \\func hide() int -> Failure{}
+        \\exit(hide())
+    );
+}
+
+test "error handlers clean entry owners before reporting an unhandled error" {
+    const fixture = try Fixture.init(
+        \\struct Failure
+        \\    error = true
+        \\    drop = func(deinit self: Failure) -> print(23)
+        \\struct Guard
+        \\    drop = func(deinit self: Guard) -> print(17)
+        \\func attempt() int | Failure -> Failure{}
+        \\const guard = Guard{}
+        \\const value = attempt()?
+        \\exit(99)
+    );
+    defer fixture.deinit();
+    const result = try fixture.runIo("");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, result.term);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "17\n") != null);
+    try testing.expect(std.mem.indexOf(u8, result.stdout, "23\n") != null);
+    try testing.expectEqualStrings("unhandled error\n", result.stderr);
+}
+
+test "error handlers preserve borrowed multi success carriers and failure aliases" {
+    try Fixture.expectParity(
+        \\struct First
+        \\    value: int
+        \\struct Second
+        \\    value: int
+        \\struct Failure
+        \\    error = true
+        \\    code: int
+        \\static Outcome = First | Second | Failure
+        \\func project(ref source: Outcome) ref First | ref Second | ref Failure
+        \\    return source?
+        \\func adjust(ref source: Outcome) int
+        \\    const success = project(source) catch err ->
+        \\        err.code += 1
+        \\        return err.code
+        \\    if success is First
+        \\        ref selected = success
+        \\        selected.value += 1
+        \\        return selected.value
+        \\    ref selected = success
+        \\    selected.value += 2
+        \\    return selected.value
+        \\func run() int
+        \\    var first: Outcome = First{value = 40}
+        \\    var second: Outcome = Second{value = 40}
+        \\    var failed: Outcome = Failure{code = 7}
+        \\    if adjust(first) <> 41 -> return 91
+        \\    if adjust(second) <> 42 -> return 92
+        \\    if adjust(failed) <> 8 -> return 93
+        \\    if not (first is First) -> return 94
+        \\    if first.value <> 41 -> return 95
+        \\    if not (failed is Failure) -> return 96
+        \\    if failed.code <> 8 -> return 97
+        \\    return 42
+    , 42);
+}
+
+test "error handlers transfer noncopyable owners and destroy each payload once" {
+    try Fixture.expectParity(
+        \\struct Failure
+        \\    error = true
+        \\    ref count: int
+        \\    drop = func(deinit self: Failure) -> self.count += 10
+        \\struct Value
+        \\    ref count: int
+        \\    drop = func(deinit self: Value) -> self.count += 1
+        \\func produce(mut count: int, fail: bool) Value | Failure
+        \\    if fail -> return Failure{count = count}
+        \\    return Value{count = count}
+        \\func forward(mut count: int, fail: bool) Value | Failure
+        \\    const value = produce(count, fail)?
+        \\    return value^
+        \\func run() int
+        \\    var count = 0
+        \\    _ = forward(count, false)
+        \\    _ = forward(count, true)
+        \\    return count + 31
+    , 42);
+}
+
+test "error handlers specialize infallible and all error inputs without implicit propagation" {
+    try Fixture.expectParity(
+        \\struct Failure
+        \\    error = true
+        \\    code: int
+        \\func recover(static T: type, value: T) int
+        \\    return value catch err -> err.code
+        \\func fail() Failure -> Failure{code = 22}?
+        \\func preserve() Failure -> fail() catch err -> err^
+        \\func run() int
+        \\    const first = recover(20)
+        \\    const second = preserve() catch err: Failure -> err.code
+        \\    return first? + second
+    , 42);
+}
+
+test "error handlers reject propagation through init or incompatible return contracts" {
+    try Fixture.expectSourceDiagnostic(
+        \\struct Failure
+        \\    error = true
+        \\func attempt() int | Failure -> Failure{}
+        \\func construct(init value: int) int -> value
+        \\func invalid() int | Failure -> construct(attempt()?)
+        \\_ = invalid()
+    , .initializer_exit_outside_boundary);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Failure
+        \\    error = true
+        \\func attempt() int | Failure -> Failure{}
+        \\func invalid() int -> attempt()?
+        \\exit(invalid())
+    , .return_type_mismatch);
+}
+
+test "error handlers leave infallible whole variant borrows unchanged" {
+    try Fixture.expectParity(
+        \\func identity(ref source: int | bool) ref (int | bool) -> source?
+        \\func run() int
+        \\    var source: int | bool = 12
+        \\    ref alias = identity(source)
+        \\    alias = 42
+        \\    if source is int -> return source
+        \\    return 99
+    , 42);
+}
+
+test "error handlers permit deliberate explicit conversion" {
+    try Fixture.expectParity(
+        \\struct Failure
+        \\    error = true
+        \\    code: int
+        \\converter(value: Failure) int -> value.code
+        \\func run() int -> int(Failure{code = 42})
+    , 42);
+}
+
+test "error handlers explicit entry forwarding follows the same exit policy" {
+    try Fixture.expectSourceExit(
+        \\struct Failure
+        \\    error = true
+        \\func attempt() int | Failure -> Failure{}
+        \\const value = attempt() catch err -> return err^
+        \\exit(99)
+    , 1);
+    try Fixture.expectSourceExit("return\nexit(99)", 0);
+    try Fixture.expectSourceExit(
+        \\struct Failure
+        \\    error = true
+        \\func attempt(fail: bool) unit | Failure
+        \\    if fail -> return Failure{}
+        \\    return ()
+        \\return attempt(false)
+    , 0);
+    try Fixture.expectSourceDiagnostic("return 42", .invalid_entry_return);
+}
+
+test "error handlers preserve mixed owned reference and multiple owned successes" {
+    try Fixture.expectParity(
+        \\struct Failure
+        \\    error = true
+        \\struct First
+        \\    value: int
+        \\struct Second
+        \\    value: int
+        \\func capture(ref value: int) ref int | Failure -> value
+        \\func choose(ref value: int, mode: int) int | ref int | Failure
+        \\    if mode == 0 -> return 20
+        \\    if mode == 1 -> return capture(value)
+        \\    return Failure{}
+        \\func forward(ref value: int, mode: int) int | ref int | Failure -> choose(value, mode)?
+        \\func owned(flag: bool) First | Second | Failure
+        \\    if flag -> return First{value = 20}
+        \\    return Second{value = 22}
+        \\func sum(flag: bool) int | Failure
+        \\    const value = owned(flag)?
+        \\    if value is First -> return value.value
+        \\    return value.value
+        \\func run() int
+        \\    var original = 7
+        \\    var borrowed = forward(original, 1) catch err -> return 90
+        \\    match borrowed
+        \\        int ->
+        \\            ref alias = borrowed
+        \\            alias += 1
+        \\    if original <> 8 -> return 91
+        \\    const first = sum(true) catch err -> return 92
+        \\    const second = sum(false) catch err -> return 93
+        \\    return first + second
+    , 42);
+}
+
+test "error handlers recompute when nominal error marking changes" {
+    const source =
+        \\struct Failure
+        \\    error = true
+        \\    code: int
+        \\func attempt() int | Failure -> Failure{code = 7}
+        \\func run() int
+        \\    const result = attempt() catch err -> 40
+        \\    if result is int -> return result + 2
+        \\    return 3
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const changed = try std.mem.replaceOwned(u8, testing.allocator, source, "error = true", "error = false");
+    defer testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(0, 3);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+}
+
+test "error handlers retain tag dependencies and validate error properties" {
+    try Fixture.expectSourceDiagnostic(
+        \\struct Failure
+        \\    error = true
+        \\func project(ref source: int | Failure) ref int | ref Failure -> source?
+        \\var source: int | Failure = 7
+        \\ref alias = project(source) catch err -> exit(1)
+        \\source = Failure{}
+        \\exit(alias)
+    , .borrow_outlives_source);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Failure
+        \\    error = 1
+        \\_ = Failure{}
+    , .invalid_error_property);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Failure
+        \\    error = true
+        \\    error = false
+        \\_ = Failure{}
+    , .duplicate_struct_property);
+}
+
+test "error handlers destroy multiple owned error alternatives exactly once" {
+    try Fixture.expectParity(
+        \\struct First
+        \\    error = true
+        \\    ref count: int
+        \\    drop = func(deinit self: First) -> self.count += 1
+        \\struct Second
+        \\    error = true
+        \\    ref count: int
+        \\    drop = func(deinit self: Second) -> self.count += 10
+        \\static Errors = First | Second | First
+        \\func attempt(mut count: int, mode: int) int | Errors
+        \\    if mode == 0 -> return 0
+        \\    if mode == 1 -> return First{count = count}
+        \\    return Second{count = count}
+        \\func recover(mut count: int, mode: int) int -> attempt(count, mode) catch err: Errors -> 0
+        \\func run() int
+        \\    var count = 0
+        \\    _ = recover(count, 0)
+        \\    _ = recover(count, 1)
+        \\    _ = recover(count, 2)
+        \\    return count + 31
+    , 42);
+}
+
+test "error handlers preserve errors while converting ordinary success alternatives" {
+    try Fixture.expectParity(
+        \\struct Failure
+        \\    error = true
+        \\    copy = trivial
+        \\struct Input
+        \\    copy = trivial
+        \\    value: int
+        \\struct Output
+        \\    copy = trivial
+        \\    value: int
+        \\converter(value: Input) Output -> Output{value = value.value}
+        \\converter(value: Failure) Output -> Output{value = 99}
+        \\func attempt(fail: bool) Input | Failure
+        \\    if fail -> return Failure{}
+        \\    return Input{value = 40}
+        \\func converted(fail: bool) Output | Failure -> attempt(fail)
+        \\func recover(fail: bool) int
+        \\    const value = converted(fail) catch err -> return 2
+        \\    return value.value
+        \\func run() int -> recover(false) + recover(true)
+    , 42);
+}
+
+test "error handlers preserve readonly access and cannot steal borrowed errors" {
+    try Fixture.expectSourceDiagnostic(
+        \\struct Failure
+        \\    error = true
+        \\    code: int
+        \\const source: int | Failure = Failure{code = 7}
+        \\const value = source catch err ->
+        \\    err.code = 42
+        \\    0
+    , .reference_not_writable);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Failure
+        \\    error = true
+        \\    copy = none
+        \\func forward(ref source: int | Failure) int | Failure -> source?
+        \\var source: int | Failure = Failure{}
+        \\_ = forward(source)
+    , .type_not_copyable);
+}
+
+test "error handlers infallible identity preserves direct immovable construction" {
+    try Fixture.expectParity(
+        \\struct Immovable
+        \\    copy = none
+        \\    move = none
+        \\    value: int
+        \\func make(value: int) Immovable -> Immovable{value = value}
+        \\func run() int
+        \\    const first = make(20)?
+        \\    const second = make(22) catch err -> err.missing_member
+        \\    return first.value + second.value
+    , 42);
+}
+
+test "marked errors remain ordinary nominal struct values" {
+    try Fixture.expectParity(
+        \\struct Failure
+        \\    error = true
+        \\    code: int
+        \\struct Ordinary
+        \\    error = false
+        \\    failure: Failure
+        \\func read(ref failure: Failure) int -> return failure.code
+        \\func run() int
+        \\    const ordinary = Ordinary{failure = Failure{code = 42}}
+        \\    return read(ordinary.failure)
+    , 42);
+}
+
 test "top-level func collection operations fall through successfully" {
     try Fixture.expectSourceExit(
         \\var numbers = List(int).new(2)
@@ -2326,6 +2724,130 @@ test "an explicit reference releases its owner after its last use" {
         \\    result and result is int -> exit(result)
         \\    _ -> exit(1)
     , 42);
+}
+
+test "nested reference fields in drop hooks retain their referents" {
+    try Fixture.expectParity(
+        \\struct Leaf
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Leaf) -> self.trace.value += 1
+        \\struct Pair
+        \\    first: Leaf
+        \\    second: int
+        \\    drop = func(deinit self: Pair) -> self.first.trace.value += 100
+        \\func run() int
+        \\    var trace = 0
+        \\    const pair = Pair{first = Leaf{trace = Ref.from(trace)}, second = 0}
+        \\    _ = pair
+        \\    return trace - 59
+    , 42);
+}
+
+test "cleanup retention releases a carrier after copying its nested reference" {
+    try Fixture.expectParity(
+        \\struct Leaf
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Leaf) -> self.trace.value = self.trace.value * 10 + 1
+        \\struct Pair
+        \\    first: Leaf
+        \\    second: int
+        \\    drop = func(deinit self: Pair) -> self.first.trace.value = self.first.trace.value * 10 + 2
+        \\func run() int
+        \\    var trace = 0
+        \\    const pair = Pair{first = Leaf{trace = Ref.from(trace)}, second = 0}
+        \\    const handle = pair.first.trace
+        \\    handle.value *= 2
+        \\    return trace
+    , 42);
+}
+
+test "cleanup retention keeps a temporary nested assignment target through writeback" {
+    try Fixture.expectParity(
+        \\struct Leaf
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Leaf) -> self.trace.value += 1
+        \\struct Pair
+        \\    first: Leaf
+        \\    second: int
+        \\    drop = func(deinit self: Pair) -> self.first.trace.value += 10
+        \\func make(trace: Ref(int)) Pair -> Pair{first = Leaf{trace = trace}, second = 0}
+        \\func produce(trace: Ref(int)) int
+        \\    trace.value = 5
+        \\    return 31
+        \\func run() int
+        \\    var trace = 0
+        \\    make(Ref.from(trace)).first.trace.value = produce(Ref.from(trace))
+        \\    return trace
+    , 42);
+}
+
+test "cleanup retention releases a temporary carrier after capturing its referent" {
+    try Fixture.expectParity(
+        \\struct Leaf
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Leaf) -> self.trace.value = self.trace.value * 10 + 1
+        \\struct Pair
+        \\    first: Leaf
+        \\    second: int
+        \\    drop = func(deinit self: Pair) -> self.first.trace.value = self.first.trace.value * 10 + 2
+        \\func make(trace: Ref(int)) Pair -> Pair{first = Leaf{trace = trace}, second = 0}
+        \\func run() int
+        \\    var trace = 0
+        \\    ref selected = make(Ref.from(trace)).first.trace.value
+        \\    selected *= 2
+        \\    return trace
+    , 42);
+}
+
+test "cleanup retention keeps a temporary target through ordinary RHS exits" {
+    try Fixture.expectParity(
+        \\struct Leaf
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Leaf) -> self.trace.value += 1
+        \\struct Pair
+        \\    first: Leaf
+        \\    second: int
+        \\    drop = func(deinit self: Pair) -> self.first.trace.value += 10
+        \\func make(trace: Ref(int)) Pair -> Pair{first = Leaf{trace = trace}, second = 0}
+        \\func calculate(trace: Ref(int)) unit | none
+        \\    make(trace).first.trace.value = if true
+        \\        trace.value = 31
+        \\        return none
+        \\    else 0
+        \\    return ()
+        \\func run() int
+        \\    var trace = 0
+        \\    _ = calculate(Ref.from(trace))
+        \\    return trace
+    , 42);
+}
+
+test "cleanup retention keeps temporary targets through loop exits" {
+    for ([_][]const u8{ "break", "continue" }) |loop_exit| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\struct Leaf
+            \\    trace: Ref(int)
+            \\    drop = func(deinit self: Leaf) -> self.trace.value += 1
+            \\struct Pair
+            \\    first: Leaf
+            \\    second: int
+            \\    drop = func(deinit self: Pair) -> self.first.trace.value += 10
+            \\func make(trace: Ref(int)) Pair -> Pair{first = Leaf{trace = trace}, second = 0}
+            \\func run() int
+            \\    var trace = 0
+            \\    var pass = 0
+            \\    loop
+            \\        if pass > 0 -> break
+            \\        make(Ref.from(trace)).first.trace.value = if pass == 0
+            \\            trace = 31
+            \\            pass += 1
+            \\            $loop_exit
+            \\        else 0
+            \\    return trace
+        , .{ .loop_exit = loop_exit });
+        defer testing.allocator.free(source);
+        try Fixture.expectParity(source, 42);
+    }
 }
 
 test "Box and Ref alias analysis recomputes after source edits" {

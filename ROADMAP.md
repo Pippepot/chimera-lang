@@ -8,6 +8,12 @@ Settle missing semantics before implementation. Each milestone covers
 diagnostics, execution, ownership, and incremental/cache behavior. Legacy parity
 is not a goal.
 
+## Error handling acceptance
+
+Complete the [routine Safe suite](docs/COMPILER.md#verify) for nominal error
+marking, `catch`, and postfix `?` before full regression acceptance. Focused
+handler and entry-query checks pass; the full run was interrupted before completion.
+
 ## Flow typing acceptance
 
 The implementation, source migration, and routine Safe verification are complete.

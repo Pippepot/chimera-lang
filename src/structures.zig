@@ -72,6 +72,7 @@ pub const Token = struct {
         .keyword_and = null,
         .keyword_as = null,
         .keyword_break = null,
+        .keyword_catch = null,
         .keyword_comptime = null,
         .keyword_const = null,
         .keyword_converter = null,
@@ -217,6 +218,8 @@ pub const Node = struct {
         param,
         param_list,
         move_expr,
+        propagate_expr,
+        catch_expr,
         break_nothing,
         break_expr,
         continue_expr,
@@ -283,12 +286,12 @@ pub const Node = struct {
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
-            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .from_end, .reference_type, .move_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread => .node,
+            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .from_end, .reference_type, .move_expr, .propagate_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread => .node,
             .add, .sub, .mul, .div, .rem, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .membership, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .binding_else, .func, .type_func, .@"if", .collection_if, .match_arm, .match_guard => .node_node,
             .param => .parameter,
             .struct_field => .field,
             .signature => .signature,
-            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .binding_tuple, .binding_sequence, .import, .selective_import, .overload, .match_expr, .match_tuple => .ref,
+            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .binding_tuple, .binding_sequence, .import, .selective_import, .overload, .match_expr, .match_tuple, .catch_expr => .ref,
             else => null,
         };
     }
@@ -916,11 +919,6 @@ pub const ArrayType = struct {
     length: u32,
 };
 
-pub const InternVariantResult = union(enum) {
-    type_id: TypeId,
-    duplicate: TypeId,
-};
-
 /// Byte size and alignment in one layout domain. Byte size includes the padding
 /// needed for an element stride; the current layout queries resolve the host ABI.
 pub const TypeLayout = struct {
@@ -947,6 +945,7 @@ pub const StructDefinition = struct {
     fields: []const StructField,
     ownership: StructOwnershipProperties = .{},
     is_static: bool = false,
+    is_error: bool = false,
 
     pub const ResolvedField = struct {
         index: u32,
@@ -1876,10 +1875,13 @@ pub const Diagnostic = struct {
         .no_matching_overload = ?TypeId,
         .ambiguous_overload = "multiple overloads match; name an implementation explicitly",
         .overload_requires_callable_context = "an overload reference requires a function-type annotation",
-        .struct_member_not_supported = "struct bodies support fields, namespace declarations, and `move`, `copy`, or `drop` properties",
+        .struct_member_not_supported = "struct bodies support fields, namespace declarations, and `move`, `copy`, `drop`, or `error` properties",
         .duplicate_struct_member = Message{ .text = "struct member is already declared", .source_label = true },
         .reserved_ownership_member = Message{ .text = "`copy` and `move` are reserved for ownership capabilities", .source_label = true },
-        .duplicate_struct_property = Message{ .text = "struct ownership property is already declared", .source_label = true },
+        .duplicate_struct_property = Message{ .text = "struct property is already declared", .source_label = true },
+        .invalid_error_property = "the `error` property requires a Boolean literal",
+        .discarded_error = "an error result must be handled, stored, propagated, or explicitly discarded with `_ =`",
+        .invalid_entry_return = "entry may return only unit or marked error alternatives",
         .unknown_struct_property = void,
         .invalid_struct_property_value = InvalidStructPropertyValue,
         .struct_ownership_hook_signature_mismatch = TypeMismatch,
@@ -1995,7 +1997,6 @@ pub const Diagnostic = struct {
         .loop_invalidates_type_proof = "this loop can repeat after invalidating a type proof used in its body; test the type inside the loop",
         .condition_binding_must_be_immutable = "an `if` binding must use `const`, not `var`",
         .value_not_callable = Message{ .text = "value is not callable", .source_label = true },
-        .duplicate_variant_member_type = "variant contains the same member type more than once",
         .local_type_mismatch = TypeMismatch,
         .comparison_operand_not_int = TypeId,
         .equality_operand_not_supported = TypeId,

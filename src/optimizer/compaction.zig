@@ -1,6 +1,7 @@
 const std = @import("std");
 const structures = @import("../structures.zig");
 const function_ir = @import("function.zig");
+const canonicalize = @import("canonicalize.zig");
 
 const Body = structures.FunctionBodyAnalysis;
 const ValueId = structures.FunctionValueId;
@@ -218,15 +219,14 @@ pub fn removeDead(function: *Function) !function_ir.Changes {
     const reachable = (try function.controlFlowEdges()).reachable;
     const live = try liveValues(function.scratch, function, reachable);
     var changes: function_ir.Changes = .{};
-    var uses: DeadUses = .{ .function = function };
+    var uses: DeadUses = .{ .function = function, .live = live };
     const tables = function_ir.tableView(function);
     for (function.results.items, function.removed.items, function.instructions.items) |result, *removed, *instruction| {
         if (!removed.* and !live[@backingInt(result)]) {
             changes.storage = changes.storage or function_ir.usesStorage(function, instruction);
-            function_ir.visitInstructionReferences(tables, instruction, &uses, DeadUses.reference);
-            switch (instruction.*) {
-                .borrow_address, .storage_cursor, .initializer_ref => uses.changed = true,
-                else => {},
+            if (!uses.changed) {
+                function_ir.visitInstructionReferences(tables, instruction, &uses, DeadUses.reference);
+                canonicalize.visitInstructionAddresses(function, instruction.*, &uses, DeadUses.address);
             }
             removed.* = true;
             changes.changed = true;
@@ -234,6 +234,12 @@ pub fn removeDead(function: *Function) !function_ir.Changes {
     }
     for (function.blocks.items, reachable) |*block, kept| if (!kept) {
         if (block.instructions.items.len != 0 or block.terminator != .diverge) changes.changed = true;
+        if (!uses.changed) {
+            function_ir.visitTerminatorReferences(tables, &block.terminator, &uses, DeadUses.reference);
+            for (block.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
+                canonicalize.visitBranchAddresses(function, branch.*, &uses, DeadUses.address);
+            };
+        }
         block.instructions.clearRetainingCapacity();
         block.terminator = .diverge;
     };
@@ -244,10 +250,18 @@ pub fn removeDead(function: *Function) !function_ir.Changes {
         while (position > 0) {
             position -= 1;
             if (!live[@backingInt(function.blocks.items[index].parameters.items[position])]) {
+                const parameter = function.blocks.items[index].parameters.items[position];
+                const data = function.definitions.items[@backingInt(parameter)].argument.data;
+                for (incoming[index].items) |edge| {
+                    const argument = function.branchArguments(edge.branch(function).*)[position];
+                    uses.reference(argument.value);
+                    if (data.representation != .value or !function.direct(data.type_id)) uses.address(argument.value);
+                    if (function.definition(argument.value)) |definition| {
+                        if (definition == .local_storage) changes.storage = true;
+                    }
+                }
                 try function.removeParameter(@intCast(index), position, incoming[index].items);
                 changes.changed = true;
-                changes.storage = true;
-                uses.changed = true;
             }
         }
     }
@@ -258,10 +272,20 @@ pub fn removeDead(function: *Function) !function_ir.Changes {
 
 const DeadUses = struct {
     function: *const Function,
+    live: []const bool,
     changed: bool = false,
 
+    fn address(self: *DeadUses, value: ValueId) void {
+        if (self.live[@backingInt(value)]) self.changed = true;
+    }
+
     fn reference(self: *DeadUses, value: ValueId) void {
-        if (!self.function.valueType(value).isPrimitive()) self.changed = true;
+        if (self.changed or !self.live[@backingInt(value)]) return;
+        // Storage eligibility is tracked separately. Other use counts matter
+        // only for splitting variant block parameters; immutable snapshots do
+        // not need another round merely because an unused reader disappeared.
+        const definition = self.function.definitions.items[@backingInt(value)];
+        if (definition == .argument and !definition.argument.data.type_id.isPrimitive()) self.changed = true;
     }
 };
 

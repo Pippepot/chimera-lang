@@ -9,6 +9,7 @@ const Function = function_ir.Function;
 const Incoming = @import("graph.zig").Incoming;
 
 pub fn simplifyParameters(function: *Function, variants: bool) !bool {
+    if (!function.hasJoinParameters()) return false;
     function.resolveReferences();
     const graph = (try function.controlFlowEdges()).*;
     var parameters: ParameterSimplifier = .{

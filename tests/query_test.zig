@@ -440,7 +440,7 @@ const InternItemLoc = struct {
 
 const InternVariantPair = struct {
     pub const Input = [2]structures.TypeId;
-    pub const Output = structures.InternVariantResult;
+    pub const Output = structures.TypeId;
 
     pub fn run(ctx: *Context, members: Input) anyerror!Output {
         return queries.internVariantType(ctx, &members);
@@ -449,7 +449,7 @@ const InternVariantPair = struct {
 
 const InternVariantTriple = struct {
     pub const Input = [3]structures.TypeId;
-    pub const Output = structures.InternVariantResult;
+    pub const Output = structures.TypeId;
 
     pub fn run(ctx: *Context, members: Input) anyerror!Output {
         return queries.internVariantType(ctx, &members);
@@ -458,7 +458,7 @@ const InternVariantTriple = struct {
 
 const InternVariantMembers = struct {
     pub const Input = [2]structures.MemberSpec;
-    pub const Output = structures.InternVariantResult;
+    pub const Output = structures.TypeId;
 
     pub fn run(ctx: *Context, members: Input) anyerror!Output {
         const facts: queries.TypeFacts(*Context) = .{ .ctx = ctx };
@@ -3352,14 +3352,8 @@ test "variant types are structurally interned in canonical member order" {
     const db = try testDatabase(2);
     defer db.deinit();
 
-    const int_or_unit = switch ((try db.get(InternVariantPair, .{ .unit, .int })).*) {
-        .type_id => |type_id| type_id,
-        .duplicate => unreachable,
-    };
-    const reordered = switch ((try db.get(InternVariantPair, .{ .int, .unit })).*) {
-        .type_id => |type_id| type_id,
-        .duplicate => unreachable,
-    };
+    const int_or_unit = (try db.get(InternVariantPair, .{ .unit, .int })).*;
+    const reordered = (try db.get(InternVariantPair, .{ .int, .unit })).*;
     try testing.expectEqual(int_or_unit, reordered);
     try testing.expect(int_or_unit.interned() != null);
     try testing.expect(structures.TypeId.int.interned() == null);
@@ -3380,29 +3374,33 @@ test "variant types are structurally interned in canonical member order" {
         db.lookupInternedAs(queries.ItemLocations, @fromBackingInt(@intCast(std.math.maxInt(u32)))),
     );
 
-    const widened = switch ((try db.get(InternVariantPair, .{ int_or_unit, .none })).*) {
-        .type_id => |type_id| type_id,
-        .duplicate => unreachable,
-    };
+    const widened = (try db.get(InternVariantPair, .{ int_or_unit, .none })).*;
     const widened_variant = try db.lookupInterned(queries.Types, widened.interned().?);
     try testing.expectEqualSlices(structures.TypeId, &.{ .int, .unit, .none }, widened_variant.variant.members);
 
     try testing.expectEqual(
-        structures.InternVariantResult{ .duplicate = .int },
+        structures.TypeId.int,
         (try db.get(InternVariantPair, .{ .int, .int })).*,
     );
     try testing.expectEqual(
-        structures.InternVariantResult{ .duplicate = .int },
+        int_or_unit,
         (try db.get(InternVariantPair, .{ int_or_unit, .int })).*,
     );
     try testing.expectEqual(
-        structures.InternVariantResult{ .duplicate = .unit },
+        widened,
         (try db.get(InternVariantTriple, .{ .none, .unit, int_or_unit })).*,
     );
     try testing.expectEqual(
-        structures.InternVariantResult{ .type_id = .int },
+        structures.TypeId.int,
         (try db.get(InternVariantPair, .{ .int, .never })).*,
     );
+    try testing.expectEqual(
+        structures.TypeId.never,
+        (try db.get(InternVariantTriple, .{ .never, .never, .never })).*,
+    );
+    const int_or_none = (try db.get(InternVariantPair, .{ .int, .none })).*;
+    try testing.expectEqual(widened, (try db.get(InternVariantPair, .{ int_or_unit, int_or_none })).*);
+    try testing.expectEqual(widened, (try db.get(InternVariantPair, .{ widened, widened })).*);
 }
 
 test "compile-time values and ordered tuples have canonical identities" {
@@ -3464,10 +3462,7 @@ test "host type layout reports size and alignment for variants" {
         (try db.get(queries.HostTypeLayout, .never)).*,
     );
 
-    const int_or_none = switch ((try db.get(InternVariantPair, .{ .int, .none })).*) {
-        .type_id => |type_id| type_id,
-        .duplicate => unreachable,
-    };
+    const int_or_none = (try db.get(InternVariantPair, .{ .int, .none })).*;
     try testing.expectEqual(
         structures.TypeLayout{
             .byte_size = 8,
@@ -3480,10 +3475,7 @@ test "host type layout reports size and alignment for variants" {
     try testing.expectEqual(@as(u32, 4), variant_layout.payload_offset);
     try testing.expectEqual((try db.get(queries.HostTypeLayout, int_or_none)).*, variant_layout.layout);
 
-    const unit_or_none = switch ((try db.get(InternVariantPair, .{ .unit, .none })).*) {
-        .type_id => |type_id| type_id,
-        .duplicate => unreachable,
-    };
+    const unit_or_none = (try db.get(InternVariantPair, .{ .unit, .none })).*;
     const first_layout = try db.get(queries.HostTypeLayout, unit_or_none);
     try testing.expectEqual(
         structures.TypeLayout{
@@ -5205,18 +5197,21 @@ test "variant member specifications distinguish storage kind and reference scope
     const db = try testDatabase(2);
     defer db.deinit();
 
-    const owned = (try db.get(InternVariantPair, .{ .int, .none })).*.type_id;
-    const borrowed = (try db.get(InternVariantMembers, .{ .{ .type_id = .int, .kind = .reference }, .{ .type_id = .none } })).*.type_id;
+    const owned = (try db.get(InternVariantPair, .{ .int, .none })).*;
+    const borrowed = (try db.get(InternVariantMembers, .{ .{ .type_id = .int, .kind = .reference }, .{ .type_id = .none } })).*;
     try testing.expect(owned != borrowed);
     const borrowed_members = (try db.lookupInterned(queries.Types, borrowed.interned().?)).variant.members;
     try testing.expectEqual(@as(usize, 2), borrowed_members.len);
     const reference = if (borrowed_members[0] == .none) borrowed_members[1] else borrowed_members[0];
     try testing.expectEqual(structures.TypeId.int, (try db.lookupInterned(queries.Types, reference.interned().?)).reference);
 
-    const mixed = (try db.get(InternVariantMembers, .{ .{ .type_id = .int }, .{ .type_id = .int, .kind = .reference } })).*.type_id;
+    const mixed = (try db.get(InternVariantMembers, .{ .{ .type_id = .int }, .{ .type_id = .int, .kind = .reference } })).*;
     try testing.expectEqual(@as(usize, 2), (try db.lookupInterned(queries.Types, mixed.interned().?)).variant.members.len);
+    try testing.expectEqual(mixed, (try db.get(InternVariantPair, .{ mixed, mixed })).*);
+    const repeated_reference = (try db.get(InternVariantMembers, .{ .{ .type_id = .int, .kind = .reference }, .{ .type_id = .int, .kind = .reference } })).*;
+    try testing.expectEqual(reference, repeated_reference);
 
-    const whole = (try db.get(InternVariantMembers, .{ .{ .type_id = owned, .kind = .reference }, .{ .type_id = .unit } })).*.type_id;
+    const whole = (try db.get(InternVariantMembers, .{ .{ .type_id = owned, .kind = .reference }, .{ .type_id = .unit } })).*;
     const whole_members = (try db.lookupInterned(queries.Types, whole.interned().?)).variant.members;
     try testing.expectEqual(@as(usize, 2), whole_members.len);
     const whole_reference = if (whole_members[0] == .unit) whole_members[1] else whole_members[0];
@@ -5248,7 +5243,7 @@ test "function signatures intern canonical variant annotations" {
     );
     try testing.expectEqual(@as(?usize, 1), (try db.get(SignatureParent, target_id)).*);
 
-    const reordered_source = "static target = func(value: none | int) unit | int -> return 1";
+    const reordered_source = "static target = func(value: none | int | none | never) unit | int | unit -> return 1";
     try setSource(db, 1, reordered_source);
     const reordered_signature = try db.get(queries.FunctionSignature, target_id);
     try testing.expectEqual(first_signature, reordered_signature);
@@ -5265,37 +5260,100 @@ test "function signatures intern canonical variant annotations" {
     try testing.expect((try db.get(queries.CompileFunction, .{ .item = target_id })).* != null);
 }
 
-test "variant annotation diagnostics belong to their semantic boundary" {
+test "variant annotations collapse repeated members in signatures and bodies" {
     const db = try testDatabase(2);
     defer db.deinit();
 
     const cases = [_]struct {
         file_id: structures.FileId,
         source: []const u8,
-        query_signature: bool,
-        marker: []const u8,
-        kind: structures.Diagnostic.Kind,
+        return_type: structures.TypeId,
     }{
-        .{ .file_id = 1, .source = "static target = func(value: int | int) unit -> return", .query_signature = true, .marker = "int", .kind = .duplicate_variant_member_type },
-        .{ .file_id = 2, .source = "static target = func() unit | unit -> return", .query_signature = true, .marker = "unit", .kind = .duplicate_variant_member_type },
-        .{ .file_id = 3, .source = "static target = func() int\n  const value: none | none = 1\n  return 1", .query_signature = false, .marker = "none", .kind = .duplicate_variant_member_type },
+        .{ .file_id = 1, .source = "static target = func(value: int | int) int | int -> value", .return_type = .int },
+        .{ .file_id = 2, .source = "static target = func() unit | unit -> return", .return_type = .unit },
+        .{ .file_id = 3, .source = "static target = func() none | none\n  const value: none | none = none\n  return value", .return_type = .none },
     };
     for (cases) |case| {
         try addSource(db, case.file_id, case.source);
         const target_id = (try db.get(queries.IndexItems, case.file_id)).*.?.ids()[0];
-        const diagnostics = if (case.query_signature) blk: {
-            try testing.expect((try db.get(queries.FunctionSignature, target_id)).* == null);
-            break :blk try db.directAccumulatorValues(queries.FunctionCandidateSignature, .{ .item = target_id }, structures.Diagnostic);
-        } else blk: {
-            try testing.expect((try db.get(queries.FunctionSignature, target_id)).* != null);
-            try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = target_id })).* == null);
-            break :blk try db.directAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = target_id }, structures.Diagnostic);
-        };
-        try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try testing.expectEqual(case.kind, diagnostics[0].kind);
-        const start = std.mem.lastIndexOf(u8, case.source, case.marker).?;
-        try testing.expectEqual(structures.SourceSpan{ .start = start, .end = start + case.marker.len }, diagnostics[0].span.?);
+        const signature = (try db.get(queries.FunctionSignature, target_id)).*.?;
+        try testing.expectEqual(case.return_type, signature.return_type);
+        try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = target_id })).* != null);
+        const diagnostics = try db.directAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = target_id }, structures.Diagnostic);
+        try testing.expectEqual(@as(usize, 0), diagnostics.len);
     }
+}
+
+test "variant set unions compose generic aliases and clean owned payloads once" {
+    try test_sources.SourceFixture.expectParity(
+        \\struct Item
+        \\    drops: Ref(int)
+        \\    value: int
+        \\    drop = func(deinit self: Item) -> self.drops.value += 1
+        \\func Union(static First: type, static Second: type) type -> First | Second
+        \\static Alias = Item
+        \\static Left = Item | none
+        \\static Right = bool | Alias
+        \\static Combined = Union(Left, Right) | Left | never
+        \\func produce(ref drops: int, mode: int) Combined
+        \\    if mode == 0 -> return none
+        \\    if mode == 1 -> return true
+        \\    return Item{drops = Ref.from(drops), value = 41}
+        \\func select(ref drops: int, mode: int) int
+        \\    const selected = produce(drops, mode)
+        \\    if selected is Item -> return selected.value
+        \\    if selected is bool -> return 1
+        \\    return 0
+        \\func run() int
+        \\    var drops = 0
+        \\    const value = select(drops, 2)
+        \\    if drops <> 1 -> return 91
+        \\    if select(drops, 0) <> 0 -> return 92
+        \\    if select(drops, 1) <> 1 -> return 93
+        \\    return value + drops
+    , 42);
+}
+
+test "variant set unions preserve owned borrowed and whole variant storage" {
+    try test_sources.SourceFixture.expectParity(
+        \\struct Holder
+        \\    value: ref int | ref int
+        \\func singleton(ref value: int) ref int | ref int -> value
+        \\func borrow(ref value: int) ref int | none | ref int -> value
+        \\func choose(ref value: int, borrowed: bool) int | ref int | none | int | ref int
+        \\    if borrowed -> return borrow(value)
+        \\    return 19
+        \\func update(ref value: int, borrowed: bool) int
+        \\    var carrier = choose(value, borrowed)
+        \\    if not (carrier is int) -> return 90
+        \\    ref payload = carrier
+        \\    payload += 23
+        \\    return carrier
+        \\func capture(ref owner: int | bool) ref (int | bool) | none | ref (int | bool) -> owner
+        \\func run() int
+        \\    var value = 19
+        \\    if update(value, false) <> 42 -> return 91
+        \\    if value <> 19 -> return 92
+        \\    if update(value, true) <> 42 -> return 93
+        \\    if value <> 42 -> return 94
+        \\    const operation: func(ref int) ref int | ref int = singleton
+        \\    ref direct = operation(value)
+        \\    direct += 1
+        \\    if value <> 43 -> return 97
+        \\    const pair: (ref int | ref int, int) = (value, 1)
+        \\    pair.0 += 1
+        \\    if value <> 44 -> return 98
+        \\    const holder = Holder{value = value}
+        \\    holder.value += 1
+        \\    if value <> 45 -> return 99
+        \\    var whole: int | bool = true
+        \\    const carrier = capture(whole)
+        \\    if carrier is none -> return 95
+        \\    ref projected = carrier
+        \\    projected = 42
+        \\    if whole is int -> return whole
+        \\    return 96
+    , 42);
 }
 
 test "variant values cross calls and subset widening remaps their tag" {
@@ -8491,7 +8549,7 @@ test "duplicate top-level names fail executable construction without any call" {
     try testing.expectEqual(structures.Diagnostic.Kind.duplicate_top_level_declaration, diagnostics[0].kind);
 }
 
-test "malformed function diagnostics remain parse-only and top-level return stays rejected" {
+test "malformed function diagnostics remain parse-only and invalid entry results stay rejected" {
     const db = try testDatabase(1);
     defer db.deinit();
 
@@ -8512,8 +8570,8 @@ test "malformed function diagnostics remain parse-only and top-level return stay
     try testing.expect((try db.get(queries.AnalyzeFunctionInstance, .{ .item = entry_instance.item })).* == null);
     try testing.expect((try db.get(queries.CompileFunction, entry_instance)).* == null);
     try testing.expect((try db.get(queries.BuildExecutable, 2)).* == null);
-    const return_span: structures.SourceSpan = .{ .start = 0, .end = "return".len };
-    const entry_kind: structures.Diagnostic.Kind = .top_level_return;
+    const return_span: structures.SourceSpan = .{ .start = "return ".len, .end = "return 7".len };
+    const entry_kind: structures.Diagnostic.Kind = .invalid_entry_return;
     try expectSingleQueryDiagnostic(db, queries.AnalyzeFunctionInstance, .{ .item = entry_id }, true, 2, return_span, entry_kind);
     try expectSingleQueryDiagnostic(db, queries.CompileFunction, entry_instance, false, 2, return_span, entry_kind);
     const entry_diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, 2, structures.Diagnostic, testing.allocator);
@@ -8522,7 +8580,7 @@ test "malformed function diagnostics remain parse-only and top-level return stay
     try testing.expectEqual(entry_kind, entry_diagnostics[0].kind);
 }
 
-test "entry analysis rejects top-level returns" {
+test "entry analysis rejects ordinary nonunit return alternatives" {
     const db = try testDatabase(2);
     defer db.deinit();
 
@@ -8530,12 +8588,12 @@ test "entry analysis rejects top-level returns" {
         source: []const u8,
         marker: []const u8,
     }{
-        .{ .source = "return", .marker = "return" },
-        .{ .source = "static ok = 1\nreturn 7\nprint(1)", .marker = "return" },
-        .{ .source = "if 1 < 2 -> return", .marker = "return" },
-        .{ .source = "loop\n  return", .marker = "return" },
+        .{ .source = "return 7", .marker = "7" },
+        .{ .source = "static ok = 1\nreturn 7\nprint(1)", .marker = "7" },
+        .{ .source = "if 1 < 2 -> return 7", .marker = "7" },
+        .{ .source = "loop\n  return 7", .marker = "7" },
     };
-    const entry_kind: structures.Diagnostic.Kind = .top_level_return;
+    const entry_kind: structures.Diagnostic.Kind = .invalid_entry_return;
 
     for (cases, 10..) |case, file_id| {
         try addSource(db, file_id, case.source);
@@ -8621,7 +8679,7 @@ test "entry analysis validates all root syntax before resolving a call" {
         marker: []const u8,
         kind: structures.Diagnostic.Kind,
     }{
-        .{ .source = "static bad = func() foo -> return 1\nbad()\nreturn", .marker = "return", .kind = .top_level_return },
+        .{ .source = "static bad = func() foo -> return 1\nbad()\ncontinue", .marker = "continue", .kind = .continue_outside_loop },
         .{ .source = "static f = func() int -> return 1\nsizeof(int)\nf()", .marker = "sizeof", .kind = .expression_not_supported },
     };
 

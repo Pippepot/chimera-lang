@@ -50,6 +50,7 @@ COMPILATION_ESTIMATES = {
 COMPILER_BRIDGE = '''pub const optimize_mode = @import("builtin").mode;
 pub const query = @import("query/engine.zig");
 pub const modules = @import("modules.zig");
+pub const profiling = @import("profiling.zig");
 pub const queries = @import("queries.zig");
 pub const structures = @import("structures.zig");
 '''

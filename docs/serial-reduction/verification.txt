@@ -1,0 +1,10 @@
+Command: zig build test --seed=0 -Doptimize=safe -j1
+Working directory: /Repos/chimera-lang
+Existing build runner: 292505
+Observed exit status: 0
+Source and test fingerprints unchanged during the run.
+The run included concurrent type/ownership changes in the shared checkout.
+
+Thread 1 "maker" hit Catchpoint 1 (call to syscall exit_group), 0x00000000013d41cd in ?? ()
+SAFE_RUNNER_EXIT_STATUS: 0
+[Inferior 1 (process 292505) detached]

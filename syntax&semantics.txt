@@ -368,10 +368,14 @@ pub import math.{Vec3}
 # Any file may contain executable top-level statements, but only the file
 # passed to the compiler executes them. Imported files never run on import;
 # imports have no runtime side effects.
-# The designated file's top-level body is an ordinary unit entry. Reaching its
-# end cleans live owners and exits with status 0. A discarded false or none is
-# data and does not exit the program. Explicit exit and panic retain their own
-# semantics. Compile-time required evaluation can return none as an ordinary value.
+# The designated file's top-level body is an entry with ordinary owner cleanup.
+# Reaching its end, returning unit, or bare return exits with status 0. Entry may
+# also return marked errors, including a unit | Error result: an active error
+# cleans live owners, writes "unhandled error" to stderr, and exits with status 1.
+# A discarded false or none is data and does not exit the program. Discarding an
+# unhandled error requires explicit acknowledgment with `_ =`. Explicit exit and
+# panic retain their own semantics; panic does not acquire entry's cleanup policy.
+# Compile-time required evaluation can return none as an ordinary value.
 
 
 
@@ -903,6 +907,9 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # Assigning a value to `_` is a non-consuming use that explicitly extends its
 # lifetime to that point. The expression is evaluated once, but an owning value
 # is neither copied nor transferred merely to perform the discard.
+# An ordinary discarded expression whose top-level alternatives include a marked
+# error is rejected. Binding or assigning stores it; `_ = expression` explicitly
+# acknowledges discarding it. This applies to unit inline bodies as well.
 # A discard produces unit when used as an inline body or a conditional body's
 # final value.
 # Its behavior does not depend on whether another statement follows it.
@@ -1055,6 +1062,8 @@ func forward_initializer(static T: type, init item: T) T
 # a loop outside the initializer are errors, not retargeted exits. Loops inside
 # the initializer retain their own break and continue; called functions return
 # normally. Forwarding, aliases, and indirect calls preserve this boundary.
+# Postfix `?` cannot forward an error across this boundary. Catch may recover
+# locally and construct the required value; it does not waive completion rules.
 # Ordinary eager argument expressions retain caller-directed exits.
 # Deferred writes and completed transfers are not rolled back by an absent or error result.
 # Reference escape, mutations of caller storage, and explicit-drop obligations still apply.
@@ -1486,6 +1495,16 @@ const inferred_wrapper = Wrapper{value = 42}
 # defined structs compatible.
 static QAlias = Q
 
+# A struct property `error = true` marks that nominal type as an error alternative.
+# The property takes a Boolean literal; false and omission leave it unmarked.
+# It is metadata, not a field, base type, wrapper, or ownership capability. Aliases
+# preserve the mark; separately declared structs and generated specializations
+# retain their ordinary nominal identities. Containing an error field, element,
+# or reference handle does not mark the containing type.
+struct InvalidNumber
+    error = true
+    text: String
+
 # Functions declared inside a struct namespace are namespace declarations,
 # not fields or part of the struct's data definition. A function declared in
 # S's namespace is addressed as S.function. For instance call syntax, the
@@ -1508,7 +1527,7 @@ func S.read_a(imm value: S) int -> value.a
 # Callable values stored in the namespace also support this receiver insertion;
 # callable instance fields are called directly without inserting the receiver.
 # Fields and ordinary namespace declarations share one name scope; duplicate
-# names are errors. Ownership properties use a separate hook scope. Within a
+# names are errors. Struct properties use a separate scope. Within a
 # namespace declaration, unqualified names search its enclosing struct
 # namespaces before module declarations and the defining file's imports.
 # A public struct exports its type, not its namespace members. Functions,
@@ -1644,11 +1663,19 @@ pub struct Interval
 
 
 # Variants
-# Variants are structural sets: flatten nested variants, ignore member order,
-# and reject duplicate member types.
-# never contributes no member, so T | never is T.
+# Variants are structural sets: | flattens nested owned variants, removes
+# identical alternatives, and ignores member order. Identity includes logical
+# type and owned/reference storage kind; T | ref T retains both alternatives.
+# Aliases preserve identity. Distinct nominal types and implicitly convertible
+# types remain distinct alternatives. References to whole variants do not flatten.
+# never contributes no member. A singleton union is its member, and a union
+# containing only never is never. Overlapping aliases compose without error.
 static int_or_float = int | float
 static number_or_bool = int_or_float | bool # same as bool | float | int
+static scalar = int | bool
+static nullable_scalar = scalar | (bool | none) # same as int | bool | none
+static repeated = scalar | scalar # same as scalar
+static singleton = int | int | never # same as int
 
 # An exact member or structural subset implicitly widens into an expected
 # containing variant at bindings, assignments, arguments, and returns.
@@ -1669,13 +1696,14 @@ reassigned = int_or_float_value
 # A payload-free case is neither bare unit nor bare none, so it does not itself
 # change the meaning of none. Existing type alternatives remain ordinary
 # members rather than becoming wrapped cases.
-# Informative errors use ordinary variants and payloads, not a new payload-carrying
-# failure effect. Declaration syntax below is a sketch; case construction,
+# These cases are not the foundation of error handling: marked nominal structs
+# and ordinary unions already provide informative errors. Declaration syntax
+# below is a sketch; case construction,
 # matching, visibility, and identity across aliases/composed variants remain open.
-static Error =
-    .Oom
-    .Message: String
-    CustomErrorType
+static Message =
+    .Empty
+    .Text: String
+    CustomMessageType
 
 
 # Converters
@@ -1745,6 +1773,11 @@ where T is String or T.String is func(imm T) String -> 1
 # The source is evaluated once; only the active
 # member's conversion executes. Reference alternatives use their referents for
 # conversion unless the expected type already accepts the stored reference.
+# Implicit conversion never hides or remaps a marked error alternative. Its exact
+# ordinary type/storage alternative must already fit the target. Other members of
+# the same source union may still convert independently. Explicit `Target(value)`
+# or a named call to a converter may deliberately transform an error; neither
+# operation catches it or propagates it implicitly.
 # Identity members retain ordinary borrowing and copying rules; converting a
 # variant never implicitly copies a noncopyable member merely to inspect it.
 func draw(angle: Radians)
@@ -1902,11 +1935,54 @@ if not (recovered is List(int)) -> panic "allocation refused"
 # An expected type never catches control flow or manufactures none. Functions
 # return none or an error explicitly. Calls use the same syntax in every context.
 # Function types describe parameters and results, with no fallibility effect or
-# implicit callable widening. There is no fail statement, query postfix, or
-# expression-level checked cast. `as` is reserved for import aliases.
+# implicit callable widening. There is no fail statement or expression-level
+# checked cast. `as` is reserved for import aliases.
 func accept_small(value: int) int | none
     if value >= 2 -> return none
     return value
+
+# Error handling
+# Errors are ordinary structs marked `error = true`, returned directly or in
+# ordinary unions. There is no Result wrapper, universal Error, distinct fallible
+# function category, or automatic propagation. Only top-level logical alternatives
+# are classified; none, false, containers, and unmarked wrappers remain successes.
+# Reference alternatives are classified by their referent's logical type.
+# No public success/error partition helpers are required.
+#
+# `expression catch err -> handler` evaluates the operand once. On success it
+# yields the selected non-error value; on error it binds that value to err and
+# evaluates the handler. Catch has lower precedence than ordinary binary operators.
+# Its body can be inline or indented, like a match arm. The expression's result is
+# the ordinary join of its success alternatives and the handler's results. Errors
+# produced by the handler remain values; this catch does not catch them again.
+const number = parse(text) catch err -> 0
+const annotated = parse(text) catch err: InvalidNumber | OutOfRange -> 0
+# The optional binder annotation must admit every caught logical error type.
+# It is not a filter and does not convert or copy the caught value. An infallible
+# specialization is legal and does not type-check an unreachable handler body.
+# The `_` binder may be used when the error payload is not needed.
+#
+# Postfix `?` yields the same success projection but returns an active error from
+# the enclosing callable. The ordinary return contract must accept that error.
+# An owned error is transferred, including a noncopyable one; a reference remains
+# a reference if the return contract admits it. Returning a borrowed error as an
+# owned value requires its ordinary copy capability and never steals its owner.
+# Infallible `?` is identity, including direct immovable construction. An input
+# consisting entirely of errors has no continuing success path (never).
+func checked_number(text: String) int | InvalidNumber | OutOfRange
+    const number = parse(text)?
+    return number + 1
+# An explicit forwarding handler uses ordinary return and movement syntax:
+# `parse(text) catch err -> return err^` transfers an owned error. A reference
+# result instead follows the ordinary reference-return contract. At entry both
+# explicit forwarding and `?` use the cleanup/report/status-1 policy above.
+#
+# Projection retains owned versus reference storage, readonly permissions, origins,
+# and tag/carrier dependencies. A borrowed union with several successful members
+# yields a union of references to those members, not a reference to a relaid-out
+# smaller union. Replacing the backing variant invalidates its payload references.
+# No handler adds a way out of deferred initialization or relaxes ownership,
+# completion, explicit-drop, or escape rules.
 
 # Comparisons, membership, is, and logical operators produce bool. and/or short
 # circuit left to right; not negates a bool. Precedence, tightest first:
@@ -1937,6 +2013,16 @@ func value_or(value: int | none, fallback: int) int
 # writable. Writes still use the declared type of the destination. A write that
 # can replace a tested carrier invalidates its fact, including writes through
 # aliases, hooks, and calls. Writing inside its payload does not replace its tag.
+# After an assignment completes, reads of its exact target are refined to the
+# known alternatives of the assigned value before widening into declared storage.
+# This establishes a fresh fact, not a revival of a pre-assignment proof. Assigning
+# a literal none therefore permits a subsequent none read without another test.
+# An uncertain variant RHS retains all of its possible alternatives. Joins union
+# the alternatives established on each incoming path. Calls and other mutations
+# without a known assigned value invalidate facts without establishing a new one.
+# A selected reference can retain the new fact for that selected place, not for
+# every backing place it might designate. Saved bool values do not change merely
+# because their old implications were invalidated.
 # Nested named fields can be refined independently. Unknown/dynamic element
 # selections do not establish facts about other element reads. A bound ref
 # keeps its selected address and can be tested and read through that alias;

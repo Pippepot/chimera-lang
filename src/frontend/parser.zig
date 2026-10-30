@@ -1009,7 +1009,20 @@ fn parseExpressionPrecedence(parser: *ParserState, min_precedence: u8) ParseErro
     }
 
     if (min_precedence == 0 and parser.current().tag == .pipe and !parser.atMatchArmBoundary()) return parseVariantMembers(parser, token_index, lhs, false);
+    if (min_precedence == 0 and parser.current().tag == .keyword_catch) return parseCatch(parser, lhs);
     return lhs;
+}
+
+fn parseCatch(parser: *ParserState, operand: Node.Index) ParseError!Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_catch);
+    const name_index = parser.index;
+    _ = try parser.expect(.identifier);
+    const annotation = try parseTypeAnnotation(parser);
+    const binding = try parser.addNode(.{ .tag = .param, .token_index = name_index, .data = .{ .parameter = .{ .annotation = annotation } } });
+    _ = try parser.expect(.arrow);
+    const body = try parseMatchArmBody(parser, token_index);
+    return parser.addNode(.{ .tag = .catch_expr, .token_index = token_index, .data = try parser.listToSpan(&.{ operand, binding, body }) });
 }
 
 fn parseRange(parser: *ParserState, first: ?Node.Index) ParseError!Node.Index {
@@ -1090,6 +1103,7 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
             },
             .period => lhs = try parseFieldAccess(parser, lhs),
             .caret => lhs = try parsePostfixNode(parser, lhs, .move_expr),
+            .question_mark => lhs = try parsePostfixNode(parser, lhs, .propagate_expr),
             else => break,
         }
     }
@@ -1925,6 +1939,30 @@ test "parse public declared and generated struct fields" {
         }
         try std.testing.expectEqual(@as(usize, 1), public_fields);
     }
+}
+
+test "parse catch annotations and postfix propagation" {
+    var report = try parseReport(std.testing.allocator, 0,
+        \\const value = parse(text)? + other() catch err: First | Second -> 0
+        \\const chained = source()?.field?
+    );
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    const ast = report.ast.?;
+    var propagation_count: usize = 0;
+    var handler_count: usize = 0;
+    for (ast.nodes) |node| {
+        if (node.tag == .propagate_expr) propagation_count += 1;
+        if (node.tag != .catch_expr) continue;
+        handler_count += 1;
+        const parts = ast.node_refs[node.data.ref.start..node.data.ref.end];
+        try std.testing.expectEqual(@as(usize, 3), parts.len);
+        const binding = ast.nodes[parts[1].index()];
+        try std.testing.expectEqual(Node.Tag.param, binding.tag);
+        try std.testing.expectEqual(Node.Tag.type_variant, ast.nodes[binding.data.parameter.annotation.index()].tag);
+    }
+    try std.testing.expectEqual(@as(usize, 3), propagation_count);
+    try std.testing.expectEqual(@as(usize, 1), handler_count);
 }
 
 test "parse struct properties" {

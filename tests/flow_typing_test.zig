@@ -67,6 +67,239 @@ test "saved boolean proofs track the version they tested" {
     , .missing_operation);
 }
 
+test "calculus correspondence keeps saved tests bound to their original place" {
+    try Fixture.expectParity(
+        \\struct Pair
+        \\    first: int | none
+        \\    second: int | none
+        \\func choose(value: int | none) int
+        \\    var pair = Pair{first = value, second = none}
+        \\    var selected = Ref.from(pair.first)
+        \\    const tested = selected.value is int
+        \\    selected = Ref.from(pair.second)
+        \\    selected.value = none
+        \\    if tested -> return pair.first
+        \\    return 0
+        \\func run() int -> choose(42) + choose(none)
+    , 42);
+}
+
+test "calculus correspondence preserves copied negated tests through sibling writes" {
+    try Fixture.expectParity(
+        \\struct Pair
+        \\    first: int | none
+        \\    second: int | none
+        \\func choose(value: int | none) int
+        \\    var pair = Pair{first = value, second = none}
+        \\    ref selected = pair.first
+        \\    ref chained = selected
+        \\    ref sibling = pair.second
+        \\    const tested = chained is int
+        \\    const copied = tested
+        \\    sibling = none
+        \\    if not copied
+        \\        const absent: none = chained
+        \\        return 0
+        \\    return chained
+        \\func run() int -> choose(42) + choose(none)
+    , 42);
+}
+
+test "calculus correspondence checks declared writes and fresh tests" {
+    try Fixture.expectParity(
+        \\func replace(value: int | none) int
+        \\    var subject = value
+        \\    if subject is int
+        \\        subject = none
+        \\        if subject is none -> return 21
+        \\        return 90
+        \\    const absent: none = subject
+        \\    return 0
+        \\func retest(value: int | none) int
+        \\    var subject = value
+        \\    subject = none
+        \\    if subject is int -> return subject
+        \\    const absent: none = subject
+        \\    return 42
+        \\func resave(value: int | none) int
+        \\    var subject = value
+        \\    var tested = subject is int
+        \\    subject = none
+        \\    tested = false
+        \\    if tested -> return 90
+        \\    if subject is none -> return 21
+        \\    return 91
+        \\func run() int
+        \\    if replace(42) <> 21 -> return 90
+        \\    if replace(none) <> 0 -> return 91
+        \\    if resave(42) <> 21 -> return 92
+        \\    if resave(none) <> 21 -> return 93
+        \\    if retest(none) <> 42 -> return 90
+        \\    return retest(19)
+    , 42);
+}
+
+test "calculus correspondence rejects copied evidence after alias writes and joins" {
+    for ([_][]const u8{
+        \\func choose(var value: int | none) int
+        \\    ref selected = value
+        \\    const tested = value is int
+        \\    const copied = tested
+        \\    selected = none
+        \\    if copied -> return value + 1
+        \\    return 0
+        \\exit(choose(41))
+        ,
+        \\func choose(var value: int | none, flag: bool) int
+        \\    ref selected = value
+        \\    const tested = value is int
+        \\    if flag -> selected = none
+        \\    if tested -> return value + 1
+        \\    return 0
+        \\exit(choose(41, true))
+        ,
+        \\func choose(value: int | none) int -> value + 1
+        \\exit(choose(41))
+        ,
+    }) |source| {
+        try Fixture.expectSourceDiagnostic(source, .missing_operation);
+    }
+}
+
+test "calculus correspondence rejects writes outside the declared variant" {
+    try Fixture.expectSourceDiagnostic(
+        \\var value: int | none = 42
+        \\value = true
+    , .assignment_type_mismatch);
+}
+
+test "calculus correspondence narrows post-write source reads" {
+    for ([_][]const u8{
+        \\func choose(value: int | none) none
+        \\    var subject = value
+        \\    if subject is int
+        \\        subject = none
+        \\        return subject
+        \\    return subject
+        \\func run() int
+        \\    _ = choose(42)
+        \\    _ = choose(none)
+        \\    return 42
+        ,
+        \\func choose(value: int | none) none
+        \\    var subject = value
+        \\    var tested = subject is int
+        \\    subject = none
+        \\    tested = false
+        \\    if tested -> return none
+        \\    return subject
+        \\func run() int
+        \\    _ = choose(42)
+        \\    _ = choose(none)
+        \\    return 42
+        ,
+        \\func choose(value: int | none) int
+        \\    var subject = value
+        \\    const tested = subject is int
+        \\    subject = none
+        \\    if tested
+        \\        const absent: none = subject
+        \\        return 42
+        \\    return 0
+        \\func run() int -> choose(42) + choose(none)
+        ,
+    }) |source| {
+        try Fixture.expectParity(source, 42);
+    }
+}
+
+test "assignment narrowing follows locals fields aliases and handles" {
+    try Fixture.expectParity(
+        \\struct Pair
+        \\    first: int | none
+        \\    second: int | none
+        \\func run() int
+        \\    var value: int | none = none
+        \\    ref selected = value
+        \\    selected = 19
+        \\    var pair = Pair{first = none, second = 90}
+        \\    pair.first = 23
+        \\    const handle = Ref.from(pair.second)
+        \\    handle.value = none
+        \\    const absent: none = handle.value
+        \\    return value + pair.first
+    , 42);
+}
+
+test "assignment narrowing keeps selected handles separate from possible targets" {
+    try Fixture.expectParity(
+        \\func choose(flag: bool) int
+        \\    var first: int | none = none
+        \\    var second: int | none = none
+        \\    const selected = if flag -> Ref.from(first) else Ref.from(second)
+        \\    selected.value = 21
+        \\    return selected.value
+        \\func run() int -> choose(true) + choose(false)
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func choose(flag: bool) int
+        \\    var first: int | none = none
+        \\    var second: int | none = none
+        \\    const selected = if flag -> Ref.from(first) else Ref.from(second)
+        \\    selected.value = 21
+        \\    return first + second
+        \\exit(choose(true))
+    , .missing_operation);
+}
+
+test "assignment narrowing joins freshly written alternatives" {
+    try Fixture.expectParity(
+        \\func choose(flag: bool) int | none
+        \\    var value: int | bool | none = false
+        \\    if flag
+        \\        value = 21
+        \\    else
+        \\        value = none
+        \\    return value
+        \\func run() int
+        \\    const first = choose(true)
+        \\    if not (first is int) -> return 90
+        \\    const second = choose(false)
+        \\    if not (second is none) -> return 91
+        \\    return first * 2
+    , 42);
+}
+
+test "assignment narrowing recomputes after source edits" {
+    const source =
+        \\func run() int
+        \\    var value: int | none = none
+        \\    value = 42
+        \\    return value
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "value = 42", "value = none");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, changed);
+    try fixture.expectDiagnostic(0, .return_type_mismatch);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+}
+
+test "calculus correspondence checks literal-unreachable source branches" {
+    try Fixture.expectSourceDiagnostic(
+        \\func choose(value: int | none) int
+        \\    if true
+        \\        return 42
+        \\    else
+        \\        return value + 1
+        \\exit(choose(none))
+    , .missing_operation);
+}
+
 test "loop backedges cannot reuse a proof from an earlier iteration" {
     try Fixture.expectSourceDiagnostic(
         \\var value: int | none = 19
@@ -212,14 +445,14 @@ test "saved bool copies survive joins and rebinding receives fresh proof version
         \\func run() int -> select(19, true) + select(23, false) + select(none, true)
     , 42);
     try Fixture.expectSourceDiagnostic(
-        \\func run() int
+        \\func choose(replacement: int | none) int
         \\    var value: int | none = 19
         \\    const tested = value is int
         \\    value = none
-        \\    value = 23
+        \\    value = replacement
         \\    if tested -> return value + 1
         \\    return 0
-        \\exit(run())
+        \\exit(choose(none))
     , .missing_operation);
 }
 
@@ -250,10 +483,13 @@ test "callee writes invalidate the selected carrier and preserve sibling proofs"
 
 test "lost proof diagnostics identify the guard and the invalidating write" {
     const source =
-        \\var value: int | none = 19
-        \\if value is int
-        \\    value = none
-        \\    exit(value + 1)
+        \\func choose(replacement: int | none) int
+        \\    var value: int | none = 19
+        \\    if value is int
+        \\        value = replacement
+        \\        return value + 1
+        \\    return 0
+        \\exit(choose(none))
     ;
     const fixture = try Fixture.init(source);
     defer fixture.deinit();

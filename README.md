@@ -205,5 +205,7 @@ and priorities.
 - [Benchmarks](benchmarks/README.md): measurement protocols and commit history.
 - [Language specification](syntax&semantics.txt): detailed rules and examples,
   including planned features.
+- [Core calculus](calculus/README.md): a descriptive semantic model and a verified
+  executable refinement core.
 - [Compiler architecture](ARCHITECTURE.md): how the implementation fits together.
 - [Query flow](PROGRAM_FLOW.md): demand, recomputation, and result lifetimes.

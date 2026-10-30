@@ -138,7 +138,19 @@ removal. A later pass changing the facts an earlier pass consumed triggers
 another local round; changes already consumed within the round do not. Storage
 uses and address exposure removed by dead-code elimination can trigger another
 round; deleting only unread scalar computations cannot. Join profiling is
-reported separately from CFG cleanup.
+reported separately from CFG cleanup. Bodies without join parameters skip join
+simplification until a new parameter is introduced. Removing a dead parameter
+invalidates earlier passes only when its incoming arguments change surviving
+uses or storage eligibility.
+Numbering processes dominating definitions before their users, so its own
+substitutions do not require another numbering or liveness pass. Those passes
+run again after other phases change inputs, or after dead-code removal changes
+address exposure. Canonicalization and dead-code removal share address-use
+visitors; removed address uses matter only for surviving values. Removed readers
+of variant block parameters can enable scalar splitting; removed readers of
+immutable snapshots do not trigger another round.
+Joins and canonicalization still consume substitutions before
+convergence is decided.
 Storage passes repeat only when downstream storage uses or control flow changed and
 local storage remains. Scalar replacement reaches its own fixed point;
 new field types are classified before promotion. Type classification visits only
@@ -565,6 +577,45 @@ builds and types exactly one body, reuses unrelated optimized bodies, and drops
 an unreachable leaf's dependency and diagnostics. Modified Zig files pass
 formatting, and `git diff --check` passes. Exhaustive allocation-failure sweeps
 were not requested or run.
+
+### Serial Compilation Work
+
+Canonical type-to-namespace associations now share a query fact; visibility and
+member selection remain at each use site. Optimizer rounds skip numbering and
+liveness when their inputs are unchanged, cache the absence of join parameters,
+and track removed uses and address exposure of surviving values. Removing dead
+parameters invalidates storage passes only when incoming storage uses change.
+Aggregate snapshot reuse and join-parameter reordering were evaluated and removed.
+
+The million-line workload used retained ReleaseFast compilers from `abb06d53`
+and the isolated performance snapshot, CPUs 0-7, and the ordinary adaptive
+protocol in both run orders. Values below are medians of the two block medians.
+Negative changes mean less elapsed time.
+
+| Measurement | Workers | Baseline | Candidate | Change |
+| --- | ---: | ---: | ---: | ---: |
+| Cold | 0 | 19.837 s | 19.388 s | -2.26% |
+| Leaf edit | 0 | 138.861 ms | 132.172 ms | -4.82% |
+| Cold | 8 | 4.395 s | 4.415 s | +0.45% |
+| Leaf edit | 8 | 169.451 ms | 180.406 ms | +6.47% |
+| Sieve runtime | 0 | 0.621 s | 0.621 s | +0.01% |
+
+Serial cold improved in both orders (-3.76% and -0.75%). Several blocks,
+including serial leaf edits and the first parallel candidate leaf edits, reached
+the sampling cap without 2% repeatability. The eight-worker leaf-edit increase
+was +11.61% in the first order and +1.66% in the reverse order; these results do
+not establish parallel leaf-edit nonregression. The existing regression test
+still verifies exactly one typed body after a leaf edit with zero and four workers.
+The generated sieve executable is byte-identical between the compilers.
+
+All 29 focused optimizer tests passed. Routine Safe verification reused the full
+run already active in the shared checkout, including concurrent type/ownership
+work; its source and test fingerprints stayed unchanged and it exited 0.
+Benchmarks exclude those concurrent edits. Formatting and diff checks passed.
+[Raw samples](serial-reduction/samples.csv), [summary](serial-reduction/summary.json),
+[environment and source identities](serial-reduction/environment.json), and
+[verification](serial-reduction/verification.txt) preserve the scope and evidence.
+Retained experiment snapshots and binaries are under `.history/serial-reduction/`.
 
 ### Sieve Runtime Attribution
 

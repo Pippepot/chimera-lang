@@ -254,10 +254,7 @@ fn Analyzer(comptime AnalysisServices: type) type {
             // A source entirely covered by fixed arms, including bare none, supplies
             // no evidence for the dependent arm. Never likewise supplies no payload.
             if (remaining.items.len == 0 or actual_type == .never) return true;
-            const payload_type = if (remaining.items.len == 1) remaining.items[0] else switch (try self.analysis_context.facts().internVariant(remaining.items)) {
-                .type_id => |type_id| type_id,
-                .duplicate => unreachable,
-            };
+            const payload_type = try self.analysis_context.facts().internVariant(remaining.items);
             return self.bindInferredType(inferred, target, payload_type);
         }
 
@@ -364,8 +361,9 @@ fn Analyzer(comptime AnalysisServices: type) type {
                 return self.reject(reference, .value_used_as_type);
             var signature: structures.FunctionSignature = .{ .parameters = parameters.items, .return_type = .unit };
             if (return_annotation.unwrap()) |return_type_index| {
-                signature.return_type = try self.typeValue(logicalTypeNode(self.ast, return_type_index), .return_type_not_supported);
-                if (self.ast.nodes[return_type_index.index()].tag == .reference_type) signature.result_mode = .reference;
+                const result = try self.typeMember(return_type_index, .return_type_not_supported);
+                signature.return_type = result.type_id;
+                signature.result_mode = if (result.kind == .reference) .reference else .owned;
             }
 
             const annotation = if (binding.tag == .static_binding) binding.data.node_node.a.unwrap() else null;
@@ -379,6 +377,12 @@ fn Analyzer(comptime AnalysisServices: type) type {
             }
             signature.parameters = try parameters.toOwnedSlice(self.gpa);
             return signature;
+        }
+
+        fn typeMember(self: *@This(), node_index: structures.Node.Index, unsupported_kind: structures.Diagnostic.Kind) anyerror!structures.MemberSpec {
+            const type_id = try self.typeValue(logicalTypeNode(self.ast, node_index), unsupported_kind);
+            if (self.ast.nodes[node_index.index()].tag == .reference_type) return .{ .type_id = type_id, .kind = .reference };
+            return self.analysis_context.facts().memberSpec(type_id);
         }
 
         fn typeValue(self: *@This(), node_index: structures.Node.Index, unsupported_kind: structures.Diagnostic.Kind) anyerror!structures.TypeId {
@@ -436,11 +440,11 @@ fn Analyzer(comptime AnalysisServices: type) type {
                     if (parameter_type == .type) return self.reject(parameter_index, unsupported_kind);
                     try parameters.append(self.gpa, .{ .mode = if (explicit_mode) parameterMode(self.ast, parameter).? else .imm, .type_id = parameter_type });
                 }
-                const return_type = try self.typeValue(logicalTypeNode(self.ast, node.data.node_node.b), unsupported_kind);
+                const result = try self.typeMember(node.data.node_node.b, unsupported_kind);
                 return self.analysis_context.facts().internCallable(.{
                     .parameters = parameters.items,
-                    .return_type = return_type,
-                    .result_mode = if (self.ast.nodes[node.data.node_node.b.index()].tag == .reference_type) .reference else .owned,
+                    .return_type = result.type_id,
+                    .result_mode = if (result.kind == .reference) .reference else .owned,
                 });
             }
             if (node.tag != .type_variant and node.tag != .type_tuple and node.tag != .tuple_literal) return self.reject(node_index, unsupported_kind);
@@ -448,29 +452,14 @@ fn Analyzer(comptime AnalysisServices: type) type {
             var members: std.ArrayList(structures.MemberSpec) = .empty;
             defer members.deinit(self.gpa);
             for (self.ast.nodeList(node_index)) |member_index| {
-                const member_node = self.ast.nodes[member_index.index()];
-                const member_type = try self.typeValue(logicalTypeNode(self.ast, member_index), unsupported_kind);
-                if (member_type == .type) return self.reject(member_index, unsupported_kind);
-                try members.append(self.gpa, .{
-                    .type_id = member_type,
-                    .kind = if (member_node.tag == .reference_type) .reference else .owned,
-                });
+                const member = try self.typeMember(member_index, unsupported_kind);
+                if (member.type_id == .type) return self.reject(member_index, unsupported_kind);
+                try members.append(self.gpa, member);
             }
             std.debug.assert(members.items.len >= 1);
             if (node.tag == .type_tuple or node.tag == .tuple_literal) return self.analysis_context.facts().internTuple(members.items);
 
-            return switch (try self.analysis_context.facts().internVariantMembers(members.items)) {
-                .type_id => |type_id| type_id,
-                .duplicate => |duplicate| blk: {
-                    var seen = false;
-                    for (self.ast.nodeList(node_index), members.items) |duplicate_member, member| {
-                        if (try self.analysis_context.facts().memberStorageType(member) != duplicate) continue;
-                        if (seen) break :blk self.reject(duplicate_member, .duplicate_variant_member_type);
-                        seen = true;
-                    }
-                    break :blk self.reject(node_index, .duplicate_variant_member_type);
-                },
-            };
+            return self.analysis_context.facts().internVariantMembers(members.items);
         }
 
         pub fn analyzeStaticDeclaration(self: *@This(), declaration: u32) !StaticInitializerPlan {
@@ -512,6 +501,7 @@ fn Analyzer(comptime AnalysisServices: type) type {
             }
             if (try validateStructNamespace(self.ast, self.source, struct_index, self.gpa)) |issue| return self.rejectIssue(issue);
             var ownership: structures.StructOwnershipProperties = .{};
+            var error_mark: ?bool = null;
 
             for (self.ast.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
                 const item = self.ast.nodes[member_index.index()];
@@ -519,6 +509,13 @@ fn Analyzer(comptime AnalysisServices: type) type {
                 if (member.tag == .struct_property) {
                     const property_span = tokenSpan(self.ast, member.token_index);
                     const property_name = self.source[property_span.start..property_span.end];
+                    if (std.mem.eql(u8, property_name, "error")) {
+                        if (error_mark != null) return self.rejectIssue(.{ .span = property_span, .kind = .duplicate_struct_property });
+                        const value = self.ast.nodes[member.data.node.index()];
+                        if (value.tag != .bool_literal) return self.reject(member.data.node, .invalid_error_property);
+                        error_mark = self.ast.tokens[value.token_index].tag == .keyword_true;
+                        continue;
+                    }
                     const operation = std.meta.stringToEnum(StructOwnershipOperation, property_name) orelse
                         return self.rejectIssue(.{ .span = property_span, .kind = .unknown_struct_property });
                     if (operation.isDefined(ownership))
@@ -577,21 +574,25 @@ fn Analyzer(comptime AnalysisServices: type) type {
                     defer self.analysis_context.public_annotation = public_annotation;
                     break :field try self.typeValue(member.data.field.type_annotation, .struct_field_type_not_supported);
                 };
-                if (field_type == .type) return self.reject(member.data.field.type_annotation, .struct_field_type_not_supported);
-                if (item.tag == .@"pub" and !try self.analysis_context.isPublicFieldType(field_type))
+                const field_member: structures.MemberSpec = if (member.data.field.kind == .reference)
+                    .{ .type_id = field_type, .kind = .reference }
+                else
+                    try self.analysis_context.facts().memberSpec(field_type);
+                if (field_member.type_id == .type) return self.reject(member.data.field.type_annotation, .struct_field_type_not_supported);
+                if (item.tag == .@"pub" and !try self.analysis_context.isPublicFieldType(field_member.type_id))
                     return self.reject(member.data.field.type_annotation, .public_field_private_type);
                 try fields.ensureUnusedCapacity(self.gpa, 1);
                 const owned_name = try self.gpa.dupe(u8, name);
                 fields.appendAssumeCapacity(.{
                     .name = owned_name,
-                    .kind = member.data.field.kind,
-                    .type_id = field_type,
+                    .kind = field_member.kind,
+                    .type_id = field_member.type_id,
                     .span = name_span,
                     .is_public = item.tag == .@"pub",
                 });
             }
 
-            return .{ .fields = try fields.toOwnedSlice(self.gpa), .ownership = ownership, .is_static = struct_node.is_static_struct };
+            return .{ .fields = try fields.toOwnedSlice(self.gpa), .ownership = ownership, .is_static = struct_node.is_static_struct, .is_error = error_mark orelse false };
         }
 
         pub fn analyzeStaticTypeArgument(self: *@This(), argument: structures.Node.Index) !structures.CompileTimeValue {
@@ -763,7 +764,7 @@ pub const UnresolvedBody = struct {
             local_read: LocalId,
             local_transfer: LocalId,
             field_transfer: struct { target: LocalId, fields: structures.FunctionValueRange },
-            annotation: struct { value: ValueUse, type_id: structures.TypeId },
+            annotation: struct { value: ValueUse, type_id: structures.TypeId, explicit: bool = false },
             struct_init: struct {
                 canonical: bool = false,
                 target: StructInitTarget,
@@ -800,6 +801,13 @@ pub const UnresolvedBody = struct {
                 carrier: LocalId,
                 read: ValueId,
                 arms: structures.FunctionValueRange,
+            },
+            error_handler: struct {
+                operand: ValueUse,
+                carrier: LocalId,
+                binding: ?Capture,
+                annotation: ?structures.TypeId,
+                handler: ?BlockId,
             },
             loop: BlockId,
             scope: BlockId,
@@ -922,7 +930,10 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 try self.static_bindings.append(self.gpa, binding);
             }
             switch (root) {
-                .entry => |declaration| try self.buildEntry(declaration),
+                .entry => |declaration| {
+                    self.can_return = true;
+                    try self.buildEntry(declaration);
+                },
                 .function => |function| {
                     self.can_return = true;
                     try self.buildFunction(function.declaration);
@@ -1033,7 +1044,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .assign => if (self.isDiscardAssignment(index))
                     .{ .lifetime_extend = try self.appendUse(node.data.node_node.b, false) }
                 else
-                    .{ .discard = try self.appendUse(index, false) },
+                    .{ .lifetime_extend = try self.appendUse(index, false) },
                 else => .{ .discard = try self.appendUse(index, false) },
             };
         }
@@ -1419,12 +1430,45 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign => return self.appendAssignment(index),
                 .@"if", .if_else => return self.appendIf(index, result_is_type),
                 .match_expr => return self.appendMatch(index, result_is_type),
+                .catch_expr, .propagate_expr => return self.appendErrorHandler(index, result_is_type),
                 .loop => return self.appendLoop(index, result_is_type),
                 .for_loop => return self.appendFor(index),
                 .static_binding, .namespace_declaration => return self.reject(index, .nested_declaration_not_supported),
                 .move_expr => return self.appendTransfer(index),
                 else => return self.reject(index, .expression_not_supported),
             }
+        }
+
+        fn appendErrorHandler(self: *Self, index: structures.Node.Index, result_is_type: bool) !ValueId {
+            const node = self.ast.nodes[index.index()];
+            const parts = if (node.tag == .catch_expr) self.ast.nodeList(index) else &.{node.data.node};
+            const operand = try self.appendUse(parts[0], false);
+            const carrier = self.newLocal();
+            var binding: ?UnresolvedBody.Capture = null;
+            var annotation: ?structures.TypeId = null;
+            var handler: ?UnresolvedBody.BlockId = null;
+            if (node.tag == .catch_expr) {
+                const scope_mark = self.local_names.items.len;
+                defer self.restoreScope(scope_mark);
+                const parameter = self.ast.nodes[parts[1].index()];
+                const span = tokenSpan(self.ast, parameter.token_index);
+                const name = self.source[span.start..span.end];
+                if (parameter.data.parameter.annotation != .null)
+                    annotation = try self.analyzeTypeOrReject(parameter.data.parameter.annotation, .local_type_not_supported);
+                binding = .{ .local = self.newLocal(), .span = span, .mode = .inferred };
+                if (!std.mem.eql(u8, name, "_")) {
+                    if (try self.nameIsVisible(name)) return self.rejectIssue(.{ .span = span, .kind = .duplicate_local_binding });
+                    try self.declare(name, .{ .place = .{ .id = binding.?.local, .mutable = false } });
+                }
+                handler = try self.buildBranch(parts[2], result_is_type);
+            }
+            return self.appendExpression(index, .{ .error_handler = .{
+                .operand = operand,
+                .carrier = carrier,
+                .binding = binding,
+                .annotation = annotation,
+                .handler = handler,
+            } });
         }
 
         fn appendComptime(self: *Self, index: structures.Node.Index) !ValueId {
@@ -2214,7 +2258,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             const operation: UnresolvedBody.Expression.Operation = if (try self.conversionTarget(node.data.node_node.a)) |target| operation: {
                 const arguments = self.ast.nodeList(node.data.node_node.b);
                 if (arguments.len != 1) return self.reject(index, .{ .call_argument_count_mismatch = .{ .expected = 1, .found = @intCast(arguments.len) } });
-                break :operation .{ .annotation = .{ .value = try self.appendUse(arguments[0], false), .type_id = target } };
+                break :operation .{ .annotation = .{ .value = try self.appendUse(arguments[0], false), .type_id = target, .explicit = true } };
             } else .{ .call = try self.buildCall(index) };
             const result = try self.appendExpression(node.data.node_node.a, operation);
             self.producer(result).?.source_node = index;
@@ -3338,7 +3382,7 @@ const TestAnalysisContext = struct {
         return self;
     }
 
-    pub fn internVariant(_: @This(), _: []const structures.TypeId) !structures.InternVariantResult {
+    pub fn internVariant(_: @This(), _: []const structures.TypeId) !structures.TypeId {
         unreachable;
     }
 
@@ -3347,7 +3391,11 @@ const TestAnalysisContext = struct {
         unreachable;
     }
 
-    pub fn internVariantMembers(_: @This(), _: []const structures.MemberSpec) !structures.InternVariantResult {
+    pub fn memberSpec(_: @This(), storage_type: structures.TypeId) !structures.MemberSpec {
+        return .{ .type_id = storage_type };
+    }
+
+    pub fn internVariantMembers(_: @This(), _: []const structures.MemberSpec) !structures.TypeId {
         unreachable;
     }
 

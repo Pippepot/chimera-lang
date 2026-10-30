@@ -63,6 +63,16 @@ pub const Function = struct {
     operands_dirty: bool = false,
     address_taken: ?[]const bool = null,
     storage_possible: bool = true,
+    join_parameters_possible: bool = true,
+
+    pub fn hasJoinParameters(self: *Function) bool {
+        if (!self.join_parameters_possible) return false;
+        for (self.blocks.items, 0..) |block, index| {
+            if (index != self.entry and block.parameters.items.len != 0) return true;
+        }
+        self.join_parameters_possible = false;
+        return false;
+    }
 
     pub fn hasStorage(self: *Function) bool {
         if (!self.storage_possible) return false;
@@ -246,6 +256,7 @@ pub const Function = struct {
 
     pub fn addParameter(self: *Function, block: u32, argument: structures.FunctionBlockArgument) !ValueId {
         self.invalidateOperands();
+        if (block != self.entry) self.join_parameters_possible = true;
         const value: ValueId = @fromBackingInt(@intCast(self.definitions.items.len));
         try self.definitions.append(self.scratch, .{ .argument = .{ .block = block, .data = argument } });
         try self.replacement.append(self.scratch, value);
@@ -369,6 +380,7 @@ test "optimizer operand normalization invalidates after replacement and appended
     };
     const span: SourceSpan = .{ .start = 0, .end = 0 };
     _ = try function.addBlock(.return_unit, span, .root);
+    try testing.expect(!function.hasJoinParameters());
     const first = try function.insertInstruction(0, 0, .{ .const_int = 1 }, span, .root);
     const second = try function.insertInstruction(0, 1, .{ .const_int = 2 }, span, .root);
     const third = try function.insertInstruction(0, 2, .{ .const_int = 3 }, span, .root);
@@ -392,6 +404,7 @@ test "optimizer operand normalization invalidates after replacement and appended
     const arguments = try function.appendBranchArguments(&.{.{ .value = first }});
     const destination = try function.addBlock(.return_unit, span, .root);
     _ = try function.addParameter(destination, .{ .type_id = .int });
+    try testing.expect(function.hasJoinParameters());
     function.blocks.items[0].terminator = .{ .branch = .{ .target = @fromBackingInt(destination), .arguments = arguments } };
     function.invalidateControlFlow();
     function.resolveReferences();

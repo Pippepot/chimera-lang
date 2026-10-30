@@ -78,6 +78,12 @@ Queries are not a fixed sequence of whole-program passes:
   Converter buckets track absent candidates as well as matches. Imports do not
   control membership. Inferred argument types do not execute conversions;
   selected arguments execute once, left to right.
+- **Type namespaces:** `ResolveTypeNamespace(TypeId)` shares primitive, declared,
+  generated, and specialized array namespace associations across bodies. Member
+  visibility and selected signatures still depend on each use site. Missing and
+  unavailable namespaces are separate published results, so rejected standard
+  definitions retain their transitive diagnostics and recover after edits. The
+  association is a portable cache dependency boundary.
 - **Reference effects:** signatures and borrow shape first exclude impossible
   effects. Acyclic contracts derive from cached typed bodies; cycles trigger
   direct-callee discovery and fixed-point inference within the recursive

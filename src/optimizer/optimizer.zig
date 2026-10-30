@@ -59,24 +59,29 @@ fn optimizeInto(scratch: std.mem.Allocator, body: *const Body, context: anytype)
 
 fn simplify(function: *Function, context: anytype, numbering_workspace: *numbering.Workspace, field_layouts: *sroa.Layouts) !void {
     var storage_dirty = true;
+    var numbering_dirty = true;
     while (true) {
         if (storage_dirty) try measured(.optimization_setup, Function.classifyTypes, .{ function, context });
         if (storage_dirty and function.hasStorage()) {
             if (try measured(.optimization_sroa, sroa.split, .{ function, context, field_layouts })) {
+                numbering_dirty = true;
                 try measured(.optimization_setup, Function.classifyTypes, .{ function, context });
             }
             try check(function);
             // Their consumers run below; storage passes need another round only
             // when those consumers change storage uses or control flow.
-            _ = try measured(.optimization_promotion, promotion.promote, .{function});
+            if (try measured(.optimization_promotion, promotion.promote, .{function})) numbering_dirty = true;
             try check(function);
         }
         const parameters_changed = try measured(.optimization_joins, cleanup.simplifyParameters, .{ function, true });
+        numbering_dirty = numbering_dirty or parameters_changed;
         try check(function);
         var folded = try measured(.optimization_canonicalize, canonicalize.canonicalize, .{function});
+        numbering_dirty = numbering_dirty or folded.changed;
         if (parameters_changed or folded.changed) {
             var variants_dirty = folded.control_flow;
             while (try measured(.optimization_joins, cleanup.simplifyParameters, .{ function, variants_dirty })) {
+                numbering_dirty = true;
                 const more = try measured(.optimization_canonicalize, canonicalize.canonicalize, .{function});
                 variants_dirty = more.control_flow;
                 folded.changed = folded.changed or more.changed;
@@ -86,11 +91,21 @@ fn simplify(function: *Function, context: anytype, numbering_workspace: *numberi
             }
         }
         try check(function);
-        const numbered = try measured(.optimization_numbering, numbering.number, .{ function, numbering_workspace });
+        const numbered: @import("function.zig").Changes = if (numbering_dirty)
+            try measured(.optimization_numbering, numbering.number, .{ function, numbering_workspace })
+        else
+            .{};
         try check(function);
-        const dead = try measured(.optimization_dead_code, compaction.removeDead, .{function});
+        const dead: @import("function.zig").Changes = if (numbering_dirty)
+            try measured(.optimization_dead_code, compaction.removeDead, .{function})
+        else
+            .{};
         try check(function);
         const cleaned = try measured(.optimization_cleanup, cleanup.simplify, .{function});
+        // Numbering visits dominating definitions before their users. Its own
+        // substitutions need another numbering pass only after another phase
+        // changes inputs or dead-code removal changes address exposure.
+        numbering_dirty = dead.uses or cleaned;
         try check(function);
         storage_dirty = folded.storage or folded.control_flow or numbered.storage or dead.storage or cleaned;
         if (!numbered.changed and !dead.uses and !cleaned and !(storage_dirty and function.hasStorage())) break;

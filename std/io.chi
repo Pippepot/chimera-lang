@@ -1,3 +1,4 @@
+import std.exit.{exit}
 import std.memory.{List}
 import std.text.{BytesView, String, StringView}
 
@@ -8,6 +9,10 @@ pub struct Stream
 pub static stdin = Stream{descriptor = 0}
 pub static stdout = Stream{descriptor = 1}
 pub static stderr = Stream{descriptor = 2}
+
+pub func unhandled_error() never
+    _ = write_text(stderr, "unhandled error\n")
+    exit(1)
 
 pub func write_once(stream: Stream, imm bytes: BytesView) int | none -> bytes.write_to(stream.descriptor)
 pub func write_all(stream: Stream, imm bytes: BytesView) unit | none

@@ -1,0 +1,55 @@
+{
+  "baseline_commit": "abb06d53ab18ac5af82fb1f2dbf52f82d6efb86b",
+  "source_sha256": {
+    "baseline": "03b65581cd7391d344875eec1948b4ef48738b4de76651ead5d6db3abba06013",
+    "candidate": "287e052782b0db75277f191143af2268856085ef345493a2202451fd43c14bcc"
+  },
+  "source_hash_method": "SHA256 of sorted relative path + NUL + file contents for src/**/*.zig, every std file, and build.zig*.",
+  "benchmark_sha256": {
+    "baseline": "97cc9f01ffc9768ef4f2b84aa01602425182c7bb888cb86f01994245079d70ac",
+    "candidate": "80cc922b481f9b880aa788b0f6ec13e053e46288dee197485bafc70f4eb4e73d"
+  },
+  "driver_sha256": {
+    "benchmarks/history_benchmark.zig": "9bf62ccf84001be87735d716bc01393d7797996706dffc096b6a66c15b3e1362",
+    "benchmarks/history_workload.zig": "aabcf0c675cd16e090623377e6ae5258ecbafbd8750066c3698e539f9519327c",
+    "benchmarks/history_sampling.zig": "e6fa44ed277958060a5cff8794659c632d6b1b0cd8ef985b5b7272de4866f7e2"
+  },
+  "settings": "Zig 0.17.0, ReleaseFast/LLVM, embedded std, default caches, seed=0, no disk cache or profiling during acceptance.",
+  "cpu": "Intel Core Ultra 7 265K",
+  "affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "protocol": "Baseline first in block 0; candidate first in block 1. One warm-up; adaptive 2-3 cold/edit samples and 2-5 runtime samples. Statistics use the median of the two block medians; raw samples and instability flags are retained.",
+  "scope": "Benchmarks isolate these performance changes from concurrent type/ownership edits in the shared checkout. The benchmark driver and workload are unchanged.",
+  "verification": {
+    "routine_safe": {
+      "command": "zig build test --seed=0 -Doptimize=safe -j1",
+      "exit_status": 0,
+      "reused_existing_run": true,
+      "source_sha256": "59230300c45b6be52bfae0f4d08f639543f8bb9f64e172fde047ad42130706cd",
+      "tests_sha256": "d82e0ec31b6ea5b975c73508d622b768af8914311baf234b624b471d98a68a69",
+      "source_and_tests_unchanged_during_run": true,
+      "source_predates_run": true,
+      "scope": "Shared checkout, including concurrent type/ownership changes and this performance implementation. Exit of the existing full build runner was observed; no duplicate full suite was started."
+    },
+    "optimizer_safe": {
+      "command": "zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/optimizer_test.zig -j1 --summary all",
+      "passed": 29,
+      "scope": "Isolated performance snapshot"
+    },
+    "native_sieve_sha256": {
+      "before": "fdfe7a22e803f11d4e38697c0c10943bfb6316c677c80043451669dc72242f38",
+      "after": "fdfe7a22e803f11d4e38697c0c10943bfb6316c677c80043451669dc72242f38"
+    },
+    "native_sieve_byte_identical": true
+  },
+  "limitations": "Several compilation/edit blocks reached the sample cap without 2% repeatability. Eight-worker leaf-edit nonregression is not established by these timings. Native sieve executables are byte-identical; runtime timing differences are environmental.",
+  "retained_sources_and_binaries": ".history/serial-reduction/"
+}

@@ -1,0 +1,10 @@
+name = "chimera-calculus"
+version = "0.1.0"
+defaultTargets = ["Refinement", "calculus-check"]
+
+[[lean_lib]]
+name = "Refinement"
+
+[[lean_exe]]
+name = "calculus-check"
+root = "Main"

@@ -331,60 +331,71 @@ fn binaryOperands(instruction: *Instruction) *structures.BinaryOperands {
     };
 }
 
+const AddressSet = struct {
+    taken: []bool,
+
+    fn mark(self: @This(), value: ValueId) void {
+        self.taken[@backingInt(value)] = true;
+    }
+};
+
 pub fn addressTaken(function: *Function) ![]const bool {
     if (function.address_taken) |taken| return taken;
     const taken = try function.scratch.alloc(bool, function.valueCount());
     @memset(taken, false);
+    const addresses: AddressSet = .{ .taken = taken };
     for (function.blocks.items) |block| for (block.instructions.items) |index| {
-        if (function.removed.items[index]) continue;
-        const instruction = &function.instructions.items[index];
-        switch (instruction.*) {
-            inline .value_copy, .variant_coerce, .variant_extract => |operation| {
-                if (operation.destination) |destination| taken[@backingInt(destination)] = true;
-            },
-            .static_conversion => |operation| {
-                taken[@backingInt(operation.operand)] = true;
-                if (operation.destination) |destination| taken[@backingInt(destination)] = true;
-            },
-            .storage_projection => |projection| taken[@backingInt(projection.owner)] = true,
-            .array_element => |element| taken[@backingInt(element.array)] = true,
-            .storage_cursor => |cursor| taken[@backingInt(cursor.source)] = true,
-            .borrow_address => |address| if (!address.base_is_reference) {
-                taken[@backingInt(address.source)] = true;
-            },
-            .initializer_ref => |reference| {
-                for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |capture| taken[@backingInt(capture)] = true;
-            },
-            .call => |call| markCallAddresses(function, call, taken),
-            .fill => |operation| taken[@backingInt(operation.first)] = true,
-            .move => |operation| {
-                taken[@backingInt(operation.destination)] = true;
-                taken[@backingInt(operation.source)] = true;
-            },
-            else => {},
-        }
+        if (!function.removed.items[index]) visitInstructionAddresses(function, function.instructions.items[index], addresses, AddressSet.mark);
     };
     for (function.blocks.items) |*block| {
-        for (block.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| markBranchAddresses(function, branch.*, taken);
+        for (block.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| visitBranchAddresses(function, branch.*, addresses, AddressSet.mark);
     }
     function.address_taken = taken;
     return taken;
 }
 
-fn markCallAddresses(function: *const Function, call: structures.FunctionCall, taken: []bool) void {
-    if (call.destination) |destination| taken[@backingInt(destination)] = true;
-    for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
-        if (argument != .prepared) taken[@backingInt(argument.valueId())] = true;
+pub fn visitInstructionAddresses(function: *const Function, instruction: Instruction, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
+    switch (instruction) {
+        inline .value_copy, .variant_coerce, .variant_extract => |operation| {
+            if (operation.destination) |destination| visit(context, destination);
+        },
+        .static_conversion => |operation| {
+            visit(context, operation.operand);
+            if (operation.destination) |destination| visit(context, destination);
+        },
+        .storage_projection => |projection| visit(context, projection.owner),
+        .array_element => |element| visit(context, element.array),
+        .storage_cursor => |cursor| visit(context, cursor.source),
+        .borrow_address => |address| if (!address.base_is_reference) {
+            visit(context, address.source);
+        },
+        .initializer_ref => |reference| {
+            for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |capture| visit(context, capture);
+        },
+        .call => |call| visitCallAddresses(function, call, context, visit),
+        .fill => |operation| visit(context, operation.first),
+        .move => |operation| {
+            visit(context, operation.destination);
+            visit(context, operation.source);
+        },
+        else => {},
     }
 }
 
-fn markBranchAddresses(function: *const Function, branch: structures.FunctionBranch, taken: []bool) void {
+fn visitCallAddresses(function: *const Function, call: structures.FunctionCall, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
+    if (call.destination) |destination| visit(context, destination);
+    for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
+        if (argument != .prepared) visit(context, argument.valueId());
+    }
+}
+
+pub fn visitBranchAddresses(function: *const Function, branch: structures.FunctionBranch, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
     const arguments = function.branch_arguments.items[branch.arguments.start..branch.arguments.end];
     const parameters = function.blocks.items[@backingInt(branch.target)].parameters.items;
     const count = @min(arguments.len, parameters.len);
     for (arguments[0..count], parameters[0..count]) |argument, parameter| {
         const data = function.definitions.items[@backingInt(parameter)].argument.data;
-        if (data.representation != .value or !function.direct(data.type_id)) taken[@backingInt(argument.value)] = true;
+        if (data.representation != .value or !function.direct(data.type_id)) visit(context, argument.value);
     }
-    for (arguments[count..]) |argument| taken[@backingInt(argument.value)] = true;
+    for (arguments[count..]) |argument| visit(context, argument.value);
 }

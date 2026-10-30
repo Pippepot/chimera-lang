@@ -316,7 +316,7 @@ fn sortIds(comptime Id: type, ids: []Id) void {
     }.lessThan);
 }
 
-pub fn internVariantType(ctx: anytype, members: []const structures.TypeId) !structures.InternVariantResult {
+pub fn internVariantType(ctx: anytype, members: []const structures.TypeId) !structures.TypeId {
     std.debug.assert(members.len >= 1);
 
     var canonical: std.ArrayList(structures.TypeId) = .empty;
@@ -330,15 +330,19 @@ pub fn internVariantType(ctx: anytype, members: []const structures.TypeId) !stru
     }
 
     sortIds(structures.TypeId, canonical.items);
-    for (canonical.items[1..], canonical.items[0 .. canonical.items.len - 1]) |member, previous| {
-        if (member == previous) return .{ .duplicate = member };
+    var member_count: usize = 0;
+    for (canonical.items) |member| {
+        if (member == .never) continue;
+        if (member_count != 0 and canonical.items[member_count - 1] == member) continue;
+        canonical.items[member_count] = member;
+        member_count += 1;
     }
-    if (std.mem.indexOfScalar(structures.TypeId, canonical.items, .never)) |index| _ = canonical.orderedRemove(index);
-    if (canonical.items.len == 0) return .{ .type_id = .never };
-    if (canonical.items.len == 1) return .{ .type_id = canonical.items[0] };
+    canonical.items.len = member_count;
+    if (canonical.items.len == 0) return .never;
+    if (canonical.items.len == 1) return canonical.items[0];
 
     const interned_id = try ctx.intern(Types, .{ .variant = .{ .members = canonical.items } });
-    return .{ .type_id = .fromInterned(interned_id) };
+    return .fromInterned(interned_id);
 }
 
 pub fn internStructType(ctx: anytype, item_id: structures.ItemId) !structures.TypeId {
@@ -505,6 +509,48 @@ const TypeNamespaceAssociation = struct {
     }
 };
 
+const TypeNamespaceResult = union(enum) {
+    missing,
+    available: TypeNamespaceAssociation,
+    unavailable,
+};
+
+pub const ResolveTypeNamespace = CompilerQuery("ResolveTypeNamespace", .type_facts, resolveTypeNamespace, .{ .disk_boundary = true });
+
+fn resolveTypeNamespace(ctx: anytype, type_id: structures.TypeId) anyerror!TypeNamespaceResult {
+    const association = computeTypeNamespace(ctx, type_id) catch |err| switch (err) {
+        error.Unavailable => return .unavailable,
+        else => return err,
+    };
+    return if (association) |available| .{ .available = available } else .missing;
+}
+
+fn computeTypeNamespace(ctx: anytype, type_id: structures.TypeId) !?TypeNamespaceAssociation {
+    if (type_id.isPrimitive()) {
+        const registered = (try standardFile(ctx, .prelude)) orelse return null;
+        const module = (try ctx.input(FileModule, registered)).*;
+        const owner = try ctx.intern(ItemLocations, .{ .origin = .{ .module = module }, .kind = .primitive, .name = .{ .identifier = @tagName(type_id) } });
+        return .{ .query_key = .{ .primitive = owner } };
+    }
+    switch ((try typeData(ctx, type_id)).?) {
+        .structure => |identity| {
+            switch (identity) {
+                .declared => return .{ .query_key = .fromStruct(identity) },
+                .generated => |generated| return .{
+                    .query_key = .{ .generated = .{
+                        .owner = .{ .item = generated.owner.item, .environment = generated.owner.environment },
+                        .node_offset = generated.node_offset,
+                    } },
+                    .specialization = generated.owner.specialization,
+                    .environment = generated.owner.environment,
+                },
+            }
+        },
+        .array => |array| return (try arrayTypeNamespace(ctx, array)) orelse return error.Unavailable,
+        .reference, .variant, .callable, .tuple => return null,
+    }
+}
+
 fn arrayTypeNamespace(ctx: anytype, array: structures.ArrayType) !?TypeNamespaceAssociation {
     const factory = (try standardFunction(ctx, .array, "Array")) orelse return null;
     const item_source = (try itemSource(ctx, factory)) orelse return error.Unavailable;
@@ -571,7 +617,7 @@ pub fn TypeFacts(comptime Context: type) type {
             };
         }
 
-        pub fn internVariant(self: @This(), members: []const structures.TypeId) !structures.InternVariantResult {
+        pub fn internVariant(self: @This(), members: []const structures.TypeId) !structures.TypeId {
             return internVariantType(self.ctx, members);
         }
 
@@ -589,7 +635,7 @@ pub fn TypeFacts(comptime Context: type) type {
             return .{ .type_id = storage_type };
         }
 
-        pub fn internVariantMembers(self: @This(), members: []const structures.MemberSpec) !structures.InternVariantResult {
+        pub fn internVariantMembers(self: @This(), members: []const structures.MemberSpec) !structures.TypeId {
             var storage_types: std.ArrayList(structures.TypeId) = .empty;
             defer storage_types.deinit(self.ctx.allocator());
             for (members) |member| try storage_types.append(self.ctx.allocator(), try self.memberStorageType(member));
@@ -898,6 +944,10 @@ pub fn AnalysisContext(comptime Context: type) type {
             return standardFunction(self.ctx, .text, "panic_message");
         }
 
+        pub fn unhandledErrorFunction(self: @This()) !?structures.InstanceId {
+            return .{ .item = (try standardFunction(self.ctx, .io, "unhandled_error")) orelse return null };
+        }
+
         pub fn rangeConstructor(self: @This(), inclusive: bool) !?structures.ItemId {
             return standardFunction(self.ctx, .range, if (inclusive) "inclusive" else "exclusive");
         }
@@ -994,28 +1044,10 @@ pub fn AnalysisContext(comptime Context: type) type {
         }
 
         pub fn typeNamespace(self: @This(), type_id: structures.TypeId) !?TypeNamespaceAssociation {
-            if (type_id.isPrimitive()) {
-                const registered = (try standardFile(self.ctx, .prelude)) orelse return null;
-                const module = (try self.ctx.input(FileModule, registered)).*;
-                const owner = try self.ctx.intern(ItemLocations, .{ .origin = .{ .module = module }, .kind = .primitive, .name = .{ .identifier = @tagName(type_id) } });
-                return .{ .query_key = .{ .primitive = owner } };
-            }
-            switch ((try typeData(self.ctx, type_id)).?) {
-                .structure => |identity| {
-                    switch (identity) {
-                        .declared => return .{ .query_key = .fromStruct(identity) },
-                        .generated => |generated| return .{
-                            .query_key = .{ .generated = .{
-                                .owner = .{ .item = generated.owner.item, .environment = generated.owner.environment },
-                                .node_offset = generated.node_offset,
-                            } },
-                            .specialization = generated.owner.specialization,
-                            .environment = generated.owner.environment,
-                        },
-                    }
-                },
-                .array => |array| return (try arrayTypeNamespace(self.ctx, array)) orelse return error.Unavailable,
-                .reference, .variant, .callable, .tuple => return null,
+            switch ((try self.ctx.get(ResolveTypeNamespace, type_id)).*) {
+                .missing => return null,
+                .available => |association| return association,
+                .unavailable => return error.Unavailable,
             }
         }
 
@@ -4129,7 +4161,7 @@ fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: str
         resolved.file_id,
         signature.parameters,
         signature.return_type,
-        .{ .publish_instruction_spans = true, .allow_type_values = allow_type_values, .builtin_body = builtin_body, .result_mode = signature.result_mode, .infer_reference_contract = reference_inference != null, .widen_reference_indices = if (reference_inference) |inference| inference.recursive else false },
+        .{ .publish_instruction_spans = true, .is_entry = loc.kind == .top_level_entry, .allow_type_values = allow_type_values, .builtin_body = builtin_body, .result_mode = signature.result_mode, .infer_reference_contract = reference_inference != null, .widen_reference_indices = if (reference_inference) |inference| inference.recursive else false },
         analysis_context,
         unresolved,
     );
@@ -4848,6 +4880,40 @@ test "inline array canonical identity and namespace do not depend on filled avai
         \\static Nonempty = Array(Item, 2)
     , &.{}, &.{});
     _ = try db.get(CheckCanonicalIdentity, 0);
+}
+
+test "canonical type namespace facts retain diagnostics and recover after standard source edits" {
+    const query = @import("query/engine.zig");
+    const modules = @import("modules.zig");
+    const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    try modules.registerSources(db, std.testing.allocator, "exit(0)", &.{}, &.{});
+    const array: structures.TypeId = .fromInterned(try db.intern(Types, .{ .array = .{ .element_type = .int, .length = 3 } }));
+    const association = try db.get(ResolveTypeNamespace, array);
+    try std.testing.expect(association.* == .available);
+    const primitive = try db.get(ResolveTypeNamespace, structures.TypeId.int);
+    try std.testing.expect(primitive.* == .available);
+    const reference: structures.TypeId = .fromInterned(try db.intern(Types, .{ .reference = .int }));
+    try std.testing.expect((try db.get(ResolveTypeNamespace, reference)).* == .missing);
+    try db.setInput(SourceText, 0, "exit(1)");
+    try std.testing.expectEqual(association, try db.get(ResolveTypeNamespace, array));
+    try std.testing.expectEqual(primitive, try db.get(ResolveTypeNamespace, structures.TypeId.int));
+
+    const array_file = (try standardFile(db, .array)).?;
+    const source = try std.testing.allocator.dupe(u8, (try db.input(SourceText, array_file)).*);
+    defer std.testing.allocator.free(source);
+    try db.setInput(SourceText, array_file, "pub struct Array(\n");
+    try std.testing.expect((try db.get(ResolveTypeNamespace, array)).* == .unavailable);
+    const analysis: AnalysisContext(@TypeOf(db)) = .{ .ctx = db, .file_id = 0 };
+    try std.testing.expectError(error.Unavailable, analysis.typeNamespace(array));
+    const diagnostics = try db.transitiveAccumulatorValues(ResolveTypeNamespace, array, structures.Diagnostic, std.testing.allocator);
+    defer std.testing.allocator.free(diagnostics);
+    try std.testing.expect(diagnostics.len != 0);
+    try db.setInput(SourceText, array_file, source);
+    try std.testing.expect((try db.get(ResolveTypeNamespace, array)).* == .available);
+    const recovered = try db.transitiveAccumulatorValues(ResolveTypeNamespace, array, structures.Diagnostic, std.testing.allocator);
+    defer std.testing.allocator.free(recovered);
+    try std.testing.expectEqual(@as(usize, 0), recovered.len);
 }
 
 test "inline array host layout uses checked element stride and retains empty alignment" {

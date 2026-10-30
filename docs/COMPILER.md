@@ -36,8 +36,11 @@ status. Options precede the source path; later arguments go to the program.
 `--workers=N` accepts 0 through 64; 0 is synchronous. The default is two workers
 on machines with at least two CPUs.
 
-A normal top-level return cleans up and exits the generated program with status 0.
-Optional and error results are ordinary values; their callers handle them explicitly.
+A top-level unit return or fallthrough cleans up and exits with status 0.
+Returning a marked error, directly or through `?`, cleans up, writes
+`unhandled error` to stderr, and exits with status 1. Entry accepts only unit and
+marked-error alternatives. Other functions return ordinary error unions, handled
+with `catch`, propagated explicitly with `?`, or stored as ordinary values.
 The CLI itself exits 0 after a normal program exit, reporting its status separately;
 invalid arguments, source or
 compiler failures, and abnormal program termination make the CLI exit 1.

@@ -11,7 +11,7 @@ const max_records = 1_000_000;
 // Snapshot records name their interner, input, or query boundary by type name.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
 pub const persisted_inputs = .{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile, queries.InlineLimit };
-pub const persisted_query_dependencies = .{ queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.ConversionCandidates, queries.InferReferenceContract, queries.AnalyzeFunctionInstance, queries.StandardLibraryUnchanged };
+pub const persisted_query_dependencies = .{ queries.ResolveTypeNamespace, queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.ConversionCandidates, queries.InferReferenceContract, queries.AnalyzeFunctionInstance, queries.StandardLibraryUnchanged };
 
 pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key: cache.Key, db: *query.Database) !void {
     var writer: codec.Writer = .{ .allocator = allocator };

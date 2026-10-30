@@ -711,7 +711,7 @@ const Fixture = struct {
         defer tmp.cleanup();
         const directory = try tmp.dir.realPathFileAlloc(io, ".", allocator);
         defer allocator.free(directory);
-        const digest = cache.querySnapshotKey(try cache.compilerDigest(io), "main.chi", &.{});
+        const digest = cache.querySnapshotKey(@splat(0), "main.chi", &.{});
         try query_disk_cache.save(io, allocator, directory, digest, first);
         const payload = (try cache.load(io, allocator, directory, digest)) orelse return error.TestUnexpectedResult;
         defer allocator.free(payload);
@@ -1937,7 +1937,7 @@ test "array intern snapshots preserve nested tuple values and reuse identical ty
     defer tmp.cleanup();
     const directory = try tmp.dir.realPathFileAlloc(std.testing.io, ".", allocator);
     defer allocator.free(directory);
-    const digest = cache.querySnapshotKey(try cache.compilerDigest(std.testing.io), "main.chi", &.{});
+    const digest = cache.querySnapshotKey(@splat(0), "main.chi", &.{});
     try query_disk_cache.save(std.testing.io, allocator, directory, digest, first);
     const payload = (try cache.load(std.testing.io, allocator, directory, digest)) orelse return error.TestUnexpectedResult;
     defer allocator.free(payload);
