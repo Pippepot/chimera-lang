@@ -69,7 +69,7 @@ No adjacent std files or disk-cache flag are required.
 analysis and linking; a changed program may reuse validated body and code
 snapshots. Keys include all loaded sources, module directories, and compiler
 identity. Damage and relevant edits fall back to compilation. Without the flag,
-the CLI does not read or write this cache. See [query flow](../PROGRAM_FLOW.md)
+the CLI does not read or write this cache. See [query lifecycle](ARCHITECTURE.md#query-lifecycle)
 for invalidation and restoration details.
 
 ### Timing
@@ -166,9 +166,8 @@ memory-limited process setup suite-local.
 
 ## Further Reading
 
-- [Architecture](../ARCHITECTURE.md): code map, boundaries, and invariants.
-- [Query flow](../PROGRAM_FLOW.md): demand, revisions, persistence, and lifetimes.
-- [Benchmark guide](../benchmarks/README.md): commands, measurement boundaries,
-  history recording, and saved experiment provenance.
+- [Architecture](ARCHITECTURE.md): stages, queries, ownership, and persistence.
+- [Benchmark guide](../benchmarks/README.md): workloads, commands, and measurement
+  boundaries.
 - [Roadmap](../ROADMAP.md): priorities and deferred decisions.
 - [Working rules](../AGENTS.md): contribution and review requirements.

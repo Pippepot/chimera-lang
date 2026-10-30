@@ -140,7 +140,11 @@ pub const Function = struct {
             positions[index] = std.math.cast(u32, encoded.code.items.len) orelse return error.FunctionTooLarge;
             field.* = positions[index];
             if (index < skip_until) continue;
-            if (self.redundantCopy(index, registers)) {
+            if (try self.encodeCopy(&encoded.code, index, registers)) {
+                skip_until = index + 2;
+                continue;
+            }
+            if (try self.encodeComparison(&encoded.code, index, registers, spills)) {
                 skip_until = index + 2;
                 continue;
             }
@@ -193,14 +197,44 @@ pub const Function = struct {
         return encoded;
     }
 
-    fn redundantCopy(self: *const Function, index: usize, registers: []const ?x86.Register) bool {
+    fn encodeCopy(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !bool {
         const instructions = self.instructions.items[index..];
         if (instructions.len < 3) return false;
         if (instructions[0] != .register or instructions[0].register.operation != .load_eax) return false;
         if (instructions[1] != .register or instructions[1].register.operation != .store_eax) return false;
         if (instructions[2] != .scratch_dead) return false;
         const source = registers[@backingInt(instructions[0].register.value)] orelse return false;
-        return registers[@backingInt(instructions[1].register.value)] == source;
+        const destination = registers[@backingInt(instructions[1].register.value)] orelse return false;
+        if (destination != source) try x86.appendRegisterBinary(code, self.gpa, .store_eax, destination, source);
+        return true;
+    }
+
+    fn encodeComparison(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register, spills: []const u32) !bool {
+        const instructions = self.instructions.items[index..];
+        if (instructions.len < 3) return false;
+        if (instructions[0] != .register or instructions[0].register.operation != .load_eax) return false;
+        if (instructions[2] != .scratch_dead) return false;
+        const lhs = registers[@backingInt(instructions[0].register.value)] orelse return false;
+        const comparison = instructions[1];
+        switch (comparison) {
+            .fixed => |fixed| {
+                const operation: x86.RegisterOperation = switch (fixed.operation) {
+                    .cmp_eax => .cmp_immediate,
+                    .cmp_eax_rsp => .cmp_stack,
+                    else => return false,
+                };
+                try x86.appendRegister(code, self.gpa, operation, lhs, fixed.bits);
+            },
+            .register => |operand| {
+                if (operand.operation != .cmp_eax) return false;
+                const value = @backingInt(operand.value);
+                if (registers[value]) |rhs| {
+                    try x86.appendRegisterBinary(code, self.gpa, .cmp_eax, lhs, rhs);
+                } else try x86.appendRegister(code, self.gpa, .cmp_stack, lhs, spills[value]);
+            },
+            else => return false,
+        }
+        return true;
     }
 
     fn encodeIndexedStore(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !bool {

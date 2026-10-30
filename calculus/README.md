@@ -909,7 +909,7 @@ dependency of the compiler build or its routine Zig tests.
 | Evaluation-local storage and snapshots | [Interpreter tests](../tests/comptime_interpreter_test.zig) |
 | Borrowed/owned alternatives and pattern projection | [Match tests](../tests/match_test.zig) and [tuple tests](../tests/tuple_test.zig) |
 | Explicit results and evaluation order through conversion | [Converter tests](../tests/converter_test.zig) |
-| Publication, typing, and stage boundaries | [Architecture](../ARCHITECTURE.md) |
+| Publication, typing, and stage boundaries | [Architecture](../docs/ARCHITECTURE.md) |
 | Panic and CLI execution outcomes | [Compiler guide](../docs/COMPILER.md) and [panic tests](../tests/panic_test.zig) |
 
 The source blocks in section 7 provide small discriminating examples, not

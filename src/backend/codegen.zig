@@ -782,6 +782,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             if (destination == .discarded) return;
             try self.loadComponent(u32, self.valueLocation(operation.operands.lhs), 0);
             try self.encoder.compareEax(self.valueLocation(operation.operands.rhs));
+            if (buffered) try self.encoder.stream.instructions.append(self.gpa, .scratch_dead);
             try self.encoder.emit(switch (operation.operation) {
                 .lti => .setl_al,
                 .gti => .setg_al,
@@ -877,6 +878,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
         fn emitPredicateBranch(self: *Self, predicate: @FieldType(structures.FunctionTerminator, "predicate_branch"), fallthrough: ?structures.FunctionBlockId) !void {
             try self.loadComponent(u32, self.valueLocation(predicate.operands.lhs), 0);
             try self.encoder.compareEax(self.valueLocation(predicate.operands.rhs));
+            if (buffered) try self.encoder.stream.instructions.append(self.gpa, .scratch_dead);
             const final_is_then = fallthrough == predicate.then_branch.target or fallthrough != predicate.else_branch.target;
             const final = if (final_is_then) predicate.then_branch else predicate.else_branch;
             const early = if (final_is_then) predicate.else_branch else predicate.then_branch;

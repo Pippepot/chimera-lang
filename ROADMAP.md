@@ -1,57 +1,11 @@
 # Roadmap
 
 [syntax&semantics.txt](syntax&semantics.txt) owns language rules;
-[ARCHITECTURE.md](ARCHITECTURE.md) describes the compiler. This file tracks future
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the compiler. This file tracks future
 work and its priority, not completed features or implementation history.
 
 Settle missing semantics before implementation. Each milestone covers
-diagnostics, execution, ownership, and incremental/cache behavior. Legacy parity
-is not a goal.
-
-## Error handling acceptance
-
-Complete the [routine Safe suite](docs/COMPILER.md#verify) for nominal error
-marking, `catch`, and postfix `?` before full regression acceptance. Focused
-handler and entry-query checks pass; the full run was interrupted before completion.
-
-## Flow typing acceptance
-
-The implementation, source migration, and routine Safe verification are complete.
-Investigate measured typing/memory overhead and finish matched cold, incremental,
-and runtime comparisons against the pre-flow parent before acceptance.
-See the [current status and remaining work](docs/FLOW_TYPING_HANDOFF.md).
-
-## Immediate engineering priority
-
-Continue reducing frontend compilation time before further runtime or machine-stage
-optimization. Use the [frontend measurements](docs/FRONTEND_PERFORMANCE.md) to
-choose the next change; this takes precedence over the milestones below without
-changing their relative order.
-
-1. Investigate remaining operation/member/call resolution costs: repeated
-   namespace and signature demands, type-only argument discovery, and type-fact
-   access. Reuse facts at their owning boundary before introducing another cache.
-2. Review refinement-heavy snapshot retention and remaining branch/join work.
-   Preserve the simple scalar, owning, narrowing, and real-backedge cases alongside
-   broad compilation throughput, diagnostics, ownership, and evaluation order.
-3. Keep fresh leaf edits proportional to the changed body. Attribute dependency
-   validation and executable linking separately from frontend reanalysis; prioritize
-   parsing or invalidation changes only when their measured contribution warrants it.
-
-Accept changes only with matched uninstrumented cold, leaf-edit, and generated
-runtime measurements under the [benchmark protocol](benchmarks/README.md#measurement-protocol).
-Keep backend and workload changes separate so frontend gains remain attributable.
-
-## Compiler simplification
-
-Reduce compiler code to at most 34,000 lines under the existing `loc.sh` code
-policy. Preserve language behavior, diagnostics, ownership, incremental queries,
-and cache validation. Consolidate repeated lifecycle and traversal logic; keep
-tests and line-count rules intact. Apply the same performance acceptance protocol
-to simplification changes.
-
-Investigate the slow precompile-std build as part of subsequent frontend
-performance work.
+diagnostics, execution, ownership, and incremental/cache behavior.
 
 ## Ordered milestones
 
@@ -64,7 +18,7 @@ performance work.
 - Settle structural mutation during iteration, distinguishing references into
   stable backing from views that depend on contents.
 
-### 7. Basic collection algorithms
+### Basic collection algorithms
 
 - `swap`, `reverse`, and `sort` need not wait for Map/Set. Define support for
   noncopyable and reference-containing elements, comparator access and
@@ -74,7 +28,7 @@ performance work.
   `pairwise`, `windows`, and `chunks`; algorithms `map`, `filter`, `find`, `any`,
   `all`, and `sorted`; numerical helpers `min`, `max`, and `clamp`.
 
-### 8. Collections
+### Collections
 
 - Map/Set hashing, equality, key-mutation rules, ownership, and ordered variants.
   Build on storage, tuples, and iteration contracts; Queue/Stack may reuse List.
@@ -89,6 +43,9 @@ performance work.
   and allocation/failure behavior.
 - Selected-branch-only analysis for `static if`, including declarations and
   dependencies in the unselected branch.
+- Further patterns: named-struct destructuring, sequence/rest patterns, extractors,
+  direct membership and relative-comparison arms, and pattern Boolean algebra.
+  Settle header initializers and capture ownership before introducing syntax.
 
 ## Independent numeric foundations
 
@@ -122,10 +79,19 @@ not gate collections or basic algorithms.
   Explicit named overload sets and noncapturing static function values exist.
 - Additional targets only for concrete use cases: target/location-specific
   layouts, allocation, access, and zero-byte behavior. Start with scalar device
-  buffers; defer raw addresses and foreign memory.
+  buffers and synchronous transfers; defer raw addresses and foreign memory.
+  Keep logical types, layouts, address spaces, providers, and ABI independent.
+  Asynchronous completion must retain resources and access obligations. Define
+  kernel synchronization, collective participation, failure, and numeric policies
+  before lowering; use established device backends where practical.
 - Finer-grained invalidation only after measurements; decide unused-declaration
   validation separately from demand-driven compilation.
 - **Enum-indexed arrays.** Dense, type-safe arrays indexed directly by enum
   values; define domain coverage, storage order, and initialization.
 - **Value-producing blocks.** Blocks and labeled `break` carrying values;
   define result typing, ownership, cleanup, and interaction with failure.
+- Runtime optimization: stronger loop bounds proofs, register allocation, and
+  machine copy/address selection; SIMD only after scalar opportunities. Preserve
+  wrapping and panic behavior without workload-specific special cases.
+- Machine-stage cost: call-site live-range splitting, frame compaction, and
+  scheduling when profiles justify them.

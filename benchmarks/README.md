@@ -7,7 +7,7 @@ helps repeatability but does not remove frequency, thermal, or system-load noise
 Compiler timings, generated-program runtime, retained memory, and code size are
 different measurements; none substitutes for another.
 
-## Commit History
+## Recording Results
 
 [history.py](history.py) records exact snapshots and updates the static report at
 `.history/index.html`. It requires Linux, Python 3.12+, Git, Zig, and Matplotlib:
@@ -37,9 +37,9 @@ python3 -m unittest discover -s benchmarks -p history_test.py -v
 zig build history-benchmark --seed=0 -j1
 ```
 
-LOC backfill is resumable and needs no historical compiler builds. It applies
-the current [loc.sh](../loc.sh) policy to past sources, including older root-level
-layouts, excluding build/benchmark drivers, comments, blank lines, and std.
+LOC backfill is resumable and needs no compiler builds. It applies
+the current [loc.sh](../loc.sh) policy to each revision, excluding
+build/benchmark drivers, comments, blank lines, and std.
 The graph plots production LOC; raw records retain test and total counts.
 
 Reports follow the selected revision's first-parent ancestry. The horizontal
@@ -52,12 +52,9 @@ not the saved measurements. The temporary point follows its parent without a
 status label. Incompatible environments remain separate. The dashboard plots
 separate zero-worker and eight-worker compilation curves per phase and matched
 environment, using the latest result per commit regardless of suite hash.
-Driver, generator, or sampling-protocol edits do not hide
-history or add duplicate workload curves. Sampling details remain in tooltips
-and raw records. Keep the benchmark input fixed for
-comparable timings; raw records retain the original suite hashes for auditing.
-Debug and obsolete protocols remain in raw records without adding duplicate
-graphs. Runtime still uses its latest compatible workload.
+Driver, generator, or sampling-protocol edits do not add duplicate workload curves.
+Sampling details and suite hashes remain in tooltips and raw records. Keep the
+benchmark input fixed for comparable timings.
 Compilation and runtime have separate identities: replacing compilation
 workloads does not discard unchanged runtime history or its cached C references.
 Zig, machine, and kernel keep incompatible timing environments
@@ -82,8 +79,7 @@ workers, using fresh databases without disk caching or profiling. Each worker
 count has one discarded warm-up per measurement, then adaptive sampling. Two
 measured runs suffice when their full range is at most 2% of their median;
 otherwise sampling continues up to three runs for compilation and five for
-runtime. Thus noisy cold compilation never exceeds the previous three-run
-budget. All measured samples are retained.
+runtime. All measured samples are retained.
 Results still outside that range at the cap are explicitly marked unstable in
 raw records and graph tooltips, not silently accepted as stable. This is an
 observed-repeatability heuristic, not a confidence interval or proof of no
@@ -116,16 +112,13 @@ other source inputs are unchanged. Cold and edit sampling stop independently.
 An edit normally follows a measured cold build; if more edit samples are needed,
 they use the last database and a new leaf value each time. They never toggle
 between already-cached leaf bodies or force extra cold builds. Every resulting
-exit status is checked. The compilation protocol versions this changed edit
-sequence separately from the earlier fixed cold/edit pairs.
+exit status is checked. The compilation protocol records the sampling sequence
+independently of the workload.
 
 This is a broad synthetic throughput/reuse workload, not a claim to represent
 every application or every language feature. Repeated shapes and shared generic
 specializations are intentional; pathological generic expansion, large individual
 functions, error reporting, and varied dependency graphs need separate workloads.
-The old four-line collection/text and 128-function measurements remain in raw
-records, not on the new compilation curves. Their timings are not comparable.
-
 Small generator/semantic checks, without recording misleading million-line points:
 
 ```sh
@@ -140,11 +133,9 @@ Nondefault line counts are labelled `probe-core-N` and rejected by the recorder.
 `--samples=N` overrides adaptive stopping for standalone probes in either case;
 one-sample probes are not accepted as history measurements. The CSV declares each
 measurement's total sample count and stability, so truncated or duplicate samples
-are rejected. Workload semantics and timer boundaries have separate versioned
-identities from the recorded sampling policy. Older raw records are preserved;
-compatible fixed-count C references remain reusable. Changed compilation
-sampling sequences retain their protocol identities in raw records without
-splitting the compilation graphs.
+are rejected. Workload semantics, timer boundaries, and sampling policy have
+separate versioned identities in raw records without splitting the compilation
+graphs. C references are reused only when their protocols are compatible.
 
 For worker-scaling measurements, the compilation driver accepts
 `--workers=N` from 0 through 64 (default 0):
@@ -173,23 +164,13 @@ toolchain. Consult the raw records when comparing runs with different affinities
 Keep the normal warm-up and cold/edit validation. The worker option does not
 change runtime sampling.
 
-Only cold-compilation legends show rounded C++20 comparison estimates, without
-reference lines or changes to the graph scale. The 2026-10-25 comparison uses
-Clang 22.1.8, serial CPU 6 builds, no debug info, PCH, LTO, or compiler cache:
-1,000,000 generated lines, 128 feature modules, and 19,584 mixed-feature units.
-Cold estimates (160 s at `-O0`, 268 s at `-O2`) use mean projections from three
-four-module resamples, checked against one full build per setting. The combined
-observed/projected ranges were 158-162 s and 266-270 s, not confidence intervals.
-C++ leaf-edit comparisons are omitted: reusing object files and invoking a
-disk-based linker differs from Chimera's query-level reuse and in-memory linking.
-C++ timing includes object/executable writes. Both exit statuses, 42 and 43,
-were checked. C++ library and ownership
-semantics differ from Chimera's; these labels are context, not matched history
-samples or a claim about every C++ project.
+Cold-compilation legends include approximate C++20 context, not matched acceptance
+samples. C++ library/ownership semantics and disk-based compilation differ from
+Chimera's; no C++ leaf-edit comparison is claimed.
 
-Historical measurements use the current fixed driver and standalone
-[build harness](history_build.zig) in temporary snapshots, not the historical
-build target. A small import bridge exposes the revision's compiler. Compiler and
+Commit measurements use the fixed driver and standalone
+[build harness](history_build.zig) in temporary snapshots rather than each
+revision's build target. An import bridge exposes the compiler. Compiler and
 standard-library sources are never replaced or patched to accept a workload.
 LOC and source identity are captured before harness insertion; the suite hash
 separately includes the driver, sampler, workload generator, C reference, build harness,
@@ -204,8 +185,8 @@ and correctness failures produce no timing; details live in raw records and
 workload fails, after saving its record and rendering the report. Backfill
 continues through unavailable revisions. Revisions predating the harness's module/query API are
 marked unavailable; this does not prove their compiler cannot compile the source.
-Backfill attempts older revisions too, rather than assuming
-one failure proves every ancestor incompatible. Normal single-commit recording
+Backfill attempts each revision independently; one failure does not establish
+incompatibility of its ancestors. Normal single-commit recording
 can retry a revision; changing the suite or environment also triggers new attempts.
 
 Generated runtime has a separate `sieve-88000000` workload: a heap-backed List
@@ -221,7 +202,7 @@ there are no volatile operations or inner-loop barriers.
 The executable builds and writes once outside the timer, then runs once
 unmeasured and then adaptively sampled under the rule above. Process wall time includes stdin/stdout,
 startup, allocation, computation, and cleanup, not just a kernel.
-Older snapshots without runtime coverage still contribute compiler measurements.
+Snapshots without runtime coverage still contribute compiler measurements.
 JSON retains all samples and executable sizes; graphs show separate workload
 medians, not one aggregate score. Code size is not a runtime benchmark.
 Compilation and runtime graphs use seconds.
@@ -230,20 +211,17 @@ The fixed limit was calibrated on CPU 4 for a C `-O3` baseline close to one seco
 There are no sleeps, repeated subprocess padding, or optimization barriers.
 Faster machines can produce subsecond samples; fresh and cached baselines accept
 these timings with the same correctness checks. The workload stays fixed across
-machines, and incompatible environments remain separate. The old one-million-element timings
-remain in raw records and are not joined to the new runtime curve.
+machines, and incompatible environments remain separate.
 
 The equivalent [C sieve](history_runtime.c) uses the same algorithm, signed 32-bit
 integer array, input, output, correctness probes, warm-up, and process timer.
-This matches Chimera's `int`; the old C reference used a wider 64-bit array.
+This matches Chimera's `int`.
 The system `cc` builds it at `-O0` and `-O3`, outside the timer;
 these snapshots require a C11 compiler on `PATH`. Each level gets one warm-up
 and its own adaptive measurement sequence.
 The latest matching run's C medians appear as two labelled horizontal runtime
 reference lines in the report and SVG/PNG exports. They share the runtime
 curve's color, with dotted `-O0` and dashed `-O3` lines. Render-only never reruns C.
-Older `-O1` and `-O2` samples remain in raw records but are neither plotted nor
-remeasured; existing complete `-O0`/`-O3` samples remain reusable.
 Normal recording reuses complete C samples from existing `.history/records/`
 when the suite (C source and timing driver), protocol, Zig/C toolchains, and
 runner (including CPU affinity) match. On a hit, C is neither compiled nor run;
@@ -253,27 +231,15 @@ C once. Use `--refresh-c` to deliberately replace that baseline, for example
 after a machine or thermal-state change. There is no separate cache to maintain;
 preserve the history records to preserve the C baseline.
 Compiler identity and C source hashes remain internal and isolate incompatible
-comparisons. Older records without C samples have no reference lines. C lacks
+comparisons. Records without C samples have no reference lines. C lacks
 Chimera's dynamic bounds checks and List machinery, so this compares equivalent
 algorithms and data layouts, not identical safety or library overhead.
 Optimization levels are not guaranteed to improve monotonically.
 
-Assembly inspection confirms that optimized C still executes the factor and
-multiple-marking loops. GCC replaces elementwise zeroing with `memset` and
-vectorizes the final count; it does not substitute a precomputed prime count.
-The generated Chimera code inlines List indexing, fills with `rep stosd`, and keeps
-unchanged List descriptors outside the marking and counting loops. Scalar
-iterator results use separate tag and payload values, and eligible loop scalars
-use preserved registers with in-place arithmetic at last-use operand reuse.
-Scalar edge copies run without staging when forward or reverse order preserves
-their sources; cycles and unsupported shapes retain scratch storage.
-Constant incoming predicates can bypass independent terminal exits instead of
-materializing exhausted iterator joins. Bounds checks and scalar counting remain
-in the hot loops. These are concrete code-generation/library differences, not evidence
-of C skipping the requested computation. ReleaseFast optimizes the Zig compiler
-itself, not the generated Chimera program through LLVM.
+ReleaseFast optimizes the Zig compiler itself, not the generated Chimera program
+through LLVM. Assembly and code-size differences are not runtime measurements.
 
-The suite does not measure CLI file discovery/startup, multi-worker scaling,
+The suite does not measure CLI file discovery/startup, general worker scaling,
 peak RSS, or broad application runtime. Those need separate versioned workloads.
 
 For CI, use a full-history checkout, the matching Zig toolchain and Python
@@ -363,9 +329,3 @@ python3 benchmarks/parallel.py zig-out/bin/chimera --temp-dir .
 The linker build ID identifies stripped Fast compiler binaries cheaply. Measure
 the explicitly built binary, not an installed binary left over from another
 source state.
-
-## Historical Results
-
-The nine old CSVs and their provenance are archived under [results/](results/README.md).
-They are experiment evidence, not inputs to the active drivers or history graphs.
-Current measurements and cached C baselines live in `.history/records/`.

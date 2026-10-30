@@ -6,9 +6,6 @@ Chimera brings native code and checked ownership to a small, expressive syntax.
 Describe optional values and errors with variants, bind their alternatives
 explicitly, and run ordinary functions at compile time.
 
-Flow typing is implemented and Safe verification passes; performance acceptance remains.
-See the [status and remaining work](docs/FLOW_TYPING_HANDOFF.md).
-
 ## A first look
 
 ```chimera
@@ -202,10 +199,10 @@ and priorities.
 ## Go deeper
 
 - [Compiler guide](docs/COMPILER.md): running, debugging, and testing.
-- [Benchmarks](benchmarks/README.md): measurement protocols and commit history.
+- [Benchmarks](benchmarks/README.md): workloads and measurement protocols.
 - [Language specification](syntax&semantics.txt): detailed rules and examples,
   including planned features.
 - [Core calculus](calculus/README.md): a descriptive semantic model and a verified
   executable refinement core.
-- [Compiler architecture](ARCHITECTURE.md): how the implementation fits together.
-- [Query flow](PROGRAM_FLOW.md): demand, recomputation, and result lifetimes.
+- [Compiler architecture](docs/ARCHITECTURE.md): stages, queries, and result lifetimes.
+- [Optimizer](docs/OPTIMIZER.md): runtime IR, passes, and native machine lowering.

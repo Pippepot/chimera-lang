@@ -216,6 +216,91 @@ test "machine symbolic positions resolve after register and spill encoding" {
     }
 }
 
+test "machine register copies forward only when scratch is dead" {
+    for (0..5) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        if (mode == 3) _ = try function.position();
+        try function.register(.store_eax, @fromBackingInt(1), 0);
+        if (mode != 2) try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{ if (mode == 4) null else .r12, if (mode == 1) .r12 else .rbx }, &.{ 0, 4 }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const expected: []const u8 = switch (mode) {
+            0 => &.{ 0x41, 0x8B, 0xDC },
+            1 => &.{},
+            2, 3 => &.{ 0x44, 0x89, 0xE0, 0x89, 0xC3 },
+            else => &.{ 0x8B, 0x04, 0x24, 0x89, 0xC3 },
+        };
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items);
+    }
+}
+
+test "machine comparisons avoid scratch copies for register and immediate operands" {
+    const cases = [_]struct { lhs: test_sources.x86_encoding.Register, rhs: test_sources.x86_encoding.Register, expected: []const u8 }{
+        .{ .lhs = .rbx, .rhs = .rbp, .expected = &.{ 0x3B, 0xDD } },
+        .{ .lhs = .rbx, .rhs = .r12, .expected = &.{ 0x41, 0x3B, 0xDC } },
+        .{ .lhs = .r12, .rhs = .rbx, .expected = &.{ 0x44, 0x3B, 0xE3 } },
+        .{ .lhs = .r12, .rhs = .r13, .expected = &.{ 0x45, 0x3B, 0xE5 } },
+    };
+    for (cases) |case| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        try function.register(.cmp_eax, @fromBackingInt(1), 0);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{ case.lhs, case.rhs }, &.{ 0, 4 }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u8, case.expected, encoded.code.items);
+    }
+    for ([_]i32{ -129, -128, 0, 127, 128 }) |immediate| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        try function.immediate(.cmp_eax, immediate);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{.r12}, &.{0}, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        var expected: std.ArrayList(u8) = .empty;
+        defer expected.deinit(std.testing.allocator);
+        try expected.appendSlice(std.testing.allocator, if (std.math.cast(i8, immediate) != null) &.{ 0x41, 0x83, 0xFC } else &.{ 0x41, 0x81, 0xFC });
+        const bytes = std.mem.toBytes(std.mem.nativeToLittle(u32, @bitCast(immediate)));
+        try expected.appendSlice(std.testing.allocator, bytes[0..if (std.math.cast(i8, immediate) != null) @as(usize, 1) else 4]);
+        try std.testing.expectEqualSlices(u8, expected.items, encoded.code.items);
+    }
+}
+
+test "machine comparisons preserve compact spill operands and scratch boundaries" {
+    for ([_]u32{ 0, 127, 128 }) |offset| for ([_]bool{ false, true }) |spilled_operand| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        if (spilled_operand) {
+            try function.register(.cmp_eax, @fromBackingInt(1), 0);
+        } else try function.offset(.cmp_eax_rsp, offset);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{ .r12, null }, &.{ 0, offset }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const expected: []const u8 = switch (offset) {
+            0 => &.{ 0x44, 0x3B, 0x24, 0x24 },
+            127 => &.{ 0x44, 0x3B, 0x64, 0x24, 127 },
+            else => &.{ 0x44, 0x3B, 0xA4, 0x24, 128, 0, 0, 0 },
+        };
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items);
+    };
+    for (0..3) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        if (mode == 1) _ = try function.position();
+        try function.immediate(.cmp_eax, 7);
+        if (mode != 0) try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{if (mode == 2) null else .rbx}, &.{0}, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        try std.testing.expectEqualSlices(u8, if (mode == 2) &.{ 0x8B, 0x04, 0x24, 0x83, 0xF8, 7 } else &.{ 0x89, 0xD8, 0x83, 0xF8, 7 }, encoded.code.items);
+    }
+}
+
 test "machine in-place arithmetic requires dead scratch and respects labels" {
     for (0..3) |mode| for ([_]bool{ false, true }) |register_operand| {
         var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };

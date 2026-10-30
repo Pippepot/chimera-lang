@@ -261,7 +261,7 @@ pub fn clobberedRegisters(operation: Operation) RegisterSet {
     };
 }
 
-pub const RegisterOperation = enum { load_eax, store_eax, load_rax, store_rax, store_indexed_i32, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, add_immediate, sub_immediate, imul_immediate, add_from_eax, sub_from_eax, imul_from_eax, load_stack, add_stack, sub_stack, imul_stack, save, restore };
+pub const RegisterOperation = enum { load_eax, store_eax, load_rax, store_rax, store_indexed_i32, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, add_immediate, sub_immediate, imul_immediate, cmp_immediate, add_from_eax, sub_from_eax, imul_from_eax, load_stack, add_stack, sub_stack, imul_stack, cmp_stack, save, restore };
 
 fn registerEncoding(comptime operation: RegisterOperation, comptime register: Register) Encoding {
     const r = register.low();
@@ -285,6 +285,7 @@ fn registerEncoding(comptime operation: RegisterOperation, comptime register: Re
         .add_immediate => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x81, 0xC0 | r }, .operand = .i32, .compact = .{ .immediate = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x83, 0xC0 | r } }, .asm_prefix = "add " ++ name ++ ", " },
         .sub_immediate => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x81, 0xE8 | r }, .operand = .i32, .compact = .{ .immediate = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x83, 0xE8 | r } }, .asm_prefix = "sub " ++ name ++ ", " },
         .imul_immediate => .{ .prefix = (if (extended) &[_]u8{0x45} else &[_]u8{}) ++ &[_]u8{ 0x69, 0xC0 | (r << 3) | r }, .operand = .i32, .compact = .{ .immediate = (if (extended) &[_]u8{0x45} else &[_]u8{}) ++ &[_]u8{ 0x6B, 0xC0 | (r << 3) | r } }, .asm_prefix = "imul " ++ name ++ ", " ++ name ++ ", " },
+        .cmp_immediate => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x81, 0xF8 | r }, .operand = .i32, .compact = .{ .immediate = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x83, 0xF8 | r } }, .asm_prefix = "cmp " ++ name ++ ", " },
         .add_from_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x01, 0xC0 | r }, .asm_prefix = "add " ++ name ++ ", eax" },
         .sub_from_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x29, 0xC0 | r }, .asm_prefix = "sub " ++ name ++ ", eax" },
         .imul_from_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x0F, 0xAF, 0xC0 | (r << 3) }, .asm_prefix = "imul " ++ name ++ ", eax" },
@@ -292,6 +293,7 @@ fn registerEncoding(comptime operation: RegisterOperation, comptime register: Re
         .add_stack => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x03, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "add " ++ name ++ ", [rsp+", .asm_suffix = "]" },
         .sub_stack => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x2B, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "sub " ++ name ++ ", [rsp+", .asm_suffix = "]" },
         .imul_stack => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x0F, 0xAF, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "imul " ++ name ++ ", [rsp+", .asm_suffix = "]" },
+        .cmp_stack => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x3B, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "cmp " ++ name ++ ", [rsp+", .asm_suffix = "]" },
         .save => .{ .prefix = &[_]u8{ if (extended) 0x4C else 0x48, 0x89, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "mov [rsp+", .asm_suffix = "], " ++ @tagName(register) },
         .restore => .{ .prefix = &[_]u8{ if (extended) 0x4C else 0x48, 0x8B, 0x84 | (r << 3), 0x24 }, .operand = .u32, .compact = .displacement, .asm_prefix = "mov " ++ @tagName(register) ++ ", [rsp+", .asm_suffix = "]" },
     };
@@ -336,7 +338,7 @@ pub fn appendRegister(code: *std.ArrayList(u8), allocator: std.mem.Allocator, op
     try appendPattern(code, allocator, registerSelectedEncoding(operation, register, bits), bits);
 }
 
-const binary_operations = [_]RegisterOperation{ .add_eax, .sub_eax, .imul_eax };
+const binary_operations = [_]RegisterOperation{ .add_eax, .sub_eax, .imul_eax, .cmp_eax, .store_eax };
 
 const binary_register_patterns = blk: {
     @setEvalBranchQuota(20000);
@@ -347,6 +349,8 @@ const binary_register_patterns = blk: {
             .add_eax => .{ .opcode = &.{0x03}, .name = "add " },
             .sub_eax => .{ .opcode = &.{0x2B}, .name = "sub " },
             .imul_eax => .{ .opcode = &.{ 0x0F, 0xAF }, .name = "imul " },
+            .cmp_eax => .{ .opcode = &.{0x3B}, .name = "cmp " },
+            .store_eax => .{ .opcode = &.{0x8B}, .name = "mov " },
             else => unreachable,
         };
         const rex: u8 = 0x40 | (if (destination.extended()) @as(u8, 4) else 0) | (if (source.extended()) @as(u8, 1) else 0);

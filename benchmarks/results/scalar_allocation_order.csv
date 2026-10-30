@@ -1,5 +1,0 @@
-variant,base_commit,parser_order,branches,trials,samples_per_trial,total_wall_ns,total_minor_faults,value_clearing_wall_ns,value_clearing_minor_faults,value_slots,value_bytes,value_size,expression_size,expression_count,allocation_count,allocation_bytes,recycled_bytes,arena_capacity,arena_used,arena_resident
-baseline,4556095,tokenizer_first,128,15,5,3274448,538,10755,0,1667,286724,172,112,1666,4043,4866315,1036552,1532934,1118456,348
-prior,7cb3afd,tokens_first,128,15,5,3684417,781,120547,70,1667,286724,172,112,1666,4043,4866315,1036552,1532934,1118456,189
-parser_order,7cb3afd,tokenizer_first,128,15,5,3135603,490,9429,0,1667,286724,172,112,1666,4043,4866315,1036552,1532934,1118456,348
-baseline_reversed,4556095,tokens_first,128,15,5,3622258,715,121105,70,1667,286724,172,112,1666,4043,4866315,1036552,1532934,1118456,189
