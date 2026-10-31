@@ -1,0 +1,53 @@
+{
+  "date": "2026-10-31",
+  "cpu": 4,
+  "processor": "AMD Ryzen 9 3900X",
+  "zig": "0.17.0",
+  "cc": "cc (GCC) 16.2.1 20260810",
+  "kernel": "7.2.5-3-omarchy",
+  "changed_compiler_files": [
+    "src/backend/codegen.zig",
+    "src/backend/registers.zig"
+  ],
+  "workloads": {
+    "benchmarks/key-gen-face-five/main.chi": "a68266c533ab0e465676b5720bffcff4472c128081efcda3283f244411b0e858",
+    "benchmarks/key-gen-face-five/main.c": "986cfe3f77eb82eedc067a25b988da7044dd2b6a62fb2a06de6fac8ae13661a8"
+  },
+  "compiler_build": [
+    "zig",
+    "build",
+    "--seed=0",
+    "-Doptimize=fast",
+    "-j1"
+  ],
+  "c_build": [
+    "cc",
+    "-std=c11",
+    "-Wall",
+    "-Wextra",
+    "-Werror",
+    "-O3",
+    "benchmarks/key-gen-face-five/main.c",
+    "-o",
+    "<C executable>"
+  ],
+  "runtime_protocol": {
+    "cpu": 4,
+    "last_index": 10,
+    "warmups_per_executable": 1,
+    "minimum_samples": 2,
+    "maximum_samples": 5,
+    "stability": "full range <= 2% of median",
+    "order": "before / after / C, reversed on alternate rounds; stop each stable executable",
+    "timer": "complete process wall time, excluding output validation",
+    "validation": "reference prefixes 3 through 7, invalid input probes, complete index-10 output"
+  },
+  "executables": {
+    "before": "f718304b72be49599906188c9b78f785c0bb0f594ddcfa7cf88a3b465ec52f02",
+    "after": "ffc45b6ca1112d66d3b1a526f695de686f455c32596b438afa78a320bf3183b7",
+    "c_o3": "4f74ed50f31f2e4dd5a6531b1c6025d8611e1270269003315208823ff909c499",
+    "sieve_before": "a7b9a037de63ef7ca868e13ab2ae378ed7ce7b4e54a23a958c971d3ef46314e8",
+    "sieve_after": "d90b02736bc441146c96edae7580e4ad8b0e49e6b16102c137fc6c0e6f4f4bb4"
+  },
+  "preview_matches_fast_executable": true
+}

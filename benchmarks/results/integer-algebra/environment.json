@@ -1,0 +1,18 @@
+{
+  "zig": "0.17.0",
+  "kernel": "Linux-7.2.5-3-omarchy-x86_64-with-glibc2.44",
+  "compiler_source_sha256": {
+    "baseline": "d9eb8306ca445afd6a9b308c6d0e37573e4ae8a82c74c9a9e1fdc6c05c60fc23",
+    "candidate": "7e6d47d418a3b6531f8e68779a1d884775d9c692589b79e16af6e084bc2121f1",
+    "initial_candidate": "4b0b3d53be0fd373050b49c5ce79e4572dec810b02d39df0ee428455a51a3c95",
+    "structural_candidate": "da43197023ee2d500c4d74d80b75e3d7e14d35cf78ccc89b3a6dea0824025934"
+  },
+  "baseline": "Working tree before the integer-algebra change; existing uncommitted optimizer/backend work included.",
+  "changed_compiler_files": [
+    "src/optimizer/canonicalize.zig"
+  ],
+  "command": "taskset -c 4 zig build history-benchmark --seed=0 -Doptimize=fast -j1 -- --skip-c",
+  "workers": 0,
+  "cpu": 4,
+  "sampling": "One discarded warm-up; adaptive 2\u20133 compilation samples and 2\u20135 runtime samples; 2% full-range stability threshold."
+}

@@ -145,12 +145,21 @@ pub const Function = struct {
             positions[index] = std.math.cast(u32, encoded.code.items.len) orelse return error.FunctionTooLarge;
             field.* = positions[index];
             if (index < skip_until) continue;
+            if (try self.encodeIndex(&encoded.code, index, registers)) {
+                skip_until = index + 2;
+                continue;
+            }
             if (try self.encodeCopy(&encoded.code, index, registers)) {
                 skip_until = index + 2;
                 continue;
             }
             if (try self.encodeComparison(&encoded.code, index, registers, spills)) {
                 skip_until = index + 2;
+                continue;
+            }
+            const indexed_load = try self.encodeIndexedLoad(&encoded.code, index, registers);
+            if (indexed_load != 0) {
+                skip_until = index + indexed_load;
                 continue;
             }
             if (try self.encodeIndexedStore(&encoded.code, index, registers)) {
@@ -202,6 +211,25 @@ pub const Function = struct {
         return encoded;
     }
 
+    fn encodeIndex(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !bool {
+        const instructions = self.instructions.items[index..];
+        if (instructions.len < 3) return false;
+        if (instructions[0] != .register or instructions[0].register.operation != .load_eax) return false;
+        if (instructions[1] != .fixed or instructions[1].fixed.operation != .movsxd_rcx_eax) return false;
+        // The original eax copy is dead only when the base load overwrites rax
+        // immediately, without a label or a read of the old accumulator.
+        switch (instructions[2]) {
+            .register => |base| if (base.operation != .load_rax) return false,
+            .fixed => |base| {
+                if (base.operation != .lea_rax_rsp and base.operation != .mov_rax_rsp) return false;
+            },
+            else => return false,
+        }
+        const source = registers[@backingInt(instructions[0].register.value)] orelse return false;
+        try x86.appendRegister(code, self.gpa, .sign_extend_rcx, source, 0);
+        return true;
+    }
+
     fn encodeCopy(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !bool {
         const instructions = self.instructions.items[index..];
         if (instructions.len < 3) return false;
@@ -240,6 +268,41 @@ pub const Function = struct {
             else => return false,
         }
         return true;
+    }
+
+    fn encodeIndexedLoad(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !usize {
+        const instructions = self.instructions.items[index..];
+        if (instructions.len < 5 or instructions[1] != .fixed or instructions[2] != .fixed) return 0;
+        if (instructions[4] != .scratch_dead) return 0;
+        var destination_register: ?x86.Register = null;
+        switch (instructions[3]) {
+            .register => |destination| {
+                if (destination.operation != .store_eax) return 0;
+                destination_register = registers[@backingInt(destination.value)];
+            },
+            .fixed => |destination| if (destination.operation != .mov_rsp_eax and destination.operation != .mov_rsp_al) return 0,
+            else => return 0,
+        }
+        const byte = switch (instructions[2].fixed.operation) {
+            .mov_eax_rax => false,
+            .movzx_eax_rax => true,
+            else => return 0,
+        };
+        if (instructions[2].fixed.bits != 0) return 0;
+        if (instructions[1].fixed.operation != (if (byte) x86.Operation.add_rax_rcx else .lea_rax_rax_rcx_4)) return 0;
+        switch (instructions[0]) {
+            .register => |source| {
+                if (source.operation != .load_rax) return 0;
+                const base = registers[@backingInt(source.value)] orelse return 0;
+                try x86.appendIndexedLoad(code, self.gpa, byte, base, destination_register, 0);
+            },
+            .fixed => |source| {
+                if (source.operation != .lea_rax_rsp) return 0;
+                try x86.appendIndexedLoad(code, self.gpa, byte, null, destination_register, source.bits);
+            },
+            else => return 0,
+        }
+        return if (destination_register != null) 4 else 3;
     }
 
     fn encodeIndexedStore(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !bool {

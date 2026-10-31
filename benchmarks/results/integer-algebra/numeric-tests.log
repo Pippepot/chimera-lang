@@ -1,0 +1,9 @@
+Build Summary: 6/6 steps succeeded; 16/16 tests passed
+test success
++- run test 16 pass (16 total) 918ms MaxRSS:27M
+   +- compile test safe native success 17s MaxRSS:462M
+   |  +- options cached
+   |  +- run exe precompile-std (std.chimera-artifact) cached
+   |     +- compile exe precompile-std safe native success 1m MaxRSS:2G
+   +- compile test safe native (+2 more reused dependencies)
+

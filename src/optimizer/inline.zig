@@ -23,6 +23,7 @@ pub const Callee = struct {
 pub const Facts = struct {
     eligible: bool,
     entry_taken: []const bool = &.{},
+    normal_return_ranges: []const ?@import("loops.zig").IntegerRange = &.{},
 };
 
 const Cache = struct {
@@ -54,7 +55,38 @@ pub fn analyzeCallee(scratch: std.mem.Allocator, body: *const Body) !Facts {
         };
     }
     const taken = try canonicalize.addressTaken(&function);
-    return .{ .eligible = true, .entry_taken = taken[body.blocks[entry].argument_start..body.blocks[entry].argument_end] };
+    const entry_taken = taken[body.blocks[entry].argument_start..body.blocks[entry].argument_end];
+    const parameters = function.blocks.items[entry].parameters.items;
+    for (parameters, entry_taken) |parameter, exposed| {
+        if (!exposed and function.valueType(parameter) == .int and function.plainValue(parameter)) break;
+    } else return .{ .eligible = true, .entry_taken = entry_taken };
+    const loops = @import("loops.zig");
+    const graph = (try function.controlFlow()).*;
+    const analysis = try loops.Analysis.init(&function, graph, &.{});
+    const ranges = try scratch.alloc(?loops.IntegerRange, parameters.len);
+    @memset(ranges, null);
+    for (graph.order) |block| {
+        switch (function.blocks.items[block].terminator) {
+            .return_unit, .return_value => {},
+            else => continue,
+        }
+        for (parameters, entry_taken, ranges) |parameter, exposed, *range| {
+            if (exposed or function.valueType(parameter) != .int or !function.plainValue(parameter)) continue;
+            const found = analysis.rangeAt(parameter, block);
+            if (range.*) |previous| {
+                range.* = .{ .lower = @min(previous.lower, found.lower), .upper = @max(previous.upper, found.upper) };
+            } else range.* = found;
+        }
+    }
+    var narrowed = false;
+    for (ranges) |*range| {
+        if (range.*) |found| {
+            if (found.lower == std.math.minInt(i32) and found.upper == std.math.maxInt(i32)) {
+                range.* = null;
+            } else narrowed = true;
+        }
+    }
+    return .{ .eligible = true, .entry_taken = entry_taken, .normal_return_ranges = if (narrowed) ranges else &.{} };
 }
 
 pub fn inlineCalls(function: *Function, context: anytype) !bool {

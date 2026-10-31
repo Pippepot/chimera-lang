@@ -7,6 +7,9 @@ helps repeatability but does not remove frequency, thermal, or system-load noise
 Compiler timings, generated-program runtime, retained memory, and code size are
 different measurements; none substitutes for another.
 
+All measured C references use `clang` explicitly at `-O0` and `-O3`; install
+Clang on `PATH`. Compiler path/version are part of reference-cache identity.
+
 ## Five-Face Key Search
 
 The standalone [five-face key search](key-gen-face-five/README.md) compares
@@ -19,7 +22,7 @@ python3 benchmarks/key-gen-face-five/run.py --cpu 4
 ## Recording Results
 
 [history.py](history.py) records exact snapshots and updates the static report at
-`.history/index.html`. It requires Linux, Python 3.12+, Git, Zig, and Matplotlib:
+`.history/index.html`. It requires Linux, Python 3.12+, Git, Zig, Clang, and Matplotlib:
 
 ```sh
 python3 -m venv .venv
@@ -176,9 +179,9 @@ runs with different affinities.
 Keep the normal warm-up and cold/edit validation. The worker option does not
 change runtime sampling.
 
-Cold-compilation legends include approximate C++20 context, not matched acceptance
-samples. C++ library/ownership semantics and disk-based compilation differ from
-Chimera's; no C++ leaf-edit comparison is claimed.
+Compilation plots contain measured Chimera results only. The former hard-coded
+C++ timing estimates had no compiler provenance and are no longer displayed;
+there is no measured Clang C++ compilation or leaf-edit baseline.
 
 Commit measurements use the fixed driver and standalone
 [build harness](history_build.zig) in temporary snapshots rather than each
@@ -219,8 +222,8 @@ JSON retains all samples and executable sizes; graphs show separate workload
 medians, not one aggregate score. Code size is not a runtime benchmark.
 Compilation and runtime graphs use seconds.
 
-The fixed limit was calibrated on CPU 4 for a C `-O3` baseline close to one second.
-There are no sleeps, repeated subprocess padding, or optimization barriers.
+The fixed limit remains 88 million across C toolchains. There are no sleeps,
+repeated subprocess padding, or optimization barriers.
 Faster machines can produce subsecond samples; fresh and cached baselines accept
 these timings with the same correctness checks. The workload stays fixed across
 machines, and incompatible environments remain separate.
@@ -228,12 +231,12 @@ machines, and incompatible environments remain separate.
 The equivalent [C sieve](history_runtime.c) uses the same algorithm, signed 32-bit
 integer array, input, output, correctness probes, warm-up, and process timer.
 This matches Chimera's `int`.
-The system `cc` builds it at `-O0` and `-O3`, outside the timer;
-these snapshots require a C11 compiler on `PATH`. Each level gets one warm-up
+`clang` builds it as C11 at `-O0` and `-O3`, outside the timer;
+there is no fallback to the system `cc`. Each level gets one warm-up
 and its own adaptive measurement sequence.
 The latest matching run's C medians appear as two labelled horizontal runtime
-reference lines in the report and SVG/PNG exports. They share the runtime
-curve's color, with dotted `-O0` and dashed `-O3` lines. Render-only never reruns C.
+reference lines named `Clang -O0` and `Clang -O3` in the report and SVG/PNG
+exports. They share the runtime curve's color, with dotted `-O0` and dashed `-O3` lines. Render-only never reruns C.
 Normal recording reuses complete C samples from existing `.history/records/`
 when the suite (C source and timing driver), protocol, Zig/C toolchains, and
 runner (including CPU affinity) match. On a hit, C is neither compiled nor run;
@@ -241,7 +244,13 @@ Chimera is still measured normally. Reused samples retain their original
 measurement timestamp and snapshot. New or incompatible configurations measure
 C once. Use `--refresh-c` to deliberately replace that baseline, for example
 after a machine or thermal-state change. There is no separate cache to maintain;
-preserve the history records to preserve the C baseline.
+preserve the history records to preserve the C baseline. Switching from an old
+GCC reference automatically misses the cache and measures Clang. Existing GCC
+records retain their compiler identity and render as `GCC` references; unknown
+legacy compilers retain generic `C` labels. Historical samples are not relabelled
+as Clang.
+The [Clang baseline qualification](results/clang-baselines/README.md) records
+matched sieve timings and verification for this switch.
 Compiler identity and C source hashes remain internal and isolate incompatible
 comparisons. Records without C samples have no reference lines. C lacks
 Chimera's dynamic bounds checks and List machinery, so this compares equivalent

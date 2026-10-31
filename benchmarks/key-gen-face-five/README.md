@@ -10,7 +10,7 @@ outer `c5` loop redundantly wraps another loop over the same variable and execut
 only once; both versions omit that wrapper without changing enumeration.
 
 Run the standalone comparison from the repository root with Linux, Python 3.12+,
-Zig 0.17, and `cc`:
+Zig 0.17, and Clang (`clang` on `PATH`):
 
 ```sh
 python3 benchmarks/key-gen-face-five/run.py
@@ -27,7 +27,7 @@ and prints one key per line. Missing/out-of-range input exits 1. Runtime input
 and the complete output keep the search observable; timing is external rather
 than printed inside the program.
 
-The runner builds the current Fast compiler and C11 `-O0`/`-O3` executables in a
+The runner builds the current Fast compiler and Clang C11 `-O0`/`-O3` executables in a
 temporary directory without replacing the repository's `prog` or installed
 compiler. All compilation is outside runtime timing. Before sampling, each
 executable passes reference-prefix and invalid-input probes, then one discarded
@@ -37,43 +37,94 @@ medians, repeatability status, toolchains, and CPU affinity are printed. Capped
 noisy results are marked unstable. The timer measures complete process wall time,
 including stdin/stdout, stack initialization, computation, and startup/cleanup;
 output validation is outside the timer. `--cpu` pins only runtime checks and
-samples, not builds. Chimera retains its normal dynamic bounds checks; C does not.
+samples, not builds. Chimera retains checked bounds and overflow semantics;
+C does not provide equivalent checks.
 This standalone workload does not modify the history suite or its graphs.
 
 ## Runtime Findings
 
-On 2026-10-31, a frozen before/after comparison on CPU 4 with Zig 0.17.0 and
-GCC 16.2.1 measured the unchanged default endpoint. Unrelated concurrent compiler
-edits were excluded from the after snapshot. Each executable passed the complete
-output and invalid-input checks, followed by one discarded warm-up. Measured
-before/after/C order alternated; all three reached the 2% stability criterion
-with two samples:
+The runner now uses Clang explicitly. The GCC measurements below retain their
+original toolchain labels and describe the earlier comparison.
+
+A matched comparison on 2026-10-31 used CPU 4 of an AMD Ryzen 9 3900X,
+Zig 0.17.0 Fast compilers, and GCC 16.2.1. The frozen baseline already includes
+the earlier arithmetic, syscall-register, flag-exit, cold-trap, bounds-inference,
+and address/load-fusion improvements. Only `src/backend/codegen.zig` and
+`src/backend/registers.zig` differ between these compiler sources; frontend,
+optimizer, standard-library sources, and workloads are matched.
+
+Each executable passed reference-prefix and invalid-input checks, followed by
+one discarded warm-up at the default endpoint. Before/after/C sampling order
+alternated with its reverse. Each executable stopped after meeting the full-range
+2% stability criterion, with a five-sample cap. The final batch qualified with
+two measured samples per executable:
 
 | Executable | Median (s) | Measured Samples (s) |
 | --- | ---: | --- |
-| Chimera before | 13.739612 | 13.755552182, 13.723672687 |
-| Chimera after | 8.491792 | 8.474561237, 8.509023415 |
-| C `-O3` | 3.517350 | 3.506475711, 3.528224174 |
+| Chimera before | 4.435842 | 4.454945105, 4.416738794 |
+| Chimera after | 3.120420 | 3.095781381, 3.145058502 |
+| GCC 16.2.1 `-O3` | 3.497764 | 3.502278340, 3.493250156 |
 
-This is **38.2% less runtime (1.62x speedup)**. Chimera remains 2.41x the C
-`-O3` wall time. A preceding batch reached the after-version noise cap
-(8.657 s median); it was not classified as stable. These are local measurements,
-not portable performance guarantees.
+This change provides **29.7% less runtime (1.42x speedup)**.
+Chimera takes 0.892x the GCC 16.2.1 `-O3` wall time, or 10.8% less. These are local
+measurements, not portable performance guarantees. An earlier batch on the same
+final native code hit the noise cap for before/after; all of its samples remain
+explicitly marked unstable in [runtime-noise-cap.json](../results/key-gen-loops/runtime-noise-cap.json).
 
-The compiler now uses compact 32-bit arithmetic operands, rotates carried
-collision flags of either polarity into direct exits, and removes overflow
-checks from recurrences only when the final update is proved safe. Linux syscall
-register reservations no longer unnecessarily exclude `r8`-`r10`; the emitted
-scan retains its right index and left-hand sum in registers. Normal and
-assembly-debug executable images were byte-identical. No benchmark algorithm or
-language safety policy changed. Repeated bounds checks and sum-generation
-iterator/array-access overhead remain; Fast optimizes the compiler itself,
-not the safety policy of generated programs.
+A subsequent independent recheck rebuilt both compilers' outputs and added
+GCC `-O2` and Clang `-O3` controls. All four executables passed the same correctness
+checks, then ran one warm-up and five measured samples each on CPU 4, alternating
+forward/reverse sampling order. The fresh Chimera and GCC `-O3` executables match
+the earlier measured binaries byte for byte. This batch did not meet the 2%
+full-range criterion for any executable; these medians are explicitly noisy:
 
-Matched zero-worker, profiling-off million-line compilation measured 33.294 s
-before and 33.380 s after (0.3% difference). Leaf edits measured 326.735 ms
-before and 321.273 ms after; the before samples reached the three-run noise cap,
-so that comparison is not a stable speedup claim. Reversed-order checks of the
-88-million sieve did not reproduce an initial 1.4% slowdown: three batch medians
-ranged from 1.300-1.343 s before and 1.283-1.319 s after. All native output and
-exit-status checks passed.
+| Executable | Median (s) | Full Sample Range (s) |
+| --- | ---: | ---: |
+| Chimera | 3.074831 | 3.007545–3.201863 |
+| GCC 16.2.1 `-O3` | 3.516294 | 3.458085–3.642684 |
+| GCC 16.2.1 `-O2` | 6.566942 | 3.640715–6.634789 |
+| Clang 22.1.8 `-O3` | 1.432032 | 1.408787–1.511207 |
+
+The result is specific to GCC's output: **Chimera beats GCC `-O3` here, while
+Clang `-O3` is substantially faster than Chimera**. GCC's nine-instruction scan
+materializes two condition flags through stack slots on every comparison.
+Chimera uses eight instructions with a register counter and direct branches.
+Clang uses six instructions, addresses the array directly with its index register,
+and lets noncollision execution fall through the equality test. It executes one
+taken branch on the common path, compared with Chimera's two. These assembly
+observations explain remaining opportunities; they are not a measured attribution
+of each instruction's cost. [All recheck samples and executable hashes](../results/key-gen-loops/c-compiler-recheck.json),
+[the GCC scan](../results/key-gen-loops/scan-gcc-o3.asm), and
+[the Clang scan](../results/key-gen-loops/scan-clang-o3.asm) are retained.
+
+Loop-weighted register preferences coalesce scalar copies and arithmetic results
+only when expanded machine live ranges permit it. Native block layout starts in
+reverse postorder and places empty two-block loop tests after their bodies.
+The collision scan's noncollision path shrinks from 12 instructions and three
+branches to **8 instructions and two branches**. The counter increments directly
+in its loop register, and the conditional backedge replaces the unconditional
+jump to a separate bound test. Initial entry still tests the bound before running
+the body. Shared exits retain their flag and counter values, including the final
+increment on collision. Existing bounds and overflow semantics are unchanged.
+
+A matched, alternating 88-million sieve comparison found essentially unchanged
+runtime: 1.222287 s before and 1.216067 s after. Both pairs met the
+2% stability criterion with two samples after small probes and one discarded
+warm-up. Each full run produced `5107832` and status 0. This does not establish
+a sieve speedup.
+
+The routine Safe suite passed **2,261 tests with 24 skips**. New coverage checks
+counter reuse with retained inputs, physical block permutations, skipped loop
+bodies, and state on bound/collision exits. The Fast build, formatting checks,
+and `git diff --check` passed.
+
+[Raw runtime samples](../results/key-gen-loops/runtime.json),
+[sieve samples](../results/key-gen-loops/sieve.json),
+[environment and executable hashes](../results/key-gen-loops/environment.json),
+[source hashes](../results/key-gen-loops/source-files.json),
+[isolated compiler patch](../results/key-gen-loops/compiler-change.patch),
+[before scan](../results/key-gen-loops/scan-before.asm),
+[after scan](../results/key-gen-loops/scan-after.asm), and
+[Safe test output](../results/key-gen-loops/safe-tests.txt) are retained in the repository.
+Frozen sources, compiler binaries, executables, complete disassembly, and sampling
+drivers are retained locally in `/tmp/chimera-key-analysis.x932d6`.

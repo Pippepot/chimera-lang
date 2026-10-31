@@ -236,7 +236,7 @@ const Forms = struct { full: Encoding, small: ?Encoding = null, zero: ?Encoding 
 
 fn displacementEncoding(comptime full: Encoding, comptime operand: Operand) Encoding {
     var prefix = full.prefix[0..full.prefix.len].*;
-    const modrm_index = prefix.len - @as(usize, if (prefix[prefix.len - 1] == 0x24) 2 else 1);
+    const modrm_index = prefix.len - @as(usize, if (prefix[prefix.len - 1] & 7 == 4) 2 else 1);
     std.debug.assert(prefix[modrm_index] & 0xc0 == 0x80);
     std.debug.assert(prefix[modrm_index] & 7 != 5);
     prefix[modrm_index] = (prefix[modrm_index] & 0x3f) | @as(u8, if (operand == .none) 0 else 0x40);
@@ -336,7 +336,7 @@ pub fn clobberedRegisters(operation: Operation) RegisterSet {
     };
 }
 
-pub const RegisterOperation = enum { load_eax, store_eax, load_rax, store_rax, store_indexed_i32, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, add_immediate, sub_immediate, imul_immediate, cmp_immediate, add_from_eax, sub_from_eax, imul_from_eax, load_stack, add_stack, sub_stack, imul_stack, cmp_stack, save, restore };
+pub const RegisterOperation = enum { load_eax, store_eax, load_rax, store_rax, store_indexed_i32, add_eax, sub_eax, imul_eax, cmp_eax, load_ecx, sign_extend_rcx, add_immediate, sub_immediate, imul_immediate, cmp_immediate, add_from_eax, sub_from_eax, imul_from_eax, load_stack, add_stack, sub_stack, imul_stack, cmp_stack, save, restore };
 
 fn registerEncoding(comptime operation: RegisterOperation, comptime register: Register) Encoding {
     const r = register.low();
@@ -357,6 +357,7 @@ fn registerEncoding(comptime operation: RegisterOperation, comptime register: Re
         .imul_eax => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x0F, 0xAF, 0xC0 | r }, .asm_prefix = "imul eax, " ++ name },
         .cmp_eax => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x39, 0xC0 | (r << 3) }, .asm_prefix = "cmp eax, " ++ name },
         .load_ecx => .{ .prefix = (if (extended) &[_]u8{0x44} else &[_]u8{}) ++ &[_]u8{ 0x89, 0xC1 | (r << 3) }, .asm_prefix = "mov ecx, " ++ name },
+        .sign_extend_rcx => .{ .prefix = &[_]u8{ if (extended) 0x49 else 0x48, 0x63, 0xC8 | r }, .asm_prefix = "movsxd rcx, " ++ name },
         .add_immediate => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x81, 0xC0 | r }, .operand = .i32, .compact = .{ .immediate = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x83, 0xC0 | r } }, .asm_prefix = "add " ++ name ++ ", " },
         .sub_immediate => .{ .prefix = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x81, 0xE8 | r }, .operand = .i32, .compact = .{ .immediate = (if (extended) &[_]u8{0x41} else &[_]u8{}) ++ &[_]u8{ 0x83, 0xE8 | r } }, .asm_prefix = "sub " ++ name ++ ", " },
         .imul_immediate => .{ .prefix = (if (extended) &[_]u8{0x45} else &[_]u8{}) ++ &[_]u8{ 0x69, 0xC0 | (r << 3) | r }, .operand = .i32, .compact = .{ .immediate = (if (extended) &[_]u8{0x45} else &[_]u8{}) ++ &[_]u8{ 0x6B, 0xC0 | (r << 3) | r } }, .asm_prefix = "imul " ++ name ++ ", " ++ name ++ ", " },
@@ -445,12 +446,59 @@ pub fn appendRegisterBinary(code: *std.ArrayList(u8), allocator: std.mem.Allocat
     try appendPattern(code, allocator, binary_register_patterns[operation_index][destination_index][source_index], 0);
 }
 
+fn indexedLoadEncoding(comptime byte: bool, comptime base: ?Register, comptime destination: ?Register) Encoding {
+    const base_low = if (base) |selected| selected.low() else 4;
+    const destination_low = if (destination) |selected| selected.low() else 0;
+    const rex: u8 = 0x40 | (if (destination != null and destination.?.extended()) @as(u8, 4) else 0) | (if (base != null and base.?.extended()) @as(u8, 1) else 0);
+    const mode: u8 = if (base == null) 0x80 else if (base_low == 5) 0x40 else 0;
+    return .{
+        .prefix = (if (rex == 0x40) &[_]u8{} else &[_]u8{rex}) ++
+            (if (byte) &[_]u8{ 0x0f, 0xb6 } else &[_]u8{0x8b}) ++
+            &[_]u8{ mode | (destination_low << 3) | 4, (if (byte) @as(u8, 0x08) else 0x88) | base_low } ++
+            (if (base != null and base_low == 5) &[_]u8{0} else &[_]u8{}),
+        .operand = if (base == null) .u32 else .none,
+        .compact = if (base == null) .displacement else .none,
+        .asm_prefix = (if (byte) "movzx " else "mov ") ++ (if (destination) |selected| selected.name32() else "eax") ++
+            (if (byte) ", byte [" else ", [") ++ (if (base) |selected| @tagName(selected) else "rsp") ++
+            (if (byte) "+rcx" else "+rcx*4") ++ (if (base == null) "+" else "]"),
+        .asm_suffix = if (base == null) "]" else "",
+    };
+}
+
+const indexed_load_forms = blk: {
+    @setEvalBranchQuota(30000);
+    const registers = std.enums.values(Register);
+    var result: [2][registers.len + 1][registers.len + 1]Forms = undefined;
+    for (0..2) |width| for (0..registers.len + 1) |base_index| for (0..registers.len + 1) |destination_index| {
+        const base: ?Register = if (base_index < registers.len) registers[base_index] else null;
+        const destination: ?Register = if (destination_index < registers.len) registers[destination_index] else null;
+        const full = indexedLoadEncoding(width == 1, base, destination);
+        const form = &result[width][base_index][destination_index];
+        form.* = .{ .full = full };
+        if (base == null) {
+            form.small = displacementEncoding(full, .u8);
+            form.zero = displacementEncoding(full, .none);
+        }
+    };
+    break :blk result;
+};
+
+pub fn appendIndexedLoad(code: *std.ArrayList(u8), allocator: std.mem.Allocator, byte: bool, base: ?Register, destination: ?Register, offset: u64) !void {
+    const registers = std.enums.values(Register);
+    const base_index = if (base) |selected| std.mem.indexOfScalar(Register, registers, selected).? else registers.len;
+    const destination_index = if (destination) |selected| std.mem.indexOfScalar(Register, registers, selected).? else registers.len;
+    const form = indexed_load_forms[@intFromBool(byte)][base_index][destination_index];
+    const selected = if (base != null) form.full else if (offset == 0) form.zero.? else if (offset <= std.math.maxInt(i8)) form.small.? else form.full;
+    try appendPattern(code, allocator, selected, offset);
+}
+
 /// Every encodable form, each operation's forms in order full, small, zero.
 pub const patterns = blk: {
     @setEvalBranchQuota(20000);
     const register_count = std.enums.values(RegisterOperation).len * std.enums.values(Register).len;
     const binary_count = binary_operations.len * std.enums.values(Register).len * std.enums.values(Register).len;
-    var result: [3 * (forms.len + register_count) + binary_count]Encoding = undefined;
+    const indexed_count = 2 * (std.enums.values(Register).len + 1) * (std.enums.values(Register).len + 1);
+    var result: [3 * (forms.len + register_count + indexed_count) + binary_count]Encoding = undefined;
     var count: usize = 0;
     for (forms) |form| for ([_]?Encoding{ form.full, form.small, form.zero }) |maybe_pattern| if (maybe_pattern) |pattern| {
         result[count] = pattern;
@@ -461,6 +509,10 @@ pub const patterns = blk: {
         count += 1;
     };
     for (binary_register_patterns) |row| for (row) |destinations| for (destinations) |pattern| {
+        result[count] = pattern;
+        count += 1;
+    };
+    for (indexed_load_forms) |width| for (width) |bases| for (bases) |form| for ([_]?Encoding{ form.full, form.small, form.zero }) |maybe_pattern| if (maybe_pattern) |pattern| {
         result[count] = pattern;
         count += 1;
     };

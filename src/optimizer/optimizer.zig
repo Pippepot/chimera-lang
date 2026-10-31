@@ -50,7 +50,7 @@ fn optimizeInto(scratch: std.mem.Allocator, body: *const Body, context: anytype)
     if (final) {
         const hoisted = try measured(.optimization_hoist, hoisting.hoist, .{&function});
         try check(&function);
-        const transformed = try measured(.optimization_idioms, idioms.transform, .{&function});
+        const transformed = try measured(.optimization_idioms, idioms.transform, .{ &function, context });
         try check(&function);
         if (hoisted or transformed) try simplify(&function, context, &numbering_workspace, &field_layouts);
     }

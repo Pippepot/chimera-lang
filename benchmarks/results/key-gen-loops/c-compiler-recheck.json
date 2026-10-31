@@ -1,0 +1,59 @@
+{
+  "cpu": 4,
+  "last_index": 10,
+  "protocol": "one warm-up plus five measured runs each, alternating forward/reverse order; correctness validated outside timing",
+  "results": {
+    "chimera": {
+      "samples": [
+        3.0748312349996922,
+        3.177692957000545,
+        3.201863373999913,
+        3.00754547500037,
+        3.0358521179996387
+      ],
+      "median": 3.0748312349996922,
+      "within_two_percent": false,
+      "executable_sha256": "ffc45b6ca1112d66d3b1a526f695de686f455c32596b438afa78a320bf3183b7"
+    },
+    "gcc-o3": {
+      "samples": [
+        3.516293626999868,
+        3.6426835879992723,
+        3.5366369530001975,
+        3.4752687079999305,
+        3.4580845559994486
+      ],
+      "median": 3.516293626999868,
+      "within_two_percent": false,
+      "executable_sha256": "4f74ed50f31f2e4dd5a6531b1c6025d8611e1270269003315208823ff909c499"
+    },
+    "gcc-o2": {
+      "samples": [
+        6.594938628999444,
+        3.640715043000455,
+        6.634789123000701,
+        6.477450438999767,
+        6.566942495999683
+      ],
+      "median": 6.566942495999683,
+      "within_two_percent": false,
+      "executable_sha256": "2430897bd48c32d53c257aa1cc26de489b3a4d675158a7ab169a75bf6aaf5569"
+    },
+    "clang-o3": {
+      "samples": [
+        1.4320315909999408,
+        1.456770501000392,
+        1.4247204700004659,
+        1.408787446000133,
+        1.5112069200004044
+      ],
+      "median": 1.4320315909999408,
+      "within_two_percent": false,
+      "executable_sha256": "799ea111b195215462abbde56b4278e8f10ea50a58372103c3523a6094fa572d"
+    }
+  },
+  "versions": {
+    "gcc": "cc (GCC) 16.2.1 20260810",
+    "clang": "clang version 22.1.8"
+  }
+}

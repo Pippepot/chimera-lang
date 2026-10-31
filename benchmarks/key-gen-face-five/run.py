@@ -82,18 +82,18 @@ def main() -> None:
         for optimization in ("-O0", "-O3"):
             executable = work / f"key-gen-c{optimization}"
             subprocess.run(
-                ["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", optimization,
+                ["clang", "-std=c11", "-Wall", "-Wextra", "-Werror", optimization,
                  str(HERE / "main.c"), "-o", str(executable)],
                 check=True,
             )
-            executables[f"C {optimization}"] = executable
+            executables[f"Clang {optimization}"] = executable
 
         if arguments.cpu is not None:
             os.sched_setaffinity(0, {arguments.cpu})
         print(f"Five-face key search, last index {arguments.last}; CPUs {sorted(os.sched_getaffinity(0))}",
               flush=True)
         print(f"Zig: {subprocess.check_output(['zig', 'version'], text=True).strip()}")
-        print(f"C: {subprocess.check_output(['cc', '--version'], text=True).splitlines()[0]}", flush=True)
+        print(f"C: {subprocess.check_output(['clang', '--version'], text=True).splitlines()[0]}", flush=True)
         results: dict[str, list[float]] = {}
         for name, executable in executables.items():
             validate(executable)
@@ -107,8 +107,8 @@ def main() -> None:
             print(f"{name}: median {statistics.median(samples):.6f} s ({status})", flush=True)
             print("  samples (s): " + ", ".join(f"{sample:.9f}" for sample in samples), flush=True)
         if results:
-            ratio = statistics.median(results["Chimera"]) / statistics.median(results["C -O3"])
-            print(f"Chimera / C -O3 wall-time ratio: {ratio:.3f}x")
+            ratio = statistics.median(results["Chimera"]) / statistics.median(results["Clang -O3"])
+            print(f"Chimera / Clang -O3 wall-time ratio: {ratio:.3f}x")
 
 
 if __name__ == "__main__":

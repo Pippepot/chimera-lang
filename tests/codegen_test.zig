@@ -35,6 +35,40 @@ test "machine pointer operands preserve register and spill width" {
     }
 }
 
+test "machine signed indices bypass eax only before an independent base load" {
+    for (std.enums.values(test_sources.x86_encoding.Register)) |selected| for (0..6) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        if (mode == 3) _ = try function.position();
+        try function.emit(.movsxd_rcx_eax);
+        switch (mode) {
+            0, 3, 5 => try function.offset(.lea_rax_rsp, 16),
+            1 => try function.register(.load_rax, @fromBackingInt(1), 0),
+            2 => try function.offset(.mov_rax_rsp, 16),
+            4 => try function.emit(.add_rax_rcx),
+            else => unreachable,
+        }
+        var encoded = try function.encode(&.{ if (mode == 5) null else selected, .rbx }, &.{ 0, 8 }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        var expected: std.ArrayList(u8) = .empty;
+        defer expected.deinit(std.testing.allocator);
+        if (mode < 3) {
+            const bits: u8 = @backingInt(selected);
+            try expected.appendSlice(std.testing.allocator, &.{ if (bits >= 8) 0x49 else 0x48, 0x63, 0xc8 | (bits & 7) });
+        } else {
+            if (mode == 5) {
+                try expected.appendSlice(std.testing.allocator, &.{ 0x8b, 0x04, 0x24 });
+            } else try test_sources.x86_encoding.appendRegister(&expected, std.testing.allocator, .load_eax, selected, 0);
+            try expected.appendSlice(std.testing.allocator, &.{ 0x48, 0x63, 0xc8 });
+        }
+        try std.testing.expectEqualSlices(u8, expected.items, encoded.code.items[0..expected.items.len]);
+        const listing = try test_sources.disasm.disassemble(encoded.code.items, std.testing.allocator);
+        defer std.testing.allocator.free(listing);
+        try std.testing.expect(std.mem.indexOf(u8, listing, "  db ") == null);
+    };
+}
+
 test "machine parameter loads disappear when the ABI home is retained" {
     for (0..3) |mode| {
         var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
@@ -113,6 +147,119 @@ test "machine indexed constant stores preserve base encoding and spill fallback"
     var encoded = try function.encode(&.{.rbx}, &.{0}, &.{});
     defer encoded.deinit(std.testing.allocator);
     try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x89, 0xd8, 0x48, 0x8d, 0x04, 0x88, 0xc7, 0, 1, 0, 0, 0, 0x48, 0x89, 0xc7 }, encoded.code.items);
+}
+
+test "machine indexed loads preserve widths bases spills and scratch lifetimes" {
+    for ([_]bool{ false, true }) |byte| for (0..5) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        if (mode == 4) try function.offset(.lea_rax_rsp, 256) else try function.register(.load_rax, @fromBackingInt(0), 0);
+        try function.emit(if (byte) .add_rax_rcx else .lea_rax_rax_rcx_4);
+        try function.offset(if (byte) .movzx_eax_rax else .mov_eax_rax, 0);
+        try function.register(.store_eax, @fromBackingInt(1), 0);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{ switch (mode) {
+            0 => .rbx,
+            1 => .r13,
+            2 => .r12,
+            else => null,
+        }, .r8 }, &.{ 256, 264 }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const expected: []const u8 = if (byte) switch (mode) {
+            0 => &.{ 0x44, 0x0f, 0xb6, 0x04, 0x0b },
+            1 => &.{ 0x45, 0x0f, 0xb6, 0x44, 0x0d, 0 },
+            2 => &.{ 0x45, 0x0f, 0xb6, 0x04, 0x0c },
+            3 => &.{ 0x48, 0x8b, 0x84, 0x24, 0, 1, 0, 0, 0x48, 0x01, 0xc8, 0x0f, 0xb6, 0 },
+            else => &.{ 0x44, 0x0f, 0xb6, 0x84, 0x0c, 0, 1, 0, 0 },
+        } else switch (mode) {
+            0 => &.{ 0x44, 0x8b, 0x04, 0x8b },
+            1 => &.{ 0x45, 0x8b, 0x44, 0x8d, 0 },
+            2 => &.{ 0x45, 0x8b, 0x04, 0x8c },
+            3 => &.{ 0x48, 0x8b, 0x84, 0x24, 0, 1, 0, 0, 0x48, 0x8d, 0x04, 0x88, 0x8b, 0 },
+            else => &.{ 0x44, 0x8b, 0x84, 0x8c, 0, 1, 0, 0 },
+        };
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items[0..expected.len]);
+        try std.testing.expectEqualSlices(u8, if (mode == 3) &.{ 0x41, 0x89, 0xc0 } else &.{}, encoded.code.items[expected.len..]);
+    };
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    try function.register(.load_rax, @fromBackingInt(0), 0);
+    try function.emit(.lea_rax_rax_rcx_4);
+    try function.offset(.mov_eax_rax, 0);
+    try function.emit(.mov_rdi_rax);
+    try function.instructions.append(std.testing.allocator, .scratch_dead);
+    var encoded = try function.encode(&.{.rbx}, &.{0}, &.{});
+    defer encoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &.{ 0x48, 0x89, 0xd8, 0x48, 0x8d, 0x04, 0x88, 0x8b, 0, 0x48, 0x89, 0xc7 }, encoded.code.items);
+}
+
+test "machine indexed loads permit last-use base and result register sharing" {
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    try function.register(.load_rax, @fromBackingInt(0), 0);
+    try function.emit(.lea_rax_rax_rcx_4);
+    try function.offset(.mov_eax_rax, 0);
+    try function.register(.store_eax, @fromBackingInt(1), 0);
+    try function.instructions.append(std.testing.allocator, .scratch_dead);
+    var encoded = try function.encode(&.{ .r13, .r13 }, &.{ 0, 8 }, &.{});
+    defer encoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &.{ 0x45, 0x8b, 0x6c, 0x8d, 0 }, encoded.code.items);
+}
+
+test "machine indexed stack loads preserve compact displacements and spilled results" {
+    for ([_]u32{ 0, 127, 128 }) |offset| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.offset(.lea_rax_rsp, offset);
+        try function.emit(.lea_rax_rax_rcx_4);
+        try function.offset(.mov_eax_rax, 0);
+        try function.offset(.mov_rsp_eax, 256);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{}, &.{}, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const expected: []const u8 = switch (offset) {
+            0 => &.{ 0x8b, 0x04, 0x8c },
+            127 => &.{ 0x8b, 0x44, 0x8c, 127 },
+            else => &.{ 0x8b, 0x84, 0x8c, 128, 0, 0, 0 },
+        };
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items[0..expected.len]);
+        try std.testing.expectEqualSlices(u8, &.{ 0x89, 0x84, 0x24, 0, 1, 0, 0 }, encoded.code.items[expected.len..]);
+    }
+}
+
+test "loop byte array element copies preserve zero extension and aliases" {
+    try test_sources.SourceFixture.expectParity(
+        \\func check(limit: int) int
+        \\    var bytes: Array(byte, 2) = [0, 0]
+        \\    var index = 0
+        \\    loop
+        \\        if index >= limit -> break
+        \\        bytes[index] = 255
+        \\        index += 1
+        \\    ref selected = bytes[0]
+        \\    selected = bytes[1]
+        \\    if selected <> 255 -> return 0
+        \\    return 42
+        \\func run() int -> check(2)
+    , 42);
+}
+
+test "loop stack array element copies preserve aliases and checked access" {
+    try test_sources.SourceFixture.expectParity(
+        \\func sum(limit: int) int
+        \\    var values: Array(int, 8) = [0, 0, 0, 0, 0, 0, 0, 0]
+        \\    ref selected = values
+        \\    var index = 0
+        \\    loop
+        \\        if index >= limit -> break
+        \\        selected[index] = index + 1
+        \\        index += 1
+        \\    var total = 0
+        \\    for number in 0..limit
+        \\        total += values[number]
+        \\    return total
+        \\func run() int -> sum(8) + sum(3)
+    , 42);
 }
 
 test "loop allocation bases preserve checked element reads and writes" {
@@ -481,6 +628,46 @@ test "machine live ranges reuse registers between separate definitions" {
     try std.testing.expectEqual(@as(usize, 1), allocation.used.len);
     try std.testing.expectEqual(allocation.registers[0], allocation.registers[1]);
     try std.testing.expect(!allocation.registers[0].?.calleeSaved());
+}
+
+test "machine loop counter preferences remove copies without overwriting retained inputs" {
+    for ([_]bool{ false, true }) |retained| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        const counter: test_sources.machine.ValueId = @fromBackingInt(0);
+        const incremented: test_sources.machine.ValueId = @fromBackingInt(1);
+        try function.immediate(.mov_eax, 0);
+        try function.register(.store_eax, counter, 0);
+        const header = try function.position();
+        try function.register(.load_eax, counter, 0);
+        try function.immediate(.add_eax, 1);
+        try function.register(.store_eax, incremented, 0);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        if (retained) try function.register(.load_eax, counter, 0);
+        try function.register(.load_eax, incremented, 0);
+        try function.register(.store_eax, counter, 0);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        try function.register(.load_eax, counter, 0);
+        try function.immediate(.cmp_eax, 5);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        const backedge = try function.patchable(.jne);
+        try function.patch(backedge, header);
+        try function.emit(.ret);
+        var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 2);
+        defer allocation.deinit(std.testing.allocator);
+        try std.testing.expect(allocation.registers[0] != null);
+        try std.testing.expect(allocation.registers[1] != null);
+        try std.testing.expectEqual(!retained, allocation.registers[0] == allocation.registers[1]);
+        if (!retained) {
+            var encoded = try function.encode(allocation.registers, &.{ 0, 4 }, allocation.used);
+            defer encoded.deinit(std.testing.allocator);
+            var expected: std.ArrayList(u8) = .empty;
+            defer expected.deinit(std.testing.allocator);
+            try test_sources.x86_encoding.appendRegister(&expected, std.testing.allocator, .add_immediate, allocation.registers[0].?, 1);
+            const start = encoded.positions[header];
+            try std.testing.expectEqualSlices(u8, expected.items, encoded.code.items[start..][0..expected.items.len]);
+        }
+    }
 }
 
 test "machine division branches preserve live loop values and signed overflow" {
@@ -1436,6 +1623,62 @@ test "native predicate branches without edge copies use one conditional jump" {
     }
 }
 
+test "loop layout preserves skipped bodies and state on both exits" {
+    try test_sources.SourceFixture.expectParity(
+        \\func scan(limit: int, needle: int) int
+        \\    var right = 0
+        \\    var valid = true
+        \\    loop
+        \\        if not valid or right >= limit -> break
+        \\        if right == needle
+        \\            valid = false
+        \\        right += 1
+        \\    if valid -> return 10 * right + 1
+        \\    return 10 * right
+        \\func run() int -> scan(0, 0) + scan(3, 1) + scan(1, 5) + 10
+    , 42);
+}
+
+test "native loop layout keeps the guarded body adjacent across block permutations" {
+    for ([_][4]usize{ .{ 0, 1, 2, 3 }, .{ 0, 2, 1, 3 }, .{ 2, 0, 3, 1 }, .{ 3, 2, 0, 1 } }) |order| {
+        for ([_]i32{ 0, 1, 7 }) |limit| {
+            var arguments = [_]structures.FunctionBlockArgument{.{ .type_id = .int }};
+            var uses = [_]structures.FunctionValueUse{ .{ .value = @fromBackingInt(1) }, .{ .value = @fromBackingInt(4) } };
+            var instructions = [_]structures.FunctionInstruction{
+                integerConstant(0),                                                                                                                        integerConstant(1), integerConstant(limit), integerBinary(.add, 0, 2),
+                .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
+            };
+            var calls = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(0) } }};
+            var blocks: [4]structures.FunctionBlock = undefined;
+            blocks[order[0]] = .{ .instruction_start = 0, .instruction_end = 3, .terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(order[1])), .arguments = .{ .start = 0, .end = 1 } } } };
+            blocks[order[1]] = .{ .argument_end = 1, .instruction_start = 3, .instruction_end = 3, .terminator = .{ .predicate_branch = .{
+                .operation = .gei,
+                .operands = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(3) },
+                .then_branch = .{ .target = @fromBackingInt(@intCast(order[2])), .arguments = .{ .start = 0, .end = 0 } },
+                .else_branch = .{ .target = @fromBackingInt(@intCast(order[3])), .arguments = .{ .start = 0, .end = 0 } },
+            } } };
+            blocks[order[2]] = .{ .instruction_start = 4, .instruction_end = 5, .terminator = .diverge };
+            blocks[order[3]] = .{ .instruction_start = 3, .instruction_end = 4, .terminator = .{ .branch = .{ .target = @fromBackingInt(@intCast(order[1])), .arguments = .{ .start = 1, .end = 2 } } } };
+            var body = functionSsa(&instructions, &blocks);
+            body.entry = @fromBackingInt(@intCast(order[0]));
+            body.block_arguments = &arguments;
+            body.branch_arguments = &uses;
+            body.call_arguments = &calls;
+            var artifact = try codegen.compileFunction(&body, TestTypes{}, std.testing.allocator);
+            defer artifact.deinit(std.testing.allocator);
+            const listing = try test_sources.disasm.disassemble(artifact.code, std.testing.allocator);
+            defer std.testing.allocator.free(listing);
+            try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, listing, "  j"));
+            const jump = std.mem.indexOf(u8, listing, "  jmp ").?;
+            const end = std.mem.indexOfScalarPos(u8, listing, jump, '\n').?;
+            const label = try std.fmt.allocPrint(std.testing.allocator, "{s}:\n", .{listing[jump + 6 .. end]});
+            defer std.testing.allocator.free(label);
+            try std.testing.expect(std.mem.indexOf(u8, listing, label).? > jump);
+            try expectArtifactExitCode(artifact, @intCast(limit));
+        }
+    }
+}
+
 test "native parallel backedge copies preserve cycles while falling through to exit" {
     for ([_]i32{ 0, 1, 2, 3 }) |count| {
         var arguments = [_]structures.FunctionBlockArgument{ .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int }, .{ .type_id = .int } };
@@ -1996,6 +2239,45 @@ test "native cursor addressing sign extends a negative dynamic index" {
     var blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = instructions.len, .terminator = .diverge }};
     var arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(5) } }};
     var body = functionSsa(&instructions, &blocks);
+    body.call_arguments = &arguments;
+    var artifact = try codegen.compileFunction(&body, TestTypes{ .data = &bytes }, std.testing.allocator);
+    defer artifact.deinit(std.testing.allocator);
+    try expectArtifactExitCode(artifact, 42);
+}
+
+test "loop cursor addressing sign extends a negative register index" {
+    const bytes = [_]u8{ 42, 99 };
+    var parameters = [_]structures.FunctionBlockArgument{ .{ .type_id = .int }, .{ .type_id = .int } };
+    var uses = [_]structures.FunctionValueUse{
+        .{ .value = @fromBackingInt(3) }, .{ .value = @fromBackingInt(4) },
+        .{ .value = @fromBackingInt(9) }, .{ .value = @fromBackingInt(8) },
+    };
+    var instructions = [_]structures.FunctionInstruction{
+        .{ .const_storage_cursor = .{ .type_id = byte_reference_type, .data = @fromBackingInt(0), .offset = 1 } },
+        integerConstant(-1),
+        integerConstant(0),
+        integerConstant(1),
+        .{ .cursor_element = .{ .cursor = @fromBackingInt(2), .index = @fromBackingInt(0), .type_id = byte_reference_type } },
+        .{ .borrow_read = .{ .source = @fromBackingInt(6), .type_id = .byte } },
+        .{ .byte_to_int = @fromBackingInt(7) },
+        integerBinary(.add, 0, 5),
+        .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
+    };
+    var blocks = [_]structures.FunctionBlock{
+        .{ .instruction_start = 0, .instruction_end = 4, .terminator = .{ .branch = .{ .target = @fromBackingInt(1), .arguments = .{ .start = 0, .end = 2 } } } },
+        .{ .argument_end = 2, .instruction_start = 4, .instruction_end = 4, .terminator = .{ .predicate_branch = .{
+            .operation = .lti,
+            .operands = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(4) },
+            .then_branch = .{ .target = @fromBackingInt(2), .arguments = .{ .start = 0, .end = 0 } },
+            .else_branch = .{ .target = @fromBackingInt(3), .arguments = .{ .start = 0, .end = 0 } },
+        } } },
+        .{ .instruction_start = 4, .instruction_end = 8, .terminator = .{ .branch = .{ .target = @fromBackingInt(1), .arguments = .{ .start = 2, .end = 4 } } } },
+        .{ .instruction_start = 8, .instruction_end = 9, .terminator = .diverge },
+    };
+    var arguments = [_]structures.FunctionCallArgument{.{ .prepared = .{ .value = @fromBackingInt(1) } }};
+    var body = functionSsa(&instructions, &blocks);
+    body.block_arguments = &parameters;
+    body.branch_arguments = &uses;
     body.call_arguments = &arguments;
     var artifact = try codegen.compileFunction(&body, TestTypes{ .data = &bytes }, std.testing.allocator);
     defer artifact.deinit(std.testing.allocator);

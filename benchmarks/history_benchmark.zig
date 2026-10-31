@@ -195,7 +195,7 @@ fn measureRuntime(init: std.process.Init, writer: *std.Io.Writer, skip_c: bool, 
     if (skip_c) return;
     defer std.Io.Dir.cwd().deleteFile(init.io, "history-c-program") catch {};
     for ([_][]const u8{ "-O0", "-O3" }) |optimization| {
-        var child = try std.process.spawn(init.io, .{ .argv = &.{ "cc", "-std=c11", optimization, "benchmarks/history_runtime.c", "-o", "history-c-program" } });
+        var child = try std.process.spawn(init.io, .{ .argv = &.{ "clang", "-std=c11", optimization, "benchmarks/history_runtime.c", "-o", "history-c-program" } });
         switch (try child.wait(init.io)) {
             .exited => |code| if (code != 0) return error.CCompilationFailed,
             else => return error.CCompilationFailed,

@@ -1,0 +1,6 @@
+Five-face key search, last index 7; CPUs [4]
+Zig: 0.17.0
+C: clang version 22.1.8
+Chimera: correctness checks passed
+Clang -O0: correctness checks passed
+Clang -O3: correctness checks passed

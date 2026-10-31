@@ -1,0 +1,10 @@
+case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable
+sieve-88000000,normal,runtime,0,1206623777,23571,2,true
+sieve-88000000,normal,runtime,1,1204301439,23571,2,true
+sieve-88000000,c-O0,runtime,0,1621636824,16248,2,true
+sieve-88000000,c-O0,runtime,1,1627757660,16248,2,true
+sieve-88000000,c-O3,runtime,0,1024123982,16296,5,false
+sieve-88000000,c-O3,runtime,1,1001771460,16296,5,false
+sieve-88000000,c-O3,runtime,2,1008782140,16296,5,false
+sieve-88000000,c-O3,runtime,3,1002715879,16296,5,false
+sieve-88000000,c-O3,runtime,4,1003815274,16296,5,false

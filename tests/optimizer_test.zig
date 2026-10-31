@@ -52,6 +52,190 @@ fn hasConstant(body: structures.FunctionBodyAnalysis, value: i32) bool {
 
 const arithmetic = [_]Tag{ .addi, .subi, .muli, .divsi, .negi };
 
+const checked_steps = block: {
+    const line = "    value += 1\n";
+    var text: [line.len * 64]u8 = undefined;
+    for (0..64) |step| @memcpy(text[step * line.len ..][0..line.len], line);
+    break :block text;
+};
+
+const guarded_call =
+    \\func bounded(index: int) int
+    \\    if index < 0 or index >= 9 -> panic "late guard"
+    \\    var value = index
+++ "\n" ++ checked_steps ++
+    \\    return value
+;
+
+test "call-boundary ranges require guards on every normal return and recompute" {
+    const program = guarded_call ++ "\n" ++
+        \\func scan(limit: int) int
+        \\    if limit < 0 or limit > 9 -> return 0
+        \\    var values: Array(int, 9) = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+        \\    var count = 0
+        \\    for row in 0..=limit
+        \\        if row > 0
+        \\            bounded(count)
+        \\            count += 1
+        \\    var valid = true
+        \\    var left = 0
+        \\    loop
+        \\        if not valid or left >= count - 1 -> break
+        \\        var right = left + 1
+        \\        loop
+        \\            if not valid or right >= count -> break
+        \\            if values[left] == values[right] -> valid = false
+        \\            right += 1
+        \\        left += 1
+        \\    return left
+        \\func run() int -> scan(9) + scan(0) + scan(1) + 34
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "scan")).*.?;
+    try testing.expectEqual(@as(usize, 1), countCalls(body));
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, program, "-> panic \"late guard\"", "-> return 0");
+    defer testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    const changed = (try optimizedBody(fixture, "scan")).*.?;
+    try testing.expect(countCalls(changed) > 1);
+}
+
+test "call-boundary ranges cannot remove an earlier overflow trap" {
+    const program = guarded_call ++ "\n" ++
+        \\func scan(first: int, limit: int) int
+        \\    var index = first
+        \\    loop
+        \\        if index > limit - 1 -> break
+        \\        index += 2
+        \\        bounded(limit)
+        \\    return 42
+        \\func run() int -> scan(7, 8)
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program ++ "\nexit(scan(2147483646, 2147483647))");
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    const result = try fixture.runIo("");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 134 }, result.term);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "late guard") == null);
+}
+
+test "nested collision counters infer guarded array bounds" {
+    const program =
+        \\func scan(limit: int) int
+        \\    if limit < 0 or limit > 8 -> return 0
+        \\    var values: Array(int, 8) = [0, 1, 2, 3, 4, 5, 6, 7]
+        \\    var valid = true
+        \\    var left = 0
+        \\    loop
+        \\        if not valid or left >= limit - 1 -> break
+        \\        var right = left + 1
+        \\        loop
+        \\            if not valid or right >= limit -> break
+        \\            if values[left] == values[right] -> valid = false
+        \\            right += 1
+        \\        left += 1
+        \\    return left
+        \\func run() int -> scan(8) + scan(0) + scan(1) + scan(-1) + scan(9) + 35
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "scan")).*.?;
+    try testing.expectEqual(@as(usize, 0), countCalls(body));
+}
+
+test "nested generation carries successful write bounds into collision scan" {
+    const program =
+        \\func scan(limit: int) int
+        \\    if limit < 0 or limit > 3 -> return 0
+        \\    var values = Array(int, 64).filled(0)
+        \\    var count = 0
+        \\    for first in 0..=limit
+        \\        for second in first..=limit
+        \\            for third in second..=limit
+        \\                for fourth in third..=limit
+        \\                    for fifth in fourth..=limit
+        \\                        if first <> fifth
+        \\                            values[count] = count
+        \\                            count += 1
+        \\    var valid = true
+        \\    var left = 0
+        \\    loop
+        \\        if not valid or left >= count - 1 -> break
+        \\        var right = left + 1
+        \\        loop
+        \\            if not valid or right >= count -> break
+        \\            if values[left] == values[right] -> valid = false
+        \\            right += 1
+        \\        left += 1
+        \\    return left
+        \\func run() int -> scan(3) + scan(0) + scan(1) + scan(-1) + scan(4) - 12
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "scan")).*.?;
+    try testing.expectEqual(@as(usize, 1), countCalls(body));
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, program ++ "\nexit(scan(3))", "count += 1", "count += 3");
+    defer testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    const changed = (try optimizedBody(fixture, "scan")).*.?;
+    try testing.expect(countCalls(changed) > 1);
+    const result = try fixture.runIo("");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 134 }, result.term);
+}
+
+test "invariant loop bounds retain traps and initial flag short circuit" {
+    const program =
+        \\func scan(limit: int, valid: bool) int
+        \\    var index = 0
+        \\    loop
+        \\        if not valid -> break
+        \\        if index >= limit - 1 -> break
+        \\        index += 1
+        \\    return index
+        \\exit(scan(-2147483648, false))
+    ;
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    const skipped = try fixture.runIo("");
+    defer testing.allocator.free(skipped.stdout);
+    defer testing.allocator.free(skipped.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, skipped.term);
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, program, "false", "true");
+    defer testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    const evaluated = try fixture.runIo("");
+    defer testing.allocator.free(evaluated.stdout);
+    defer testing.allocator.free(evaluated.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 134 }, evaluated.term);
+}
+
+test "conditional bounds cannot prove a wrapping recurrence safe" {
+    try Fixture.expectParity(
+        \\func scan(first: int, limit: int) int
+        \\    if limit > 100 -> return 0
+        \\    var index = first
+        \\    var guarded = false
+        \\    loop
+        \\        if guarded
+        \\            if index >= limit -> break
+        \\            if index < 0 -> return 42
+        \\        guarded = true
+        \\        index = wrapping(index + 1)
+        \\    return 0
+        \\func run() int -> scan(2147483647, 10)
+    , 42);
+}
+
 test "carried boolean exits rotate both stop and valid flags" {
     for ([_]bool{ false, true }) |exit_value| {
         const program = try testing.allocator.print(
@@ -730,6 +914,105 @@ test "optimized native code agrees with unoptimized compile-time execution" {
         \\    if 1 > 2 -> return 94
         \\    return 42
     , 42);
+}
+
+test "integer algebra shares width-correct identities across overflow modes" {
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize" }) |kind| {
+        for ([_][]const u8{ "", "wrapping", "saturating" }) |mode| {
+            const program = try test_sources.renderTemplate(testing.allocator,
+                \\func identity(value: $T) $T -> $mode(((value & ~$T(0)) | 0) * 1 + 0)
+                \\func repeated(value: $T) $T -> (value & value) | (value | value)
+                \\func zero(value: $T) $T -> $mode((value - value) | (value ^ value) | (value & 0) | (value % 1))
+                \\func ones(value: $T) $T -> value | ~$T(0)
+                \\func run() int
+                \\    if identity(42) <> 42 or repeated(42) <> 42 -> return 90
+                \\    if zero(~$T(0)) <> 0 or ones(0) <> ~$T(0) -> return 91
+                \\    if identity(~$T(0)) <> ~$T(0) or repeated(~$T(0)) <> ~$T(0) -> return 92
+                \\    return 42
+            , .{ .T = kind, .mode = mode });
+            defer testing.allocator.free(program);
+            try Fixture.expectParity(program, 42);
+            const fixture = try Fixture.init(program);
+            defer fixture.deinit();
+            for ([_][]const u8{ "identity", "repeated", "zero", "ones" }) |name| {
+                errdefer std.debug.print("integer algebra: {s} {s} {s}\n", .{ kind, mode, name });
+                const body = (try optimizedBody(fixture, name)).*.?;
+                try testing.expectEqual(@as(usize, 0), count(body, &.{ .numeric_binary, .addi, .subi, .muli, .divsi }));
+            }
+        }
+    }
+}
+
+test "integer identity copies preserve snapshots and distinct writable storage" {
+    try Fixture.expectParity(
+        \\func overwrite(ref value: i16, replacement: i16)
+        \\    value = replacement
+        \\func snapshot(ref original: i16) int
+        \\    var saved = original + 0
+        \\    overwrite(original, 7)
+        \\    if saved <> 42 -> return 90
+        \\    overwrite(saved, 19)
+        \\    if original <> 7 or saved <> 19 -> return 91
+        \\    return 42
+        \\func run() int
+        \\    var value: i16 = 42
+        \\    return snapshot(value)
+    , 42);
+}
+
+test "signed negative-one rewrites preserve checked wrapping and saturated results" {
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "isize" }) |kind| {
+        const program = try test_sources.renderTemplate(testing.allocator,
+            \\func multiply(value: $T) $T -> value * -1
+            \\func divide(value: $T) $T -> value / -1
+            \\func wrapped(value: $T) $T -> wrapping(value / -1)
+            \\func saturated(value: $T) $T -> saturating(value * -1)
+            \\func run() int
+            \\    const minimum = $T(1) << ($T($width) - 1)
+            \\    if multiply(7) <> -7 or divide(-7) <> 7 -> return 90
+            \\    if wrapped(minimum) <> minimum -> return 91
+            \\    if saturated(minimum) <> (minimum ^ ~$T(0)) -> return 92
+            \\    return 42
+        , .{ .T = kind, .width = if (std.mem.eql(u8, kind, "i8")) "8" else if (std.mem.eql(u8, kind, "i16")) "16" else if (std.mem.eql(u8, kind, "i32")) "32" else "64" });
+        defer testing.allocator.free(program);
+        try Fixture.expectParity(program, 42);
+        const fixture = try Fixture.init(program);
+        defer fixture.deinit();
+        for ([_][]const u8{ "multiply", "divide", "wrapped", "saturated" }) |name| {
+            const body = (try optimizedBody(fixture, name)).*.?;
+            try testing.expectEqual(@as(usize, 0), count(body, &.{ .muli, .divsi }));
+            try testing.expectEqual(@as(usize, 1), count(body, &.{.negi}));
+        }
+    }
+}
+
+test "algebraic results retain traps and recompute after operator edits" {
+    for ([_][]const u8{
+        "func fail(value: i8)\n    value * -1\nfail(-128)",
+        "func fail(value: i64)\n    value / -1\nfail(-9223372036854775808)",
+        "func fail(value: u8)\n    (value + 1) & 0\nfail(255)",
+        "func fail(value: u64)\n    (value / 0) | ~u64(0)\nfail(42)",
+        "func fail(value: i16)\n    (value << 16) % 1\nfail(42)",
+    }) |program| {
+        const fixture = try Fixture.init(program);
+        defer fixture.deinit();
+        const result = try fixture.runIo("");
+        defer testing.allocator.free(result.stdout);
+        defer testing.allocator.free(result.stderr);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 134 }, result.term);
+        try testing.expect(std.mem.startsWith(u8, result.stderr, "panic: invalid numeric operation\n"));
+        try testing.expect(std.mem.indexOf(u8, result.stderr, "at fail ") != null);
+    }
+
+    const program = "func changed(value: u64) u64 -> value ^ value\nexit(wrap(i32, changed(42)))";
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 0);
+    const original = try optimizedBody(fixture, "changed");
+    try testing.expectEqual(@as(usize, 0), count(original.*.?, &.{.numeric_binary}));
+    try fixture.db.setInput(queries.SourceText, 0, "func changed(value: u64) u64 -> value | value\nexit(wrap(i32, changed(42)))");
+    try fixture.expectExit(0, 42);
+    try testing.expect(original != try optimizedBody(fixture, "changed"));
 }
 
 test "optimized bodies recompute only when their typed body changes" {

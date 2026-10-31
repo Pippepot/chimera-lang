@@ -10,21 +10,22 @@ const Instruction = structures.FunctionInstruction;
 const Function = function_ir.Function;
 const Loop = loops.Loop;
 
-pub fn transform(function: *Function) !bool {
+pub fn transform(function: *Function, context: anytype) !bool {
     var changed = false;
     var filled: std.AutoHashMapUnmanaged(u32, void) = .empty;
-    while (try once(function, &filled)) changed = true;
+    while (try once(function, context, &filled)) changed = true;
     if (changed) function.resolveReferences();
     return changed;
 }
 
-fn once(function: *Function, filled: *std.AutoHashMapUnmanaged(u32, void)) !bool {
+fn once(function: *Function, context: anytype, filled: *std.AutoHashMapUnmanaged(u32, void)) !bool {
     while (try loops.canonicalize(function)) {}
     function.resolveReferences();
     const graph = (try function.controlFlow()).*;
     const found = try loops.find(function.scratch, function, graph);
     if (found.len == 0) return false;
-    const analysis = try loops.Analysis.init(function, graph);
+    var analysis = try loops.Analysis.init(function, graph, found);
+    analysis.call_arguments = try successfulCallArguments(function, context);
     for (found) |loop| {
         const preheader = loops.preheader(function, graph, loop) orelse continue;
         if (loop.latches.len != 1) continue;
@@ -34,6 +35,34 @@ fn once(function: *Function, filled: *std.AutoHashMapUnmanaged(u32, void)) !bool
         }
     }
     return false;
+}
+
+fn successfulCallArguments(function: *Function, context: anytype) ![]const loops.Analysis.CallArgumentRange {
+    var ranges: std.ArrayList(loops.Analysis.CallArgumentRange) = .empty;
+    const taken = try canonicalize.addressTaken(function);
+    for (function.instructions.items, function.removed.items, 0..) |instruction, removed, index| {
+        if (removed or instruction != .call or instruction.call.target != .direct) continue;
+        const call = instruction.call;
+        const arguments = function.call_arguments.items[call.arguments.start..call.arguments.end];
+        for (arguments) |argument| {
+            const value = function.find(argument.valueId());
+            if (function.valueType(value) == .int and function.plainValue(value) and !taken[@backingInt(value)]) break;
+        } else continue;
+        const body = (try context.inlineBody(call.target.direct)) orelse continue;
+        const facts = if (@hasDecl(@TypeOf(context), "inlineFacts"))
+            (try context.inlineFacts(call.target.direct)) orelse continue
+        else
+            try @import("inline.zig").analyzeCallee(function.scratch, body);
+        if (!facts.eligible or facts.normal_return_ranges.len == 0) continue;
+        std.debug.assert(facts.normal_return_ranges.len == arguments.len);
+        for (arguments, facts.normal_return_ranges) |argument, range| {
+            const known = range orelse continue;
+            const value = function.find(argument.valueId());
+            if (function.valueType(value) != .int or !function.plainValue(value) or taken[@backingInt(value)]) continue;
+            try ranges.append(function.scratch, .{ .instruction = @intCast(index), .value = value, .range = known });
+        }
+    }
+    return ranges.items;
 }
 
 fn rewriteLoop(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32, filled: *std.AutoHashMapUnmanaged(u32, void)) !bool {
@@ -469,36 +498,43 @@ const Replace = struct {
 };
 
 fn boundsChecks(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32) bool {
-    const test_result = loops.exitTestWithArguments(function, loop) orelse return false;
-    var changed = false;
     for (function.blocks.items[loop.header].parameters.items) |parameter| {
-        const counter = analysis.inductionExit(loop, preheader, test_result, parameter) orelse continue;
-        const limit = counter.comparison.other;
         for (loop.blocks) |block| {
-            if (!analysis.graph.dominates(test_result.stay, block)) continue;
-            const range = analysis.iterationRange(block, counter) orelse continue;
-            for (function.blocks.items[block].instructions.items) |index| {
-                if (function.removed.items[index] or function.results.items[index] != counter.induction.next) continue;
-                const instruction = &function.instructions.items[index];
-                if (instruction.* == .numeric_binary and instruction.numeric_binary.overflow == .checked) {
-                    instruction.numeric_binary.overflow = .wrapping;
-                    changed = true;
-                }
-            }
-            const terminator = &function.blocks.items[block].terminator;
-            if (terminator.* != .predicate_branch) continue;
-            const predicate = terminator.predicate_branch;
-            const comparison = loops.IntegerComparison.init(function, predicate.operation, predicate.operands, counter.induction.parameter) orelse continue;
-            const holds = if (analysis.integerConstant(comparison.other)) |number|
-                range.absolute.known(comparison.operation, number)
-            else if (comparison.other == limit)
-                range.relative.known(comparison.operation, 0)
-            else
-                null;
-            if (holds) |taken| {
-                terminator.* = .{ .branch = if (taken) predicate.then_branch else predicate.else_branch };
+            const test_result = loops.exitTestAt(function, loop, block) orelse continue;
+            const counter = analysis.invariantInductionExit(loop, preheader, test_result, parameter) orelse continue;
+            if (boundsForCounter(function, analysis, loop, counter, test_result)) return true;
+        }
+    }
+    return false;
+}
+
+fn boundsForCounter(function: *Function, analysis: *const loops.Analysis, loop: Loop, counter: loops.InductionExit, test_result: loops.ExitTest) bool {
+    var changed = false;
+    const limit = counter.comparison.other;
+    for (loop.blocks) |block| {
+        if (!analysis.graph.dominates(test_result.stay, block)) continue;
+        const range = analysis.iterationRange(block, counter) orelse continue;
+        for (function.blocks.items[block].instructions.items) |index| {
+            if (function.removed.items[index] or function.results.items[index] != counter.induction.next) continue;
+            const instruction = &function.instructions.items[index];
+            if (instruction.* == .numeric_binary and instruction.numeric_binary.overflow == .checked) {
+                instruction.numeric_binary.overflow = .wrapping;
                 changed = true;
             }
+        }
+        const terminator = &function.blocks.items[block].terminator;
+        if (terminator.* != .predicate_branch) continue;
+        const predicate = terminator.predicate_branch;
+        const comparison = loops.IntegerComparison.init(function, predicate.operation, predicate.operands, counter.induction.parameter) orelse continue;
+        const holds = if (analysis.integerConstant(comparison.other)) |number|
+            range.absolute.known(comparison.operation, number)
+        else if (comparison.other == limit)
+            range.relative.known(comparison.operation, 0)
+        else
+            null;
+        if (holds) |taken| {
+            terminator.* = .{ .branch = if (taken) predicate.then_branch else predicate.else_branch };
+            return true;
         }
     }
     return changed;

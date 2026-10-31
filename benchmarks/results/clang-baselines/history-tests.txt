@@ -1,0 +1,79 @@
+test_adaptive_counts_and_independent_phases (history_test.HistoryTests.test_adaptive_counts_and_independent_phases) ... ok
+test_backfill_resumes_matching_attempts_including_failures (history_test.HistoryTests.test_backfill_resumes_matching_attempts_including_failures) ... ok
+test_c_reference_accepts_complete_adaptive_and_legacy_samples (history_test.HistoryTests.test_c_reference_accepts_complete_adaptive_and_legacy_samples) ... ok
+test_c_reference_cache_accepts_valid_subsecond_samples (history_test.HistoryTests.test_c_reference_cache_accepts_valid_subsecond_samples) ... ok
+test_c_reference_cache_matches_environment_and_preserves_origin (history_test.HistoryTests.test_c_reference_cache_matches_environment_and_preserves_origin) ... ok
+test_c_reference_cache_rejects_incomplete_and_invalid_samples (history_test.HistoryTests.test_c_reference_cache_rejects_incomplete_and_invalid_samples) ... ok
+test_c_reference_csv_requires_all_levels_and_samples (history_test.HistoryTests.test_c_reference_csv_requires_all_levels_and_samples) ... ok
+test_chart_preserves_tooltips_and_commit_spacing (history_test.HistoryTests.test_chart_preserves_tooltips_and_commit_spacing) ... ok
+test_clang_reference_does_not_reuse_a_gcc_baseline (history_test.HistoryTests.test_clang_reference_does_not_reuse_a_gcc_baseline) ... ok
+test_compilation_legend_contains_only_measured_series (history_test.HistoryTests.test_compilation_legend_contains_only_measured_series) ... ok
+test_compilation_series_use_monochrome_line_styles (history_test.HistoryTests.test_compilation_series_use_monochrome_line_styles) ... ok
+test_cpu_pin_preserves_original_worker_affinity (history_test.HistoryTests.test_cpu_pin_preserves_original_worker_affinity) ... Report: /tmp/tmpa86_88ch/index.html
+Benchmarks: /tmp/tmpa86_88ch/benchmarks.html
+Recorded abc: 10 production lines, 6 benchmark samples
+ok
+test_csv_round_trip (history_test.HistoryTests.test_csv_round_trip) ... ok
+test_eight_worker_compilation_samples (history_test.HistoryTests.test_eight_worker_compilation_samples) ... ok
+test_empty_loc (history_test.HistoryTests.test_empty_loc) ... ok
+test_environment_records_the_clang_executable_and_version (history_test.HistoryTests.test_environment_records_the_clang_executable_and_version) ... ok
+test_failed_workload_preserves_other_results_and_diagnostic_log (history_test.HistoryTests.test_failed_workload_preserves_other_results_and_diagnostic_log) ... Report: /tmp/tmph1qznft9/index.html
+Benchmarks: /tmp/tmph1qznft9/benchmarks.html
+Benchmarking tree (ReleaseFast)
+  core-1000000: unavailable (see failures/2026-10-31T17-05-17.215346+00-00-abc-core-1000000.log)
+Warning: 8 workers share only 1 allowed CPU(s); this measures oversubscription, not multicore scaling. Use taskset with at least 8 CPUs for worker comparisons.
+  core-1000000-workers-8: unavailable (see failures/2026-10-31T17-05-17.215346+00-00-abc-core-1000000-workers-8.log)
+ok
+test_historical_harness_preserves_compiler_and_std_sources (history_test.HistoryTests.test_historical_harness_preserves_compiler_and_std_sources) ... ok
+test_historical_root_layout_excludes_build_and_benchmark (history_test.HistoryTests.test_historical_root_layout_excludes_build_and_benchmark) ... ok
+test_individual_cases_require_exactly_their_own_samples (history_test.HistoryTests.test_individual_cases_require_exactly_their_own_samples) ... ok
+test_line_chart_has_no_commit_markers (history_test.HistoryTests.test_line_chart_has_no_commit_markers) ... ok
+test_loc_grid_is_dotted_at_ten_thousand_line_intervals (history_test.HistoryTests.test_loc_grid_is_dotted_at_ten_thousand_line_intervals) ... ok
+test_loc_uses_existing_code_and_test_classification (history_test.HistoryTests.test_loc_uses_existing_code_and_test_classification) ... ok
+test_measure_reuses_c_samples_and_refresh_forces_remeasurement (history_test.HistoryTests.test_measure_reuses_c_samples_and_refresh_forces_remeasurement) ... Benchmarking new-tree (ReleaseFast)
+Benchmarking new-tree (ReleaseFast)
+Reusing cached Clang reference (-O0 and -O3)
+Benchmarking new-tree (ReleaseFast)
+Benchmarking new-tree (ReleaseFast)
+Reusing cached Clang reference (-O0 and -O3)
+Benchmarking new-tree (ReleaseFast)
+ok
+test_new_compilation_workload_preserves_only_unchanged_runtime_history (history_test.HistoryTests.test_new_compilation_workload_preserves_only_unchanged_runtime_history) ... ok
+test_new_recording_replaces_temporary_worktree_point (history_test.HistoryTests.test_new_recording_replaces_temporary_worktree_point) ... ok
+test_oversubscribed_workers_preserve_latest_eligible_series_and_c_reference (history_test.HistoryTests.test_oversubscribed_workers_preserve_latest_eligible_series_and_c_reference) ... ok
+test_rejects_incomplete_duplicate_or_changed_suite (history_test.HistoryTests.test_rejects_incomplete_duplicate_or_changed_suite) ... ok
+test_rejects_inconsistent_count_and_stability_metadata (history_test.HistoryTests.test_rejects_inconsistent_count_and_stability_metadata) ... ok
+test_rejects_invalid_measurements (history_test.HistoryTests.test_rejects_invalid_measurements) ... ok
+test_rejects_premature_or_falsely_stable_measurements (history_test.HistoryTests.test_rejects_premature_or_falsely_stable_measurements) ... ok
+test_rejects_truncated_csv_fields (history_test.HistoryTests.test_rejects_truncated_csv_fields) ... ok
+test_report_hides_obsolete_protocol_without_deleting_records (history_test.HistoryTests.test_report_hides_obsolete_protocol_without_deleting_records) ... ok
+test_report_joins_compilation_history_across_sampling_protocols (history_test.HistoryTests.test_report_joins_compilation_history_across_sampling_protocols) ... ok
+test_report_keeps_one_compilation_series_across_suite_changes (history_test.HistoryTests.test_report_keeps_one_compilation_series_across_suite_changes) ... ok
+test_report_separates_machines_and_deduplicates_reruns (history_test.HistoryTests.test_report_separates_machines_and_deduplicates_reruns) ... ok
+test_report_separates_runtime_from_compilation (history_test.HistoryTests.test_report_separates_runtime_from_compilation) ... ok
+test_requested_failures_raise_after_saving_and_rendering_but_backfill_continues (history_test.HistoryTests.test_requested_failures_raise_after_saving_and_rendering_but_backfill_continues) ... Recorded abc: 10 production lines, 6 benchmark samples
+Report: /tmp/tmpq1ev6b7o/index.html
+Benchmarks: /tmp/tmpq1ev6b7o/benchmarks.html
+Recorded abc: 10 production lines, 6 benchmark samples
+Report: /tmp/tmplz8pq39k/index.html
+Benchmarks: /tmp/tmplz8pq39k/benchmarks.html
+Recorded abc: 10 production lines, 6 benchmark samples
+ok
+test_runtime_csv_round_trip_and_incomplete_sample_rejection (history_test.HistoryTests.test_runtime_csv_round_trip_and_incomplete_sample_rejection) ... ok
+test_runtime_reference_lines_span_the_plot_without_commit_markers (history_test.HistoryTests.test_runtime_reference_lines_span_the_plot_without_commit_markers) ... ok
+test_runtime_report_labels_and_separates_gcc_and_clang_references (history_test.HistoryTests.test_runtime_report_labels_and_separates_gcc_and_clang_references) ... ok
+test_runtime_report_uses_latest_medians_in_legend (history_test.HistoryTests.test_runtime_report_uses_latest_medians_in_legend) ... ok
+test_sampling_notes_distinguish_stable_capped_and_legacy_results (history_test.HistoryTests.test_sampling_notes_distinguish_stable_capped_and_legacy_results) ... ok
+test_single_worktree_point_has_visible_date (history_test.HistoryTests.test_single_worktree_point_has_visible_date) ... ok
+test_worker_failure_restores_serial_affinity_before_runtime (history_test.HistoryTests.test_worker_failure_restores_serial_affinity_before_runtime) ... Report: /tmp/tmprx20p7xb/index.html
+Benchmarks: /tmp/tmprx20p7xb/benchmarks.html
+Benchmarking tree (ReleaseFast)
+  core-1000000-workers-8: unavailable (see failures/2026-10-31T17-05-23.531417+00-00-abc-core-1000000-workers-8.log)
+ok
+test_worker_series_join_existing_graphs_across_affinities (history_test.HistoryTests.test_worker_series_join_existing_graphs_across_affinities) ... ok
+test_worktree_status_is_retained_without_displaying_it (history_test.HistoryTests.test_worktree_status_is_retained_without_displaying_it) ... ok
+
+----------------------------------------------------------------------
+Ran 47 tests in 6.826s
+
+OK

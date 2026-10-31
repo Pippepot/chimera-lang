@@ -196,7 +196,7 @@ class HistoryTests(unittest.TestCase):
         previous["benchmarks"][0]["samples"].extend(
             dict(sample, lane=lane) for lane in ("c-O1", "c-O2")
             for sample in samples(include_c=True) if sample["lane"] == "c-O3")
-        previous["c_compiler"] = {"path": "/usr/bin/cc", "version": "cc 1.0"}
+        previous["c_compiler"] = {"path": "/usr/bin/clang", "version": "clang version 22.1.8"}
         expected = [sample for sample in previous["benchmarks"][0]["samples"] if sample["lane"] in history.C_LANES]
         cached, origin = history.cached_c_reference([previous], previous)
         self.assertEqual(cached, expected)
@@ -220,6 +220,24 @@ class HistoryTests(unittest.TestCase):
             previous["benchmarks"][0]["samples"][-1][field] = value
             with self.subTest(field=field):
                 self.assertIsNone(history.cached_c_reference([previous], previous))
+
+    def test_clang_reference_does_not_reuse_a_gcc_baseline(self):
+        gcc = record()
+        gcc["c_compiler"] = {"path": "/usr/bin/cc", "version": "cc (GCC) 16.2.1"}
+        gcc["benchmarks"][0]["samples"] = samples(include_c=True)
+        clang = copy.deepcopy(gcc)
+        clang["c_compiler"] = {"path": "/usr/bin/clang", "version": "clang version 22.1.8"}
+        self.assertIsNone(history.cached_c_reference([gcc], clang))
+        self.assertEqual(history.cached_c_reference([gcc, clang], clang)[0],
+                         [sample for sample in clang["benchmarks"][0]["samples"] if sample["lane"] in history.C_LANES])
+
+    def test_environment_records_the_clang_executable_and_version(self):
+        versions = {("zig", "version"): "0.17.0", ("clang", "--version"): "clang version 22.1.8"}
+        with patch.object(history, "command", side_effect=lambda args: versions[tuple(args)]), \
+                patch.object(history.shutil, "which", return_value="/usr/bin/clang") as which:
+            current = history.environment()
+        which.assert_called_once_with("clang")
+        self.assertEqual(current["c_compiler"], {"path": "/usr/bin/clang", "version": "clang version 22.1.8"})
 
     def test_c_reference_cache_accepts_valid_subsecond_samples(self):
         previous = record()
@@ -247,7 +265,7 @@ class HistoryTests(unittest.TestCase):
                 previous = record()
                 previous["runner"]["affinity"] = affinity
                 previous["suite"] = history.suite_id()
-                previous["c_compiler"] = {"path": "/usr/bin/cc", "version": "cc 1.0"}
+                previous["c_compiler"] = {"path": "/usr/bin/clang", "version": "clang version 22.1.8"}
                 previous["benchmarks"][0]["samples"] = samples(include_c=True)
                 if saved:
                     history.save(data, previous)
@@ -259,8 +277,8 @@ class HistoryTests(unittest.TestCase):
                     active_affinity[:] = cpus
 
                 def command(arguments, cwd=history.ROOT):
-                    if arguments == ["cc", "--version"]:
-                        return "cc 1.0"
+                    if arguments == ["clang", "--version"]:
+                        return "clang version 22.1.8"
                     if arguments == ["zig", "version"]:
                         return previous["zig"]
                     self.assertEqual(arguments[:2], ["zig", "build"])
@@ -280,7 +298,7 @@ class HistoryTests(unittest.TestCase):
                         patch.object(history, "loc", return_value=previous["loc"]), \
                         patch.object(history, "runner", return_value=previous["runner"]), \
                         patch.object(history.os, "sched_setaffinity", side_effect=set_affinity), \
-                        patch.object(history.shutil, "which", return_value="/usr/bin/cc"), \
+                        patch.object(history.shutil, "which", return_value="/usr/bin/clang"), \
                         patch.object(history.sys, "stderr", new_callable=io.StringIO) as stderr:
                     measured = history.measure(snapshot, "abc", previous["commit_date"], "new-tree", True, False, data,
                                                refresh, worker_affinity=worker_affinity)
@@ -417,20 +435,14 @@ class HistoryTests(unittest.TestCase):
         self.assertNotEqual(dash_patterns[0], dash_patterns[1])
         self.assertEqual(len(tree.findall(".//svg:title", namespace)), 6)
 
-    def test_compilation_estimates_are_legend_only_and_preserve_the_axis(self):
+    def test_compilation_legend_contains_only_measured_series(self):
         series = {"Compile": [(0, 2, "first"), (1, 3, "second")]}
         commits = [("a", "2026-10-22"), ("b", "2026-10-23")]
-        estimates = ("C++ -O0 estimate: ~158 s", "C++ -O2 estimate: ~269 s")
-        baseline = ElementTree.fromstring(history.chart(series, commits, "s"))
-        tree = ElementTree.fromstring(history.chart(series, commits, "s", estimates=estimates))
+        tree = ElementTree.fromstring(history.chart(series, commits, "s"))
         namespace = {"svg": "http://www.w3.org/2000/svg"}
-        baseline_ticks = baseline.find(".//*[@id='matplotlib.axis_2']")
-        ticks = tree.find(".//*[@id='matplotlib.axis_2']")
-        self.assertEqual([label.text for label in ticks.findall(".//svg:text", namespace)],
-                         [label.text for label in baseline_ticks.findall(".//svg:text", namespace)])
         legend = tree.find(".//*[@id='legend_1']")
         labels = [label.text for label in legend.findall(".//svg:text", namespace)]
-        self.assertEqual(labels, ["Compile: 3.000 s", *estimates])
+        self.assertEqual(labels, ["Compile: 3.000 s"])
         self.assertIsNone(tree.find(".//*[@id='reference-0']"))
         self.assertEqual(len(tree.findall(".//svg:title", namespace)), 2)
 
@@ -542,15 +554,13 @@ class HistoryTests(unittest.TestCase):
                 tree = ElementTree.parse(compilation_graph)
                 legend = tree.find(".//*[@id='legend_1']")
                 labels = [label.text for label in legend.findall(".//svg:text", namespace)]
-                estimates = history.COMPILATION_ESTIMATES.get(phase, ())
-                self.assertEqual(labels, ["Compile: 0.002 s", "Compile (8 workers): 0.001 s", *estimates])
+                self.assertEqual(labels, ["Compile: 0.002 s", "Compile (8 workers): 0.001 s"])
                 tooltips = tree.findall(".//svg:title", namespace)
                 self.assertEqual(len(tooltips), 2)
                 self.assertTrue(tooltips[1].text.startswith("Compile (8 workers): 0.001 s"))
                 self.assertIsNone(tree.find(".//*[@id='reference-0']"))
                 self.assertNotIn("est.:", compilation_graph.read_text())
-                if phase == "leaf-edit":
-                    self.assertNotIn("C++", compilation_graph.read_text())
+                self.assertNotIn("C++", compilation_graph.read_text())
             self.assertNotIn("C++", graph.read_text())
             tooltip, = ElementTree.parse(graph).findall(".//svg:title", namespace)
             self.assertTrue(tooltip.text.startswith("Runtime: 0.100 s"))
@@ -620,6 +630,25 @@ class HistoryTests(unittest.TestCase):
                             self.assertEqual([point[1] for point in series["Runtime"]], [1.0])
                             self.assertAlmostEqual(call.kwargs["references"]["C -O3"][0], 16.01)
                     self.assertEqual(history.read_records(data), [previous, current])
+
+    def test_runtime_report_labels_and_separates_gcc_and_clang_references(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            gcc = record()
+            gcc["c_compiler"] = {"path": "/usr/bin/cc", "version": "cc (GCC) 16.2.1"}
+            gcc["benchmarks"][0]["samples"] = samples(include_c=True)
+            clang = copy.deepcopy(gcc)
+            clang["recorded_at"] = "2026-10-24T11:00:00Z"
+            clang["c_compiler"] = {"path": "/usr/bin/clang", "version": "clang version 22.1.8"}
+            for entry in (gcc, clang):
+                history.save(data, entry)
+            with patch.object(history, "graph_artifact", return_value="") as graph, \
+                    patch.object(history, "benchmark_overview"):
+                history.render(data, [(gcc["commit"], gcc["commit_date"])])
+            references = [set(call.kwargs["references"]) for call in graph.call_args_list
+                          if "Runtime" in call.args[2]]
+            self.assertEqual(references, [{"GCC -O0", "GCC -O3"}, {"Clang -O0", "Clang -O3"}])
+            self.assertEqual(history.read_records(data), [gcc, clang])
 
     def test_runtime_report_uses_latest_medians_in_legend(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -737,7 +766,7 @@ class HistoryTests(unittest.TestCase):
                 self.assertIsNone(tree.find(".//*[@id='point-1-0']"))
                 legend = tree.find(".//*[@id='legend_1']")
                 labels = [label.text for label in legend.findall(".//svg:text", namespace)]
-                self.assertEqual(labels, ["Compile: 0.004 s", *history.COMPILATION_ESTIMATES.get(phase, ())])
+                self.assertEqual(labels, ["Compile: 0.004 s"])
                 self.assertNotIn("Workload", graph.read_text())
                 self.assertNotIn("previous suite", graph.read_text())
             self.assertEqual(history.read_records(data), records)

@@ -17,6 +17,7 @@ pub const Allocation = struct {
 };
 
 const Interval = struct { start: u32 = std.math.maxInt(u32), end: u32 = 0 };
+const Preference = struct { value: u32, weight: u64 };
 
 pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value_count: usize) !Allocation {
     const registers = try gpa.alloc(?Register, value_count);
@@ -197,22 +198,79 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
     }
     const allocated = try scratch.alloc(bool, available.len);
     @memset(allocated, false);
+    const preferences = try scratch.alloc(std.ArrayList(Preference), candidate_count);
+    @memset(preferences, .empty);
+    try collectPreferences(scratch, instructions, mapping, depth, preferences);
     for (order.items) |value| {
-        for (available, assigned, allocated) |register, *taken, *used_register| {
+        var scores: [std.enums.values(Register).len]u64 = @splat(0);
+        for (preferences[value].items) |preference| {
+            const selected = registers[values.items[preference.value]] orelse continue;
+            const index = std.mem.indexOfScalar(Register, available, selected).?;
+            scores[index] +|= preference.weight;
+        }
+        var best: ?usize = null;
+        for (available, assigned, 0..) |register, taken, index| {
             if (parameters[value] and register.calleeSaved()) continue;
             if (fixed.contains(register)) continue;
             if (overlap(ranges[value].items, taken.items)) continue;
-            try taken.appendSlice(scratch, ranges[value].items);
-            normalizeRanges(taken);
-            registers[values.items[value]] = register;
-            used_register.* = true;
-            break;
+            if (best == null or scores[index] > scores[best.?]) best = index;
         }
+        const selected = best orelse continue;
+        try assigned[selected].appendSlice(scratch, ranges[value].items);
+        normalizeRanges(&assigned[selected]);
+        registers[values.items[value]] = available[selected];
+        allocated[selected] = true;
     }
     var used: std.ArrayList(Register) = .empty;
     defer used.deinit(gpa);
     for (available, allocated) |register, taken| if (taken) try used.append(gpa, register);
     return .{ .registers = registers, .used = try used.toOwnedSlice(gpa) };
+}
+
+// These are allocation preferences, not aliases: every choice still has to
+// satisfy the complete expanded-stream liveness and fixed-register constraints.
+fn collectPreferences(allocator: std.mem.Allocator, instructions: []const machine.Instruction, mapping: []const ?u32, depth: []const u32, preferences: []std.ArrayList(Preference)) !void {
+    for (instructions, 0..) |instruction, index| {
+        if (instruction != .register or instruction.register.operation != .load_eax) continue;
+        if (index + 2 >= instructions.len) continue;
+        const lhs = instruction.register.value;
+        var destination = index + 1;
+        var rhs: ?machine.ValueId = null;
+        switch (instructions[destination]) {
+            .fixed => |operation| {
+                switch (operation.operation) {
+                    .add_eax, .sub_eax, .imul_eax, .add_eax_rsp, .sub_eax_rsp, .imul_eax_rsp => destination += 1,
+                    else => continue,
+                }
+            },
+            .register => |operation| {
+                switch (operation.operation) {
+                    .store_eax => {},
+                    .add_eax, .imul_eax => {
+                        rhs = operation.value;
+                        destination += 1;
+                    },
+                    .sub_eax => destination += 1,
+                    else => continue,
+                }
+            },
+            else => continue,
+        }
+        if (destination + 1 >= instructions.len) continue;
+        if (instructions[destination] != .register or instructions[destination].register.operation != .store_eax) continue;
+        if (instructions[destination + 1] != .scratch_dead) continue;
+        const result = instructions[destination].register.value;
+        try prefer(allocator, mapping, preferences, lhs, result, loopWeight(depth[index]));
+        if (rhs) |value| try prefer(allocator, mapping, preferences, value, result, loopWeight(depth[index]));
+    }
+}
+
+fn prefer(allocator: std.mem.Allocator, mapping: []const ?u32, preferences: []std.ArrayList(Preference), lhs: machine.ValueId, rhs: machine.ValueId, weight: u64) !void {
+    const left = mapping[@backingInt(lhs)].?;
+    const right = mapping[@backingInt(rhs)].?;
+    if (left == right) return;
+    try preferences[left].append(allocator, .{ .value = right, .weight = weight });
+    try preferences[right].append(allocator, .{ .value = left, .weight = weight });
 }
 
 fn normalizeRanges(ranges: *std.ArrayList(Interval)) void {

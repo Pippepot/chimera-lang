@@ -238,37 +238,11 @@ const Rules = struct {
 
     fn simplifyNumeric(self: *Rules, instruction: *Instruction, result: ValueId) bool {
         switch (instruction.*) {
-            .numeric_binary => |operation| return self.simplifyNumericBinary(instruction, result, operation),
+            .numeric_binary => return self.simplifyBinary(instruction, result),
             .numeric_unary => |operation| return self.simplifyNumericUnary(instruction, operation),
             .numeric_convert => |operation| return self.simplifyNumericConversion(instruction, result, operation),
             else => unreachable,
         }
-    }
-
-    fn simplifyNumericBinary(self: *Rules, instruction: *Instruction, result: ValueId, operation: structures.NumericBinary) bool {
-        const lhs = self.numericConstant(operation.operands.lhs);
-        const rhs = self.numericConstant(operation.operands.rhs);
-        if (lhs != null and rhs != null) {
-            const bits = structures.numeric.binary(operation.type_id.numericType().?, operation.operation, operation.overflow, lhs.?.bits, rhs.?.bits) catch return false;
-            instruction.* = if (operation.operation.isComparison()) .{ .const_bool = bits != 0 } else Instruction.numericConstantInstruction(operation.type_id, bits);
-            return true;
-        }
-        if (self.lowerNumericBinary(instruction, operation)) return true;
-        if (operation.type_id.numericType().?.isFloat()) return false;
-        if (lhs != null and rhs == null and (operation.operation == .add or operation.operation == .mul or operation.operation == .bit_and or operation.operation == .bit_or or operation.operation == .bit_xor)) {
-            instruction.numeric_binary.operands = .{ .lhs = operation.operands.rhs, .rhs = operation.operands.lhs };
-            return true;
-        }
-        if (rhs) |right| {
-            const zero_identity = operation.operation == .add or operation.operation == .sub or operation.operation == .bit_or or operation.operation == .bit_xor or operation.operation == .shl or operation.operation == .shr;
-            if (zero_identity and right.bits == 0) return self.alias(result, operation.operands.lhs);
-            if ((operation.operation == .mul or operation.operation == .div) and right.bits == 1) return self.alias(result, operation.operands.lhs);
-            if ((operation.operation == .mul or operation.operation == .bit_and) and right.bits == 0) {
-                instruction.* = Instruction.numericConstantInstruction(operation.type_id, 0);
-                return true;
-            }
-        }
-        return false;
     }
 
     fn simplifyNumericUnary(self: *Rules, instruction: *Instruction, operation: structures.NumericUnary) bool {
@@ -289,35 +263,76 @@ const Rules = struct {
     }
 
     fn simplifyBinary(self: *Rules, instruction: *Instruction, result: ValueId) bool {
-        const operands = binaryOperands(instruction);
-        const original = operands.*;
-        const lhs = self.constant(original.lhs);
-        const rhs = self.constant(original.rhs);
-        if (lhs != null and rhs != null) {
-            const folded = instruction.integerResult(lhs.?, rhs.?) orelse return false;
-            instruction.* = .{ .const_int = folded };
-            return true;
-        }
-        const laws = algebra(instruction.*);
-        if (laws.commutative and lhs != null) {
-            operands.* = .{ .lhs = original.rhs, .rhs = original.lhs };
-            return true;
-        }
-        if (rhs) |constant_rhs| {
-            if (laws.identity == constant_rhs) return self.alias(result, original.lhs);
-            if (laws.absorbing == constant_rhs) {
-                instruction.* = .{ .const_int = constant_rhs };
-                return true;
-            }
-            if (laws.negating == constant_rhs) {
-                instruction.* = .{ .negi = original.lhs };
-                return true;
-            }
-        }
-        if (laws.self_result) |self_result| if (original.lhs == original.rhs) {
-            instruction.* = .{ .const_int = self_result };
-            return true;
+        const operation: structures.NumericBinary = switch (instruction.*) {
+            .numeric_binary => |operation| operation,
+            inline .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands, tag| .{
+                .operation = switch (tag) {
+                    .addi => .add,
+                    .subi => .sub,
+                    .muli => .mul,
+                    .divsi => .div,
+                    .shli => .shl,
+                    .shrsi => .shr,
+                    else => unreachable,
+                },
+                .type_id = .int,
+                .overflow = .wrapping,
+                .operands = operands,
+            },
+            else => unreachable,
         };
+        const operands = operation.operands;
+        const lhs = if (self.numericConstant(operands.lhs)) |value| value.bits else null;
+        const rhs = if (self.numericConstant(operands.rhs)) |value| value.bits else null;
+        const kind = operation.type_id.numericType().?;
+        if (lhs != null and rhs != null) {
+            const bits = structures.numeric.binary(kind, operation.operation, operation.overflow, lhs.?, rhs.?) catch return false;
+            instruction.* = if (operation.operation.isComparison()) .{ .const_bool = bits != 0 } else Instruction.numericConstantInstruction(operation.type_id, bits);
+            return true;
+        }
+        if (instruction.* == .numeric_binary and self.lowerNumericBinary(instruction, operation)) return true;
+        if (kind.isFloat()) return false;
+        const commutative = switch (operation.operation) {
+            .add, .mul, .bit_and, .bit_or, .bit_xor => true,
+            else => false,
+        };
+        if (commutative and lhs != null) {
+            const references = instruction.operands();
+            std.mem.swap(ValueId, references[0].?, references[1].?);
+            return true;
+        }
+        const all_bits = @as(u64, std.math.maxInt(u64)) >> @intCast(64 - @as(u8, kind.width()));
+        const same = operands.lhs == operands.rhs;
+        const identity = switch (operation.operation) {
+            .add, .sub, .bit_xor, .shl, .shr => rhs == 0,
+            .mul, .div => rhs == 1,
+            .bit_and => rhs == all_bits or same,
+            .bit_or => rhs == 0 or same,
+            else => false,
+        };
+        if (identity) {
+            // Record the no-trap proof; keep a snapshot when storage prevents aliasing.
+            instruction.* = .{ .value_copy = .{ .source = operands.lhs, .type_id = operation.type_id } };
+            _ = self.alias(result, operands.lhs);
+            return true;
+        }
+        const zero = switch (operation.operation) {
+            .sub, .bit_xor => same,
+            .mul, .bit_and => rhs == 0,
+            .rem => rhs == 1,
+            else => false,
+        };
+        if (zero or (operation.operation == .bit_or and rhs == all_bits)) {
+            instruction.* = Instruction.numericConstantInstruction(operation.type_id, if (zero) 0 else all_bits);
+            return true;
+        }
+        if (kind.isSigned() and rhs == all_bits and (operation.operation == .mul or operation.operation == .div)) {
+            instruction.* = if (instruction.* == .numeric_binary)
+                .{ .numeric_unary = .{ .operation = .neg, .type_id = operation.type_id, .overflow = operation.overflow, .operand = operands.lhs } }
+            else
+                .{ .negi = operands.lhs };
+            return true;
+        }
         return false;
     }
 
@@ -540,32 +555,6 @@ const Rules = struct {
         };
     }
 };
-
-const Algebra = struct {
-    commutative: bool = false,
-    identity: ?i32 = null,
-    absorbing: ?i32 = null,
-    negating: ?i32 = null,
-    self_result: ?i32 = null,
-};
-
-fn algebra(instruction: Instruction) Algebra {
-    return switch (instruction) {
-        .addi => .{ .commutative = true, .identity = 0 },
-        .subi => .{ .identity = 0, .self_result = 0 },
-        .muli => .{ .commutative = true, .identity = 1, .absorbing = 0, .negating = -1 },
-        .divsi => .{ .identity = 1, .negating = -1 },
-        .shli, .shrsi => .{ .identity = 0 },
-        else => unreachable,
-    };
-}
-
-fn binaryOperands(instruction: *Instruction) *structures.BinaryOperands {
-    return switch (instruction.*) {
-        inline .addi, .subi, .muli, .divsi, .shli, .shrsi => |*operands| operands,
-        else => unreachable,
-    };
-}
 
 const AddressSet = struct {
     taken: []bool,

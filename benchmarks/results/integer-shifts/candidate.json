@@ -1,0 +1,236 @@
+{
+  "schema": 1,
+  "commit": "689bdaa1337fadc2ab9a3d14a57d98386a7872f4",
+  "commit_date": "2026-10-30T18:53:51+01:00",
+  "snapshot": "9ffb26303e09a127239fa5ed67a494387d70e24a539c5a67cc2f7071ee309ddb",
+  "worktree": true,
+  "recorded_at": "2026-10-30T19:05:11.444861+00:00",
+  "loc_policy": "a453e6f82a5fc2a1172898612654d5447b2950ce917b5e703b9ec67ad4df1be5",
+  "loc": {
+    "code": 36458,
+    "test": 53165,
+    "total": 89623
+  },
+  "benchmarks": [
+    {
+      "mode": "fast",
+      "samples": [
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "cold",
+          "sample": 0,
+          "nanoseconds": 27080803293,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "cold",
+          "sample": 1,
+          "nanoseconds": 28393116381,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "cold",
+          "sample": 2,
+          "nanoseconds": 28532988793,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "leaf-edit",
+          "sample": 0,
+          "nanoseconds": 195980212,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "leaf-edit",
+          "sample": 1,
+          "nanoseconds": 202328154,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "leaf-edit",
+          "sample": 2,
+          "nanoseconds": 202857059,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "cold",
+          "sample": 0,
+          "nanoseconds": 7035414138,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "cold",
+          "sample": 1,
+          "nanoseconds": 7073533544,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "leaf-edit",
+          "sample": 0,
+          "nanoseconds": 257951028,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "leaf-edit",
+          "sample": 1,
+          "nanoseconds": 251055963,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "leaf-edit",
+          "sample": 2,
+          "nanoseconds": 255157407,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false
+        },
+        {
+          "case": "sieve-88000000",
+          "lane": "normal",
+          "phase": "runtime",
+          "sample": 0,
+          "nanoseconds": 1062359355,
+          "executable_bytes": 18524,
+          "sample_count": 2,
+          "stable": true
+        },
+        {
+          "case": "sieve-88000000",
+          "lane": "normal",
+          "phase": "runtime",
+          "sample": 1,
+          "nanoseconds": 1051541317,
+          "executable_bytes": 18524,
+          "sample_count": 2,
+          "stable": true
+        },
+        {
+          "case": "sieve-88000000",
+          "lane": "c-O0",
+          "phase": "runtime",
+          "sample": 0,
+          "nanoseconds": 1634181415,
+          "executable_bytes": 16232,
+          "sample_count": 2,
+          "stable": true
+        },
+        {
+          "case": "sieve-88000000",
+          "lane": "c-O0",
+          "phase": "runtime",
+          "sample": 1,
+          "nanoseconds": 1616370704,
+          "executable_bytes": 16232,
+          "sample_count": 2,
+          "stable": true
+        },
+        {
+          "case": "sieve-88000000",
+          "lane": "c-O3",
+          "phase": "runtime",
+          "sample": 0,
+          "nanoseconds": 1005775688,
+          "executable_bytes": 16280,
+          "sample_count": 2,
+          "stable": true
+        },
+        {
+          "case": "sieve-88000000",
+          "lane": "c-O3",
+          "phase": "runtime",
+          "sample": 1,
+          "nanoseconds": 1004172860,
+          "executable_bytes": 16280,
+          "sample_count": 2,
+          "stable": true
+        }
+      ]
+    }
+  ],
+  "suite": "2f50d3bf98a9e8389c31d580624abac4d86acfb2374bbe95844e33dd7e195fc3",
+  "protocol": "core-million-zero-workers-v6",
+  "compilation_protocol": "core-million-modules-one-line-leaf-v2",
+  "sampling_protocol": "one-warmup-range-2pct-min2-compile3-runtime5-v1",
+  "runtime_suite": {
+    "protocol": "sieve-88000000-i32-wall-v1",
+    "source": "6daad48db9d9581f742de5185243d81c1ca139dd5a3029355bd383aa616ad9e4"
+  },
+  "zig": "0.17.0",
+  "runner": {
+    "host": "arch",
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "kernel": "7.2.5-3-omarchy",
+    "architecture": "x86_64",
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      6,
+      7,
+      8,
+      9
+    ]
+  },
+  "c_compiler": {
+    "path": "/usr/bin/cc",
+    "version": "cc (GCC) 16.2.1 20260810\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+  },
+  "worker_affinity": [
+    0,
+    1,
+    2,
+    3,
+    6,
+    7,
+    8,
+    9
+  ],
+  "standard_library": "bundled",
+  "failures": [],
+  "c_reference": {
+    "snapshot": "8d49a375f62561e1310546a467b7d21071cd8116",
+    "recorded_at": "2026-10-30T18:52:06.174893+00:00"
+  }
+}

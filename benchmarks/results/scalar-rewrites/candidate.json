@@ -1,0 +1,306 @@
+{
+  "schema": 1,
+  "commit": "689bdaa1337fadc2ab9a3d14a57d98386a7872f4",
+  "commit_date": "2026-10-30T18:53:51+01:00",
+  "snapshot": "1fa7b6c4110c6386dc1a4caba9b11bde0bc858583e7199e40c55867cb968065b",
+  "worktree": true,
+  "recorded_at": "2026-10-30T19:49:48.390343+00:00",
+  "loc_policy": "a453e6f82a5fc2a1172898612654d5447b2950ce917b5e703b9ec67ad4df1be5",
+  "loc": {
+    "code": 36435,
+    "test": 53187,
+    "total": 89622
+  },
+  "benchmarks": [
+    {
+      "mode": "fast",
+      "samples": [
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "cold",
+          "sample": 0,
+          "nanoseconds": 28938875043,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 0
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "cold",
+          "sample": 1,
+          "nanoseconds": 29034935131,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 0
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "leaf-edit",
+          "sample": 0,
+          "nanoseconds": 273225753,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false,
+          "measurement_block": 0
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "leaf-edit",
+          "sample": 1,
+          "nanoseconds": 258992216,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false,
+          "measurement_block": 0
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "leaf-edit",
+          "sample": 2,
+          "nanoseconds": 260859084,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false,
+          "measurement_block": 0
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "cold",
+          "sample": 0,
+          "nanoseconds": 7543202854,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 0
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "cold",
+          "sample": 1,
+          "nanoseconds": 7665223458,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 0
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "leaf-edit",
+          "sample": 0,
+          "nanoseconds": 291042191,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false,
+          "measurement_block": 0
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "leaf-edit",
+          "sample": 1,
+          "nanoseconds": 307824375,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false,
+          "measurement_block": 0
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "leaf-edit",
+          "sample": 2,
+          "nanoseconds": 323352557,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false,
+          "measurement_block": 0
+        },
+        {
+          "case": "sieve-88000000",
+          "lane": "normal",
+          "phase": "runtime",
+          "sample": 0,
+          "nanoseconds": 1076916222,
+          "executable_bytes": 18524,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 0
+        },
+        {
+          "case": "sieve-88000000",
+          "lane": "normal",
+          "phase": "runtime",
+          "sample": 1,
+          "nanoseconds": 1057939095,
+          "executable_bytes": 18524,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 0
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "cold",
+          "sample": 0,
+          "nanoseconds": 7446668923,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 1
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "cold",
+          "sample": 1,
+          "nanoseconds": 7491748236,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 1
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "leaf-edit",
+          "sample": 0,
+          "nanoseconds": 294580090,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false,
+          "measurement_block": 1
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "leaf-edit",
+          "sample": 1,
+          "nanoseconds": 285240843,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false,
+          "measurement_block": 1
+        },
+        {
+          "case": "core-1000000",
+          "lane": "workers-8",
+          "phase": "leaf-edit",
+          "sample": 2,
+          "nanoseconds": 291653398,
+          "executable_bytes": 118104377,
+          "sample_count": 3,
+          "stable": false,
+          "measurement_block": 1
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "cold",
+          "sample": 0,
+          "nanoseconds": 27549419128,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 1
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "cold",
+          "sample": 1,
+          "nanoseconds": 27693658078,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 1
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "leaf-edit",
+          "sample": 0,
+          "nanoseconds": 232820181,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 1
+        },
+        {
+          "case": "core-1000000",
+          "lane": "normal",
+          "phase": "leaf-edit",
+          "sample": 1,
+          "nanoseconds": 236372558,
+          "executable_bytes": 118104377,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 1
+        },
+        {
+          "case": "sieve-88000000",
+          "lane": "normal",
+          "phase": "runtime",
+          "sample": 0,
+          "nanoseconds": 1031329857,
+          "executable_bytes": 18524,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 1
+        },
+        {
+          "case": "sieve-88000000",
+          "lane": "normal",
+          "phase": "runtime",
+          "sample": 1,
+          "nanoseconds": 1022675575,
+          "executable_bytes": 18524,
+          "sample_count": 2,
+          "stable": true,
+          "measurement_block": 1
+        }
+      ]
+    }
+  ],
+  "suite": "2f50d3bf98a9e8389c31d580624abac4d86acfb2374bbe95844e33dd7e195fc3",
+  "protocol": "core-million-zero-workers-v6",
+  "compilation_protocol": "core-million-modules-one-line-leaf-v2",
+  "sampling_protocol": "one-warmup-range-2pct-min2-compile3-runtime5-v1",
+  "runtime_suite": {
+    "protocol": "sieve-88000000-i32-wall-v1",
+    "source": "6daad48db9d9581f742de5185243d81c1ca139dd5a3029355bd383aa616ad9e4"
+  },
+  "zig": "0.17.0",
+  "runner": {
+    "host": "arch",
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "kernel": "7.2.5-3-omarchy",
+    "architecture": "x86_64",
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      6,
+      7,
+      8,
+      9
+    ]
+  },
+  "c_compiler": {
+    "path": "/usr/bin/cc",
+    "version": "cc (GCC) 16.2.1 20260810\nCopyright (C) 2026 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE."
+  },
+  "failures": [],
+  "implementation": "candidate",
+  "standard_library": "bundled"
+}

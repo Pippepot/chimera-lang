@@ -1,0 +1,40 @@
+{
+  "baseline_commit": "cf30f8d65e6eeab1b1da7b58b9e23dc0edc5c485",
+  "zig": "0.17.0",
+  "machine": "x86_64",
+  "kernel": "7.2.5-3-omarchy",
+  "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+  "benchmark_affinity": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+  ],
+  "compiler_mode": "fast (LLVM)",
+  "standard_library": "bundled",
+  "protocol": "benchmarks/README.md Measurement Protocol",
+  "compilation_lines": 1000000,
+  "compilation_workers": [
+    0,
+    8
+  ],
+  "runtime_sieve_limit": 88000000,
+  "sampling": "one discarded warm-up, adaptive stopping, default sample caps",
+  "driver_sha256": {
+    "benchmarks/history_benchmark.zig": "9bf62ccf84001be87735d716bc01393d7797996706dffc096b6a66c15b3e1362",
+    "benchmarks/history_workload.zig": "aabcf0c675cd16e090623377e6ae5258ecbafbd8750066c3698e539f9519327c",
+    "benchmarks/history_sampling.zig": "e6fa44ed277958060a5cff8794659c632d6b1b0cd8ef985b5b7272de4866f7e2",
+    "benchmarks/comptime_benchmark.zig": "b4e1ccd8722e57337688e615ad812113467a9d0ffee436acd028128388a58f0f"
+  },
+  "affinity_cores": "eight distinct physical cores on socket 0",
+  "zig_executable": "/home/pippe/.local/share/mise/shims/zig",
+  "baseline_directory": "/tmp/chimera-numeric-baseline",
+  "candidate_directory": "/run/media/pippe/Star/zig/x86",
+  "recorded_utc": "2026-10-31T08:50:36.280206+00:00",
+  "completed_utc": "2026-10-31T09:05:48.771389+00:00",
+  "evaluator_remeasurement": "Initial candidate evaluator samples overlapped an unrelated terminal build and were replaced after it finished; history runs preceded that build."
+}

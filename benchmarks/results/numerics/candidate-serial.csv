@@ -1,0 +1,7 @@
+case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable
+core-1000000,normal,cold,0,30506634647,162356053,2,true
+core-1000000,normal,cold,1,30152951729,162356053,2,true
+core-1000000,normal,leaf-edit,0,272260802,162356053,2,true
+core-1000000,normal,leaf-edit,1,276204696,162356053,2,true
+sieve-88000000,normal,runtime,0,1194788880,24689,2,true
+sieve-88000000,normal,runtime,1,1186154333,24689,2,true

@@ -512,6 +512,73 @@ const LocationPlan = struct {
     }
 };
 
+// Reverse postorder keeps loop bodies together. An empty loop test can follow
+// its body so the conditional backedge replaces a jump to the test. Block
+// identities and all edge arguments remain unchanged.
+fn emissionOrder(ssa: *const structures.FunctionBodyAnalysis, allocator: std.mem.Allocator) ![]structures.FunctionBlockId {
+    const order = try allocator.alloc(structures.FunctionBlockId, ssa.blocks.len);
+    errdefer allocator.free(order);
+    const visited = try allocator.alloc(bool, ssa.blocks.len);
+    defer allocator.free(visited);
+    @memset(visited, false);
+    const Frame = struct { block: structures.FunctionBlockId, successor: usize = 0 };
+    const stack = try allocator.alloc(Frame, ssa.blocks.len);
+    defer allocator.free(stack);
+    var count: usize = 0;
+    for (0..ssa.blocks.len) |root_position| {
+        const root_index = if (root_position == 0) @backingInt(ssa.entry) else root_position - 1 + @intFromBool(root_position - 1 >= @backingInt(ssa.entry));
+        if (visited[root_index]) continue;
+        const start = count;
+        stack[0] = .{ .block = @fromBackingInt(@intCast(root_index)) };
+        visited[root_index] = true;
+        var pending: usize = 1;
+        while (pending != 0) {
+            const frame = &stack[pending - 1];
+            var terminator = ssa.blocks[@backingInt(frame.block)].terminator;
+            const successors = terminator.successors();
+            if (frame.successor < successors.len) {
+                const successor = successors[frame.successor];
+                frame.successor += 1;
+                const target = (successor orelse continue).*;
+                if (visited[@backingInt(target)]) continue;
+                visited[@backingInt(target)] = true;
+                stack[pending] = .{ .block = target };
+                pending += 1;
+            } else {
+                order[count] = frame.block;
+                count += 1;
+                pending -= 1;
+            }
+        }
+        std.mem.reverse(structures.FunctionBlockId, order[start..count]);
+    }
+    std.debug.assert(count == order.len);
+    std.debug.assert(order[0] == ssa.entry);
+    placeLoopTestsAfterBodies(ssa, order);
+    return order;
+}
+
+fn placeLoopTestsAfterBodies(ssa: *const structures.FunctionBodyAnalysis, order: []structures.FunctionBlockId) void {
+    var position: usize = 1;
+    while (position + 1 < order.len) : (position += 1) {
+        const header = order[position];
+        const body = order[position + 1];
+        const block = ssa.blocks[@backingInt(header)];
+        if (block.instruction_start != block.instruction_end) continue;
+        if (block.terminator != .predicate_branch) continue;
+        const predicate = block.terminator.predicate_branch;
+        if (predicate.then_branch.target != body and predicate.else_branch.target != body) continue;
+        var terminator = ssa.blocks[@backingInt(body)].terminator;
+        for (terminator.successors()) |successor| {
+            if (successor == null or successor.?.* != header) continue;
+            order[position] = body;
+            order[position + 1] = header;
+            position += 1;
+            break;
+        }
+    }
+}
+
 fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
     return struct {
         const Self = @This();
@@ -605,9 +672,11 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                     try self.encoder.stream.instructions.append(self.gpa, .{ .parameter = .{ .value = location.register, .offset = self.plan.spills[index] } });
                 }
             }
-            for (0..ssa.blocks.len) |position| {
-                const fallthrough = if (position + 1 < ssa.blocks.len) blockInEmissionOrder(ssa, position + 1) else null;
-                try self.emitBlock(blockInEmissionOrder(ssa, position), fallthrough);
+            const order = try emissionOrder(ssa, self.gpa);
+            defer self.gpa.free(order);
+            for (order, 0..) |block, position| {
+                const fallthrough = if (position + 1 < order.len) order[position + 1] else null;
+                try self.emitBlock(block, fallthrough);
             }
             if (self.numeric_traps.items.len != 0) {
                 // Successful arithmetic falls through. Cold calls retain a
@@ -639,12 +708,6 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             }
         }
 
-        fn blockInEmissionOrder(ssa: *const structures.FunctionBodyAnalysis, position: usize) structures.FunctionBlockId {
-            if (position == 0) return ssa.entry;
-            const index = position - 1;
-            return @fromBackingInt(@intCast(index + @intFromBool(index >= @backingInt(ssa.entry))));
-        }
-
         fn emitBlock(self: *Self, block_id: structures.FunctionBlockId, fallthrough: ?structures.FunctionBlockId) !void {
             const ssa = self.ssa;
             const block_index = @backingInt(block_id);
@@ -663,7 +726,9 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                     if (buffered) try self.encoder.stream.instructions.append(self.gpa, .scratch_dead);
                     continue;
                 }
-                if (ssa.instructions[instruction_index] == .allocation_element and try self.emitElementCopy(instruction_index, block.instruction_end)) {
+                if ((ssa.instructions[instruction_index] == .allocation_element or ssa.instructions[instruction_index] == .array_element) and
+                    try self.emitElementCopy(instruction_index, block.instruction_end))
+                {
                     instruction_index += 1;
                     if (buffered) try self.encoder.stream.instructions.append(self.gpa, .scratch_dead);
                     continue;
@@ -693,7 +758,11 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             if (!reading and copy.destination != value) return false;
             const size = (try self.types.layout(copy.type_id)).byte_size;
             if (size != 1 and size != 4) return false;
-            try self.emitAllocationElementAddress(self.ssa.instructions[index].allocation_element);
+            switch (self.ssa.instructions[index]) {
+                .allocation_element => |element| try self.emitAllocationElementAddress(element),
+                .array_element => |element| try self.emitElementAddress(self.valueLocation(element.array), true, element.index, element.type_id),
+                else => unreachable,
+            }
             if (reading) {
                 try self.encoder.offset(if (size == 1) .movzx_eax_rax else .mov_eax_rax, 0);
                 const destination = self.resultLocation(copy.destination, self.valueLocation(self.ssa.instructionValue(index + 1)));

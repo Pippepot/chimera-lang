@@ -1,0 +1,249 @@
+{
+  "baseline": "Previous implementation with the division-specific traversal and builder",
+  "baseline_snapshot": "e6762290a7ae9902432b00a73688319b73c5f33a88fd2a528f095d2877ed478f",
+  "candidate_snapshot": "1fa7b6c4110c6386dc1a4caba9b11bde0bc858583e7199e40c55867cb968065b",
+  "changed_compiler_files": [
+    "src/optimizer/canonicalize.zig"
+  ],
+  "production_loc": {
+    "baseline": 36458,
+    "candidate": 36435,
+    "delta": -23
+  },
+  "zig": "0.17.0",
+  "runner": {
+    "host": "arch",
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "kernel": "7.2.5-3-omarchy",
+    "architecture": "x86_64",
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      6,
+      7,
+      8,
+      9
+    ]
+  },
+  "measurement_order": [
+    "baseline workers-8 block 0",
+    "candidate serial block 0",
+    "candidate workers-8 block 0",
+    "candidate runtime block 0",
+    "candidate workers-8 block 1",
+    "baseline workers-8 block 1",
+    "baseline serial/runtime block 1",
+    "candidate serial/runtime block 1"
+  ],
+  "comparisons": [
+    {
+      "case": "core-1000000",
+      "lane": "workers-8",
+      "phase": "cold",
+      "measurement_block": 0,
+      "baseline": {
+        "median_ns": 7545722029.5,
+        "minimum_ns": 7492651468,
+        "maximum_ns": 7598792591,
+        "samples": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "median_ns": 7604213156.0,
+        "minimum_ns": 7543202854,
+        "maximum_ns": 7665223458,
+        "samples": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "median_change_percent": 0.7751561251703842
+    },
+    {
+      "case": "core-1000000",
+      "lane": "workers-8",
+      "phase": "leaf-edit",
+      "measurement_block": 0,
+      "baseline": {
+        "median_ns": 303807241,
+        "minimum_ns": 288207499,
+        "maximum_ns": 353570759,
+        "samples": 3,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "median_ns": 307824375,
+        "minimum_ns": 291042191,
+        "maximum_ns": 323352557,
+        "samples": 3,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "median_change_percent": 1.3222640733569602
+    },
+    {
+      "case": "core-1000000",
+      "lane": "workers-8",
+      "phase": "cold",
+      "measurement_block": 1,
+      "baseline": {
+        "median_ns": 7536431904,
+        "minimum_ns": 7386436037,
+        "maximum_ns": 7558422082,
+        "samples": 3,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "median_ns": 7469208579.5,
+        "minimum_ns": 7446668923,
+        "maximum_ns": 7491748236,
+        "samples": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "median_change_percent": -0.8919781317777264
+    },
+    {
+      "case": "core-1000000",
+      "lane": "workers-8",
+      "phase": "leaf-edit",
+      "measurement_block": 1,
+      "baseline": {
+        "median_ns": 304531867.5,
+        "minimum_ns": 302453554,
+        "maximum_ns": 306610181,
+        "samples": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "median_ns": 291653398,
+        "minimum_ns": 285240843,
+        "maximum_ns": 294580090,
+        "samples": 3,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "median_change_percent": -4.228939849784363
+    },
+    {
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "cold",
+      "measurement_block": 1,
+      "baseline": {
+        "median_ns": 27120316061,
+        "minimum_ns": 26971202012,
+        "maximum_ns": 28085067540,
+        "samples": 3,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "median_ns": 27621538603.0,
+        "minimum_ns": 27549419128,
+        "maximum_ns": 27693658078,
+        "samples": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "median_change_percent": 1.8481441767589812
+    },
+    {
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "leaf-edit",
+      "measurement_block": 1,
+      "baseline": {
+        "median_ns": 236453991.0,
+        "minimum_ns": 234505083,
+        "maximum_ns": 238402899,
+        "samples": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "median_ns": 234596369.5,
+        "minimum_ns": 232820181,
+        "maximum_ns": 236372558,
+        "samples": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "median_change_percent": -0.7856164711552704
+    },
+    {
+      "case": "sieve-88000000",
+      "lane": "normal",
+      "phase": "runtime",
+      "measurement_block": 1,
+      "baseline": {
+        "median_ns": 1029934302.5,
+        "minimum_ns": 1028986390,
+        "maximum_ns": 1030882215,
+        "samples": 2,
+        "stable": true,
+        "executable_bytes": [
+          18524
+        ]
+      },
+      "candidate": {
+        "median_ns": 1027002716.0,
+        "minimum_ns": 1022675575,
+        "maximum_ns": 1031329857,
+        "samples": 2,
+        "stable": true,
+        "executable_bytes": [
+          18524
+        ]
+      },
+      "median_change_percent": -0.2846382039013551
+    }
+  ],
+  "investigation": [
+    "The initial shared-emitter version showed a possible parallel-compilation regression against an earlier baseline. Initial records are retained separately.",
+    "The final version retains the Boolean ordinary-arithmetic simplifier; fallible division expansion has its own dispatch arm.",
+    "Fresh alternating worker runs did not reproduce the initial slowdown."
+  ],
+  "limitations": [
+    "Capped unstable samples remain marked unstable; observed median changes are not causal estimates.",
+    "The existing sieve measures broad runtime regressions, not division-heavy kernels."
+  ],
+  "verification": {
+    "passed": [
+      "zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/optimizer_test.zig -j1",
+      "zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/operation_test.zig -j1",
+      "zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/codegen_test.zig -j1",
+      "zig fmt --check src/optimizer/canonicalize.zig tests/optimizer_test.zig",
+      "git diff --check"
+    ]
+  }
+}

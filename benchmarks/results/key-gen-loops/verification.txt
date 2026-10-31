@@ -1,0 +1,16 @@
+zig build test --seed=0 -Doptimize=safe -j1 --summary all
+54/54 steps succeeded; 2261 tests passed; 24 skipped.
+
+zig build --seed=0 -Doptimize=fast -j1 --summary all
+5/5 steps succeeded; installed zig-out/bin/chimera.
+
+zig fmt --check src/backend/codegen.zig src/backend/registers.zig tests/codegen_test.zig
+Passed.
+
+git diff --check
+Passed.
+
+Key-search validation: reference prefixes 3 through 7, invalid input probes,
+complete index-10 output for before/after/C. All passed.
+Sieve validation: limits 2, 3, 10, 97, and 88000000. All passed.
+Fast compiler's generated key-search executable matches the tested preview byte for byte.

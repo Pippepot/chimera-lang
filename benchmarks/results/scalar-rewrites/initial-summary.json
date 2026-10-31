@@ -1,0 +1,172 @@
+{
+  "baseline": "Previous shift implementation, before shared scalar rewriting",
+  "baseline_snapshot": "9ffb26303e09a127239fa5ed67a494387d70e24a539c5a67cc2f7071ee309ddb",
+  "candidate_snapshot": "905c0138696917440dfbfef7e3f985e39d2805c1034876b0fa0ede6739008a75",
+  "zig": "0.17.0",
+  "runner": {
+    "host": "arch",
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "kernel": "7.2.5-3-omarchy",
+    "architecture": "x86_64",
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      6,
+      7,
+      8,
+      9
+    ]
+  },
+  "production_loc": {
+    "baseline": 36458,
+    "candidate": 36432,
+    "delta": -26
+  },
+  "measurements": [
+    {
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "cold",
+      "baseline": {
+        "median_ns": 28393116381,
+        "minimum_ns": 27080803293,
+        "maximum_ns": 28532988793,
+        "sample_count": 3,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "median_ns": 27928915883.5,
+        "minimum_ns": 27836938212,
+        "maximum_ns": 28020893555,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "median_change_percent": -1.6349050638577722
+    },
+    {
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "leaf-edit",
+      "baseline": {
+        "median_ns": 202328154,
+        "minimum_ns": 195980212,
+        "maximum_ns": 202857059,
+        "sample_count": 3,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "median_ns": 203536735.0,
+        "minimum_ns": 202659749,
+        "maximum_ns": 204413721,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "median_change_percent": 0.5973370369404929
+    },
+    {
+      "case": "core-1000000",
+      "lane": "workers-8",
+      "phase": "cold",
+      "baseline": {
+        "median_ns": 7054473841.0,
+        "minimum_ns": 7035414138,
+        "maximum_ns": 7073533544,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "median_ns": 7399000323.5,
+        "minimum_ns": 7390106626,
+        "maximum_ns": 7407894021,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "median_change_percent": 4.8838012623654725
+    },
+    {
+      "case": "core-1000000",
+      "lane": "workers-8",
+      "phase": "leaf-edit",
+      "baseline": {
+        "median_ns": 255157407,
+        "minimum_ns": 251055963,
+        "maximum_ns": 257951028,
+        "sample_count": 3,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "median_ns": 245808826,
+        "minimum_ns": 245772107,
+        "maximum_ns": 276286915,
+        "sample_count": 3,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "median_change_percent": -3.6638485670141607
+    },
+    {
+      "case": "sieve-88000000",
+      "lane": "normal",
+      "phase": "runtime",
+      "baseline": {
+        "median_ns": 1056950336.0,
+        "minimum_ns": 1051541317,
+        "maximum_ns": 1062359355,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          18524
+        ]
+      },
+      "candidate": {
+        "median_ns": 1055416528.5,
+        "minimum_ns": 1052590624,
+        "maximum_ns": 1058242433,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          18524
+        ]
+      },
+      "median_change_percent": -0.14511632644961248
+    }
+  ],
+  "verification": {
+    "passed": [
+      "zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/optimizer_test.zig -j1",
+      "zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/operation_test.zig -j1",
+      "zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/codegen_test.zig -j1",
+      "zig fmt --check src/optimizer/canonicalize.zig tests/optimizer_test.zig",
+      "git diff --check"
+    ]
+  },
+  "limitations": [
+    "Capped unstable samples remain marked unstable; observed median changes are not causal estimates.",
+    "The runtime workload is the existing sieve, not a division-heavy kernel."
+  ]
+}

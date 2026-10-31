@@ -1,0 +1,1130 @@
+{
+  "history": {
+    "core-1000000 / normal / cold": {
+      "baseline": {
+        "samples_ns": [
+          26956925542,
+          26788230292
+        ],
+        "median_ns": 26872577917.0,
+        "min_ns": 26788230292,
+        "max_ns": 26956925542,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "samples_ns": [
+          30506634647,
+          30152951729
+        ],
+        "median_ns": 30329793188.0,
+        "min_ns": 30152951729,
+        "max_ns": 30506634647,
+        "stable": true,
+        "executable_bytes": [
+          162356053
+        ]
+      },
+      "change_percent": 12.865216287317605
+    },
+    "core-1000000 / normal / leaf-edit": {
+      "baseline": {
+        "samples_ns": [
+          212272102,
+          242842708,
+          242683973
+        ],
+        "median_ns": 242683973,
+        "min_ns": 212272102,
+        "max_ns": 242842708,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "samples_ns": [
+          272260802,
+          276204696
+        ],
+        "median_ns": 274232749.0,
+        "min_ns": 272260802,
+        "max_ns": 276204696,
+        "stable": true,
+        "executable_bytes": [
+          162356053
+        ]
+      },
+      "change_percent": 12.999942109897788
+    },
+    "sieve-88000000 / normal / runtime": {
+      "baseline": {
+        "samples_ns": [
+          990111685,
+          1019189422,
+          1002240171,
+          987316911,
+          992277506
+        ],
+        "median_ns": 992277506,
+        "min_ns": 987316911,
+        "max_ns": 1019189422,
+        "stable": false,
+        "executable_bytes": [
+          18524
+        ]
+      },
+      "candidate": {
+        "samples_ns": [
+          1194788880,
+          1186154333
+        ],
+        "median_ns": 1190471606.5,
+        "min_ns": 1186154333,
+        "max_ns": 1194788880,
+        "stable": true,
+        "executable_bytes": [
+          24689
+        ]
+      },
+      "change_percent": 19.973656492420776
+    },
+    "core-1000000 / workers-8 / cold": {
+      "baseline": {
+        "samples_ns": [
+          7122919380,
+          7298609839,
+          7221076014
+        ],
+        "median_ns": 7221076014,
+        "min_ns": 7122919380,
+        "max_ns": 7298609839,
+        "stable": false,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "samples_ns": [
+          7676943231,
+          7772306799
+        ],
+        "median_ns": 7724625015.0,
+        "min_ns": 7676943231,
+        "max_ns": 7772306799,
+        "stable": true,
+        "executable_bytes": [
+          162356053
+        ]
+      },
+      "change_percent": 6.973323643508733
+    },
+    "core-1000000 / workers-8 / leaf-edit": {
+      "baseline": {
+        "samples_ns": [
+          297441870,
+          292056025
+        ],
+        "median_ns": 294748947.5,
+        "min_ns": 292056025,
+        "max_ns": 297441870,
+        "stable": true,
+        "executable_bytes": [
+          118104377
+        ]
+      },
+      "candidate": {
+        "samples_ns": [
+          335379604,
+          347631706,
+          314514445
+        ],
+        "median_ns": 335379604,
+        "min_ns": 314514445,
+        "max_ns": 347631706,
+        "stable": false,
+        "executable_bytes": [
+          162356053
+        ]
+      },
+      "change_percent": 13.784835143474083
+    }
+  },
+  "comptime": {
+    "constant / analyze": {
+      "baseline": {
+        "samples_ns": [
+          81992,
+          97090,
+          76833,
+          79407,
+          92021
+        ],
+        "median_ns": 81992,
+        "min_ns": 76833,
+        "max_ns": 97090
+      },
+      "candidate": {
+        "samples_ns": [
+          90007,
+          80770,
+          94245,
+          99384,
+          110025
+        ],
+        "median_ns": 94245,
+        "min_ns": 80770,
+        "max_ns": 110025
+      },
+      "change_percent": 14.944140891794323
+    },
+    "constant / execute": {
+      "baseline": {
+        "samples_ns": [
+          6492,
+          8025,
+          6061,
+          5259,
+          7524
+        ],
+        "median_ns": 6492,
+        "min_ns": 5259,
+        "max_ns": 8025
+      },
+      "candidate": {
+        "samples_ns": [
+          4288,
+          3176,
+          6442,
+          6071,
+          6081
+        ],
+        "median_ns": 6071,
+        "min_ns": 3176,
+        "max_ns": 6442
+      },
+      "change_percent": -6.484904497843502
+    },
+    "constant / publish": {
+      "baseline": {
+        "samples_ns": [
+          2805,
+          3707,
+          2725,
+          2103,
+          2785
+        ],
+        "median_ns": 2785,
+        "min_ns": 2103,
+        "max_ns": 3707
+      },
+      "candidate": {
+        "samples_ns": [
+          1723,
+          1503,
+          3236,
+          2765,
+          2806
+        ],
+        "median_ns": 2765,
+        "min_ns": 1503,
+        "max_ns": 3236
+      },
+      "change_percent": -0.7181328545781018
+    },
+    "constant / cached-1000": {
+      "baseline": {
+        "samples_ns": [
+          16651,
+          20719,
+          16551,
+          16661,
+          16872
+        ],
+        "median_ns": 16661,
+        "min_ns": 16551,
+        "max_ns": 20719
+      },
+      "candidate": {
+        "samples_ns": [
+          16671,
+          16651,
+          17562,
+          16661,
+          15859
+        ],
+        "median_ns": 16661,
+        "min_ns": 15859,
+        "max_ns": 17562
+      },
+      "change_percent": 0.0
+    },
+    "short-expression / analyze": {
+      "baseline": {
+        "samples_ns": [
+          100807,
+          95458,
+          90829,
+          95278,
+          94586
+        ],
+        "median_ns": 95278,
+        "min_ns": 90829,
+        "max_ns": 100807
+      },
+      "candidate": {
+        "samples_ns": [
+          106107,
+          98503,
+          105195,
+          108832,
+          100316
+        ],
+        "median_ns": 105195,
+        "min_ns": 98503,
+        "max_ns": 108832
+      },
+      "change_percent": 10.408488843174712
+    },
+    "short-expression / execute": {
+      "baseline": {
+        "samples_ns": [
+          7104,
+          4478,
+          2906,
+          3005,
+          3226
+        ],
+        "median_ns": 3226,
+        "min_ns": 2906,
+        "max_ns": 7104
+      },
+      "candidate": {
+        "samples_ns": [
+          4679,
+          5370,
+          4558,
+          4679,
+          5040
+        ],
+        "median_ns": 4679,
+        "min_ns": 4558,
+        "max_ns": 5370
+      },
+      "change_percent": 45.04029758214507
+    },
+    "short-expression / publish": {
+      "baseline": {
+        "samples_ns": [
+          2504,
+          2545,
+          2304,
+          2475,
+          2545
+        ],
+        "median_ns": 2504,
+        "min_ns": 2304,
+        "max_ns": 2545
+      },
+      "candidate": {
+        "samples_ns": [
+          2475,
+          2895,
+          2565,
+          2535,
+          2555
+        ],
+        "median_ns": 2555,
+        "min_ns": 2475,
+        "max_ns": 2895
+      },
+      "change_percent": 2.0367412140575025
+    },
+    "short-expression / cached-1000": {
+      "baseline": {
+        "samples_ns": [
+          16531,
+          16561,
+          19116,
+          16551,
+          16861
+        ],
+        "median_ns": 16561,
+        "min_ns": 16531,
+        "max_ns": 19116
+      },
+      "candidate": {
+        "samples_ns": [
+          17272,
+          17312,
+          17362,
+          17422,
+          15248
+        ],
+        "median_ns": 17312,
+        "min_ns": 15248,
+        "max_ns": 17422
+      },
+      "change_percent": 4.53475031700985
+    },
+    "loop-10000 / analyze": {
+      "baseline": {
+        "samples_ns": [
+          119442,
+          134160,
+          115485,
+          117568,
+          179985
+        ],
+        "median_ns": 119442,
+        "min_ns": 115485,
+        "max_ns": 179985
+      },
+      "candidate": {
+        "samples_ns": [
+          128558,
+          121656,
+          147564,
+          139199,
+          142154
+        ],
+        "median_ns": 139199,
+        "min_ns": 121656,
+        "max_ns": 147564
+      },
+      "change_percent": 16.54108270122738
+    },
+    "loop-10000 / execute": {
+      "baseline": {
+        "samples_ns": [
+          4258159,
+          3836194,
+          3792954,
+          4018824,
+          3786141
+        ],
+        "median_ns": 3836194,
+        "min_ns": 3786141,
+        "max_ns": 4258159
+      },
+      "candidate": {
+        "samples_ns": [
+          3973547,
+          3892707,
+          3850860,
+          3767195,
+          3753709
+        ],
+        "median_ns": 3850860,
+        "min_ns": 3753709,
+        "max_ns": 3973547
+      },
+      "change_percent": 0.38230600433659667
+    },
+    "loop-10000 / publish": {
+      "baseline": {
+        "samples_ns": [
+          10309,
+          3867,
+          8946,
+          3276,
+          5390
+        ],
+        "median_ns": 5390,
+        "min_ns": 3276,
+        "max_ns": 10309
+      },
+      "candidate": {
+        "samples_ns": [
+          5420,
+          6402,
+          2956,
+          2985,
+          2866
+        ],
+        "median_ns": 2985,
+        "min_ns": 2866,
+        "max_ns": 6402
+      },
+      "change_percent": -44.61966604823747
+    },
+    "loop-10000 / cached-1000": {
+      "baseline": {
+        "samples_ns": [
+          16982,
+          17352,
+          16490,
+          16631,
+          16881
+        ],
+        "median_ns": 16881,
+        "min_ns": 16490,
+        "max_ns": 17352
+      },
+      "candidate": {
+        "samples_ns": [
+          16661,
+          19707,
+          16881,
+          16641,
+          15128
+        ],
+        "median_ns": 16661,
+        "min_ns": 15128,
+        "max_ns": 19707
+      },
+      "change_percent": -1.3032403293643746
+    },
+    "fibonacci-20 / analyze": {
+      "baseline": {
+        "samples_ns": [
+          55393,
+          22451,
+          45885,
+          26419,
+          24195
+        ],
+        "median_ns": 26419,
+        "min_ns": 22451,
+        "max_ns": 55393
+      },
+      "candidate": {
+        "samples_ns": [
+          61705,
+          25187,
+          30336,
+          24184,
+          24005
+        ],
+        "median_ns": 25187,
+        "min_ns": 24005,
+        "max_ns": 61705
+      },
+      "change_percent": -4.663310496233775
+    },
+    "fibonacci-20 / execute": {
+      "baseline": {
+        "samples_ns": [
+          159016,
+          137215,
+          159707,
+          130813,
+          136274
+        ],
+        "median_ns": 137215,
+        "min_ns": 130813,
+        "max_ns": 159707
+      },
+      "candidate": {
+        "samples_ns": [
+          198558,
+          148385,
+          145390,
+          137345,
+          138928
+        ],
+        "median_ns": 145390,
+        "min_ns": 137345,
+        "max_ns": 198558
+      },
+      "change_percent": 5.957803447144983
+    },
+    "fibonacci-20 / publish": {
+      "baseline": {
+        "samples_ns": [
+          1202,
+          1202,
+          1243,
+          1102,
+          1132
+        ],
+        "median_ns": 1202,
+        "min_ns": 1102,
+        "max_ns": 1243
+      },
+      "candidate": {
+        "samples_ns": [
+          2004,
+          1142,
+          1182,
+          1082,
+          1293
+        ],
+        "median_ns": 1182,
+        "min_ns": 1082,
+        "max_ns": 2004
+      },
+      "change_percent": -1.6638935108153063
+    },
+    "fibonacci-20 / cached-1000": {
+      "baseline": {
+        "samples_ns": [
+          16190,
+          16651,
+          16110,
+          16170,
+          16411
+        ],
+        "median_ns": 16190,
+        "min_ns": 16110,
+        "max_ns": 16651
+      },
+      "candidate": {
+        "samples_ns": [
+          16762,
+          16761,
+          17352,
+          16190,
+          18134
+        ],
+        "median_ns": 16762,
+        "min_ns": 16190,
+        "max_ns": 18134
+      },
+      "change_percent": 3.5330450895614485
+    },
+    "unique-recursion-200 / analyze": {
+      "baseline": {
+        "samples_ns": [
+          22051,
+          18074,
+          18685,
+          17833,
+          22772
+        ],
+        "median_ns": 18685,
+        "min_ns": 17833,
+        "max_ns": 22772
+      },
+      "candidate": {
+        "samples_ns": [
+          24095,
+          24015,
+          22672,
+          19697,
+          20148
+        ],
+        "median_ns": 22672,
+        "min_ns": 19697,
+        "max_ns": 24095
+      },
+      "change_percent": 21.33797163500133
+    },
+    "unique-recursion-200 / execute": {
+      "baseline": {
+        "samples_ns": [
+          1325786,
+          1398170,
+          1329092,
+          1627347,
+          1485884
+        ],
+        "median_ns": 1398170,
+        "min_ns": 1325786,
+        "max_ns": 1627347
+      },
+      "candidate": {
+        "samples_ns": [
+          1469860,
+          1358012,
+          1416941,
+          1441626,
+          1377557
+        ],
+        "median_ns": 1416941,
+        "min_ns": 1358012,
+        "max_ns": 1469860
+      },
+      "change_percent": 1.342540606650111
+    },
+    "unique-recursion-200 / publish": {
+      "baseline": {
+        "samples_ns": [
+          1372,
+          1422,
+          1403,
+          1363,
+          2996
+        ],
+        "median_ns": 1403,
+        "min_ns": 1363,
+        "max_ns": 2996
+      },
+      "candidate": {
+        "samples_ns": [
+          2244,
+          1292,
+          1273,
+          1302,
+          1282
+        ],
+        "median_ns": 1292,
+        "min_ns": 1273,
+        "max_ns": 2244
+      },
+      "change_percent": -7.911617961511053
+    },
+    "unique-recursion-200 / cached-1000": {
+      "baseline": {
+        "samples_ns": [
+          16210,
+          16852,
+          16110,
+          13725,
+          16410
+        ],
+        "median_ns": 16210,
+        "min_ns": 13725,
+        "max_ns": 16852
+      },
+      "candidate": {
+        "samples_ns": [
+          16200,
+          16190,
+          17081,
+          16751,
+          15279
+        ],
+        "median_ns": 16200,
+        "min_ns": 15279,
+        "max_ns": 17081
+      },
+      "change_percent": -0.061690314620599374
+    },
+    "memoized-call / analyze": {
+      "baseline": {
+        "samples_ns": [
+          38762,
+          36287,
+          35396,
+          34925,
+          45855
+        ],
+        "median_ns": 36287,
+        "min_ns": 34925,
+        "max_ns": 45855
+      },
+      "candidate": {
+        "samples_ns": [
+          47478,
+          48089,
+          45654,
+          42138,
+          42669
+        ],
+        "median_ns": 45654,
+        "min_ns": 42138,
+        "max_ns": 48089
+      },
+      "change_percent": 25.81365227216359
+    },
+    "memoized-call / execute": {
+      "baseline": {
+        "samples_ns": [
+          15348,
+          16291,
+          19547,
+          16220,
+          20628
+        ],
+        "median_ns": 16291,
+        "min_ns": 15348,
+        "max_ns": 20628
+      },
+      "candidate": {
+        "samples_ns": [
+          16290,
+          14868,
+          14757,
+          14948,
+          14998
+        ],
+        "median_ns": 14948,
+        "min_ns": 14757,
+        "max_ns": 16290
+      },
+      "change_percent": -8.24381560370757
+    },
+    "memoized-call / publish": {
+      "baseline": {
+        "samples_ns": [
+          1092,
+          1062,
+          1062,
+          1052,
+          1042
+        ],
+        "median_ns": 1062,
+        "min_ns": 1042,
+        "max_ns": 1092
+      },
+      "candidate": {
+        "samples_ns": [
+          2415,
+          2364,
+          2294,
+          2365,
+          2335
+        ],
+        "median_ns": 2364,
+        "min_ns": 2294,
+        "max_ns": 2415
+      },
+      "change_percent": 122.59887005649719
+    },
+    "memoized-call / cached-1000": {
+      "baseline": {
+        "samples_ns": [
+          16180,
+          16631,
+          16100,
+          16281,
+          16300
+        ],
+        "median_ns": 16281,
+        "min_ns": 16100,
+        "max_ns": 16631
+      },
+      "candidate": {
+        "samples_ns": [
+          16751,
+          16180,
+          13946,
+          16721,
+          15268
+        ],
+        "median_ns": 16180,
+        "min_ns": 13946,
+        "max_ns": 16751
+      },
+      "change_percent": -0.6203550150482129
+    },
+    "aggregate-call / analyze": {
+      "baseline": {
+        "samples_ns": [
+          195734,
+          214208,
+          197728,
+          195623,
+          205913
+        ],
+        "median_ns": 197728,
+        "min_ns": 195623,
+        "max_ns": 214208
+      },
+      "candidate": {
+        "samples_ns": [
+          252549,
+          208256,
+          201023,
+          195192,
+          200622
+        ],
+        "median_ns": 201023,
+        "min_ns": 195192,
+        "max_ns": 252549
+      },
+      "change_percent": 1.6664306522091055
+    },
+    "aggregate-call / execute": {
+      "baseline": {
+        "samples_ns": [
+          42950,
+          40395,
+          38311,
+          42869,
+          40305
+        ],
+        "median_ns": 40395,
+        "min_ns": 38311,
+        "max_ns": 42950
+      },
+      "candidate": {
+        "samples_ns": [
+          68237,
+          59280,
+          60082,
+          58068,
+          60412
+        ],
+        "median_ns": 60082,
+        "min_ns": 58068,
+        "max_ns": 68237
+      },
+      "change_percent": 48.73622973140239
+    },
+    "aggregate-call / publish": {
+      "baseline": {
+        "samples_ns": [
+          1002,
+          1032,
+          1032,
+          991,
+          1022
+        ],
+        "median_ns": 1022,
+        "min_ns": 991,
+        "max_ns": 1032
+      },
+      "candidate": {
+        "samples_ns": [
+          1172,
+          1122,
+          1132,
+          1072,
+          1082
+        ],
+        "median_ns": 1122,
+        "min_ns": 1072,
+        "max_ns": 1172
+      },
+      "change_percent": 9.784735812133082
+    },
+    "aggregate-call / cached-1000": {
+      "baseline": {
+        "samples_ns": [
+          18044,
+          18534,
+          17924,
+          18033,
+          24235
+        ],
+        "median_ns": 18044,
+        "min_ns": 17924,
+        "max_ns": 24235
+      },
+      "candidate": {
+        "samples_ns": [
+          18655,
+          18665,
+          26870,
+          18525,
+          22111
+        ],
+        "median_ns": 18665,
+        "min_ns": 18525,
+        "max_ns": 26870
+      },
+      "change_percent": 3.441587231212595
+    },
+    "type-specialization / analyze": {
+      "baseline": {
+        "samples_ns": [
+          44573,
+          39563,
+          41016,
+          43771,
+          40044
+        ],
+        "median_ns": 41016,
+        "min_ns": 39563,
+        "max_ns": 44573
+      },
+      "candidate": {
+        "samples_ns": [
+          46466,
+          44904,
+          44713,
+          41788,
+          40796
+        ],
+        "median_ns": 44713,
+        "min_ns": 40796,
+        "max_ns": 46466
+      },
+      "change_percent": 9.013555685586105
+    },
+    "type-specialization / execute": {
+      "baseline": {
+        "samples_ns": [
+          7714,
+          7584,
+          7755,
+          7493,
+          7734
+        ],
+        "median_ns": 7714,
+        "min_ns": 7493,
+        "max_ns": 7755
+      },
+      "candidate": {
+        "samples_ns": [
+          7775,
+          7514,
+          7774,
+          7574,
+          7514
+        ],
+        "median_ns": 7574,
+        "min_ns": 7514,
+        "max_ns": 7775
+      },
+      "change_percent": -1.814882032667875
+    },
+    "type-specialization / publish": {
+      "baseline": {
+        "samples_ns": [
+          1012,
+          972,
+          1052,
+          981,
+          952
+        ],
+        "median_ns": 981,
+        "min_ns": 952,
+        "max_ns": 1052
+      },
+      "candidate": {
+        "samples_ns": [
+          931,
+          912,
+          941,
+          962,
+          931
+        ],
+        "median_ns": 931,
+        "min_ns": 912,
+        "max_ns": 962
+      },
+      "change_percent": -5.096839959225285
+    },
+    "type-specialization / cached-1000": {
+      "baseline": {
+        "samples_ns": [
+          16550,
+          16541,
+          16571,
+          16651,
+          16871
+        ],
+        "median_ns": 16571,
+        "min_ns": 16541,
+        "max_ns": 16871
+      },
+      "candidate": {
+        "samples_ns": [
+          16691,
+          16661,
+          17583,
+          17152,
+          14477
+        ],
+        "median_ns": 16691,
+        "min_ns": 14477,
+        "max_ns": 17583
+      },
+      "change_percent": 0.7241566592239401
+    },
+    "incremental / no-op-edit": {
+      "baseline": {
+        "samples_ns": [
+          201,
+          210,
+          180,
+          200,
+          191
+        ],
+        "median_ns": 200,
+        "min_ns": 180,
+        "max_ns": 210
+      },
+      "candidate": {
+        "samples_ns": [
+          240,
+          211,
+          250,
+          271,
+          250
+        ],
+        "median_ns": 250,
+        "min_ns": 211,
+        "max_ns": 271
+      },
+      "change_percent": 25.0
+    },
+    "incremental / unrelated-edit": {
+      "baseline": {
+        "samples_ns": [
+          28794,
+          28353,
+          28583,
+          35226,
+          28643
+        ],
+        "median_ns": 28643,
+        "min_ns": 28353,
+        "max_ns": 35226
+      },
+      "candidate": {
+        "samples_ns": [
+          38352,
+          35115,
+          36989,
+          36678,
+          37289
+        ],
+        "median_ns": 36989,
+        "min_ns": 35115,
+        "max_ns": 38352
+      },
+      "change_percent": 29.138009286736732
+    },
+    "incremental / callee-edit": {
+      "baseline": {
+        "samples_ns": [
+          23473,
+          23254,
+          27200,
+          23814,
+          23244
+        ],
+        "median_ns": 23473,
+        "min_ns": 23244,
+        "max_ns": 27200
+      },
+      "candidate": {
+        "samples_ns": [
+          22952,
+          22502,
+          23354,
+          30146,
+          23614
+        ],
+        "median_ns": 23354,
+        "min_ns": 22502,
+        "max_ns": 30146
+      },
+      "change_percent": -0.5069654496655751
+    },
+    "incremental / argument-edit": {
+      "baseline": {
+        "samples_ns": [
+          17783,
+          17753,
+          17774,
+          17683,
+          17953
+        ],
+        "median_ns": 17774,
+        "min_ns": 17683,
+        "max_ns": 17953
+      },
+      "candidate": {
+        "samples_ns": [
+          20257,
+          20198,
+          20768,
+          21210,
+          21290
+        ],
+        "median_ns": 20768,
+        "min_ns": 20198,
+        "max_ns": 21290
+      },
+      "change_percent": 16.84482952627433
+    }
+  },
+  "candidate_source_sha256": "6ff92fcbcc2d215af146df741b2652269593864521ed1a546a3d5d00d6176594"
+}

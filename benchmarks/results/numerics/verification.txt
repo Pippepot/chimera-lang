@@ -1,0 +1,12 @@
+Final implementation verification (Zig 0.17.0)
+
+zig build test --seed=0 -Doptimize=safe --summary all -j1
+54/54 build steps succeeded; 2237 tests passed, 24 skipped.
+Full output: safe-tests.txt
+
+zig build test --seed=0 -Doptimize=fast -Dtest-source=tests/numeric_test.zig --summary all -j1
+6/6 build steps succeeded; 15/15 tests passed.
+Full output: fast-tests.txt
+
+zig fmt --check (all changed Zig files and new numeric sources): passed.
+git diff --check: passed.

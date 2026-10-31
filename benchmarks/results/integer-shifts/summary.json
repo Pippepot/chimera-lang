@@ -1,0 +1,136 @@
+{
+  "baseline_commit": "689bdaa1337fadc2ab9a3d14a57d98386a7872f4",
+  "baseline_snapshot": "8d49a375f62561e1310546a467b7d21071cd8116",
+  "candidate_snapshot": "9ffb26303e09a127239fa5ed67a494387d70e24a539c5a67cc2f7071ee309ddb",
+  "zig": "0.17.0",
+  "runner": {
+    "host": "arch",
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+    "kernel": "7.2.5-3-omarchy",
+    "architecture": "x86_64",
+    "affinity": [
+      0,
+      1,
+      2,
+      3,
+      6,
+      7,
+      8,
+      9
+    ]
+  },
+  "standard_library": "bundled",
+  "measurements": [
+    {
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "cold",
+      "baseline": {
+        "median_ns": 27777588750.0,
+        "minimum_ns": 27754399610,
+        "maximum_ns": 27800777890,
+        "samples": 2,
+        "stable": true
+      },
+      "candidate": {
+        "median_ns": 28393116381,
+        "minimum_ns": 27080803293,
+        "maximum_ns": 28532988793,
+        "samples": 3,
+        "stable": false
+      },
+      "median_change_percent": 2.2159145508985123
+    },
+    {
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "leaf-edit",
+      "baseline": {
+        "median_ns": 253838646,
+        "minimum_ns": 233272931,
+        "maximum_ns": 265657338,
+        "samples": 3,
+        "stable": false
+      },
+      "candidate": {
+        "median_ns": 202328154,
+        "minimum_ns": 195980212,
+        "maximum_ns": 202857059,
+        "samples": 3,
+        "stable": false
+      },
+      "median_change_percent": -20.292612181677015
+    },
+    {
+      "case": "core-1000000",
+      "lane": "workers-8",
+      "phase": "cold",
+      "baseline": {
+        "median_ns": 7488773724.5,
+        "minimum_ns": 7481057961,
+        "maximum_ns": 7496489488,
+        "samples": 2,
+        "stable": true
+      },
+      "candidate": {
+        "median_ns": 7054473841.0,
+        "minimum_ns": 7035414138,
+        "maximum_ns": 7073533544,
+        "samples": 2,
+        "stable": true
+      },
+      "median_change_percent": -5.799345787136822
+    },
+    {
+      "case": "core-1000000",
+      "lane": "workers-8",
+      "phase": "leaf-edit",
+      "baseline": {
+        "median_ns": 299255713,
+        "minimum_ns": 287651805,
+        "maximum_ns": 323735871,
+        "samples": 3,
+        "stable": false
+      },
+      "candidate": {
+        "median_ns": 255157407,
+        "minimum_ns": 251055963,
+        "maximum_ns": 257951028,
+        "samples": 3,
+        "stable": false
+      },
+      "median_change_percent": -14.73599469761836
+    },
+    {
+      "case": "sieve-88000000",
+      "lane": "normal",
+      "phase": "runtime",
+      "baseline": {
+        "median_ns": 1071496134,
+        "minimum_ns": 1062324517,
+        "maximum_ns": 1098417106,
+        "samples": 5,
+        "stable": false
+      },
+      "candidate": {
+        "median_ns": 1056950336.0,
+        "minimum_ns": 1051541317,
+        "maximum_ns": 1062359355,
+        "samples": 2,
+        "stable": true
+      },
+      "median_change_percent": -1.3575222101547935
+    }
+  ],
+  "limitations": [
+    "Capped unstable samples remain marked unstable; medians do not establish causal changes or zero compilation overhead.",
+    "These are broad regression workloads, not a benchmark of division-heavy kernels.",
+    "An earlier candidate run overlapped an independent benchmark and was excluded; its raw record is retained under /tmp/chimera-shift-measurements/overlapping/."
+  ],
+  "verification": {
+    "routine_suite": "zig build test --seed=0 -Doptimize=safe -j1",
+    "result": "passed; 2220 tests passed and 24 skipped across the full run and corrected operator-suite rerun",
+    "formatting": "zig fmt --check passed",
+    "whitespace": "git diff --check passed"
+  }
+}

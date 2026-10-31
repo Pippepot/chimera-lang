@@ -1,0 +1,17 @@
+python3 -m unittest discover -s benchmarks -p history_test.py -v
+47 tests passed.
+
+taskset -c 4 zig build history-benchmark --seed=0 -Doptimize=fast -j1 -- --case=sieve-88000000
+Build and runtime validation passed. Qualification: two stable samples per lane.
+
+python3 benchmarks/key-gen-face-five/run.py --check-only --last 7 --cpu 4
+Chimera, Clang -O0, Clang -O3: correctness checks passed.
+
+python3 benchmarks/history.py --render-only
+Reports regenerated successfully from existing records.
+
+zig fmt --check benchmarks/history_benchmark.zig
+Passed.
+
+git diff --check
+Passed.

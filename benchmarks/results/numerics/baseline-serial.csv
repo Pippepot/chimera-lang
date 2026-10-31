@@ -1,0 +1,11 @@
+case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable
+core-1000000,normal,cold,0,26956925542,118104377,2,true
+core-1000000,normal,cold,1,26788230292,118104377,2,true
+core-1000000,normal,leaf-edit,0,212272102,118104377,3,false
+core-1000000,normal,leaf-edit,1,242842708,118104377,3,false
+core-1000000,normal,leaf-edit,2,242683973,118104377,3,false
+sieve-88000000,normal,runtime,0,990111685,18524,5,false
+sieve-88000000,normal,runtime,1,1019189422,18524,5,false
+sieve-88000000,normal,runtime,2,1002240171,18524,5,false
+sieve-88000000,normal,runtime,3,987316911,18524,5,false
+sieve-88000000,normal,runtime,4,992277506,18524,5,false

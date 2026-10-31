@@ -1,0 +1,291 @@
+{
+  "environment": "environment.json",
+  "measurements": [
+    {
+      "comparison": "final",
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "cold",
+      "baseline": {
+        "median_ns": 31342422330.0,
+        "minimum_ns": 31289834521,
+        "maximum_ns": 31395010139,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "candidate": {
+        "median_ns": 31382995297.0,
+        "minimum_ns": 31353024683,
+        "maximum_ns": 31412965911,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "median_change_percent": 0.1294506422407693
+    },
+    {
+      "comparison": "final",
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "leaf-edit",
+      "baseline": {
+        "median_ns": 214565166,
+        "minimum_ns": 213780023,
+        "maximum_ns": 224866711,
+        "sample_count": 3,
+        "stable": false,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "candidate": {
+        "median_ns": 211265727,
+        "minimum_ns": 210519440,
+        "maximum_ns": 216274585,
+        "sample_count": 3,
+        "stable": false,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "median_change_percent": -1.5377328303141202
+    },
+    {
+      "comparison": "final",
+      "case": "sieve-88000000",
+      "lane": "normal",
+      "phase": "runtime",
+      "baseline": {
+        "median_ns": 1175890495.0,
+        "minimum_ns": 1170842882,
+        "maximum_ns": 1180938108,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          23757
+        ]
+      },
+      "candidate": {
+        "median_ns": 1200604749.5,
+        "minimum_ns": 1190578643,
+        "maximum_ns": 1210630856,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          23757
+        ]
+      },
+      "median_change_percent": 2.101747960808198
+    },
+    {
+      "comparison": "final-runtime-confirmation",
+      "case": "sieve-88000000",
+      "lane": "normal",
+      "phase": "runtime",
+      "baseline": {
+        "median_ns": 1188549143.5,
+        "minimum_ns": 1182214851,
+        "maximum_ns": 1194883436,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          23757
+        ]
+      },
+      "candidate": {
+        "median_ns": 1183454027,
+        "minimum_ns": 1176638755,
+        "maximum_ns": 1212518570,
+        "sample_count": 5,
+        "stable": false,
+        "executable_bytes": [
+          23757
+        ]
+      },
+      "median_change_percent": -0.42868370465490857
+    },
+    {
+      "comparison": "initial",
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "cold",
+      "baseline": {
+        "median_ns": 31342422330.0,
+        "minimum_ns": 31289834521,
+        "maximum_ns": 31395010139,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "candidate": {
+        "median_ns": 32140726607.5,
+        "minimum_ns": 32127430587,
+        "maximum_ns": 32154022628,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "median_change_percent": 2.547040777814691
+    },
+    {
+      "comparison": "initial",
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "leaf-edit",
+      "baseline": {
+        "median_ns": 214565166,
+        "minimum_ns": 213780023,
+        "maximum_ns": 224866711,
+        "sample_count": 3,
+        "stable": false,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "candidate": {
+        "median_ns": 229863180,
+        "minimum_ns": 218373254,
+        "maximum_ns": 236757245,
+        "sample_count": 3,
+        "stable": false,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "median_change_percent": 7.129775203119415
+    },
+    {
+      "comparison": "initial",
+      "case": "sieve-88000000",
+      "lane": "normal",
+      "phase": "runtime",
+      "baseline": {
+        "median_ns": 1175890495.0,
+        "minimum_ns": 1170842882,
+        "maximum_ns": 1180938108,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          23757
+        ]
+      },
+      "candidate": {
+        "median_ns": 1180397800.5,
+        "minimum_ns": 1178816003,
+        "maximum_ns": 1181979598,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          23757
+        ]
+      },
+      "median_change_percent": 0.3833099696923803
+    },
+    {
+      "comparison": "initial-confirmation",
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "cold",
+      "baseline": {
+        "median_ns": 31321747433.5,
+        "minimum_ns": 31271710074,
+        "maximum_ns": 31371784793,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "candidate": {
+        "median_ns": 32048180464,
+        "minimum_ns": 31502818646,
+        "maximum_ns": 32142613141,
+        "sample_count": 3,
+        "stable": true,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "median_change_percent": 2.319260865129924
+    },
+    {
+      "comparison": "initial-confirmation",
+      "case": "core-1000000",
+      "lane": "normal",
+      "phase": "leaf-edit",
+      "baseline": {
+        "median_ns": 215115916.5,
+        "minimum_ns": 213029520,
+        "maximum_ns": 217202313,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "candidate": {
+        "median_ns": 213381096.0,
+        "minimum_ns": 213356282,
+        "maximum_ns": 213405910,
+        "sample_count": 2,
+        "stable": true,
+        "executable_bytes": [
+          153273483
+        ]
+      },
+      "median_change_percent": -0.8064584565503297
+    }
+  ],
+  "investigation": [
+    "Initial cold compilation slowdown repeated at roughly 2.3\u20132.5%.",
+    "Final implementation substitutes immutable identities immediately after recording their nontrapping copy, and bypasses the arithmetic rule table for comparisons.",
+    "Final cold compilation median is within 0.2% of both baseline runs.",
+    "The isolated runtime comparison did not reproduce the earlier sieve slowdown; its medians differ by under 0.5%."
+  ],
+  "limitations": [
+    "Compilation measured with zero workers on CPU 4.",
+    "Capped unstable samples remain unstable; these are repeatability checks, not statistical confidence intervals.",
+    "The sieve checks broad runtime regressions rather than measuring a kernel dominated by the new identities."
+  ],
+  "verification": {
+    "optimizer_tests_passed": 46,
+    "numeric_tests_passed": 16,
+    "commands": [
+      "zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/optimizer_test.zig -j1 --summary all",
+      "zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/numeric_test.zig -j1 --summary all",
+      "zig fmt --check src/optimizer/canonicalize.zig tests/optimizer_test.zig",
+      "git diff --check"
+    ]
+  },
+  "structural_revision": {
+    "note": "Earlier final measurements describe the preceding implementation.",
+    "measurements_csv": "structural-candidate.csv",
+    "production_loc": {
+      "original": 589,
+      "previous": 605,
+      "current": 581
+    },
+    "median_ms": {
+      "cold": 31323.8558815,
+      "leaf-edit": 212.98698,
+      "runtime": 1180.9032315
+    },
+    "change_from_previous_percent": {
+      "cold": -0.18844413970151574,
+      "leaf-edit": 0.8147336647746917,
+      "runtime": -1.6409661887648586
+    },
+    "all_sample_sets_stable": true,
+    "optimizer_tests_passed": 46,
+    "numeric_tests_passed": 16
+  }
+}

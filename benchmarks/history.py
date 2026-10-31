@@ -44,9 +44,6 @@ COMPILATION_CASE = "core-1000000"
 RUNTIME_CASE = "sieve-88000000"
 COMPILATION_LANES = {"normal": "Compile", "workers-8": "Compile (8 workers)"}
 CORE_CASES = {COMPILATION_CASE: ("cold", "leaf-edit"), RUNTIME_CASE: ("runtime",)}
-COMPILATION_ESTIMATES = {
-    "cold": ("C++ -O0: 160 s", "C++ -O2: 268 s"),
-}
 COMPILER_BRIDGE = '''pub const optimize_mode = @import("builtin").mode;
 pub const query = @import("query/engine.zig");
 pub const modules = @import("modules.zig");
@@ -263,7 +260,16 @@ def environment() -> dict:
             "runtime_suite": {"protocol": RUNTIME_PROTOCOL,
                               "source": hashlib.sha256((ROOT / "benchmarks/history_runtime.c").read_bytes()).hexdigest()},
             "zig": command(["zig", "version"]),
-            "runner": runner(), "c_compiler": {"path": shutil.which("cc"), "version": command(["cc", "--version"])}}
+            "runner": runner(), "c_compiler": {"path": shutil.which("clang"), "version": command(["clang", "--version"])}}
+
+
+def c_compiler_name(record: dict) -> str:
+    version = record.get("c_compiler", {}).get("version", "").lower()
+    if "clang" in version:
+        return "Clang"
+    if "gcc" in version:
+        return "GCC"
+    return "C"
 
 
 def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: bool,
@@ -285,7 +291,7 @@ def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: boo
                  f"-Dbundled-std={'true' if bundled else 'false'}", "--"]
     if cached is not None:
         arguments.append("--skip-c")
-        print("Reusing cached C reference (-O0 and -O3)", flush=True)
+        print("Reusing cached Clang reference (-O0 and -O3)", flush=True)
     print(f"Benchmarking {identity[:12]} (ReleaseFast)", flush=True)
     measured = []
     for case, workers in ((COMPILATION_CASE, 0), (COMPILATION_CASE, 8), (RUNTIME_CASE, 0)):
@@ -332,11 +338,10 @@ def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: boo
 
 def chart(series: dict[str, list[tuple[float, float, str]]], history: list[tuple[str, str]],
     unit: str, png: Path | None = None, title: str | None = None, markers: bool = True,
-    references: dict[str, tuple[float, str]] | None = None, estimates: tuple[str, ...] = ()) -> str:
+    references: dict[str, tuple[float, str]] | None = None) -> str:
     import matplotlib
     matplotlib.use("Agg")
     from matplotlib import font_manager, pyplot, ticker
-    from matplotlib.lines import Line2D
 
     references = references or {}
     points = [point for values in series.values() for point in values]
@@ -360,7 +365,7 @@ def chart(series: dict[str, list[tuple[float, float, str]]], history: list[tuple
                 color = "#444444"
                 line_style, line_width = (("-", 1.8), (":", 2.6), ("--", 1.5), ("-.", 2.2))[index % 4]
                 label = name
-                if (name.startswith("Compile") or name == "Runtime" or estimates) and values:
+                if (name.startswith("Compile") or name == "Runtime") and values:
                     label = f"{name}: {max(values, key=lambda point: point[0])[1]:.3f} {unit}"
                 line, = axis.plot([point[0] for point in values], [point[1] for point in values],
                                   color=color, linestyle=line_style, linewidth=line_width, label=label,
@@ -399,13 +404,10 @@ def chart(series: dict[str, list[tuple[float, float, str]]], history: list[tuple
             if title:
                 axis.set_title(title, fontsize=12, pad=14)
             compilation = any(name.startswith("Compile") for name in series)
-            if len(series) > 1 or references or estimates or compilation:
+            if len(series) > 1 or references or compilation:
                 handles, labels = axis.get_legend_handles_labels()
-                handles.extend(Line2D([], [], linestyle="none") for _ in estimates)
-                labels.extend(estimates)
-                side_legend = bool(estimates) or compilation
-                axis.legend(handles, labels, frameon=False, loc="upper left" if side_legend else "upper right",
-                            bbox_to_anchor=(1.02, 1) if side_legend else (1, 1))
+                axis.legend(handles, labels, frameon=False, loc="upper left" if compilation else "upper right",
+                            bbox_to_anchor=(1.02, 1) if compilation else (1, 1))
             for text in figure.findobj(matplotlib.text.Text):
                 text.set_path_effects([])
             output = io.StringIO()
@@ -436,12 +438,11 @@ def chart(series: dict[str, list[tuple[float, float, str]]], history: list[tuple
 
 def graph_artifact(data: Path, name: str, series: dict, history: list[tuple[str, str]],
                    unit: str, title: str, markers: bool = True,
-                   references: dict[str, tuple[float, str]] | None = None,
-                   estimates: tuple[str, ...] = ()) -> str:
+                   references: dict[str, tuple[float, str]] | None = None) -> str:
     directory = data / "graphs"
     directory.mkdir(parents=True, exist_ok=True)
     svg = chart(series, history, unit, png=directory / f"{name}.png", title=title, markers=markers,
-                references=references, estimates=estimates)
+                references=references)
     (directory / f"{name}.svg").write_text(svg + "\n")
     label = html.escape(title, quote=True)
     return (f"<object type='image/svg+xml' data='graphs/{name}.svg' aria-label='{label}'>"
@@ -546,7 +547,7 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
                             if sample["case"] == case and sample["lane"] == lane and sample["phase"] == "runtime")
             spread += sampling_note(metadata)
             reference_date = reference_record.get("c_reference", reference_record)["recorded_at"][:10]
-            references[case][f"C {lane[1:]}"] = (statistics.median(values), reference_date + "\n" + spread)
+            references[case][f"{c_compiler_name(reference_record)} {lane[1:]}"] = (statistics.median(values), reference_date + "\n" + spread)
         for record, benchmark in entries.values():
             samples = defaultdict(list)
             for sample in benchmark["samples"]:
@@ -576,8 +577,7 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
             for (case, phase), series in sorted(selected.items()):
                 name = f"{mode}-{configuration_id}-{case}-{phase}"
                 graph = graph_artifact(data, name, series, history, "s", f"{case} / {phase}",
-                                       references=references.get(case) if runtime else None,
-                                       estimates=COMPILATION_ESTIMATES.get(phase, ()) if case == COMPILATION_CASE else ())
+                                       references=references.get(case) if runtime else None)
                 benchmark_sections.append("<article>" + graph + "</article>")
                 benchmark_images.append(data / "graphs" / f"{name}.png")
             benchmark_sections.append("</div></section>")

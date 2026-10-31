@@ -47,6 +47,15 @@ and cannot be speculatively hoisted. Native 32-bit arithmetic uses
 add/subtract and signed multiply retain native overflow-flag traps. Division and
 narrow saturation widen operands only when their lowering algorithm needs it.
 Floating-point identities must preserve NaN, infinity, subnormals, and signed zero.
+Typed operations and internal i32 arithmetic share one binary simplifier and
+constant evaluator, with integer rules for identities, absorbing constants,
+repeated operands, and signed multiplication/division by negative one. Negation
+retains the original overflow mode; folding a result never discards a trapping operand producer. Proven
+identities become nontrapping value copies, which can alias immutable inputs or
+retain distinct storage for snapshots and addressable results. Immutable inputs
+substitute immediately so following users do not need an extra sweep. All-ones
+masks use the operand width, including unsigned 64-bit values. Dynamic shift counts and
+zero divisors retain their checks.
 Compiler-internal i32 address/count operations retain their established modular
 semantics. Canonicalization lowers
 i32 comparisons to ordinary predicates and arithmetic to those modular operations
@@ -122,7 +131,8 @@ because they expose scalar-replacement opportunities. Caller growth still counts
 every inserted instruction. No std identity or speculative specialization is
 needed. Within one pass, repeated calls reuse resolution and eligibility facts.
 `InlineFunctionFacts` shares immutable callee analysis and depends on its optimized
-body; initializer-region facts stay local.
+body, including integer-argument ranges valid on every normal return;
+initializer-region facts stay local.
 
 Arguments become entry block parameters unless readonly values, storage, or
 initializers can substitute directly. Returns branch to a continuation and write
@@ -190,6 +200,19 @@ strict/inclusive exits. Proved-safe latch arithmetic becomes modular only when
 the widened range includes its final update. Fill/move
 uses `0 <= start <= end` guards and retains the original loop as its fallback.
 
+Integer exits may follow a flag test inside the loop body when their staying
+edge dominates the latch and the proof site. Counter matching follows
+identity-only acyclic joins; range derivation unions concrete incoming values
+through unchanged cyclic joins. Successful write guards therefore constrain a
+carried count after its checked increment, including across nested generation
+loops. Bounded derivation falls back to unknown when its budget is exhausted.
+Loop-invariant arithmetic may supply a bound without being hoisted or losing its
+trap; bulk-loop replacement still requires the bound to be defined outside.
+Offset derivation can also use a non-inlined callee's normal-return range when
+the call dominates and precedes that arithmetic producer. Only immutable scalar
+arguments qualify. A later guard cannot justify removing an earlier trap, and
+an unguarded normal return withdraws the fact through ordinary query dependencies.
+
 Carried boolean exits rotate either flag polarity into the latch predicate.
 Explicit exit parameters preserve bound-exit and collision-exit state, including
 shared exits and existing branch arguments. Latch effects still execute before
@@ -224,6 +247,15 @@ registers across calls, but there is no general call-site splitting or reload
 insertion. Frames reserve preservation capacity before allocation; only used
 preserved registers are saved and restored.
 
+Loop-weighted preferences favor sharing registers across scalar copies and
+in-place arithmetic operands/results. Preferences never override interference,
+fixed-register reservations, call clobbers, or parameter restrictions. Native
+blocks start in reverse postorder, with unreachable components afterward. Empty
+two-block loop tests follow their bodies so the conditional backedge replaces
+the body's jump to the test. This changes physical layout without moving executed
+effects or relying on IR block numbering. Edge copies, branch targets,
+relocations, and panic metadata retain their ordinary mappings.
+
 Arithmetic may reuse a legal operand register when scratch results are dead;
 subtraction reuses only its left operand. Direct register/stack arithmetic avoids
 unnecessary `eax` copies, while fixed/spilled operands retain compact addressing.
@@ -245,7 +277,16 @@ counts trap. Comparisons produce canonical bools, selections use conditional mov
 single-use compare/increment/select combinations can use wrapping boolean addition.
 Fills use `rep stosb`/`rep stosd`; directed copies use `rep movsb` and restore the
 direction flag after descending copies. Single-use element addresses and legal
-constant stores can use indexed operands without pointer temporaries.
+constant stores can use indexed operands without pointer temporaries. Adjacent
+stack-array and allocation element copies preserve the same storage and access
+order without spilling the element pointer. With dead address scratch, byte and
+32-bit reads use indexed memory operands for stack or register bases; spilled
+pointers, retained addresses, and unsupported layouts keep ordinary lowering.
+An allocated signed index extends directly into `rcx` when the following base
+load independently overwrites `rax`, eliminating the intermediate `eax` copy.
+Labels, retained accumulator values, and spilled indices keep ordinary lowering.
+Allocated results load directly into their assigned registers; spilled result
+stores remain explicit. Bounds and numeric traps are unchanged.
 
 ## Verification and Measurement
 

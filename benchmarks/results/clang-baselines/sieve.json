@@ -1,0 +1,133 @@
+{
+  "command": [
+    "taskset",
+    "-c",
+    "4",
+    "zig",
+    "build",
+    "history-benchmark",
+    "--seed=0",
+    "-Doptimize=fast",
+    "-j1",
+    "--",
+    "--case=sieve-88000000"
+  ],
+  "environment": {
+    "suite": "07c397aad3c35ad6cb45cc4424f57072a7bdf0a545fd9472521f1dd468347725",
+    "protocol": "core-million-zero-workers-v6",
+    "compilation_protocol": "core-million-modules-one-line-leaf-v2",
+    "sampling_protocol": "one-warmup-range-2pct-min2-compile3-runtime5-v1",
+    "runtime_suite": {
+      "protocol": "sieve-88000000-i32-wall-v1",
+      "source": "6daad48db9d9581f742de5185243d81c1ca139dd5a3029355bd383aa616ad9e4"
+    },
+    "zig": "0.17.0",
+    "runner": {
+      "host": "arch",
+      "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+      "kernel": "7.2.5-3-omarchy",
+      "architecture": "x86_64",
+      "affinity": [
+        4
+      ]
+    },
+    "c_compiler": {
+      "path": "/usr/bin/clang",
+      "version": "clang version 22.1.8\nTarget: x86_64-pc-linux-gnu\nThread model: posix\nInstalledDir: /usr/bin"
+    }
+  },
+  "samples": [
+    {
+      "case": "sieve-88000000",
+      "lane": "normal",
+      "phase": "runtime",
+      "sample": 0,
+      "nanoseconds": 1216273322,
+      "executable_bytes": 23571,
+      "sample_count": 2,
+      "stable": true
+    },
+    {
+      "case": "sieve-88000000",
+      "lane": "normal",
+      "phase": "runtime",
+      "sample": 1,
+      "nanoseconds": 1222763494,
+      "executable_bytes": 23571,
+      "sample_count": 2,
+      "stable": true
+    },
+    {
+      "case": "sieve-88000000",
+      "lane": "c-O0",
+      "phase": "runtime",
+      "sample": 0,
+      "nanoseconds": 1609980849,
+      "executable_bytes": 16248,
+      "sample_count": 2,
+      "stable": true
+    },
+    {
+      "case": "sieve-88000000",
+      "lane": "c-O0",
+      "phase": "runtime",
+      "sample": 1,
+      "nanoseconds": 1615986804,
+      "executable_bytes": 16248,
+      "sample_count": 2,
+      "stable": true
+    },
+    {
+      "case": "sieve-88000000",
+      "lane": "c-O3",
+      "phase": "runtime",
+      "sample": 0,
+      "nanoseconds": 1008549491,
+      "executable_bytes": 16296,
+      "sample_count": 2,
+      "stable": true
+    },
+    {
+      "case": "sieve-88000000",
+      "lane": "c-O3",
+      "phase": "runtime",
+      "sample": 1,
+      "nanoseconds": 1000895206,
+      "executable_bytes": 16296,
+      "sample_count": 2,
+      "stable": true
+    }
+  ],
+  "source_hashes": {
+    "benchmarks/history_benchmark.zig": "288f0f1639ae92bd98f273452d435e36145d31a811416a91e80c9d0ac47331c0",
+    "benchmarks/history_runtime.c": "6daad48db9d9581f742de5185243d81c1ca139dd5a3029355bd383aa616ad9e4",
+    "benchmarks/history.py": "1ca58b8b73654e75be52602b82bb3a47d36d24f896f1991fc6b2ca1de8ca4e8a"
+  },
+  "validation": "Small probes 2, 10, 100, 1000; every full run printed 5107832 with status 0; one warm-up per lane.",
+  "summary": {
+    "Chimera": {
+      "samples_seconds": [
+        1.216273322,
+        1.222763494
+      ],
+      "median_seconds": 1.2195184079999999,
+      "stable": true
+    },
+    "Clang -O0": {
+      "samples_seconds": [
+        1.609980849,
+        1.615986804
+      ],
+      "median_seconds": 1.6129838265,
+      "stable": true
+    },
+    "Clang -O3": {
+      "samples_seconds": [
+        1.008549491,
+        1.000895206
+      ],
+      "median_seconds": 1.0047223485,
+      "stable": true
+    }
+  }
+}
