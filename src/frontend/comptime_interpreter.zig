@@ -4,6 +4,7 @@ const structures = @import("../structures.zig");
 pub const ExecutionErrorReason = union(enum) {
     call_cycle,
     division_by_zero,
+    integer_overflow,
     invalid_shift_count,
     unsupported_operation,
     escaping_storage,
@@ -429,8 +430,13 @@ fn ExecutionFrame(comptime Executor: type) type {
         fn instructionValue(self: *const Self, instruction: structures.FunctionInstruction, span: ?structures.SourceSpan) anyerror!Result {
             const slots = self.slots;
             switch (instruction) {
+                .type_union => |operands| return .{ .returned = .{ .type = (try self.executor.unionType(slots[@backingInt(operands.lhs)].type, slots[@backingInt(operands.rhs)].type, span)) orelse return .reported_error } },
+                .const_numeric => |value| return .{ .returned = .{ .runtime = .{ .numeric = value.bits } } },
+                .numeric_binary => |operation| return self.numericBinary(operation, span),
+                .numeric_unary => |operation| return self.numericUnary(operation, span),
+                .numeric_convert => |operation| return self.numericConvert(operation),
                 .const_int => |value| return .{ .returned = .{ .runtime = .{ .int = value } } },
-                .const_int_literal => |value| return .{ .returned = .{ .runtime = .{ .int_literal = value } } },
+                .const_int_literal => |value| return .{ .returned = .{ .runtime = (try self.executor.lookupRuntime(value)).?.value } },
                 .const_string_literal => |value| return .{ .returned = .{ .runtime = .{ .string_literal = value } } },
                 .const_static_string => |constant| return .{ .returned = .{ .runtime = try self.executor.staticString(constant) } },
                 .const_storage_cursor => |value| return .{ .returned = .{ .runtime = .{ .storage_cursor = value } } },
@@ -466,6 +472,21 @@ fn ExecutionFrame(comptime Executor: type) type {
                 .compare => |comparison| return .{ .returned = .{ .runtime = .{ .bool = predicateValue(slots, comparison.operation, comparison.operands) } } },
                 .select, .aggregate, .fill, .move => unreachable,
             }
+        }
+
+        fn numericBinary(self: *const Self, operation: structures.NumericBinary, span: ?structures.SourceSpan) !Result {
+            const result = structures.numeric.binary(operation.type_id.numericType().?, operation.operation, operation.overflow, numericBits(scalar(self.slots, operation.operands.lhs)), numericBits(scalar(self.slots, operation.operands.rhs))) catch |err| return numericError(err, span);
+            return .{ .returned = .{ .runtime = if (operation.operation.isComparison()) .{ .bool = result != 0 } else numericValue(operation.type_id, result) } };
+        }
+        fn numericUnary(self: *const Self, operation: structures.NumericUnary, span: ?structures.SourceSpan) !Result {
+            const result = structures.numeric.unary(operation.type_id.numericType().?, operation.operation, operation.overflow, numericBits(scalar(self.slots, operation.operand))) catch |err| return numericError(err, span);
+            return .{ .returned = .{ .runtime = numericValue(operation.type_id, result) } };
+        }
+        fn numericConvert(self: *const Self, operation: structures.NumericConversion) !Result {
+            const source_type = self.body.valueType(operation.operand);
+            const result = structures.numeric.convert(source_type.numericType().?, operation.destination_type.numericType().?, operation.policy, numericBits(scalar(self.slots, operation.operand)));
+            if (operation.result_type == operation.destination_type) return .{ .returned = .{ .runtime = numericValue(operation.destination_type, result.?) } };
+            return .{ .returned = try storedVariantValue(operation.result_type, if (result != null) operation.destination_type else .none, .{ .runtime = if (result) |bits| numericValue(operation.destination_type, bits) else .none }, self.executor) };
         }
 
         fn initializerValue(self: *const Self, reference: @FieldType(structures.FunctionInstruction, "initializer_ref")) !Value {
@@ -789,18 +810,17 @@ fn predicateValue(
     operands: structures.BinaryOperands,
 ) bool {
     return operation.holds(switch (operation) {
-        .lti, .gti, .lei, .gei, .eqi, .nei => std.math.order(predicateInteger(slots, operands.lhs), predicateInteger(slots, operands.rhs)),
+        .lti, .gti, .lei, .gei, .eqi, .nei => predicateIntegerOrder(scalar(slots, operands.lhs), scalar(slots, operands.rhs)),
         .eqb, .neb => std.math.order(@intFromBool(scalar(slots, operands.lhs).bool), @intFromBool(scalar(slots, operands.rhs).bool)),
         .eqt, .net => if (slots[@backingInt(operands.lhs)].type == slots[@backingInt(operands.rhs)].type) .eq else .lt,
     });
 }
 
-fn predicateInteger(slots: []const Value, value: structures.FunctionValueId) i64 {
-    return switch (scalar(slots, value)) {
-        .int => |integer_value| integer_value,
-        .int_literal => |literal| literal,
-        else => unreachable,
-    };
+fn predicateIntegerOrder(left: structures.CompileTimeValue.RuntimeValue, right: structures.CompileTimeValue.RuntimeValue) std.math.Order {
+    if (left == .int_literal and right == .int_literal) return left.int_literal.order(right.int_literal);
+    if (left == .int_literal) return left.int_literal.big().orderAgainstScalar(right.int);
+    if (right == .int_literal) return right.int_literal.big().orderAgainstScalar(left.int).invert();
+    return std.math.order(left.int, right.int);
 }
 
 fn readSlot(slots: []const Value, value: structures.FunctionValueId, executor: anytype, gpa: std.mem.Allocator) !?Value {
@@ -1105,4 +1125,27 @@ pub fn releaseAllocation(value: Value) void {
 
 pub fn allocationCount(value: Value) i32 {
     return @intCast(allocationRecord(value).capacity);
+}
+
+pub fn numericBits(value: structures.CompileTimeValue.RuntimeValue) u64 {
+    return switch (value) {
+        .int => |integer_value| structures.numeric.encode(i32, integer_value),
+        .byte => |byte| byte,
+        .numeric => |bits| bits,
+        else => unreachable,
+    };
+}
+pub fn numericValue(type_id: structures.TypeId, bits: u64) structures.CompileTimeValue.RuntimeValue {
+    return switch (type_id) {
+        .int => .{ .int = structures.numeric.decode(i32, bits) },
+        .byte => .{ .byte = @intCast(bits) },
+        else => .{ .numeric = bits },
+    };
+}
+fn numericError(err: structures.numeric.Error, span: ?structures.SourceSpan) Result {
+    return executionError(switch (err) {
+        error.Overflow => .integer_overflow,
+        error.DivisionByZero => .division_by_zero,
+        error.InvalidShift => .invalid_shift_count,
+    }, span);
 }

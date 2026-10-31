@@ -131,7 +131,13 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
     const instruction = ssa.instructions[instruction_index];
     try writer.print("    %{d} = {s}", .{ @backingInt(ssa.instructionValue(instruction_index)), @tagName(instruction) });
     switch (instruction) {
-        inline .const_int, .const_byte, .const_int_literal => |value| try writer.print(" {d}", .{value}),
+        .type_union => |operands| try writer.print(" %{d}, %{d}", .{ @backingInt(operands.lhs), @backingInt(operands.rhs) }),
+        .const_numeric => |number| try writer.print(" {s} 0x{x}", .{ @tagName(number.type_id), number.bits }),
+        .numeric_binary => |operation| try writer.print(" {s} {s} {s} %{d}, %{d}", .{ @tagName(operation.operation), @tagName(operation.type_id), @tagName(operation.overflow), @backingInt(operation.operands.lhs), @backingInt(operation.operands.rhs) }),
+        .numeric_unary => |operation| try writer.print(" {s} {s} {s} %{d}", .{ @tagName(operation.operation), @tagName(operation.type_id), @tagName(operation.overflow), @backingInt(operation.operand) }),
+        .numeric_convert => |operation| try writer.print(" {s} {s} %{d}", .{ @tagName(operation.policy), @tagName(operation.destination_type), @backingInt(operation.operand) }),
+        inline .const_int, .const_byte => |value| try writer.print(" {d}", .{value}),
+        .const_int_literal => |value| try writer.print(" @{d}", .{@backingInt(value)}),
         .const_string_literal => |value| try writer.print(" @{d}", .{@backingInt(value)}),
         .const_static_string => |constant| {
             try writer.print(" @{d} ", .{@backingInt(constant.data)});

@@ -19,10 +19,11 @@ a runtime-type diagnostic.
 
 Passes consume IR facts, never source syntax, typing state, `CallBehavior`, or
 standard-library names. Unknown address uses count as address-taking; unknown
-instructions are not removed, moved, or numbered. Preserve wrapping arithmetic,
-eager effects, conditional initialization, ownership hooks, storage identity,
-and panic behavior. Shift counts outside 0 through 31 remain executed errors,
-even when their result is unused. Mutable references do not imply universal non-aliasing.
+instructions are not removed, moved, or numbered. Preserve typed numeric widths,
+overflow and conversion policies, eager effects, conditional initialization,
+ownership hooks, storage identity, and panic behavior. Shift counts outside the
+operand width remain executed errors, even when their result is unused. Mutable
+references do not imply universal non-aliasing.
 
 ## IR and Local Passes
 
@@ -37,6 +38,20 @@ so block merging substitutes them rather than treating them as snapshots.
 Logical type, addressability, move capability, and argument passing remain
 independent. Addressable values require private, unwritten storage before a
 rewrite can alias them as immutable snapshots.
+
+`numeric_binary` and `numeric_unary` retain concrete types and overflow modes;
+`numeric_convert` retains a destination type and policy independently of its
+optional result representation. Trapping arithmetic remains live when discarded
+and cannot be speculatively hoisted. Native 32-bit arithmetic uses
+32-bit operand bits and immediate/register/memory operands directly; checked
+add/subtract and signed multiply retain native overflow-flag traps. Division and
+narrow saturation widen operands only when their lowering algorithm needs it.
+Floating-point identities must preserve NaN, infinity, subnormals, and signed zero.
+Compiler-internal i32 address/count operations retain their established modular
+semantics. Canonicalization lowers
+i32 comparisons to ordinary predicates and arithmetic to those modular operations
+only under wrapping or a proof that overflow is impossible. Bounds describe
+successful results; the potentially trapping producer remains live.
 
 `aggregate` constructs fields, `compare` produces bool, `select` chooses a scalar,
 and `pbr` branches. `fill` and directed `move` preserve the element order of the
@@ -164,16 +179,24 @@ Counter matching alone proves neither monotonicity nor termination. Range proofs
 must bound the latch update, including the final increment, in widened arithmetic.
 Address-taken values cannot supply immutable counter/range facts. Dead-loop
 removal separately requires an acyclic iteration body, so potentially nonterminating
-nested loops survive.
+nested loops survive. A checked unit-stride equality counter can be discarded
+only when its initial value approaches the bound without crossing an endpoint.
 
 Supported rewrites remove effect-free terminating equality loops, eliminate
 proven integer comparisons, and replace eligible element loops with fill or
 descending move. Check elimination supports constant or guarded dynamic starts,
-nonzero constant strides, invariant bounds, and strict/inclusive exits. Fill/move
-uses `0 <= start <= end` guards to retain the original wrapping fallback.
+checked constant-offset starts, nonzero constant strides, invariant bounds, and
+strict/inclusive exits. Proved-safe latch arithmetic becomes modular only when
+the widened range includes its final update. Fill/move
+uses `0 <= start <= end` guards and retains the original loop as its fallback.
 
-Entry ranges intersect dominating predicates only where one successor dominates
-the preheader; a guard on one path through a join is insufficient. Body proofs
+Carried boolean exits rotate either flag polarity into the latch predicate.
+Explicit exit parameters preserve bound-exit and collision-exit state, including
+shared exits and existing branch arguments. Latch effects still execute before
+the exit decision; a final overflowing increment remains a panic.
+
+Ranges intersect dominating predicates only where one successor dominates
+the proof site; a guard on one path through a join is insufficient. Body proofs
 combine numeric intervals with relationships to the same invariant limit.
 These are local proofs, not a general range solver or vectorizer.
 
@@ -187,6 +210,9 @@ is temporary analysis of expanded instructions, not a second authoritative CFG.
 
 Virtual values use caller-saved `r8`-`r11` or preserved `rbx`, `rbp`, `r12`-`r15`.
 Fixed operands reserve conflicts and calls exclude caller-saved crossing ranges.
+Syscall argument setup reserves the registers it writes. Linux preserves
+`r8`-`r10`; a syscall itself reserves/clobbers `r11`, so a cold panic syscall
+does not exclude the other three from the entire function.
 Eligible locals retain the backward-positioned-edge gate; repeated unaddressed
 scalar parameters are separate candidates with incoming ABI spill homes.
 Temporaries allocate first, then parameters use spare caller-saved registers.

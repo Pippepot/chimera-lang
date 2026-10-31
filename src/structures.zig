@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const numeric = @import("numeric.zig");
 const value_operations = @import("value.zig");
 
 // Shared compiler structures.
@@ -166,6 +167,9 @@ pub const Node = struct {
         mul,
         div,
         rem,
+        bit_and,
+        bit_xor,
+        bit_not,
         shift_left,
         shift_right,
         eq,
@@ -193,6 +197,9 @@ pub const Node = struct {
         mul_assign,
         div_assign,
         rem_assign,
+        bit_and_assign,
+        bit_or_assign,
+        bit_xor_assign,
         shift_left_assign,
         shift_right_assign,
         block,
@@ -290,8 +297,8 @@ pub const Node = struct {
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
-            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .from_end, .reference_type, .move_expr, .propagate_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread => .node,
-            .add, .sub, .mul, .div, .rem, .shift_left, .shift_right, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .membership, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .shift_left_assign, .shift_right_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .binding_else, .func, .type_func, .@"if", .collection_if, .match_arm, .match_guard => .node_node,
+            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .bit_not, .from_end, .reference_type, .move_expr, .propagate_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread => .node,
+            .add, .sub, .mul, .div, .rem, .bit_and, .bit_xor, .shift_left, .shift_right, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .membership, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .bit_and_assign, .bit_or_assign, .bit_xor_assign, .shift_left_assign, .shift_right_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .binding_else, .func, .type_func, .@"if", .collection_if, .match_arm, .match_guard => .node_node,
             .param => .parameter,
             .struct_field => .field,
             .signature => .signature,
@@ -428,6 +435,10 @@ pub const Operation = enum {
     @"*",
     @"/",
     @"%",
+    @"&",
+    @"|",
+    @"^",
+    @"~",
     @"<<",
     @">>",
     unary_minus,
@@ -455,7 +466,7 @@ pub const Operation = enum {
 
     pub fn operandCount(self: Operation) usize {
         return switch (self) {
-            .unary_minus, .not => 1,
+            .unary_minus, .not, .@"~" => 1,
             .@"[]=" => 3,
             else => 2,
         };
@@ -473,10 +484,41 @@ pub const Operation = enum {
     }
 
     pub fn supportsPrimitive(self: Operation, receiver: TypeId) bool {
-        return switch (receiver) {
-            .int => !self.isIndexer() and self != .not,
-            .bool => self == .@"==" or self == .@"<>" or self == .not,
-            else => false,
+        if (receiver.numericType()) |kind| {
+            if (self.numericUnary()) |operation| return kind.supportsUnary(operation);
+            if (self.numericBinary()) |operation| return kind.supportsBinary(operation);
+            return false;
+        }
+        return receiver == .bool and (self == .@"==" or self == .@"<>" or self == .not);
+    }
+
+    pub fn numericUnary(self: Operation) ?numeric.Unary {
+        return switch (self) {
+            .unary_minus => .neg,
+            .@"~" => .bit_not,
+            else => null,
+        };
+    }
+
+    pub fn numericBinary(self: Operation) ?numeric.Binary {
+        return switch (self) {
+            .@"+" => .add,
+            .@"-" => .sub,
+            .@"*" => .mul,
+            .@"/" => .div,
+            .@"%" => .rem,
+            .@"&" => .bit_and,
+            .@"|" => .bit_or,
+            .@"^" => .bit_xor,
+            .@"<<" => .shl,
+            .@">>" => .shr,
+            .@"==" => .eq,
+            .@"<>" => .ne,
+            .@"<" => .lt,
+            .@">" => .gt,
+            .@"<=" => .le,
+            .@">=" => .ge,
+            else => null,
         };
     }
 };
@@ -747,7 +789,8 @@ pub const CompileTimeValue = union(enum) {
 
     pub const RuntimeValue = union(enum) {
         int: i32,
-        int_literal: i64,
+        numeric: u64,
+        int_literal: numeric.Integer,
         string_literal: ByteStringId,
         storage_cursor: StaticStorageCursor,
         byte: u8,
@@ -766,7 +809,7 @@ pub const CompileTimeValue = union(enum) {
                 // Primitive values are named after their types.
                 inline .int, .int_literal, .string_literal, .byte, .bool, .unit, .none => |_, tag| @field(TypeId, @tagName(tag)),
                 inline .storage_cursor, .function_ref => |typed| typed.type_id,
-                .structure, .variant => null,
+                .numeric, .structure, .variant => null,
             };
         }
     };
@@ -827,6 +870,16 @@ pub const TypeId = enum(u32) {
     type,
     int_literal,
     string_literal,
+    i8,
+    i16,
+    i64,
+    u16,
+    u32,
+    u64,
+    isize,
+    usize,
+    f32,
+    f64,
     _,
 
     const interned_mask: u32 = 1 << 31;
@@ -841,8 +894,24 @@ pub const TypeId = enum(u32) {
         return @fromBackingInt(@intCast(@as(u31, @truncate(raw))));
     }
 
+    pub fn fromName(name: []const u8) ?TypeId {
+        if (std.mem.eql(u8, name, "i32")) return .int;
+        if (std.mem.eql(u8, name, "u8")) return .byte;
+        if (std.mem.eql(u8, name, "float")) return .f64;
+        return std.meta.stringToEnum(TypeId, name);
+    }
+
+    pub fn numericType(self: TypeId) ?numeric.Type {
+        return switch (self) {
+            .int => .i32,
+            .byte => .u8,
+            inline .i8, .i16, .i64, .u16, .u32, .u64, .isize, .usize, .f32, .f64 => |tag| @field(numeric.Type, @tagName(tag)),
+            else => null,
+        };
+    }
+
     pub fn isPrimitive(self: TypeId) bool {
-        return @backingInt(self) <= @backingInt(TypeId.string_literal);
+        return @backingInt(self) <= @backingInt(TypeId.f64);
     }
 };
 
@@ -1351,9 +1420,34 @@ pub const AggregateOperation = struct {
     type_id: TypeId,
 };
 
+pub const NumericConstant = struct { type_id: TypeId, bits: u64 };
+pub const NumericBinary = struct {
+    operation: numeric.Binary,
+    type_id: TypeId,
+    overflow: numeric.Overflow = .checked,
+    operands: BinaryOperands,
+};
+pub const NumericUnary = struct {
+    operation: numeric.Unary,
+    type_id: TypeId,
+    overflow: numeric.Overflow = .checked,
+    operand: FunctionValueId,
+};
+pub const NumericConversion = struct {
+    operand: FunctionValueId,
+    destination_type: TypeId,
+    policy: numeric.Policy,
+    result_type: TypeId,
+};
+
 pub const FunctionInstruction = union(enum) {
+    type_union: BinaryOperands,
+    const_numeric: NumericConstant,
+    numeric_binary: NumericBinary,
+    numeric_unary: NumericUnary,
+    numeric_convert: NumericConversion,
     const_int: i32,
-    const_int_literal: i64,
+    const_int_literal: CompileTimeValueId,
     const_string_literal: ByteStringId,
     const_static_string: StaticStringConstant,
     const_storage_cursor: StaticStorageCursor,
@@ -1396,9 +1490,43 @@ pub const FunctionInstruction = union(enum) {
     fill: FillOperation,
     move: MoveOperation,
 
+    pub fn numericConstant(self: FunctionInstruction) ?NumericConstant {
+        return switch (self) {
+            .const_int => |integer| .{ .type_id = .int, .bits = numeric.encode(i32, integer) },
+            .const_byte => |byte| .{ .type_id = .byte, .bits = byte },
+            .const_numeric => |constant| constant,
+            else => null,
+        };
+    }
+
+    pub fn numericConstantInstruction(type_id: TypeId, bits: u64) FunctionInstruction {
+        return switch (type_id) {
+            .int => .{ .const_int = numeric.decode(i32, bits) },
+            .byte => .{ .const_byte = @intCast(bits) },
+            else => .{ .const_numeric = .{ .type_id = type_id, .bits = bits } },
+        };
+    }
+
+    pub fn numericMayTrap(self: FunctionInstruction) bool {
+        switch (self) {
+            .numeric_binary => |operation| {
+                if (operation.type_id.numericType().?.isFloat()) return false;
+                return switch (operation.operation) {
+                    .add, .sub, .mul => operation.overflow == .checked,
+                    .div, .rem, .shl, .shr => true,
+                    else => false,
+                };
+            },
+            .numeric_unary => |operation| return !operation.type_id.numericType().?.isFloat() and operation.operation == .neg and operation.overflow == .checked,
+            else => unreachable,
+        }
+    }
+
     pub fn operands(self: anytype) [3]?OperandPointer(@TypeOf(self)) {
         return switch (self.*) {
-            .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage, .aggregate => .{ null, null, null },
+            .const_numeric, .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage, .aggregate => .{ null, null, null },
+            .numeric_binary => |*operation| .{ &operation.operands.lhs, &operation.operands.rhs, null },
+            inline .numeric_unary, .numeric_convert => |*operation| .{ &operation.operand, null, null },
             .variant_tag, .negi, .byte_to_int => |*operand| .{ operand, null, null },
             inline .variant_coerce, .variant_extract, .static_conversion => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null, null },
             .storage_projection => |*operation| .{ &operation.owner, null, null },
@@ -1410,7 +1538,7 @@ pub const FunctionInstruction = union(enum) {
             .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null, null },
             .field_access => |*operation| .{ &operation.operand, null, null },
             .call => |*call| call.operands() ++ .{null},
-            .addi, .subi, .muli, .divsi, .shli, .shrsi => |*binary| .{ &binary.lhs, &binary.rhs, null },
+            .type_union, .addi, .subi, .muli, .divsi, .shli, .shrsi => |*binary| .{ &binary.lhs, &binary.rhs, null },
             .compare => |*operation| .{ &operation.operands.lhs, &operation.operands.rhs, null },
             .select => |*operation| .{ &operation.condition, &operation.then_value, &operation.else_value },
             .fill => |*operation| .{ &operation.first, &operation.count, &operation.value },
@@ -1442,6 +1570,10 @@ pub const FunctionInstruction = union(enum) {
 
     pub fn resultType(self: FunctionInstruction) TypeId {
         return switch (self) {
+            .type_union => .type,
+            inline .const_numeric, .numeric_unary => |operation| operation.type_id,
+            .numeric_binary => |operation| if (operation.operation.isComparison()) .bool else operation.type_id,
+            .numeric_convert => |operation| operation.result_type,
             // Each primitive constant is named after the type of its value.
             inline .const_int, .const_int_literal, .const_string_literal, .const_byte, .const_bool, .const_type, .const_unit, .const_none => |_, tag| @field(TypeId, @tagName(tag)["const_".len..]),
             .variant_tag, .negi, .addi, .subi, .muli, .divsi, .shli, .shrsi, .byte_to_int => .int,
@@ -1753,7 +1885,7 @@ pub const CompiledFunction = struct {
     /// Return addresses and caller frame sizes; consumed only on panic.
     trace_sites: []const TraceSite = &.{},
     /// The linker supplies the shared trace reporter to this runtime entrypoint.
-    panic_trace_offset: ?u32 = null,
+    panic_trace_offsets: []const u32 = &.{},
 
     pub const TraceSite = struct {
         return_offset: u32,
@@ -2002,14 +2134,15 @@ pub const Diagnostic = struct {
         .unknown_field = Message{ .text = "unknown struct field", .source_label = true },
         .duplicate_local_binding = Message{ .text = "binding is already declared in this scope", .source_label = true },
         .local_type_not_supported = "this local binding type is not supported yet",
-        .float_type_not_supported = "the `float` type is not supported yet",
         .unknown_type = Message{ .text = "unknown type", .source_label = true },
         .unknown_value = Message{ .text = "unknown value", .source_label = true },
         .assignment_to_immutable = Message{ .text = "cannot assign to immutable binding", .source_label = true },
         .assignment_type_mismatch = TypeMismatch,
-        .integer_literal_not_decimal = "integer literal must use decimal notation",
-        .float_literal_not_supported = "float literals are not supported yet",
-        .integer_literal_out_of_range = "integer literal is outside the supported i32 range",
+        .integer_literal_out_of_range = "integer literal is outside the destination numeric range or is not exactly representable",
+        .invalid_numeric_literal = "invalid numeric literal",
+        .float_literal_out_of_range = "floating-point literal overflows or rounds a nonzero value to zero",
+        .invalid_numeric_conversion = "unsupported numeric conversion policy or types",
+        .compile_time_integer_overflow = "integer overflow during compile-time execution",
         .invalid_string_escape = "invalid string escape",
         .invalid_string_utf8 = "string literal is not valid UTF-8",
         .condition_not_bool = TypeId,

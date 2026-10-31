@@ -463,6 +463,10 @@ test "evaluation heap snapshots freeze lazy allocation identities aliases and re
 }
 
 const ArrayTestExecutor = struct {
+    pub fn unionType(_: *@This(), _: structures.TypeId, _: structures.TypeId, _: ?structures.SourceSpan) !?structures.TypeId {
+        unreachable;
+    }
+
     allocator: std.mem.Allocator,
     values: std.ArrayList(structures.CompileTimeValue.Runtime) = .empty,
     tuples: std.ArrayList([]const structures.CompileTimeValueId) = .empty,
@@ -1000,6 +1004,10 @@ test "initializer capture cell subtrees survive the constructing region storage"
     const nested_type: structures.TypeId = @fromBackingInt(@intCast(101));
     const variant_type: structures.TypeId = @fromBackingInt(@intCast(102));
     const Executor = struct {
+        pub fn unionType(_: *@This(), _: structures.TypeId, _: structures.TypeId, _: ?structures.SourceSpan) !?structures.TypeId {
+            unreachable;
+        }
+
         pub fn convertStaticValue(_: *@This(), _: structures.TypeId, _: structures.CompileTimeValue.RuntimeValue, _: structures.TypeId, _: ?structures.SourceSpan, _: std.mem.Allocator) !Result {
             unreachable;
         }

@@ -8,13 +8,13 @@ const Fixture = test_sources.SourceFixture;
 const Tag = std.meta.Tag(structures.FunctionInstruction);
 
 const source =
-    \\func identities(a: int) int -> 0 + a * 1 * -1 / -1 - 0
-    \\func folded() int -> (2147483647 + 1) / -1 + 7 * 6
+    \\func identities(a: int) int -> wrapping(0 + a * 1 * -1 / -1 - 0)
+    \\func folded() int -> wrapping((2147483647 + 1) / -1 + 7 * 6)
     \\func branch(a: int) int
     \\    if 3 < 4 -> return a
     \\    return 90
     \\func failing(a: int) int -> a / 0
-    \\func run() int -> identities(2) + branch(40) + folded() - folded()
+    \\func run() int -> wrapping(identities(2) + branch(40) + folded() - folded())
 ;
 
 fn optimizedBody(fixture: Fixture, name: []const u8) !*const ?structures.FunctionBodyAnalysis {
@@ -25,7 +25,20 @@ fn optimizedBody(fixture: Fixture, name: []const u8) !*const ?structures.Functio
 fn count(body: structures.FunctionBodyAnalysis, tags: []const Tag) usize {
     var total: usize = 0;
     for (body.instructions) |instruction| {
-        if (std.mem.indexOfScalar(Tag, tags, std.meta.activeTag(instruction))) |_| total += 1;
+        const tag: Tag = switch (instruction) {
+            .numeric_binary => |operation| switch (operation.operation) {
+                .add => .addi,
+                .sub => .subi,
+                .mul => .muli,
+                .div => .divsi,
+                .shl => .shli,
+                .shr => .shrsi,
+                else => .numeric_binary,
+            },
+            .numeric_unary => |operation| if (operation.operation == .neg) .negi else .numeric_unary,
+            else => std.meta.activeTag(instruction),
+        };
+        if (std.mem.indexOfScalar(Tag, tags, tag)) |_| total += 1;
     }
     return total;
 }
@@ -38,6 +51,39 @@ fn hasConstant(body: structures.FunctionBodyAnalysis, value: i32) bool {
 }
 
 const arithmetic = [_]Tag{ .addi, .subi, .muli, .divsi, .negi };
+
+test "carried boolean exits rotate both stop and valid flags" {
+    for ([_]bool{ false, true }) |exit_value| {
+        const program = try testing.allocator.print(
+            \\func scan(first: int, limit: int, stop: int, initial: bool) int
+            \\    var index = first
+            \\    var flag = initial
+            \\    var total = 0
+            \\    loop
+            \\        if {s} -> break
+            \\        if index >= limit -> break
+            \\        total += index
+            \\        if index == stop -> flag = {s}
+            \\        index += 1
+            \\    if flag -> total += 100
+            \\    return total + index
+            \\func run() int -> scan(0, 6, 3, {s}) + scan(0, 6, 9, {s}) + scan(2, 2, 2, {s}) + scan(1, 4, 2, {s}) - 192
+        , .{
+            if (exit_value) "flag" else "not flag",
+            if (exit_value) "true" else "false",
+            if (exit_value) "false" else "true",
+            if (exit_value) "false" else "true",
+            if (exit_value) "false" else "true",
+            if (exit_value) "true" else "false",
+        });
+        defer testing.allocator.free(program);
+        try Fixture.expectParity(program, 42);
+        const fixture = try Fixture.init(program);
+        defer fixture.deinit();
+        const body = (try optimizedBody(fixture, "scan")).*.?;
+        try testing.expectEqual(@as(usize, 0), count(body, &.{.select}));
+    }
+}
 
 test "numbering substitutions converge through branch folding" {
     const program =
@@ -52,7 +98,8 @@ test "numbering substitutions converge through branch folding" {
     const fixture = try Fixture.init(program);
     defer fixture.deinit();
     const body = (try optimizedBody(fixture, "same")).*.?;
-    try testing.expectEqual(@as(usize, 0), count(body, &arithmetic));
+    // The shared checked addition must still panic for MAX.
+    try testing.expectEqual(@as(usize, 1), count(body, &arithmetic));
     try testing.expectEqual(@as(usize, 0), countPredicates(body));
     try testing.expect(hasConstant(body, 42));
 }
@@ -83,7 +130,7 @@ test "guarded dynamic loop ranges remove redundant checks for ascending strides"
             \\        sum += index
             \\        index += {d}
             \\    return sum
-            \\func run() int -> scan(1, 7) + scan(-1, 7) + scan(8, 7) + scan(9, 7) + {d} + scan({d}, {d}) - {d}
+            \\func run() int -> wrapping(scan(1, 7) + scan(-1, 7) + scan(8, 7) + scan(9, 7) + {d} + scan({d}, {d}) - {d})
         , .{
             if (reversed) "0 > first" else "first < 0",
             std.math.maxInt(i32) - step + @intFromBool(!inclusive),
@@ -103,6 +150,58 @@ test "guarded dynamic loop ranges remove redundant checks for ascending strides"
         const body = (try optimizedBody(fixture, "scan")).*.?;
         try testing.expectEqual(@as(usize, 3), countPredicates(body));
     };
+}
+
+test "loop proofs follow checked shifted starts and lower safe recurrences" {
+    const program =
+        \\func shifted(first: int, limit: int) int
+        \\    if limit > 100 -> return 0
+        \\    var index = first + 1
+        \\    var total = 0
+        \\    loop
+        \\        if index >= limit -> break
+        \\        if first < 0 -> return -100
+        \\        if index < 1 -> return -200
+        \\        total += index
+        \\        index += 1
+        \\    return total
+        \\func run() int -> shifted(0, 7) + shifted(1, 6) + shifted(9, 9) + shifted(-2, 6) + 107
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "shifted")).*.?;
+    try testing.expectEqual(@as(usize, 3), countPredicates(body));
+    var checked: usize = 0;
+    var wrapping: usize = 0;
+    for (body.instructions) |instruction| {
+        if (instruction == .addi) wrapping += 1;
+        if (instruction != .numeric_binary) continue;
+        if (instruction.numeric_binary.overflow == .checked) checked += 1;
+        if (instruction.numeric_binary.overflow == .wrapping) wrapping += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), checked);
+    try testing.expectEqual(@as(usize, 1), wrapping);
+}
+
+test "carried collision exits preserve an overflowing final increment" {
+    const fixture = try Fixture.init(
+        \\func scan(first: int, limit: int)
+        \\    var index = first
+        \\    var valid = true
+        \\    loop
+        \\        if not valid -> break
+        \\        if index > limit -> break
+        \\        if index == limit -> valid = false
+        \\        index += 1
+        \\scan(2147483647, 2147483647)
+    );
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    const result = try fixture.runIo("");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 134 }, result.term);
 }
 
 test "guarded dynamic loop ranges remove redundant checks for descending strides" {
@@ -159,7 +258,7 @@ test "loop ranges retain checks across wrapping and non-dominating guards" {
         \\        if index < 0 -> return 21
         \\        if visited == 2 -> return -100
         \\        visited += 1
-        \\        index += 2
+        \\        index = wrapping(index + 2)
         \\    return -200
         \\func descending() int
         \\    var index = -2147483647
@@ -169,7 +268,7 @@ test "loop ranges retain checks across wrapping and non-dominating guards" {
         \\        if index > 0 -> return 21
         \\        if visited == 2 -> return -100
         \\        visited += 1
-        \\        index -= 2
+        \\        index = wrapping(index - 2)
         \\    return -200
         \\func partial(first: int, limit: int, guarded: bool) int
         \\    if guarded
@@ -221,7 +320,7 @@ test "loop rewrites compose and recompute range proofs after source edits" {
         \\        var discarded = index
         \\        loop
         \\            if discarded == 0 -> break
-        \\            discarded -= 1
+        \\            discarded = wrapping(discarded - 1)
         \\        if index < 0 -> return -100
         \\        if index >= limit -> return -200
         \\        sum += index
@@ -621,13 +720,13 @@ test "optimizer folds integer constants identities and constant branches" {
 test "optimized native code agrees with unoptimized compile-time execution" {
     try Fixture.expectParity(source, 42);
     try Fixture.expectParity(
-        \\func scale(a: int, b: int) int -> a * 0 + b * -1 + b / -1 + -(-a)
+        \\func scale(a: int, b: int) int -> wrapping(a * 0 + b * -1 + b / -1 + -(-a))
         \\func run() int
         \\    const minimum = -2147483647 - 1
-        \\    if scale(minimum, minimum) <> 0 - minimum - minimum + minimum -> return 90
+        \\    if scale(minimum, minimum) <> wrapping(0 - minimum - minimum + minimum) -> return 90
         \\    if scale(5, -1) <> 7 -> return 91
-        \\    if minimum * -1 <> minimum -> return 92
-        \\    if minimum / -1 * 1 + 0 <> minimum -> return 93
+        \\    if wrapping(minimum * -1) <> minimum -> return 92
+        \\    if wrapping(minimum / -1 * 1 + 0) <> minimum -> return 93
         \\    if 1 > 2 -> return 94
         \\    return 42
     , 42);
@@ -856,7 +955,8 @@ test "inlining exposes callee bodies to scalar replacement selects and loop idio
     };
 
     const spin = (try optimizedBody(fixture, "spin")).*.?;
-    try testing.expectEqual(@as(usize, 0), countPredicates(spin));
+    // An arbitrary negative start eventually overflows its checked decrement.
+    try testing.expectEqual(@as(usize, 1), countPredicates(spin));
 }
 
 fn countCallsTo(body: structures.FunctionBodyAnalysis, name: []const u8, fixture: Fixture) !usize {

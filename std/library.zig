@@ -12,6 +12,7 @@ pub const File = enum(u32) {
     range,
     iteration,
     math,
+    primitives,
 
     pub fn path(file: File) []const u8 {
         return switch (file) {
@@ -26,6 +27,7 @@ pub const File = enum(u32) {
             .range => "range.chi",
             .iteration => "iteration.chi",
             .math => "math.chi",
+            .primitives => "primitives.chi",
         };
     }
 
@@ -74,11 +76,12 @@ pub const External = enum {
     io_read,
     io_write,
     primitive_operation,
+    numeric_converter,
 
     pub fn file(symbol: External) File {
         return switch (symbol) {
             .exit => .exit,
-            .literal_byte, .primitive_operation => .prelude,
+            .literal_byte, .primitive_operation, .numeric_converter => .primitives,
             .byte_int, .panic_message => .text,
             .io_read => .memory_allocation,
             .io_write => .text,

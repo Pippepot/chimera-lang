@@ -84,6 +84,7 @@ const Rules = struct {
     fn simplify(self: *Rules, instruction: *Instruction, result: ValueId) !bool {
         if (self.function.find(result) != result) return false;
         switch (instruction.*) {
+            .numeric_binary, .numeric_unary, .numeric_convert => return self.simplifyNumeric(instruction, result),
             .addi, .subi, .muli, .shli, .shrsi => return self.simplifyBinary(instruction, result),
             .divsi => return self.simplifyDivision(instruction, result),
             .negi => |operand| return self.simplifyNegation(instruction, result, operand),
@@ -104,6 +105,187 @@ const Rules = struct {
             .select => |operation| return self.simplifySelect(operation, result),
             else => return false,
         }
+    }
+
+    /// Bounds describe successful i32 results. A trapping producer remains live
+    /// independently, so narrowing its successful result never suppresses a panic.
+    const IntegerBounds = struct {
+        lower: i64 = std.math.minInt(i32),
+        upper: i64 = std.math.maxInt(i32),
+
+        fn fits(self: IntegerBounds) bool {
+            return self.lower >= std.math.minInt(i32) and self.upper <= std.math.maxInt(i32);
+        }
+        fn arithmetic(operation: structures.numeric.Binary, left: IntegerBounds, right: IntegerBounds) IntegerBounds {
+            switch (operation) {
+                .add => return .{ .lower = left.lower + right.lower, .upper = left.upper + right.upper },
+                .sub => return .{ .lower = left.lower - right.upper, .upper = left.upper - right.lower },
+                .mul => {
+                    const products = [_]i64{ left.lower * right.lower, left.lower * right.upper, left.upper * right.lower, left.upper * right.upper };
+                    return .{ .lower = std.mem.min(i64, &products), .upper = std.mem.max(i64, &products) };
+                },
+                else => unreachable,
+            }
+        }
+    };
+
+    fn integerBounds(self: *const Rules, value: ValueId, depth: u8) IntegerBounds {
+        if (depth >= 16 or self.isAddressTaken(value) or !self.function.plainValue(value)) return .{};
+        const definition = self.function.definition(value) orelse return .{};
+        switch (definition) {
+            .const_int => |integer| return .{ .lower = integer, .upper = integer },
+            .value_copy => |copy| return self.integerBounds(copy.source, depth + 1),
+            .select => |selection| {
+                const left = self.integerBounds(selection.then_value, depth + 1);
+                const right = self.integerBounds(selection.else_value, depth + 1);
+                return .{ .lower = @min(left.lower, right.lower), .upper = @max(left.upper, right.upper) };
+            },
+            .shrsi => |operands| {
+                const count_value = self.constant(operands.rhs) orelse return .{};
+                if (count_value < 0 or count_value >= 32) return .{};
+                const source = self.integerBounds(operands.lhs, depth + 1);
+                return .{ .lower = source.lower >> @intCast(count_value), .upper = source.upper >> @intCast(count_value) };
+            },
+            .negi => |operand| {
+                const source = self.integerBounds(operand, depth + 1);
+                if (source.lower == std.math.minInt(i32)) return .{};
+                return .{ .lower = -source.upper, .upper = -source.lower };
+            },
+            .addi, .subi, .muli => |operands| {
+                const operation: structures.numeric.Binary = switch (definition) {
+                    .addi => .add,
+                    .subi => .sub,
+                    .muli => .mul,
+                    else => unreachable,
+                };
+                const range = IntegerBounds.arithmetic(operation, self.integerBounds(operands.lhs, depth + 1), self.integerBounds(operands.rhs, depth + 1));
+                return if (range.fits()) range else .{};
+            },
+            .numeric_unary => |operation| {
+                if (operation.type_id != .int or operation.operation != .neg) return .{};
+                const source = self.integerBounds(operation.operand, depth + 1);
+                if (operation.overflow == .wrapping and source.lower == std.math.minInt(i32)) return .{};
+                return .{ .lower = @min(-source.upper, std.math.maxInt(i32)), .upper = @min(-source.lower, std.math.maxInt(i32)) };
+            },
+            .numeric_binary => |operation| {
+                if (operation.type_id != .int) return .{};
+                if (operation.operation != .add and operation.operation != .sub and operation.operation != .mul) return .{};
+                var range = IntegerBounds.arithmetic(operation.operation, self.integerBounds(operation.operands.lhs, depth + 1), self.integerBounds(operation.operands.rhs, depth + 1));
+                if (operation.overflow == .wrapping and !range.fits()) return .{};
+                range.lower = std.math.clamp(range.lower, std.math.minInt(i32), std.math.maxInt(i32));
+                range.upper = std.math.clamp(range.upper, std.math.minInt(i32), std.math.maxInt(i32));
+                return range;
+            },
+            else => return .{},
+        }
+    }
+
+    fn lowerNumericBinary(self: *Rules, instruction: *Instruction, operation: structures.NumericBinary) bool {
+        if (operation.type_id != .int) return false;
+        const operands = operation.operands;
+        if (operation.operation.isComparison()) {
+            const predicate: structures.PredicateOperation = switch (operation.operation) {
+                .eq => .eqi,
+                .ne => .nei,
+                .lt => .lti,
+                .gt => .gti,
+                .le => .lei,
+                .ge => .gei,
+                else => unreachable,
+            };
+            instruction.* = .{ .compare = .{ .operation = predicate, .operands = operands } };
+            return true;
+        }
+        switch (operation.operation) {
+            .add, .sub, .mul => {
+                if (operation.overflow != .wrapping) {
+                    const bounds = IntegerBounds.arithmetic(operation.operation, self.integerBounds(operands.lhs, 0), self.integerBounds(operands.rhs, 0));
+                    if (!bounds.fits()) return false;
+                }
+                instruction.* = switch (operation.operation) {
+                    .add => .{ .addi = operands },
+                    .sub => .{ .subi = operands },
+                    .mul => .{ .muli = operands },
+                    else => unreachable,
+                };
+            },
+            .div => {
+                const divisor = self.constant(operands.rhs) orelse return false;
+                if (divisor == 0) return false;
+                if (divisor == -1 and operation.overflow != .wrapping) return false;
+                instruction.* = .{ .divsi = operands };
+            },
+            .shl, .shr => {
+                const count_value = self.constant(operands.rhs) orelse return false;
+                if (count_value < 0 or count_value >= 32) return false;
+                instruction.* = if (operation.operation == .shl) .{ .shli = operands } else .{ .shrsi = operands };
+            },
+            else => return false,
+        }
+        return true;
+    }
+
+    fn lowerNumericUnary(self: *Rules, instruction: *Instruction, operation: structures.NumericUnary) bool {
+        if (operation.type_id != .int or operation.operation != .neg) return false;
+        if (operation.overflow != .wrapping and self.integerBounds(operation.operand, 0).lower == std.math.minInt(i32)) return false;
+        instruction.* = .{ .negi = operation.operand };
+        return true;
+    }
+
+    fn numericConstant(self: *const Rules, value: ValueId) ?structures.NumericConstant {
+        return (self.function.definition(value) orelse return null).numericConstant();
+    }
+
+    fn simplifyNumeric(self: *Rules, instruction: *Instruction, result: ValueId) bool {
+        switch (instruction.*) {
+            .numeric_binary => |operation| return self.simplifyNumericBinary(instruction, result, operation),
+            .numeric_unary => |operation| return self.simplifyNumericUnary(instruction, operation),
+            .numeric_convert => |operation| return self.simplifyNumericConversion(instruction, result, operation),
+            else => unreachable,
+        }
+    }
+
+    fn simplifyNumericBinary(self: *Rules, instruction: *Instruction, result: ValueId, operation: structures.NumericBinary) bool {
+        const lhs = self.numericConstant(operation.operands.lhs);
+        const rhs = self.numericConstant(operation.operands.rhs);
+        if (lhs != null and rhs != null) {
+            const bits = structures.numeric.binary(operation.type_id.numericType().?, operation.operation, operation.overflow, lhs.?.bits, rhs.?.bits) catch return false;
+            instruction.* = if (operation.operation.isComparison()) .{ .const_bool = bits != 0 } else Instruction.numericConstantInstruction(operation.type_id, bits);
+            return true;
+        }
+        if (self.lowerNumericBinary(instruction, operation)) return true;
+        if (operation.type_id.numericType().?.isFloat()) return false;
+        if (lhs != null and rhs == null and (operation.operation == .add or operation.operation == .mul or operation.operation == .bit_and or operation.operation == .bit_or or operation.operation == .bit_xor)) {
+            instruction.numeric_binary.operands = .{ .lhs = operation.operands.rhs, .rhs = operation.operands.lhs };
+            return true;
+        }
+        if (rhs) |right| {
+            const zero_identity = operation.operation == .add or operation.operation == .sub or operation.operation == .bit_or or operation.operation == .bit_xor or operation.operation == .shl or operation.operation == .shr;
+            if (zero_identity and right.bits == 0) return self.alias(result, operation.operands.lhs);
+            if ((operation.operation == .mul or operation.operation == .div) and right.bits == 1) return self.alias(result, operation.operands.lhs);
+            if ((operation.operation == .mul or operation.operation == .bit_and) and right.bits == 0) {
+                instruction.* = Instruction.numericConstantInstruction(operation.type_id, 0);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn simplifyNumericUnary(self: *Rules, instruction: *Instruction, operation: structures.NumericUnary) bool {
+        const operand = self.numericConstant(operation.operand) orelse return self.lowerNumericUnary(instruction, operation);
+        const bits = structures.numeric.unary(operation.type_id.numericType().?, operation.operation, operation.overflow, operand.bits) catch return false;
+        instruction.* = Instruction.numericConstantInstruction(operation.type_id, bits);
+        return true;
+    }
+
+    fn simplifyNumericConversion(self: *Rules, instruction: *Instruction, result: ValueId, operation: structures.NumericConversion) bool {
+        if (operation.result_type != operation.destination_type) return false;
+        const source_type = self.function.valueType(operation.operand);
+        if (source_type == operation.destination_type) return self.alias(result, operation.operand);
+        const operand = self.numericConstant(operation.operand) orelse return false;
+        const bits = structures.numeric.convert(source_type.numericType().?, operation.destination_type.numericType().?, operation.policy, operand.bits) orelse return false;
+        instruction.* = Instruction.numericConstantInstruction(operation.destination_type, bits);
+        return true;
     }
 
     fn simplifyBinary(self: *Rules, instruction: *Instruction, result: ValueId) bool {
@@ -237,14 +419,14 @@ const Rules = struct {
                 if (previous == field) continue;
                 const first = function.definition(previous) orelse return false;
                 switch (first) {
-                    .const_int, .const_bool, .const_byte => if (!std.meta.eql(first, function.definition(field) orelse return false)) return false,
+                    .const_numeric, .const_int, .const_bool, .const_byte => if (!std.meta.eql(first, function.definition(field) orelse return false)) return false,
                     else => return false,
                 }
             } else common = field;
         }
         const field = common orelse return false;
         if (function.definition(field)) |definition| switch (definition) {
-            .const_int, .const_bool, .const_byte => {
+            .const_numeric, .const_int, .const_bool, .const_byte => {
                 instruction.* = definition;
                 return true;
             },

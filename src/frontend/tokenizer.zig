@@ -270,7 +270,14 @@ pub const Tokenizer = struct {
                     self.index += 1;
                     continue :state if (number == .int) .int else .float;
                 },
-                'e', 'E', 'p', 'P' => continue :state if (number == .int) .int_exponent else .float_exponent,
+                'e', 'E', 'p', 'P' => {
+                    const hexadecimal = self.index >= result.loc.start + 2 and self.buffer[result.loc.start] == '0' and (self.buffer[result.loc.start + 1] == 'x' or self.buffer[result.loc.start + 1] == 'X');
+                    if (hexadecimal and self.current() != 'p' and self.current() != 'P') {
+                        self.index += 1;
+                        continue :state .int;
+                    }
+                    continue :state if (number == .int) .int_exponent else .float_exponent;
+                },
                 else => {},
             },
             inline .int_exponent, .float_exponent => |exponent| {

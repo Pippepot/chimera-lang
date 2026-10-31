@@ -404,8 +404,7 @@ fn Analyzer(comptime AnalysisServices: type) type {
             if (node.tag == .type or node.tag == .identifier) {
                 const span = tokenSpan(self.ast, node.token_index);
                 const name = self.source[span.start..span.end];
-                if (std.meta.stringToEnum(structures.TypeId, name)) |type_id| return type_id;
-                if (std.mem.eql(u8, name, "float")) return self.rejectIssue(.{ .span = span, .kind = .float_type_not_supported });
+                if (structures.TypeId.fromName(name)) |type_id| return type_id;
             }
             if (node.tag == .type or node.tag == .identifier or node.tag == .field_access) {
                 const reference = resolveNamedExpression(self.ast, self.source, node_index, self.analysis_context) catch |err|
@@ -749,10 +748,15 @@ pub const UnresolvedBody = struct {
             disjunction: BinaryOperands,
             negation: ValueUse,
             pattern_test: PatternBinding,
-            integer_literal: i64,
-            int_literal_value: i64,
+            integer_literal: structures.CompileTimeValueId,
+            int_literal_value: structures.CompileTimeValueId,
             string_literal: structures.ByteStringId,
             storage_cursor: structures.StaticStorageCursor,
+            numeric: structures.NumericConstant,
+            float_literal: struct { text: []const u8, negative: bool },
+            overflow_context: struct { value: ValueId, mode: structures.numeric.Overflow },
+            pipe: BinaryOperands,
+            numeric_conversion: struct { value: ValueId, target: structures.TypeId, policy: structures.numeric.Policy },
             integer: i32,
             byte: u8,
             boolean: bool,
@@ -1170,8 +1174,9 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
 
         fn appendCompileTimeValue(self: *Self, index: structures.Node.Index, runtime: structures.CompileTimeValue.Runtime) !ValueId {
             const primitive = try switch (runtime.value) {
+                .numeric => |bits| self.appendExpression(index, .{ .numeric = .{ .type_id = runtime.type_id, .bits = bits } }),
                 .int => |integer| self.appendExpression(index, .{ .integer = integer }),
-                .int_literal => |integer| self.appendExpression(index, .{ .int_literal_value = integer }),
+                .int_literal => self.appendExpression(index, .{ .int_literal_value = try self.analysis_context.internCompileTimeValue(.{ .runtime = runtime }) }),
                 .string_literal => |data| self.appendExpression(index, .{ .string_literal = data }),
                 .storage_cursor => |cursor| self.appendExpression(index, .{ .storage_cursor = cursor }),
                 .byte => |byte| self.appendExpression(index, .{ .byte = byte }),
@@ -1189,7 +1194,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 },
             };
             const representation_type = runtime.value.scalarTypeId() orelse switch (runtime.value) {
-                .structure => runtime.type_id,
+                .structure, .numeric => runtime.type_id,
                 .variant => |variant| variant.member_type,
                 else => unreachable,
             };
@@ -1411,7 +1416,8 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .bool_literal => return self.appendExpression(index, .{ .boolean = self.ast.tokens[node.token_index].tag == .keyword_true }),
                 .unit_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .unit } else .unit),
                 .none_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .none } else .none),
-                .type, .implicit_type, .type_func, .type_variant, .type_tuple, .reference_type => return self.appendTypeValue(index),
+                .type, .implicit_type, .type_func, .type_tuple, .reference_type => return self.appendTypeValue(index),
+                .type_variant => return self.appendPipe(index),
                 .comptime_expr => return self.appendComptime(index),
                 .call => return self.appendCall(index),
                 .panic_expr => return self.appendPanic(index),
@@ -1423,11 +1429,12 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .@"struct" => return self.appendExpression(index, .{ .type_value = try self.analysis_context.generatedStructType(index) }),
                 .identifier => return self.appendIdentifier(index, result_is_type),
                 .neg => return self.appendNegation(index),
+                .bit_not => return self.appendOperationCall(index, .@"~", &.{try self.appendUse(node.data.node, false)}),
                 .from_end => return self.appendFromEnd(index),
-                .add, .sub, .mul, .div, .rem, .shift_left, .shift_right => return self.appendBinary(index),
+                .add, .sub, .mul, .div, .rem, .bit_and, .bit_xor, .shift_left, .shift_right => return self.appendBinary(index),
                 .range, .range_inclusive => return self.appendRange(index),
                 .eq, .ne, .lt, .gt, .le, .ge, .not, .@"and", .@"or", .is, .membership => return self.appendPredicate(index),
-                .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .shift_left_assign, .shift_right_assign => return self.appendAssignment(index),
+                .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .bit_and_assign, .bit_or_assign, .bit_xor_assign, .shift_left_assign, .shift_right_assign => return self.appendAssignment(index),
                 .@"if", .if_else => return self.appendIf(index, result_is_type),
                 .match_expr => return self.appendMatch(index, result_is_type),
                 .catch_expr, .propagate_expr => return self.appendErrorHandler(index, result_is_type),
@@ -1488,9 +1495,8 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
 
         fn appendIdentifier(self: *Self, index: structures.Node.Index, result_is_type: bool) !ValueId {
             const name = tokenText(self.ast, self.source, self.ast.nodes[index.index()].token_index);
-            for ([_]structures.TypeId{ .int, .byte, .bool, .never, .type }) |primitive| {
-                if (std.mem.eql(u8, name, @tagName(primitive))) return self.appendExpression(index, .{ .type_value = primitive });
-            }
+            if (std.mem.eql(u8, name, "unit")) return self.appendExpression(index, if (result_is_type) .{ .type_value = .unit } else .unit);
+            if (structures.TypeId.fromName(name)) |primitive| return self.appendExpression(index, .{ .type_value = primitive });
             if (self.locals.get(name)) |local| return switch (local) {
                 .value => |value| value,
                 .static_value => |value| self.appendConstant(index, value),
@@ -1498,7 +1504,6 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .type_value => |type_id| self.appendExpression(index, .{ .type_value = type_id }),
                 .place => |place| self.appendExpression(index, .{ .local_read = place.id }),
             };
-            if (std.mem.eql(u8, name, "unit")) return self.appendExpression(index, if (result_is_type) .{ .type_value = .unit } else .unit);
             const reference = (try self.namedExpression(index)) orelse return self.reject(index, .unknown_value);
             return self.appendNamedReference(index, reference);
         }
@@ -1785,10 +1790,29 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         }
 
         fn appendInteger(self: *Self, index: structures.Node.Index, literal: structures.Node.Index, negative: bool) !ValueId {
-            return switch (parseIntegerLiteral(tokenText(self.ast, self.source, self.ast.nodes[literal.index()].token_index), negative)) {
-                .value => |value| self.appendExpression(index, .{ .integer_literal = value }),
-                .unsupported => |kind| self.reject(index, kind),
+            const text = tokenText(self.ast, self.source, self.ast.nodes[literal.index()].token_index);
+            if (structures.numeric.isFloatLiteral(text)) return self.appendExpression(index, .{ .float_literal = .{ .text = text, .negative = negative } });
+            if (!structures.numeric.validSeparators(text)) return self.reject(index, .invalid_numeric_literal);
+            if (std.fmt.parseInt(u64, text, 0)) |magnitude| {
+                const integer: structures.numeric.Integer = .{ .limbs = &.{magnitude}, .positive = !negative or magnitude == 0 };
+                return self.appendExpression(index, .{ .integer_literal = try self.analysis_context.internCompileTimeValue(.{ .runtime = .{ .type_id = .int_literal, .value = .{ .int_literal = integer } } }) });
+            } else |_| {}
+            const integer = structures.numeric.Integer.parse(self.gpa, text, negative) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return self.reject(index, .invalid_numeric_literal),
             };
+            defer self.gpa.free(integer.limbs);
+            return self.appendExpression(index, .{ .integer_literal = try self.analysis_context.internCompileTimeValue(.{ .runtime = .{ .type_id = .int_literal, .value = .{ .int_literal = integer } } }) });
+        }
+
+        fn appendPipe(self: *Self, index: structures.Node.Index) !ValueId {
+            const members = self.ast.nodeList(index);
+            var left = try self.appendUse(members[0], true);
+            for (members[1..]) |member| {
+                const right = try self.appendUse(member, true);
+                left = .{ .value = try self.appendExpression(index, .{ .pipe = .{ .lhs = left, .rhs = right } }), .span = nodeFocusSpan(self.ast, index) };
+            }
+            return left.value;
         }
 
         fn appendBinary(self: *Self, index: structures.Node.Index) !ValueId {
@@ -1919,6 +1943,9 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .mul, .mul_assign => .@"*",
                 .div, .div_assign => .@"/",
                 .rem, .rem_assign => .@"%",
+                .bit_and, .bit_and_assign => .@"&",
+                .bit_or_assign => .@"|",
+                .bit_xor, .bit_xor_assign => .@"^",
                 .shift_left, .shift_left_assign => .@"<<",
                 .shift_right, .shift_right_assign => .@">>",
                 else => unreachable,
@@ -2079,7 +2106,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             const constant = try self.analysis_context.lookupCompileTimeValue(value_id);
             if (constant == .runtime) switch (constant.runtime.value) {
                 .int => |integer| return integer,
-                .int_literal => |integer| return integer,
+                .int_literal => |integer| return integer.toInt(i64) orelse self.reject(index, .match_range_bound_not_integer),
                 .byte => |byte| return byte,
                 .none => return null,
                 else => {},
@@ -2257,6 +2284,21 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
 
         fn appendCall(self: *Self, index: structures.Node.Index) !ValueId {
             const node = self.ast.nodes[index.index()];
+            if (self.ast.nodes[node.data.node_node.a.index()].tag == .identifier) {
+                const name = tokenText(self.ast, self.source, self.ast.nodes[node.data.node_node.a.index()].token_index);
+                const policy = std.meta.stringToEnum(structures.numeric.Policy, name);
+                const overflow_context = std.mem.eql(u8, name, "wrapping") or std.mem.eql(u8, name, "saturating");
+                if ((overflow_context or (policy != null and policy.? != .lossless)) and !self.locals.contains(name) and try self.namedExpression(node.data.node_node.a) == null) {
+                    const arguments = self.ast.nodeList(node.data.node_node.b);
+                    if (overflow_context) {
+                        if (arguments.len != 1) return self.reject(index, .{ .call_argument_count_mismatch = .{ .expected = 1, .found = @intCast(arguments.len) } });
+                        return self.appendExpression(index, .{ .overflow_context = .{ .value = (try self.appendUse(arguments[0], false)).value, .mode = if (std.mem.eql(u8, name, "wrapping")) .wrapping else .saturating } });
+                    }
+                    if (arguments.len != 2) return self.reject(index, .{ .call_argument_count_mismatch = .{ .expected = 2, .found = @intCast(arguments.len) } });
+                    const target = try self.analyzeTypeOrReject(arguments[0], .unknown_type);
+                    return self.appendExpression(index, .{ .numeric_conversion = .{ .value = (try self.appendUse(arguments[1], false)).value, .target = target, .policy = policy.? } });
+                }
+            }
             const operation: UnresolvedBody.Expression.Operation = if (try self.conversionTarget(node.data.node_node.a)) |target| operation: {
                 const arguments = self.ast.nodeList(node.data.node_node.b);
                 if (arguments.len != 1) return self.reject(index, .{ .call_argument_count_mismatch = .{ .expected = 1, .found = @intCast(arguments.len) } });
@@ -2271,7 +2313,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             const node = self.ast.nodes[index.index()];
             if (node.tag == .identifier) {
                 const name = tokenText(self.ast, self.source, node.token_index);
-                if (std.meta.stringToEnum(structures.TypeId, name)) |primitive| return primitive;
+                if (structures.TypeId.fromName(name)) |primitive| return primitive;
                 if (self.locals.get(name)) |local| {
                     return if (local == .type_value) local.type_value else null;
                 }
@@ -2846,40 +2888,33 @@ fn isMetaTypeAnnotation(ast: *const structures.Ast, source: []const u8, annotati
     return node.tag == .implicit_type or (node.tag == .type and std.mem.eql(u8, tokenText(ast, source, node.token_index), "type"));
 }
 
-const IntegerLiteralResult = union(enum) {
-    value: i64,
-    unsupported: structures.Diagnostic.Kind,
-};
-
+/// Fast scalar probe only. Full literals are parsed without a magnitude limit
+/// by semantic construction, before contextual range checks in typing.
 pub fn integerLiteralValue(ast: *const structures.Ast, source: []const u8, expression: structures.Node.Index) ?i64 {
     const node = ast.nodes[expression.index()];
     const negative = node.tag == .neg;
     const literal = if (negative) ast.nodes[node.data.node.index()] else node;
     if (literal.tag != .number_literal) return null;
-    return switch (parseIntegerLiteral(tokenText(ast, source, literal.token_index), negative)) {
-        .value => |value| value,
-        .unsupported => null,
-    };
+    const text = tokenText(ast, source, literal.token_index);
+    if (!structures.numeric.validSeparators(text)) return null;
+    const magnitude = std.fmt.parseInt(u64, text, 0) catch return null;
+    if (negative and magnitude == @as(u64, std.math.maxInt(i64)) + 1) return std.math.minInt(i64);
+    const integer = std.math.cast(i64, magnitude) orelse return null;
+    return if (negative) -integer else integer;
 }
 
-fn parseIntegerLiteral(literal: []const u8, negative: bool) IntegerLiteralResult {
-    const prefix = if (literal.len >= 2) literal[0..2] else "";
-    const is_hex = std.ascii.eqlIgnoreCase(prefix, "0x");
-    const is_other_base = std.ascii.eqlIgnoreCase(prefix, "0b") or std.ascii.eqlIgnoreCase(prefix, "0o");
-    for (literal) |byte| {
-        if (byte == '.' or (is_hex and (byte == 'p' or byte == 'P')) or
-            (!is_hex and !is_other_base and (byte == 'e' or byte == 'E')))
-        {
-            return .{ .unsupported = .float_literal_not_supported };
-        }
-    }
-    for (literal) |byte| {
-        if (!std.ascii.isDigit(byte)) return .{ .unsupported = .integer_literal_not_decimal };
-    }
-    const magnitude = std.fmt.parseInt(u64, literal, 10) catch return .{ .unsupported = .integer_literal_out_of_range };
-    if (negative and magnitude == @as(u64, std.math.maxInt(i64)) + 1) return .{ .value = std.math.minInt(i64) };
-    const value = std.math.cast(i64, magnitude) orelse return .{ .unsupported = .integer_literal_out_of_range };
-    return .{ .value = if (negative) -value else value };
+/// Contextual literals prefer their ordinary default when it is a variant
+/// member; otherwise a single numeric member supplies the concrete target.
+pub fn numericLiteralTarget(analysis_context: anytype, expected: structures.TypeId, preferred: structures.TypeId) !?structures.TypeId {
+    if (expected.numericType() != null) return expected;
+    const members = (try analysis_context.facts().variantMembers(expected)) orelse return null;
+    if (std.mem.indexOfScalar(structures.TypeId, members, preferred) != null) return preferred;
+    var selected: ?structures.TypeId = null;
+    for (members) |member| if (member.numericType() != null) {
+        if (selected != null) return null;
+        selected = member;
+    };
+    return selected;
 }
 
 pub fn canWidenTo(analysis_context: anytype, actual: structures.TypeId, expected: structures.TypeId) !bool {

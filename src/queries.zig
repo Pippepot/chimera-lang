@@ -527,7 +527,7 @@ fn resolveTypeNamespace(ctx: anytype, type_id: structures.TypeId) anyerror!TypeN
 
 fn computeTypeNamespace(ctx: anytype, type_id: structures.TypeId) !?TypeNamespaceAssociation {
     if (type_id.isPrimitive()) {
-        const registered = (try standardFile(ctx, .prelude)) orelse return null;
+        const registered = (try standardFile(ctx, .primitives)) orelse return null;
         const module = (try ctx.input(FileModule, registered)).*;
         const owner = try ctx.intern(ItemLocations, .{ .origin = .{ .module = module }, .kind = .primitive, .name = .{ .identifier = @tagName(type_id) } });
         return .{ .query_key = .{ .primitive = owner } };
@@ -1160,7 +1160,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             if (root_node.tag != .field_access) {
                 const span = nodeSpan(&declaration.parsed, root);
                 const name = declaration.source[span.start..span.end];
-                if (std.meta.stringToEnum(structures.TypeId, name)) |primitive|
+                if (structures.TypeId.fromName(name)) |primitive|
                     return .{ .constant = try self.ctx.intern(CompileTimeValues, .{ .type = primitive }) };
             }
             return semantic.resolveNamedExpression(&declaration.parsed, declaration.source, root, declaration.analysis);
@@ -1217,7 +1217,7 @@ pub fn AnalysisContext(comptime Context: type) type {
 
         fn conversionOwner(self: @This(), type_id: structures.TypeId) !?structures.ModuleId {
             if (type_id.isPrimitive()) {
-                const file = (try standardFile(self.ctx, .prelude)) orelse return null;
+                const file = (try standardFile(self.ctx, .primitives)) orelse return null;
                 return (try self.ctx.input(FileModule, file)).*;
             }
             const association = (try self.typeNamespace(type_id)) orelse return null;
@@ -1345,7 +1345,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             const symbol = (try self.ctx.get(ExternalSymbol, item)).* orelse return null;
             switch (symbol) {
                 .primitive_operation => return .{ .symbol = symbol, .operation = (try self.ctx.lookupInterned(ItemLocations, item)).name.operation },
-                .literal_byte => return .{ .symbol = symbol },
+                .literal_byte, .numeric_converter => return .{ .symbol = symbol },
                 else => return null,
             }
         }
@@ -1583,7 +1583,11 @@ pub fn AnalysisContext(comptime Context: type) type {
                 {
                     const source = (try self.ctx.input(SourceText, self.file_id.?)).*;
                     if (semantic.integerLiteralValue(&parsed, source, node)) |integer| {
-                        if (expected == .int_literal) return try self.internCompileTimeValue(.{ .runtime = .{ .type_id = .int_literal, .value = .{ .int_literal = integer } } });
+                        if (expected == .int_literal) {
+                            const literal = try structures.numeric.Integer.fromInt(self.ctx.allocator(), integer);
+                            defer self.ctx.allocator().free(literal.limbs);
+                            return try self.internCompileTimeValue(.{ .runtime = .{ .type_id = .int_literal, .value = .{ .int_literal = literal } } });
+                        }
                         if (std.math.cast(i32, integer)) |value| return try self.internCompileTimeValue(.{ .runtime = .{ .type_id = .int, .value = .{ .int = value } } });
                     }
                 }
@@ -1719,7 +1723,7 @@ pub fn AnalysisContext(comptime Context: type) type {
                     .namespace => |namespace| .{ .namespace = namespace },
                 };
             }
-            if (std.meta.stringToEnum(structures.TypeId, name)) |type_id|
+            if (structures.TypeId.fromName(name)) |type_id|
                 return .{ .constant = try self.ctx.intern(CompileTimeValues, .{ .type = type_id }) };
             return null;
         }
@@ -2050,9 +2054,9 @@ pub const HostTypeLayout = struct {
     pub const Output = structures.TypeLayout;
 
     fn primitiveLayout(type_id: structures.TypeId) ?structures.TypeLayout {
+        if (type_id.numericType()) |number| return .{ .byte_size = number.width() / 8, .byte_alignment = number.width() / 8 };
         switch (type_id) {
-            .int, .bool => return .{ .byte_size = 4, .byte_alignment = 4 },
-            .byte => return .{ .byte_size = 1, .byte_alignment = 1 },
+            .bool => return .{ .byte_size = 4, .byte_alignment = 4 },
             .unit, .none, .never => return .{ .byte_size = 0, .byte_alignment = 1 },
             else => return null,
         }
@@ -2372,7 +2376,7 @@ fn indexItems(ctx: anytype, file_id: structures.FileId) anyerror!?structures.Ite
             var owner: ?structures.ItemId = null;
             while (segments.next()) |segment| {
                 std.debug.assert(segment.len != 0);
-                const primitive = if (owner == null) std.meta.stringToEnum(structures.TypeId, segment) else null;
+                const primitive = if (owner == null) structures.TypeId.fromName(segment) else null;
                 owner = try ctx.intern(ItemLocations, .{
                     .origin = .{ .module = loc.origin.module },
                     .owner = owner,
@@ -2476,7 +2480,7 @@ fn converterAnnotationHead(ctx: anytype, declaration: anytype, annotation: struc
         if (node.tag != .call and location.kind == .structure) return .{ .nominal = instance.item };
         if (node.tag == .call and try declaration.analysis.isGenericStruct(instance.item)) return .{ .nominal = instance.item };
     } else if (node.tag != .call) {
-        if (std.meta.stringToEnum(structures.TypeId, name)) |type_id| return .{ .primitive = type_id };
+        if (structures.TypeId.fromName(name)) |type_id| return .{ .primitive = type_id };
     }
     return .any;
 }
@@ -3015,11 +3019,11 @@ pub const IndexModuleItems = struct {
                 return rejectItem(ctx, entry.location, .duplicate_struct_member);
             const loc = try ctx.lookupInterned(ItemLocations, entry.item);
             if (loc.owner) |owner| {
-                // Entry members stay in their file; primitive namespaces belong to the prelude.
+                // Entry members stay in their file; primitive namespaces belong to their registered module.
                 const owner_location = try ctx.lookupInterned(ItemLocations, owner);
                 const valid_owner = switch (owner_location.kind) {
                     .top_level_entry => owner_location.origin.entry == entry.location.file_id,
-                    .primitive => entry.location.file_id == try standardFile(ctx, .prelude),
+                    .primitive => entry.location.file_id == try standardFile(ctx, .primitives),
                     else => index.resolve(owner) != null,
                 };
                 if (!valid_owner) return rejectItem(ctx, entry.location, .invalid_namespace_owner);
@@ -3068,10 +3072,10 @@ const ExternalSymbol = struct {
             const owner_location = try ctx.lookupInterned(ItemLocations, owner);
             if (owner_location.kind != .primitive) return null;
             if (loc.name != .operation) return null;
-            const type_id = std.meta.stringToEnum(structures.TypeId, owner_location.name.text()) orelse unreachable;
+            const type_id = structures.TypeId.fromName(owner_location.name.text()) orelse unreachable;
             if (!loc.name.operation.supportsPrimitive(type_id)) return null;
             break :primitive standard_library.External.primitive_operation;
-        } else std.meta.stringToEnum(standard_library.External, loc.name.text()) orelse return null;
+        } else if (loc.name == .converter) standard_library.External.numeric_converter else std.meta.stringToEnum(standard_library.External, loc.name.text()) orelse return null;
         if (symbol == .primitive_operation and loc.owner == null) return null;
         const file = symbol.file();
         const path = (try ctx.lookupInterned(ModulePaths, loc.origin.module)).path;
@@ -3629,15 +3633,15 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             const resolved = (try self.ctx.get(ResolveItem, self.owner.item)).* orelse return .unavailable;
             const analysis: AnalysisContext(Context) = .{ .ctx = self.ctx, .file_id = resolved.file_id, .instance = self.owner };
             if (source_type == .int_literal) {
-                const members = try analysis.facts().variantMembers(target_type);
-                if (target_type == .int or (members != null and std.mem.indexOfScalar(structures.TypeId, members.?, .int) != null)) {
-                    const integer = std.math.cast(i32, source.int_literal) orelse {
+                const destination = try semantic.numericLiteralTarget(analysis, target_type, .int);
+                if (destination) |target| {
+                    const bits = source.int_literal.bits(target.numericType().?) orelse {
                         try self.ctx.emit(structures.Diagnostic, .{ .file_id = resolved.file_id, .span = span, .instance = self.owner, .kind = .integer_literal_out_of_range });
                         return .reported_error;
                     };
-                    const value: comptime_interpreter.Value = .{ .runtime = .{ .int = integer } };
-                    if (target_type == .int) return .{ .returned = value };
-                    return .{ .returned = try comptime_interpreter.storedVariantValue(target_type, .int, value, self) };
+                    const value: comptime_interpreter.Value = .{ .runtime = comptime_interpreter.numericValue(target, bits) };
+                    if (target_type == target) return .{ .returned = value };
+                    return .{ .returned = try comptime_interpreter.storedVariantValue(target_type, target, value, self) };
                 }
             }
             const candidates = if (source_type == .string_literal and !try analysis.hasConverters(source_type, target_type))
@@ -3693,7 +3697,7 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             if (external) |symbol| {
                 switch (symbol) {
                     .static_iteration_item => return self.captureStaticItem(signature.parameters[0].type_id, arguments[0], call_span),
-                    .primitive_operation, .copy_value, .move_value, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => {},
+                    .primitive_operation, .numeric_converter, .copy_value, .move_value, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => {},
                     .allocate, .allocate_host_storage => return self.allocateStorage(symbol, signature.return_type, arguments, storage),
                     .deallocate, .deallocate_host_storage => {
                         comptime_interpreter.releaseAllocation(arguments[0]);
@@ -3794,6 +3798,15 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             return .{ .ctx = self.ctx };
         }
 
+        pub fn unionType(self: *@This(), left: structures.TypeId, right: structures.TypeId, span: ?structures.SourceSpan) !?structures.TypeId {
+            if (left == .type or right == .type) {
+                const resolved = (try self.ctx.get(ResolveItem, self.owner.item)).* orelse return null;
+                try self.ctx.emit(structures.Diagnostic, .{ .file_id = resolved.file_id, .span = span, .instance = self.owner, .kind = .type_value_used_as_runtime_value });
+                return null;
+            }
+            return try self.facts().internVariant(&.{ left, right });
+        }
+
         pub fn variantMembers(self: *@This(), type_id: structures.TypeId) !?[]const structures.TypeId {
             return self.facts().variantMembers(type_id);
         }
@@ -3843,6 +3856,7 @@ fn emitComptimeExecutionIssue(
             .panic => |message| .{ .compile_time_panic = message },
             .call_cycle => .compile_time_call_cycle,
             .division_by_zero => .compile_time_division_by_zero,
+            .integer_overflow => .compile_time_integer_overflow,
             .invalid_shift_count => .compile_time_invalid_shift_count,
             .unsupported_operation => .compile_time_unsupported_operation,
             .escaping_storage => .compile_time_escaping_storage,
@@ -4415,7 +4429,7 @@ fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?s
     if (intrinsics.hasTypedBody(symbol)) return compileTypedFunction(ctx, instance_id);
     return switch (symbol) {
         .static_iteration_item => null,
-        .primitive_operation, .copy_value, .move_value, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => unreachable,
+        .primitive_operation, .numeric_converter, .copy_value, .move_value, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => unreachable,
         .io_read, .io_write => try codegen.compileExternalByteIo(symbol == .io_read, signature, types, ctx.allocator()),
         .exit => try codegen.compileExternalExit(ctx.allocator()),
         .panic_message => try codegen.compileExternalPanic(signature, types, ctx.allocator()),

@@ -110,7 +110,7 @@ fn immediateComponent(comptime Component: type, value: i32, offset: u32) i32 {
     }
     std.debug.assert(offset < @sizeOf(i32));
     const bits: u32 = @bitCast(value);
-    return @intCast((bits >> @intCast(offset * 8)) & 0xff);
+    return @intCast((bits >> @intCast(offset * 8)) & std.math.maxInt(Component));
 }
 
 fn branchStorageEnd(ssa: *const structures.FunctionBodyAnalysis, types: anytype, branch: structures.FunctionBranch, start: u32) !u32 {
@@ -270,7 +270,7 @@ const LocationPlan = struct {
                 markUsed(&needed[@backingInt(value.*)]);
             };
             switch (instruction) {
-                .const_type, .const_int_literal, .static_conversion => unreachable,
+                .type_union, .const_type, .const_int_literal, .static_conversion => unreachable,
                 .initializer_ref => |operation| {
                     for (ssa.initializer_captures[operation.captures.start..operation.captures.end]) |capture| {
                         markUsed(&needed[@backingInt(capture)]);
@@ -360,7 +360,7 @@ const LocationPlan = struct {
                     inline .const_int, .const_byte, .const_bool => |value| if (!addressable[value_index]) {
                         break :location_blk .{ .immediate = if (@TypeOf(value) == bool) @intFromBool(value) else value };
                     },
-                    .const_type, .const_int_literal, .const_string_literal, .static_conversion => unreachable,
+                    .type_union, .const_type, .const_int_literal, .const_string_literal, .static_conversion => unreachable,
                     .initializer_ref => |operation| break :location_blk .{ .stack = try reserveStack(&local_end, try initializerSlotLayout(operation.captures)) },
                     .const_unit, .const_none => if (!addressable[value_index]) break :location_blk .discarded,
                     .call => |call| if (call.return_type == .unit and !addressable[value_index]) {
@@ -519,6 +519,11 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             field_offset: u32,
             target: structures.FunctionBlockId,
         };
+        const NumericTrap = struct {
+            target_patch: u32,
+            span: ?structures.SourceSpan,
+            frame: structures.InlineFrameId,
+        };
 
         gpa: std.mem.Allocator,
         ssa: *const structures.FunctionBodyAnalysis,
@@ -530,6 +535,8 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
         referenced_instances: std.ArrayList(structures.InstanceId) = .empty,
         constant_data: std.ArrayList(structures.ByteString) = .empty,
         trace_sites: std.ArrayList(structures.CompiledFunction.TraceSite) = .empty,
+        numeric_traps: std.ArrayList(NumericTrap) = .empty,
+        panic_trace_offsets: std.ArrayList(u32) = .empty,
         current_span: ?structures.SourceSpan = null,
         current_frame: structures.InlineFrameId = .root,
         // Scratch inverse of referenced_instances; relocations index the slice.
@@ -552,6 +559,8 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
 
         fn deinit(self: *Self) void {
             self.gpa.free(self.block_offsets);
+            self.numeric_traps.deinit(self.gpa);
+            self.panic_trace_offsets.deinit(self.gpa);
             self.jump_patches.deinit(self.gpa);
             self.initializer_patches.deinit(self.gpa);
             self.referenced_instances.deinit(self.gpa);
@@ -599,6 +608,29 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             for (0..ssa.blocks.len) |position| {
                 const fallthrough = if (position + 1 < ssa.blocks.len) blockInEmissionOrder(ssa, position + 1) else null;
                 try self.emitBlock(blockInEmissionOrder(ssa, position), fallthrough);
+            }
+            if (self.numeric_traps.items.len != 0) {
+                // Successful arithmetic falls through. Cold calls retain a
+                // return address and the source context of each failed check.
+                for (self.numeric_traps.items) |*trap| {
+                    try self.encoder.patchHere(trap.target_patch);
+                    trap.target_patch = try self.encoder.patchable(.call_relative);
+                    self.current_span = trap.span;
+                    self.current_frame = trap.frame;
+                    try self.recordTraceSite();
+                }
+                const handler = try self.encoder.position();
+                for (self.numeric_traps.items) |trap| try self.encoder.patch(trap.target_patch, handler);
+                const address = try self.encoder.patchable(.mov_rax);
+                const message = "panic: invalid numeric operation\n";
+                const data_index = try self.dataIndex(message);
+                try self.relocations.append(self.gpa, .{ .offset = address, .reference = .{ .data = data_index }, .kind = .address_absolute_64, .addend = 0 });
+                try self.encoder.emit(.mov_rsi_rax);
+                try self.encoder.immediate(.mov_edx, message.len);
+                const write = try self.encoder.patchable(.call_relative);
+                try self.panic_trace_offsets.append(self.gpa, try self.encoder.patchable(.jmp));
+                try self.encoder.patchHere(write);
+                try emitPanicWriter(&self.encoder);
             }
             for (self.jump_patches.items) |patch| {
                 const target_offset = self.block_offsets[@backingInt(patch.target)];
@@ -713,12 +745,16 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
 
         fn emitInstruction(self: *Self, instruction: structures.FunctionInstruction, destination: ValueLocation) !void {
             switch (instruction) {
+                .const_numeric => |constant| try self.emitNumericConstant(constant, destination),
+                .numeric_binary => |operation| try self.emitNumericBinary(operation, destination),
+                .numeric_unary => |operation| try self.emitNumericUnary(operation, destination),
+                .numeric_convert => |operation| try self.emitNumericConversion(operation, destination),
                 inline .const_int, .const_byte, .const_bool => |value| if (destination == .stack) {
                     try self.encoder.immediate(.mov_eax, if (@TypeOf(value) == bool) @intFromBool(value) else value);
                     try self.storeComponent(if (@TypeOf(value) == u8) u8 else u32, destination, 0);
                 },
                 .const_unit, .const_none, .local_storage, .result_storage => {},
-                .const_type, .const_int_literal, .const_string_literal, .static_conversion => unreachable,
+                .type_union, .const_type, .const_int_literal, .const_string_literal, .static_conversion => unreachable,
                 .const_static_string => |constant| try self.emitStaticString(constant, destination),
                 .const_storage_cursor => |cursor| if (cursor.data) |data| {
                     try self.emitDataAddress(data, cursor.offset, destination);
@@ -768,6 +804,480 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                 .fill => |operation| try self.emitFill(operation),
                 .move => |operation| try self.emitMove(operation),
             }
+        }
+
+        fn loadNumeric(self: *Self, type_id: structures.TypeId, source: ValueLocation) !void {
+            const kind = type_id.numericType().?;
+            switch (kind.width()) {
+                8 => try self.loadComponent(u8, source, 0),
+                16 => try self.loadComponent(u16, source, 0),
+                32 => try self.loadComponent(u32, source, 0),
+                64 => try self.loadAddress(source),
+                else => unreachable,
+            }
+            if (!kind.isFloat()) try self.normalizeNumeric(kind);
+        }
+
+        fn storeNumeric(self: *Self, kind: structures.numeric.Type, destination: ValueLocation, offset: u32) !void {
+            switch (kind.width()) {
+                8 => try self.storeComponent(u8, destination, offset),
+                16 => try self.storeComponent(u16, destination, offset),
+                32 => try self.storeComponent(u32, destination, offset),
+                64 => try self.storeComponent(u64, destination, offset),
+                else => unreachable,
+            }
+        }
+
+        fn normalizeNumeric(self: *Self, kind: structures.numeric.Type) !void {
+            switch (kind.width()) {
+                8 => try self.encoder.emit(if (kind.isSigned()) .movsx_rax_al else .movzx_eax_al),
+                16 => try self.encoder.emit(if (kind.isSigned()) .movsx_rax_ax else .movzx_eax_ax),
+                32 => try self.encoder.emit(if (kind.isSigned()) .movsxd_rax_eax else .mov_eax_eax),
+                64 => {},
+                else => unreachable,
+            }
+        }
+
+        fn emitNumericConstant(self: *Self, constant: structures.NumericConstant, destination: ValueLocation) !void {
+            if (destination == .discarded) return;
+            try self.encoder.absolute(.mov_rax, constant.bits);
+            try self.storeNumeric(constant.type_id.numericType().?, destination, 0);
+        }
+
+        fn numericTrapIf(self: *Self, condition: x86.Operation) !void {
+            const branch = try self.encoder.patchable(condition);
+            try self.numeric_traps.append(self.gpa, .{
+                .target_patch = branch,
+                .span = self.current_span,
+                .frame = self.current_frame,
+            });
+        }
+
+        fn numericTrap(self: *Self) !void {
+            return self.numericTrapIf(.jmp);
+        }
+
+        fn numericBounds(self: *Self, kind: structures.numeric.Type, overflow: structures.numeric.Overflow) !void {
+            if (overflow == .wrapping) return;
+            if (overflow == .checked) {
+                if (kind.isSigned()) {
+                    try self.encoder.absolute(.mov_rcx, @bitCast(@as(i64, @intCast(kind.minimum()))));
+                    try self.encoder.emit(.cmp_rax_rcx);
+                    try self.numericTrapIf(.jl);
+                }
+                try self.encoder.absolute(.mov_rcx, @intCast(kind.maximum()));
+                try self.encoder.emit(.cmp_rax_rcx);
+                return self.numericTrapIf(if (kind.isSigned()) .jg else .ja);
+            }
+            try self.encoder.absolute(.mov_rcx, @bitCast(@as(i64, @intCast(kind.minimum()))));
+            try self.encoder.emit(.cmp_rax_rcx);
+            const above_minimum = try self.encoder.patchable(if (kind.isSigned()) .jge else .jae);
+            try self.encoder.emit(.mov_rax_rcx);
+            const lower_done = try self.encoder.patchable(.jmp);
+            try self.encoder.patchHere(above_minimum);
+            try self.encoder.absolute(.mov_rcx, @intCast(kind.maximum()));
+            try self.encoder.emit(.cmp_rax_rcx);
+            const below_maximum = try self.encoder.patchable(if (kind.isSigned()) .jle else .jbe);
+            try self.encoder.emit(.mov_rax_rcx);
+            try self.encoder.patchHere(below_maximum);
+            try self.encoder.patchHere(lower_done);
+        }
+
+        fn numericArithmeticOverflow(self: *Self, kind: structures.numeric.Type, operation: structures.numeric.Binary, overflow: structures.numeric.Overflow) !void {
+            if (overflow == .wrapping) return;
+            if (overflow == .checked) {
+                if (kind.isSigned()) return self.numericTrapIf(.jo);
+                if (operation == .mul) {
+                    try self.encoder.emit(.test_rdx);
+                    return self.numericTrapIf(.jne);
+                }
+                return self.numericTrapIf(.jb);
+            }
+            // rsi retains the original left operand; rcx retains the right.
+            if (kind.isSigned()) {
+                const valid = try self.encoder.patchable(.jno);
+                if (operation == .mul) {
+                    try self.encoder.emit(.mov_rax_rsi);
+                    try self.encoder.emit(.xor_rax_rcx);
+                    try self.encoder.emit(.mov_rsi_rax);
+                }
+                try self.encoder.absolute(.mov_rax, @intCast(kind.maximum()));
+                try self.encoder.emit(.test_rsi);
+                const positive = try self.encoder.patchable(.jns);
+                try self.encoder.absolute(.mov_rax, @bitCast(@as(i64, @intCast(kind.minimum()))));
+                try self.encoder.patchHere(positive);
+                try self.encoder.patchHere(valid);
+            } else {
+                if (operation == .mul) try self.encoder.emit(.test_rdx);
+                const valid = try self.encoder.patchable(if (operation == .mul) .je else .jae);
+                try self.encoder.absolute(.mov_rax, if (operation == .sub) 0 else std.math.maxInt(u64));
+                try self.encoder.patchHere(valid);
+            }
+        }
+
+        /// Add/subtract/multiply at 32 bits consume and produce only their
+        /// low 32 bits. Widening is needed by the 64-bit division and narrow
+        /// saturation algorithms, not by checked 32-bit arithmetic.
+        fn loadNumericBinaryOperand(self: *Self, operation: structures.NumericBinary, source: ValueLocation) !void {
+            const kind = operation.type_id.numericType().?;
+            switch (operation.operation) {
+                .add, .sub, .mul => {
+                    if (kind.width() == 32 and !kind.isFloat() and operation.overflow != .saturating)
+                        return self.loadComponent(u32, source, 0);
+                },
+                else => {},
+            }
+            return self.loadNumeric(operation.type_id, source);
+        }
+
+        fn emitNumericBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !void {
+            const kind = operation.type_id.numericType().?;
+            if (try self.emitCompactNumericBinary(operation, destination)) return;
+            // The right operand is loaded first so loading an indirect operand
+            // never destroys a live scratch register holding the other input.
+            try self.loadNumericBinaryOperand(operation, self.valueLocation(operation.operands.rhs));
+            if (kind.isFloat()) try self.encoder.emit(.movq_xmm1_rax) else try self.encoder.emit(.mov_rcx_rax);
+            try self.loadNumericBinaryOperand(operation, self.valueLocation(operation.operands.lhs));
+            if (kind.isFloat()) {
+                try self.encoder.emit(.movq_xmm0_rax);
+                return self.emitFloatBinary(operation, destination);
+            }
+            if (operation.operation.isComparison()) {
+                try self.encoder.emit(.cmp_rax_rcx);
+                try self.numericComparisonResult(operation.operation, kind.isSigned(), destination);
+                return;
+            }
+            switch (operation.operation) {
+                .add, .sub, .mul => try self.emitNumericArithmetic(kind, operation.operation, operation.overflow),
+                .div, .rem => try self.emitNumericDivision(kind, operation.operation, operation.overflow),
+                .shl, .shr => {
+                    try self.encoder.emit(.mov_rsi_rax);
+                    try self.encoder.absolute(.mov_rax, kind.width());
+                    try self.encoder.emit(.cmp_rax_rcx);
+                    try self.numericTrapIf(.jbe);
+                    try self.encoder.emit(.mov_rax_rsi);
+                    try self.encoder.emit(if (operation.operation == .shl) .shl_rax_cl else if (kind.isSigned()) .sar_rax_cl else .shr_rax_cl);
+                },
+                .bit_and => try self.encoder.emit(.and_rax_rcx),
+                .bit_or => try self.encoder.emit(.or_rax_rcx),
+                .bit_xor => try self.encoder.emit(.xor_rax_rcx),
+                else => unreachable,
+            }
+            try self.storeNumeric(kind, destination, 0);
+        }
+
+        fn emitCompactNumericBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !bool {
+            const kind = operation.type_id.numericType().?;
+            if (kind.width() != 32 or kind.isFloat() or operation.overflow == .saturating) return false;
+            switch (operation.operation) {
+                .add, .sub => {},
+                .mul => if (!kind.isSigned() and operation.overflow != .wrapping) return false,
+                else => return false,
+            }
+            try self.loadComponent(u32, self.valueLocation(operation.operands.lhs), 0);
+            const right = self.valueLocation(operation.operands.rhs);
+            switch (operation.operation) {
+                .add => try self.encoder.integerBinary(.addi, right),
+                .sub => try self.encoder.integerBinary(.subi, right),
+                .mul => try self.encoder.integerBinary(.muli, right),
+                else => unreachable,
+            }
+            try self.numericArithmeticOverflow(kind, operation.operation, operation.overflow);
+            try self.storeNumeric(kind, destination, 0);
+            return true;
+        }
+
+        fn emitNumericArithmetic(self: *Self, kind: structures.numeric.Type, operation: structures.numeric.Binary, overflow: structures.numeric.Overflow) !void {
+            if (overflow == .saturating and kind.isSigned() and kind.width() >= 32) try self.encoder.emit(.mov_rsi_rax);
+            const narrow = kind.width() == 32;
+            switch (operation) {
+                .add => try self.encoder.emit(if (narrow) .add_eax_ecx else .add_rax_rcx),
+                .sub => try self.encoder.emit(if (narrow) .sub_eax_ecx else .sub_rax_rcx),
+                .mul => try self.encoder.emit(if (narrow) (if (kind.isSigned()) .imul_eax_ecx else .mul_ecx) else if (kind.isSigned() or kind.width() < 64) .imul_rax_rcx else .mul_rcx),
+                else => unreachable,
+            }
+            if (kind.width() >= 32) {
+                try self.numericArithmeticOverflow(kind, operation, overflow);
+            } else {
+                if (!kind.isSigned() and operation == .sub and overflow != .wrapping) {
+                    if (overflow == .checked) {
+                        try self.numericTrapIf(.jb);
+                    } else {
+                        const valid = try self.encoder.patchable(.jae);
+                        try self.encoder.immediate(.mov_eax, 0);
+                        try self.encoder.patchHere(valid);
+                    }
+                }
+                try self.numericBounds(kind, overflow);
+            }
+        }
+
+        fn emitNumericDivision(self: *Self, kind: structures.numeric.Type, operation: structures.numeric.Binary, overflow: structures.numeric.Overflow) !void {
+            try self.encoder.emit(.test_rcx);
+            try self.numericTrapIf(.je);
+            var done: ?u32 = null;
+            if (kind.isSigned()) {
+                try self.encoder.emit(.mov_rsi_rax);
+                try self.encoder.absolute(.mov_rax, @bitCast(@as(i64, @intCast(kind.minimum()))));
+                // Compare the dividend with MIN, then the divisor with -1.
+                try self.encoder.emit(.mov_rdx_rax);
+                try self.encoder.emit(.mov_rax_rsi);
+                try self.encoder.emit(.cmp_rax_rdx);
+                const ordinary = try self.encoder.patchable(.jne);
+                try self.encoder.absolute(.mov_rax, std.math.maxInt(u64));
+                try self.encoder.emit(.cmp_rax_rcx);
+                const other_divisor = try self.encoder.patchable(.jne);
+                if (operation == .rem) {
+                    try self.encoder.immediate(.mov_eax, 0);
+                } else switch (overflow) {
+                    .checked => try self.numericTrap(),
+                    .wrapping => try self.encoder.emit(.mov_rax_rsi),
+                    .saturating => try self.encoder.absolute(.mov_rax, @intCast(kind.maximum())),
+                }
+                done = try self.encoder.patchable(.jmp);
+                try self.encoder.patchHere(ordinary);
+                try self.encoder.patchHere(other_divisor);
+                try self.encoder.emit(.mov_rax_rsi);
+                try self.encoder.emit(.cqo);
+            } else try self.encoder.emit(.zero_edx);
+            try self.encoder.emit(if (kind.isSigned()) .idiv_rcx else .div_rcx);
+            if (operation == .rem) try self.encoder.emit(.mov_rax_rdx);
+            if (done) |field| try self.encoder.patchHere(field);
+        }
+
+        fn numericComparisonResult(self: *Self, operation: structures.numeric.Binary, signed: bool, destination: ValueLocation) !void {
+            const yes = try self.encoder.patchable(switch (operation) {
+                .eq => .je,
+                .ne => .jne,
+                .lt => if (signed) .jl else .jb,
+                .gt => if (signed) .jg else .ja,
+                .le => if (signed) .jle else .jbe,
+                .ge => if (signed) .jge else .jae,
+                else => unreachable,
+            });
+            try self.encoder.immediate(.mov_eax, 0);
+            const done = try self.encoder.patchable(.jmp);
+            try self.encoder.patchHere(yes);
+            try self.encoder.immediate(.mov_eax, 1);
+            try self.encoder.patchHere(done);
+            try self.storeResult(destination);
+        }
+
+        fn emitFloatBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !void {
+            const single = operation.type_id == .f32;
+            if (operation.operation.isComparison()) {
+                try self.encoder.emit(if (single) .ucomiss_xmm0_xmm1 else .ucomisd_xmm0_xmm1);
+                const unordered = try self.encoder.patchable(.jp);
+                try self.numericComparisonResult(operation.operation, false, destination);
+                const done = try self.encoder.patchable(.jmp);
+                try self.encoder.patchHere(unordered);
+                try self.encoder.immediate(.mov_eax, @intFromBool(operation.operation == .ne));
+                try self.storeResult(destination);
+                try self.encoder.patchHere(done);
+                return;
+            }
+            try self.encoder.emit(switch (operation.operation) {
+                .add => if (single) .addss_xmm0_xmm1 else .addsd_xmm0_xmm1,
+                .sub => if (single) .subss_xmm0_xmm1 else .subsd_xmm0_xmm1,
+                .mul => if (single) .mulss_xmm0_xmm1 else .mulsd_xmm0_xmm1,
+                .div => if (single) .divss_xmm0_xmm1 else .divsd_xmm0_xmm1,
+                else => unreachable,
+            });
+            try self.encoder.emit(.movq_rax_xmm0);
+            try self.storeNumeric(operation.type_id.numericType().?, destination, 0);
+        }
+
+        fn emitNumericUnary(self: *Self, operation: structures.NumericUnary, destination: ValueLocation) !void {
+            const kind = operation.type_id.numericType().?;
+            if (kind.width() == 32) try self.loadComponent(u32, self.valueLocation(operation.operand), 0) else try self.loadNumeric(operation.type_id, self.valueLocation(operation.operand));
+            if (kind.isFloat()) {
+                try self.encoder.absolute(.mov_rcx, @as(u64, 1) << @intCast(kind.width() - 1));
+                try self.encoder.emit(.xor_rax_rcx);
+            } else if (operation.operation == .bit_not) {
+                try self.encoder.emit(.not_rax);
+            } else {
+                try self.encoder.emit(.mov_rcx_rax);
+                try self.encoder.immediate(.mov_eax, 0);
+                try self.emitNumericArithmetic(kind, .sub, operation.overflow);
+            }
+            try self.storeNumeric(kind, destination, 0);
+        }
+
+        fn conversionFailure(self: *Self, failures: *std.ArrayList(u32), condition: x86.Operation) !void {
+            try failures.append(self.gpa, try self.encoder.patchable(condition));
+        }
+
+        fn conversionIntegerBounds(self: *Self, source: structures.numeric.Type, target: structures.numeric.Type, policy: structures.numeric.Policy, failures: *std.ArrayList(u32)) !void {
+            if (policy == .wrap) return;
+            if (source.minimum() < target.minimum()) {
+                try self.encoder.absolute(.mov_rcx, @bitCast(@as(i64, @intCast(target.minimum()))));
+                try self.encoder.emit(.cmp_rax_rcx);
+                if (policy == .saturate) {
+                    const valid = try self.encoder.patchable(.jge);
+                    try self.encoder.emit(.mov_rax_rcx);
+                    try self.encoder.patchHere(valid);
+                } else try self.conversionFailure(failures, .jl);
+            }
+            if (source.maximum() > target.maximum()) {
+                try self.encoder.absolute(.mov_rcx, @intCast(target.maximum()));
+                try self.encoder.emit(.cmp_rax_rcx);
+                const signed = source.isSigned();
+                if (policy == .saturate) {
+                    const valid = try self.encoder.patchable(if (signed) .jle else .jbe);
+                    try self.encoder.emit(.mov_rax_rcx);
+                    try self.encoder.patchHere(valid);
+                } else try self.conversionFailure(failures, if (signed) .jg else .ja);
+            }
+        }
+
+        fn integerToFloat(self: *Self, source: structures.numeric.Type, target: structures.numeric.Type) !void {
+            const single = target == .f32;
+            if (!source.isSigned() and source.width() == 64) {
+                try self.encoder.emit(.test_rax);
+                const low = try self.encoder.patchable(.jns);
+                // (x >> 1) | (x & 1) retains the sticky bit, so the final
+                // doubling rounds once, including for unsigned MAX.
+                try self.encoder.emit(.mov_rcx_rax);
+                try self.encoder.byteImmediate(.shr_rax, 1);
+                try self.encoder.emit(.mov_rdx_rax);
+                try self.encoder.immediate(.mov_eax, 1);
+                try self.encoder.emit(.and_rax_rcx);
+                try self.encoder.emit(.mov_rcx_rax);
+                try self.encoder.emit(.mov_rax_rdx);
+                try self.encoder.emit(.or_rax_rcx);
+                try self.encoder.emit(if (single) .cvtsi2ss_xmm0_rax else .cvtsi2sd_xmm0_rax);
+                try self.encoder.emit(.movaps_xmm1_xmm0);
+                try self.encoder.emit(if (single) .addss_xmm0_xmm1 else .addsd_xmm0_xmm1);
+                const done = try self.encoder.patchable(.jmp);
+                try self.encoder.patchHere(low);
+                try self.encoder.emit(if (single) .cvtsi2ss_xmm0_rax else .cvtsi2sd_xmm0_rax);
+                try self.encoder.patchHere(done);
+            } else try self.encoder.emit(if (single) .cvtsi2ss_xmm0_rax else .cvtsi2sd_xmm0_rax);
+        }
+
+        fn floatBound(self: *Self, value: f64) !void {
+            try self.encoder.absolute(.mov_rax, @bitCast(value));
+            try self.encoder.emit(.movq_xmm2_rax);
+            try self.encoder.emit(.ucomisd_xmm0_xmm2);
+        }
+
+        fn floatToInteger(self: *Self, target: structures.numeric.Type, policy: structures.numeric.Policy, failures: *std.ArrayList(u32)) !void {
+            try self.encoder.emit(.ucomisd_xmm0_xmm0);
+            try self.conversionFailure(failures, .jp);
+            var saturated: std.ArrayList(u32) = .empty;
+            defer saturated.deinit(self.gpa);
+            if (policy == .saturate) {
+                try self.floatBound(@floatFromInt(target.minimum()));
+                const above_minimum = try self.encoder.patchable(.ja);
+                try self.encoder.absolute(.mov_rax, @bitCast(@as(i64, @intCast(target.minimum()))));
+                try saturated.append(self.gpa, try self.encoder.patchable(.jmp));
+                try self.encoder.patchHere(above_minimum);
+                try self.floatBound(@floatFromInt(target.maximum()));
+                const below_maximum = try self.encoder.patchable(.jb);
+                try self.encoder.absolute(.mov_rax, @intCast(target.maximum()));
+                try saturated.append(self.gpa, try self.encoder.patchable(.jmp));
+                try self.encoder.patchHere(below_maximum);
+            }
+            try self.encoder.emit(.movaps_xmm1_xmm0);
+            try self.floatBound(0);
+            const negative = try self.encoder.patchable(.jb);
+            try self.floatBound(18446744073709551616.0);
+            try self.conversionFailure(failures, .jae);
+            try self.floatBound(9223372036854775808.0);
+            const low = try self.encoder.patchable(.jb);
+            // Convert the high half of u64 through an exact power-of-two bias.
+            try self.encoder.emit(.movaps_xmm2_xmm0);
+            try self.encoder.absolute(.mov_rax, @bitCast(@as(f64, 9223372036854775808.0)));
+            try self.encoder.emit(.movq_xmm1_rax);
+            try self.encoder.emit(.subsd_xmm0_xmm1);
+            try self.encoder.emit(if (policy == .round) .cvtsd2si_rax_xmm0 else .cvttsd2si_rax_xmm0);
+            try self.encoder.absolute(.mov_rcx, @as(u64, 1) << 63);
+            try self.encoder.emit(.or_rax_rcx);
+            try self.encoder.emit(.movaps_xmm1_xmm2);
+            try self.conversionIntegerBounds(.u64, target, policy, failures);
+            const high_done = try self.encoder.patchable(.jmp);
+            try self.encoder.patchHere(low);
+            try self.encoder.emit(if (policy == .round) .cvtsd2si_rax_xmm0 else .cvttsd2si_rax_xmm0);
+            try self.conversionIntegerBounds(.u64, target, policy, failures);
+            const low_done = try self.encoder.patchable(.jmp);
+            try self.encoder.patchHere(negative);
+            try self.floatBound(-9223372036854775808.0);
+            try self.conversionFailure(failures, .jb);
+            try self.encoder.emit(if (policy == .round) .cvtsd2si_rax_xmm0 else .cvttsd2si_rax_xmm0);
+            try self.conversionIntegerBounds(.i64, target, policy, failures);
+            try self.encoder.patchHere(high_done);
+            try self.encoder.patchHere(low_done);
+            if (policy == .checked) {
+                try self.encoder.emit(.mov_rsi_rax);
+                // integerToFloat may use xmm1 for unsigned conversion.
+                try self.encoder.emit(.movaps_xmm2_xmm1);
+                try self.integerToFloat(target, .f64);
+                try self.encoder.emit(.ucomisd_xmm0_xmm2);
+                try self.conversionFailure(failures, .jne);
+                try self.encoder.emit(.mov_rax_rsi);
+            }
+            for (saturated.items) |field| try self.encoder.patchHere(field);
+        }
+
+        fn emitNumericConversion(self: *Self, operation: structures.NumericConversion, destination: ValueLocation) !void {
+            if (destination == .discarded) return;
+            const source = self.valueType(operation.operand).numericType().?;
+            const target = operation.destination_type.numericType().?;
+            var failures: std.ArrayList(u32) = .empty;
+            defer failures.deinit(self.gpa);
+            try self.loadNumeric(self.valueType(operation.operand), self.valueLocation(operation.operand));
+            if (!source.isFloat() and !target.isFloat()) {
+                try self.conversionIntegerBounds(source, target, operation.policy, &failures);
+            } else if (source.isFloat() and !target.isFloat()) {
+                try self.encoder.emit(.movq_xmm0_rax);
+                if (source == .f32) try self.encoder.emit(.cvtss2sd_xmm0_xmm0);
+                try self.floatToInteger(target, operation.policy, &failures);
+            } else if (!source.isFloat()) {
+                try self.encoder.emit(.mov_rdi_rax);
+                try self.integerToFloat(source, target);
+                if (operation.policy == .checked) {
+                    try self.encoder.emit(.movaps_xmm2_xmm0);
+                    if (target == .f32) try self.encoder.emit(.cvtss2sd_xmm0_xmm0);
+                    try self.floatToInteger(source, .truncate, &failures);
+                    try self.encoder.emit(.mov_rcx_rax);
+                    try self.encoder.emit(.mov_rax_from_rdi);
+                    try self.encoder.emit(.cmp_rax_rcx);
+                    try self.conversionFailure(&failures, .jne);
+                    try self.encoder.emit(.mov_rax_from_rdi);
+                    try self.integerToFloat(source, target);
+                }
+                try self.encoder.emit(.movq_rax_xmm0);
+            } else {
+                try self.encoder.emit(.movq_xmm0_rax);
+                if (operation.policy == .checked) {
+                    try self.encoder.emit(.movaps_xmm1_xmm0);
+                    try self.encoder.emit(if (source == .f32) .ucomiss_xmm0_xmm0 else .ucomisd_xmm0_xmm0);
+                    try self.conversionFailure(&failures, .jp);
+                }
+                if (source != target) try self.encoder.emit(if (target == .f32) .cvtsd2ss_xmm0_xmm0 else .cvtss2sd_xmm0_xmm0);
+                try self.encoder.emit(.movq_rax_xmm0);
+                if (operation.policy == .checked and source != target) {
+                    try self.encoder.emit(.mov_rsi_rax);
+                    try self.encoder.emit(if (target == .f32) .cvtss2sd_xmm0_xmm0 else .cvtsd2ss_xmm0_xmm0);
+                    try self.encoder.emit(if (source == .f32) .ucomiss_xmm0_xmm1 else .ucomisd_xmm0_xmm1);
+                    try self.conversionFailure(&failures, .jne);
+                    try self.encoder.emit(.mov_rax_rsi);
+                }
+            }
+            if (operation.result_type == operation.destination_type) {
+                std.debug.assert(failures.items.len == 0);
+                return self.storeNumeric(target, destination, 0);
+            }
+            const layout = try self.types.variantLayout(operation.result_type);
+            const members = (try self.types.facts().variantMembers(operation.result_type)).?;
+            try self.storeNumeric(target, destination, layout.payload_offset);
+            try self.encoder.immediate(.mov_eax, @intCast(std.mem.indexOfScalar(structures.TypeId, members, operation.destination_type).?));
+            try self.storeComponent(u32, destination, 0);
+            const done = try self.encoder.patchable(.jmp);
+            for (failures.items) |field| try self.encoder.patchHere(field);
+            try self.encoder.immediate(.mov_eax, @intCast(std.mem.indexOfScalar(structures.TypeId, members, .none).?));
+            try self.storeComponent(u32, destination, 0);
+            try self.encoder.patchHere(done);
         }
 
         fn emitIntegerBinary(self: *Self, comptime operation: std.meta.Tag(structures.FunctionInstruction), operands: structures.BinaryOperands, destination: ValueLocation) !void {
@@ -1121,6 +1631,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                     try self.encoder.patch(patch.field_offset, start);
                 };
                 try self.encoder.code.appendSlice(self.gpa, compiled.code);
+                for (compiled.panic_trace_offsets) |field| try self.panic_trace_offsets.append(self.gpa, std.math.add(u32, start, field) catch return error.FunctionTooLarge);
                 for (compiled.trace_sites) |site| {
                     const label = try self.gpa.dupe(u8, site.label);
                     errdefer self.gpa.free(label);
@@ -1457,7 +1968,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                     try self.loadComponent(Component, source, source_start + offset);
                     switch (destination) {
                         .value => |location| try self.storeComponent(Component, location, destination_start + offset),
-                        .reference => try self.encoder.offset(if (Component == u8) .mov_rdi_al else .mov_rdi_eax, destination_start + offset),
+                        .reference => try self.encoder.offset(if (Component == u8) .mov_rdi_al else if (Component == u16) .mov_rdi_ax else if (Component == u64) .mov_rdi_rax_offset else .mov_rdi_eax, destination_start + offset),
                     }
                 }
             }
@@ -1522,7 +2033,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
         }
 
         fn loadComponent(self: *Self, comptime Component: type, location: ValueLocation, component_offset: u32) !void {
-            std.debug.assert(Component == u8 or Component == u32);
+            std.debug.assert(Component == u8 or Component == u16 or Component == u32);
             switch (location) {
                 .immediate => |value| try self.encoder.immediate(.mov_eax, immediateComponent(Component, value, component_offset)),
                 .eax => std.debug.assert(component_offset == 0),
@@ -1530,19 +2041,19 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                     std.debug.assert(component_offset == 0);
                     try self.encoder.register(.load_eax, register, 0);
                 },
-                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(if (Component == u8) .movzx_eax_rsp else .mov_eax_rsp, std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(if (Component == u8) .movzx_eax_rsp else if (Component == u16) .movzx_eax_word_rsp else .mov_eax_rsp, std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
                 .indirect => |offset| {
                     try self.encoder.offset(.mov_rax_rsp, offset);
-                    try self.encoder.offset(if (Component == u8) .movzx_eax_rax else .mov_eax_rax, component_offset);
+                    try self.encoder.offset(if (Component == u8) .movzx_eax_rax else if (Component == u16) .movzx_eax_word_rax else .mov_eax_rax, component_offset);
                 },
                 .discarded => unreachable,
             }
         }
 
         fn storeComponent(self: *Self, comptime Component: type, location: ValueLocation, component_offset: u32) !void {
-            std.debug.assert(Component == u8 or Component == u32);
+            std.debug.assert(Component == u8 or Component == u16 or Component == u32 or Component == u64);
             switch (location) {
-                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(if (Component == u8) .mov_rsp_al else .mov_rsp_eax, std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(if (Component == u8) .mov_rsp_al else if (Component == u16) .mov_rsp_ax else if (Component == u64) .mov_rsp_rax else .mov_rsp_eax, std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
                 .eax => std.debug.assert(component_offset == 0),
                 .register => |register| {
                     std.debug.assert(component_offset == 0);
@@ -1552,7 +2063,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
                 .immediate => unreachable,
                 .indirect => |offset| {
                     try self.encoder.offset(.mov_rdi_rsp, offset);
-                    try self.encoder.offset(if (Component == u8) .mov_rdi_al else .mov_rdi_eax, component_offset);
+                    try self.encoder.offset(if (Component == u8) .mov_rdi_al else if (Component == u16) .mov_rdi_ax else if (Component == u64) .mov_rdi_rax_offset else .mov_rdi_eax, component_offset);
                 },
             }
         }
@@ -1576,6 +2087,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             for (self.relocations.items) |*relocation| relocation.offset = encoded.fields[relocation.offset];
             for (self.trace_sites.items) |*site| site.return_offset = encoded.positions[site.return_offset];
             for (self.initializer_patches.items) |*patch| patch.field_offset = encoded.fields[patch.field_offset];
+            for (self.panic_trace_offsets.items) |*field| field.* = encoded.fields[field.*];
             self.encoder.code = encoded.code;
             encoded.code = .empty;
             self.encoder.materialized = true;
@@ -1585,6 +2097,8 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
             var artifact: structures.CompiledFunction = .{ .required_alignment = 1 };
             errdefer artifact.deinit(self.gpa);
             artifact.relocations = try self.relocations.toOwnedSlice(self.gpa);
+            artifact.panic_trace_offsets = try self.panic_trace_offsets.toOwnedSlice(self.gpa);
+            artifact.requires_sigpipe_ignore = artifact.panic_trace_offsets.len != 0;
             artifact.trace_sites = try self.trace_sites.toOwnedSlice(self.gpa);
             artifact.referenced_instances = try self.referenced_instances.toOwnedSlice(self.gpa);
             artifact.constant_data = try self.constant_data.toOwnedSlice(self.gpa);
@@ -1659,7 +2173,8 @@ pub fn compileExternalPanic(signature: structures.FunctionSignature, types: anyt
     try encoder.patchHere(newline_address);
     try encoder.code.append(gpa, '\n');
     var artifact = try externalArtifact(&encoder);
-    artifact.panic_trace_offset = trace;
+    errdefer artifact.deinit(gpa);
+    artifact.panic_trace_offsets = try gpa.dupe(u32, &.{trace});
     artifact.requires_sigpipe_ignore = true;
     return artifact;
 }
@@ -1703,7 +2218,7 @@ fn emitPanicText(encoder: *X86Encoder, size: i32) !u32 {
 }
 
 /// Best-effort, allocation-free stderr output. Failed writes never panic again.
-fn emitPanicWriter(encoder: *X86Encoder) !void {
+fn emitPanicWriter(encoder: anytype) !void {
     try encoder.emit(.test_edx);
     const empty = try encoder.patchable(.je);
     const retry = try encoder.position();
@@ -1803,7 +2318,7 @@ fn compileExternalAllocateStorage(signature: structures.FunctionSignature, types
     try encoder.immediate(.cmp_rax, -4095);
     const allocation_failed = try encoder.patchable(.jae);
     try encoder.offset(.mov_rsp_eax, result.payload);
-    try encoder.emit(.shr_rax_32);
+    try encoder.byteImmediate(.shr_rax, 32);
     try encoder.offset(.mov_rsp_eax, result.payload + 4);
     try encoder.emit(.mov_eax_esi);
     try encoder.offset(.mov_rsp_eax, result.payload + 8);
@@ -1964,7 +2479,7 @@ pub fn buildExecutableWithResultAllocator(
     try image.emit(.syscall);
 
     const needs_panic_trace = for (functions) |function| {
-        if (function.artifact.panic_trace_offset != null) break true;
+        if (function.artifact.panic_trace_offsets.len != 0) break true;
     } else false;
     var bulk_capacity = image.code.items.len;
     for (functions) |function| {
@@ -2022,7 +2537,7 @@ pub fn buildExecutableWithResultAllocator(
 fn appendPanicTrace(image: *X86Encoder, functions: []const ReachableFunction, function_offsets: []const usize) !void {
     const trace = image.code.items.len;
     const table_field = try emitPanicTrace(image);
-    for (functions, function_offsets) |function, function_offset| if (function.artifact.panic_trace_offset) |field| {
+    for (functions, function_offsets) |function, function_offset| for (function.artifact.panic_trace_offsets) |field| {
         try image.patch(function_offset + field, trace);
     };
     // Labels precede the fixed-width table; pointers are final ELF addresses.

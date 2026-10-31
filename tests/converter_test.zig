@@ -110,7 +110,7 @@ test "static conversion matches specialize by canonical source value" {
     const module = (try db.input(sources.queries.FileModule, 0)).*;
     var instances: [2]sources.structures.InstanceId = undefined;
     for (&instances, 0..) |*instance, index| {
-        const value = try db.intern(sources.queries.CompileTimeValues, .{ .runtime = .{ .type_id = .int_literal, .value = .{ .int_literal = @intCast(index) } } });
+        const value = try db.intern(sources.queries.CompileTimeValues, .{ .runtime = .{ .type_id = .int_literal, .value = .{ .int_literal = .{ .limbs = &.{index}, .positive = true } } } });
         const candidates = (try db.get(sources.queries.ConversionCandidates, .{ .source = .{ .constant = value }, .target = target, .requester = module })).*.?;
         try testing.expectEqual(@as(usize, 1), candidates.len);
         instance.* = candidates[0].instance;
@@ -892,8 +892,8 @@ test "integer literal defaults and standard byte converter preserve distinct typ
         \\    _ -> ()
         \\exit(90)
     , 42);
-    try Fixture.expectAnySourceDiagnostic("const value: byte = 256\nexit(0)", .where_condition_failed);
-    try Fixture.expectAnySourceDiagnostic("const value: byte = -1\nexit(0)", .where_condition_failed);
+    try Fixture.expectAnySourceDiagnostic("const value: byte = 256\nexit(0)", .integer_literal_out_of_range);
+    try Fixture.expectAnySourceDiagnostic("const value: byte = -1\nexit(0)", .integer_literal_out_of_range);
     try Fixture.expectAnySourceDiagnostic("const value = 2147483648\nexit(0)", .integer_literal_out_of_range);
     try Fixture.expectAnySourceDiagnostic("const number = 42\nconst value: byte = number\nexit(0)", .local_type_mismatch);
 }
@@ -1433,7 +1433,7 @@ test "initializer inference does not execute converters inside static sources" {
         \\    answer and answer is Wrapper -> exit(answer.inner.value)
         \\    _ -> ()
         \\exit(90)
-    , .where_condition_failed);
+    , .integer_literal_out_of_range);
     try Fixture.expectSourceExit(declarations ++
         \\func construct(init value: Wrapper) Wrapper | none -> value
         \\match construct(loop -> break Wrapper{inner = Source{value = 42}})
@@ -1490,10 +1490,10 @@ test "literal converters inspect wide signed values without defaulting to int" {
         \\const selected: Target = -9223372036854775808
         \\exit(selected.value)
     , 42);
-    try Fixture.expectAnySourceDiagnostic("const value: byte = 9223372036854775807\nexit(0)", .where_condition_failed);
-    try Fixture.expectAnySourceDiagnostic("const value: byte = -9223372036854775808\nexit(0)", .where_condition_failed);
-    try Fixture.expectAnySourceDiagnostic("const value = -0xff\nexit(0)", .integer_literal_not_decimal);
-    try Fixture.expectAnySourceDiagnostic("const value = -1.5\nexit(0)", .float_literal_not_supported);
+    try Fixture.expectAnySourceDiagnostic("const value: byte = 9223372036854775807\nexit(0)", .integer_literal_out_of_range);
+    try Fixture.expectAnySourceDiagnostic("const value: byte = -9223372036854775808\nexit(0)", .integer_literal_out_of_range);
+    try Fixture.expectSourceExit("const value = -0xff\nif value == -255 -> exit(42) else exit(90)", 42);
+    try Fixture.expectSourceExit("const value = -1.5\nif value == -1.5 -> exit(42) else exit(90)", 42);
     try Fixture.expectSourceExit("static literal: int_literal = 42\nconst value: byte = literal\nfunc take(imm item: byte) int -> 42\nexit(take(value))", 42);
 }
 

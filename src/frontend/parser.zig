@@ -379,6 +379,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_not,
         .minus,
         .caret,
+        .tilde,
         => {
             const expr = try parseExpressionPrecedence(parser, 0);
             const tag = assignmentTag(parser.current().tag) orelse return expr;
@@ -552,7 +553,7 @@ fn parseDeclarationName(parser: *ParserState, allow_qualified: bool) !Declaratio
 
 fn isOperationName(tag: Token.Tag) bool {
     return switch (tag) {
-        .plus, .minus, .asterisk, .slash, .percent, .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .equal_equal, .angle_bracket_left_angle_bracket_right, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal, .keyword_not, .l_bracket => true,
+        .plus, .minus, .asterisk, .slash, .percent, .ampersand, .pipe, .caret, .tilde, .angle_bracket_angle_bracket_left, .angle_bracket_angle_bracket_right, .equal_equal, .angle_bracket_left_angle_bracket_right, .angle_bracket_left, .angle_bracket_right, .angle_bracket_left_equal, .angle_bracket_right_equal, .keyword_not, .l_bracket => true,
         else => false,
     };
 }
@@ -628,6 +629,9 @@ fn assignmentTag(token: Token.Tag) ?Node.Tag {
         .asterisk_equal => .mul_assign,
         .slash_equal => .div_assign,
         .percent_equal => .rem_assign,
+        .ampersand_equal => .bit_and_assign,
+        .pipe_equal => .bit_or_assign,
+        .caret_equal => .bit_xor_assign,
         .angle_bracket_angle_bracket_left_equal => .shift_left_assign,
         .angle_bracket_angle_bracket_right_equal => .shift_right_assign,
         else => null,
@@ -785,6 +789,7 @@ fn parseMatchTuple(parser: *ParserState) ParseError!Node.Index {
 fn parseFunction(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
     const external = parser.eat(.keyword_extern) != null;
+    if (external and parser.current().tag == .keyword_converter) return parseConverterBody(parser, token_index, true);
     // Only `extern` can reach here without a function keyword.
     if (parser.eatAny(&.{.keyword_func}) == null) _ = try parser.expect(.keyword_func);
     const name: ?DeclarationName = if (external or parser.current().tag == .identifier or isOperationName(parser.current().tag))
@@ -811,10 +816,13 @@ fn parseOverload(parser: *ParserState) !Node.Index {
 }
 
 fn parseConverter(parser: *ParserState) !Node.Index {
-    const token_index = parser.index;
+    return parseConverterBody(parser, parser.index, false);
+}
+
+fn parseConverterBody(parser: *ParserState, token_index: u32, external: bool) !Node.Index {
     _ = try parser.expect(.keyword_converter);
     const signature = try parseFuncSignature(parser);
-    const body = try parseCallableBody(parser, token_index);
+    const body = if (external) Node.Index.null else try parseCallableBody(parser, token_index);
     const function = try parser.addNode(.{
         .tag = .func,
         .token_index = token_index,
@@ -977,6 +985,8 @@ fn binaryOpInfo(token: Token.Tag) ?BinaryOpInfo {
         .keyword_in => .{ .tag = .membership, .precedence = 3 },
         .keyword_is => .{ .tag = .is, .precedence = 3 },
         .ellipsis2 => .{ .tag = .range, .precedence = 4 },
+        .ampersand => .{ .tag = .bit_and, .precedence = 5 },
+        .caret => .{ .tag = .bit_xor, .precedence = 5 },
         .angle_bracket_angle_bracket_left => .{ .tag = .shift_left, .precedence = 5 },
         .angle_bracket_angle_bracket_right => .{ .tag = .shift_right, .precedence = 5 },
         .plus => .{ .tag = .add, .precedence = 6 },
@@ -1055,6 +1065,7 @@ fn parseRange(parser: *ParserState, first: ?Node.Index) ParseError!Node.Index {
         .l_bracket,
         .minus,
         .caret,
+        .tilde,
         => false,
         else => true,
     };
@@ -1074,10 +1085,11 @@ fn parseUnary(parser: *ParserState) ParseError!Node.Index {
             const operand = try parseExpressionPrecedence(parser, 3);
             return parser.addNode(.{ .tag = .not, .token_index = token_index, .data = .{ .node = operand } });
         },
-        .minus => {
+        .minus, .tilde => {
+            const tag: Node.Tag = if (parser.current().tag == .minus) .neg else .bit_not;
             parser.index += 1;
             const operand = try parseUnary(parser);
-            return parser.addNode(.{ .tag = .neg, .token_index = token_index, .data = .{ .node = operand } });
+            return parser.addNode(.{ .tag = tag, .token_index = token_index, .data = .{ .node = operand } });
         },
         .caret => {
             parser.index += 1;
@@ -1085,6 +1097,15 @@ fn parseUnary(parser: *ParserState) ParseError!Node.Index {
             return parser.addNode(.{ .tag = .from_end, .token_index = token_index, .data = .{ .node = operand } });
         },
         else => parsePostfix(parser),
+    };
+}
+
+fn caretHasRightOperand(parser: *ParserState) bool {
+    const next = parser.tokens[parser.index + 1];
+    if (std.mem.indexOfScalar(u8, parser.source[parser.current().loc.end..next.loc.start], '\n') != null) return false;
+    return switch (next.tag) {
+        .identifier, .number_literal, .l_paren, .tilde => true,
+        else => false,
     };
 }
 
@@ -1106,7 +1127,10 @@ fn parsePostfix(parser: *ParserState) ParseError!Node.Index {
                 lhs = try parser.addNode(.{ .tag = .index_access, .token_index = token_index, .data = .{ .node_node = .{ .a = lhs, .b = index } } });
             },
             .period => lhs = try parseFieldAccess(parser, lhs),
-            .caret => lhs = try parsePostfixNode(parser, lhs, .move_expr),
+            .caret => {
+                if (caretHasRightOperand(parser)) break;
+                lhs = try parsePostfixNode(parser, lhs, .move_expr);
+            },
             .question_mark => lhs = try parsePostfixNode(parser, lhs, .propagate_expr),
             else => break,
         }

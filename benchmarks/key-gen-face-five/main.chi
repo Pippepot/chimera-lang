@@ -1,0 +1,41 @@
+import std.io.{stdin, read_bytes}
+
+func generate_keys(last: int)
+    var keys: Array(int, 13) = [0, 1, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var sums = Array(int, 50000).filled(0)
+    for key_index in 3..=last
+        var candidate = keys[key_index - 1] + 1
+        loop
+            keys[key_index] = candidate
+            var count = 0
+            for face1 in 0..=key_index
+                for face2 in face1..=key_index
+                    for face3 in face2..=key_index
+                        for face4 in face3..=key_index
+                            for face5 in face4..=key_index
+                                if face1 <> face5
+                                    sums[count] = keys[face1] + keys[face2] + keys[face3] + keys[face4] + keys[face5]
+                                    count += 1
+            var valid = true
+            var left = 0
+            loop
+                if not valid or left >= count - 1 -> break
+                var right = left + 1
+                loop
+                    if not valid or right >= count -> break
+                    if sums[left] == sums[right]
+                        valid = false
+                    right += 1
+                left += 1
+            if valid -> break
+            candidate += 1
+    for key_index in 0..=last
+        print(keys[key_index])
+
+var input: List(byte) = []
+const received = read_bytes(stdin, input, 1)
+if not (received is int) -> exit(1)
+if received <> 1 -> exit(1)
+const last = int(input[0])
+if last < 3 or last > 12 -> exit(1)
+generate_keys(last)

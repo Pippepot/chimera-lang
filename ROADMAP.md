@@ -47,18 +47,12 @@ diagnostics, execution, ownership, and incremental/cache behavior.
   direct membership and relative-comparison arms, and pattern Boolean algebra.
   Settle header initializers and capture ownership before introducing syntax.
 
-## Independent numeric foundations
+## Independent numeric library work
 
-Schedule integer/byte work when earlier milestones need it; floating point does
-not gate collections or basic algorithms.
-
-- Nondecimal integer literals and magnitudes beyond the current signed-64-bit
-  literal representation; define spelling, typing, and range diagnostics.
-- Byte arithmetic and comparisons, and named wrap/truncate/round/saturate/widen
-  conversions (including int/byte), with explicit overflow and failure rules;
-  no converters between numeric runtime types.
-- Float representation, literals, operations, conversions, and exceptional
-  values before library math. Mixed operations and extra widths need decisions.
+- Extend text formatting and parsing to every numeric width and floating-point
+  format, with explicit locale and exceptional-value rules.
+- Build floating-point library math on the concrete arithmetic and conversion
+  policies in [docs/NUMERICS.md](docs/NUMERICS.md).
 
 ## Deferred or independent
 

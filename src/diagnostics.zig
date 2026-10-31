@@ -538,7 +538,12 @@ fn writeStaticValue(types: anytype, writer: *std.Io.Writer, id: structures.Compi
 
 fn writeStaticRuntime(types: anytype, writer: *std.Io.Writer, runtime: structures.CompileTimeValue.Runtime) anyerror!void {
     switch (runtime.value) {
-        inline .int, .int_literal, .byte => |value| try writer.print("{d}", .{value}),
+        .numeric => |bits| {
+            const kind = runtime.type_id.numericType().?;
+            if (kind.isFloat()) try writer.print("{d}", .{structures.numeric.asFloat(kind, bits)}) else try writer.print("{d}", .{structures.numeric.asInteger(kind, bits)});
+        },
+        inline .int, .byte => |value| try writer.print("{d}", .{value}),
+        .int_literal => |integer| try writer.print("{f}", .{integer}),
         .bool => |value| try writer.writeAll(if (value) "true" else "false"),
         .unit => try writer.writeAll("()"),
         .none => try writer.writeAll("none"),

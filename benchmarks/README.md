@@ -7,6 +7,15 @@ helps repeatability but does not remove frequency, thermal, or system-load noise
 Compiler timings, generated-program runtime, retained memory, and code size are
 different measurements; none substitutes for another.
 
+## Five-Face Key Search
+
+The standalone [five-face key search](key-gen-face-five/README.md) compares
+matching Chimera and C workloads:
+
+```sh
+python3 benchmarks/key-gen-face-five/run.py --cpu 4
+```
+
 ## Recording Results
 
 [history.py](history.py) records exact snapshots and updates the static report at

@@ -5,22 +5,4 @@ pub import std.memory.{Box, Ref, Span, List, collection_sequence}
 pub import std.array.{Array, collection_literal}
 pub import std.iteration.{End}
 
-extern func literal_byte(static value: int_literal) byte
-pub converter(static value: int_literal) byte where value >= 0 where value <= 255 -> literal_byte(value)
-
-pub extern func int.+(imm left: int, imm right: int) int
-pub extern func int.-(imm left: int, imm right: int) int
-pub extern func int.*(imm left: int, imm right: int) int
-pub extern func int./(imm left: int, imm right: int) int
-pub extern func int.%(imm left: int, imm right: int) int
-pub extern func int.<<(imm left: int, imm right: int) int
-pub extern func int.>>(imm left: int, imm right: int) int
-pub extern func int.-(imm self: int) int
-pub extern func int.==(imm left: int, imm right: int) bool
-pub extern func int.<>(imm left: int, imm right: int) bool
-pub extern func int.<(imm left: int, imm right: int) bool
-pub extern func int.>(imm left: int, imm right: int) bool
-pub extern func int.<=(imm left: int, imm right: int) bool
-pub extern func int.>=(imm left: int, imm right: int) bool
-pub extern func bool.==(imm left: bool, imm right: bool) bool
-pub extern func bool.<>(imm left: bool, imm right: bool) bool
+import std.primitives.{}

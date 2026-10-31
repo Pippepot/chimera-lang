@@ -283,10 +283,10 @@ test "operation functions primitive externs preserve arithmetic and evaluation o
         \\    total *= 2
         \\    total -= 2
         \\    total /= 2
-        \\    const minimum = 2147483647 + 1
-        \\    const maximum = minimum - 1
-        \\    const doubled = 1073741824 * 2
-        \\    if order == 12345 and sum == 3 and comparison and inverted and negative == -3 and not uninverted and literal_sum == 42 and literal_negative == -19 and literal_copy == 19 and total == 41 and minimum == -2147483648 and maximum == 2147483647 and doubled == minimum and -minimum == minimum and -7 / 3 == -2 and int./(7, -3) == -2 and less(-2, -1) and not less(-1, -2) and not false and true and not bool.==(true, false) and not bool.<>(true, true)
+        \\    const minimum = wrapping(2147483647 + 1)
+        \\    const maximum = wrapping(minimum - 1)
+        \\    const doubled = wrapping(1073741824 * 2)
+        \\    if order == 12345 and sum == 3 and comparison and inverted and negative == -3 and not uninverted and literal_sum == 42 and literal_negative == -19 and literal_copy == 19 and total == 41 and minimum == -2147483648 and maximum == 2147483647 and doubled == minimum and wrapping(-minimum) == minimum and -7 / 3 == -2 and int./(7, -3) == -2 and less(-2, -1) and not less(-1, -2) and not false and true and not bool.==(true, false) and not bool.<>(true, true)
         \\        return 42
         \\    return 90
     , 42);
@@ -302,10 +302,10 @@ test "operation functions primitive namespaces reject foreign extensions" {
         const source = try testing.allocator.print("{s}\nexit(42)", .{declaration});
         defer testing.allocator.free(source);
         try Fixture.expectSourceDiagnostic(source, .invalid_namespace_owner);
-        const fixture = try Fixture.initFiles("import std.prelude.{}\nimport std.exit.{exit}\nexit(42)", &.{.{ .path = "std/extension.chi", .module_path = "std.prelude", .source = declaration }});
+        const fixture = try Fixture.initFiles("import std.prelude.{}\nimport std.exit.{exit}\nexit(42)", &.{.{ .path = "std/extension.chi", .module_path = "std.primitives", .source = declaration }});
         defer fixture.deinit();
-        const prelude = (try fixture.db.input(queries.StandardFile, queries.standardFileKey("prelude.chi"))).*;
-        try fixture.db.setInput(queries.SourceText, prelude, "");
+        const primitives = (try fixture.db.input(queries.StandardFile, queries.standardFileKey("primitives.chi"))).*;
+        try fixture.db.setInput(queries.SourceText, primitives, "");
         try fixture.expectDiagnostic(1, .invalid_namespace_owner);
     }
 }
@@ -322,24 +322,24 @@ test "operation functions primitive division by zero retains caller source locat
     }
 }
 
-test "minimum integer division by negative one wraps for every divisor location in both engines" {
+test "explicit wrapping minimum integer division covers every divisor location in both engines" {
     try Fixture.expectParity(
-        \\func divide(left: int, right: int) int -> left / right
-        \\func divide_borrowed(left: int, ref right: int) int -> left / right
+        \\func divide(left: int, right: int) int -> wrapping(left / right)
+        \\func divide_borrowed(left: int, ref right: int) int -> wrapping(left / right)
         \\func run() int
         \\    const minimum = -2147483647 - 1
         \\    var negative_one = -1
         \\    var three = 3
-        \\    if minimum / -1 <> minimum -> return 90
-        \\    if minimum / negative_one <> minimum -> return 91
+        \\    if wrapping(minimum / -1) <> minimum -> return 90
+        \\    if wrapping(minimum / negative_one) <> minimum -> return 91
         \\    if divide(minimum, -1) <> minimum -> return 92
         \\    if divide_borrowed(minimum, negative_one) <> minimum -> return 93
         \\    if divide(minimum, three) <> -715827882 -> return 94
         \\    if divide_borrowed(-7, three) <> -2 -> return 95
         \\    if divide(7, -1) <> -7 -> return 96
         \\    if minimum / 1 <> minimum -> return 97
-        \\    if int./(minimum, -1) <> minimum -> return 98
-        \\    if divide(minimum, -1) * -1 + minimum % -1 <> minimum -> return 99
+        \\    if wrapping(int./(minimum, -1)) <> minimum -> return 98
+        \\    if wrapping(divide(minimum, -1) * -1 + minimum % -1) <> minimum -> return 99
         \\    return 42
     , 42);
 }
@@ -387,16 +387,16 @@ test "operation functions primitive signatures invalidate and recover every call
         defer testing.allocator.free(source);
         const fixture = try Fixture.init(source);
         defer fixture.deinit();
-        const prelude = (try fixture.db.input(queries.StandardFile, queries.standardFileKey("prelude.chi"))).*;
-        try fixture.db.setInput(queries.SourceText, prelude, case.valid);
+        const primitives = (try fixture.db.input(queries.StandardFile, queries.standardFileKey("primitives.chi"))).*;
+        try fixture.db.setInput(queries.SourceText, primitives, case.valid);
         try fixture.expectExit(0, 42);
-        try fixture.db.setInput(queries.SourceText, prelude, case.invalid);
-        try fixture.expectDiagnostic(prelude, .invalid_operation_signature);
-        try fixture.db.setInput(queries.SourceText, prelude, "");
+        try fixture.db.setInput(queries.SourceText, primitives, case.invalid);
+        try fixture.expectDiagnostic(primitives, .invalid_operation_signature);
+        try fixture.db.setInput(queries.SourceText, primitives, "");
         try fixture.expectDiagnostic(null, .missing_operation);
-        try fixture.db.setInput(queries.SourceText, prelude, case.valid["pub ".len..]);
+        try fixture.db.setInput(queries.SourceText, primitives, case.valid["pub ".len..]);
         try fixture.expectDiagnostic(null, .private_access);
-        try fixture.db.setInput(queries.SourceText, prelude, case.valid);
+        try fixture.db.setInput(queries.SourceText, primitives, case.valid);
         try fixture.expectExit(0, 42);
     };
 }
@@ -405,7 +405,7 @@ test "operation functions minus callable ambiguity and independent invalidation"
     try Fixture.expectSourceDiagnostic("const operation = int.-\nexit(42)", .ambiguous_operation_reference);
     const unary = "pub extern func int.-(imm value: int) int";
     const binary = "pub extern func int.-(imm left: int, imm right: int) int";
-    const prelude_source = unary ++ "\n" ++ binary;
+    const primitives_source = unary ++ "\n" ++ binary;
     const calls = [_][]const u8{
         "return -(-42)",
         "return int.-(-42)",
@@ -417,18 +417,18 @@ test "operation functions minus callable ambiguity and independent invalidation"
         defer testing.allocator.free(source);
         const fixture = try Fixture.init(source);
         defer fixture.deinit();
-        const prelude = (try fixture.db.input(queries.StandardFile, queries.standardFileKey("prelude.chi"))).*;
-        try fixture.db.setInput(queries.SourceText, prelude, prelude_source);
+        const primitives = (try fixture.db.input(queries.StandardFile, queries.standardFileKey("primitives.chi"))).*;
+        try fixture.db.setInput(queries.SourceText, primitives, primitives_source);
         try fixture.expectExit(0, 42);
-        try fixture.db.setInput(queries.SourceText, prelude, "pub extern func int.-(mut value: int) int\n" ++ binary);
-        try fixture.expectDiagnostic(prelude, .invalid_operation_signature);
-        try fixture.db.setInput(queries.SourceText, prelude, unary ++ "\npub extern func int.-(imm left: int, imm right: int) bool");
+        try fixture.db.setInput(queries.SourceText, primitives, "pub extern func int.-(mut value: int) int\n" ++ binary);
+        try fixture.expectDiagnostic(primitives, .invalid_operation_signature);
+        try fixture.db.setInput(queries.SourceText, primitives, unary ++ "\npub extern func int.-(imm left: int, imm right: int) bool");
         try fixture.expectExit(0, 42);
-        try fixture.db.setInput(queries.SourceText, prelude, "extern func int.-(imm value: int) int\n" ++ binary);
+        try fixture.db.setInput(queries.SourceText, primitives, "extern func int.-(imm value: int) int\n" ++ binary);
         try fixture.expectDiagnostic(null, .private_access);
-        try fixture.db.setInput(queries.SourceText, prelude, binary);
+        try fixture.db.setInput(queries.SourceText, primitives, binary);
         try fixture.expectDiagnostic(null, if (call_index == 2) .local_type_mismatch else .missing_operation);
-        try fixture.db.setInput(queries.SourceText, prelude, prelude_source);
+        try fixture.db.setInput(queries.SourceText, primitives, primitives_source);
         try fixture.expectExit(0, 42);
     };
     try Fixture.expectParity(
@@ -734,7 +734,7 @@ test "invalid shift counts remain executed errors in direct and callable forms" 
             const result = try fixture.runIo("");
             defer testing.allocator.free(result.stdout);
             defer testing.allocator.free(result.stderr);
-            try testing.expect(result.term == .signal);
+            try testing.expectEqual(std.process.Child.Term{ .exited = 134 }, result.term);
         }
     };
     try Fixture.expectParity(

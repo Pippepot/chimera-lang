@@ -490,7 +490,7 @@ fn expectLimitedExit(source: []const u8, status: u8, limit: []const u8) !void {
     const executable = try fixture.executable(0);
     try test_sources.runtime.writeProgram(std.testing.io, executable.bytes);
     defer std.Io.Dir.cwd().deleteFile(std.testing.io, "prog") catch {};
-    var child = std.process.spawn(std.testing.io, .{ .argv = &.{ "prlimit", limit, "--", "./prog" } }) catch |err| switch (err) {
+    var child = std.process.spawn(std.testing.io, .{ .argv = &.{ "prlimit", limit, "--", "./prog" }, .stdout = .ignore, .stderr = .ignore }) catch |err| switch (err) {
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };

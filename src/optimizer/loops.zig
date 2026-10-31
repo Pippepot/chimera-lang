@@ -74,6 +74,21 @@ pub const Analysis = struct {
         );
     }
 
+    /// Equality loops with unit strides terminate without overflowing only when
+    /// the initial counter is on the approaching side of the bound.
+    pub fn equalityRecurrenceSafe(self: Analysis, preheader_block: u32, counter: InductionExit) bool {
+        if (!self.immutable(counter.comparison.other)) return false;
+        if (counter.induction.start == counter.comparison.other) return true;
+        const start = self.rangeAt(counter.induction.start, preheader_block);
+        const bound = self.rangeAt(counter.comparison.other, preheader_block);
+        return if (counter.induction.step == 1)
+            start.upper <= bound.lower
+        else if (counter.induction.step == -1)
+            start.lower >= bound.upper
+        else
+            false;
+    }
+
     fn immutable(self: Analysis, value: ValueId) bool {
         const resolved = self.function.find(value);
         return self.function.plainValue(resolved) and !self.address_taken[@backingInt(resolved)];
@@ -96,6 +111,19 @@ pub const Analysis = struct {
         const next = function.definition(function.find(back.value)) orelse return null;
         var step: i32 = undefined;
         switch (next) {
+            .numeric_binary => |operation| {
+                if (operation.type_id != .int or operation.overflow == .saturating) return null;
+                const operands = operation.operands;
+                if (operation.operation == .add) {
+                    const operand = if (function.find(operands.lhs) == parameter) operands.rhs else if (function.find(operands.rhs) == parameter) operands.lhs else return null;
+                    step = self.integerConstant(operand) orelse return null;
+                } else if (operation.operation == .sub) {
+                    if (function.find(operands.lhs) != parameter) return null;
+                    const decrement = self.integerConstant(operands.rhs) orelse return null;
+                    if (decrement == std.math.minInt(i32)) return null;
+                    step = -decrement;
+                } else return null;
+            },
             .addi => |operands| {
                 const operand = if (function.find(operands.lhs) == parameter) operands.rhs else if (function.find(operands.rhs) == parameter) operands.lhs else return null;
                 step = self.integerConstant(operand) orelse return null;
@@ -107,13 +135,17 @@ pub const Analysis = struct {
             else => return null,
         }
         if (step == 0) return null;
-        return .{ .parameter = parameter, .start = function.find(start.value), .step = step };
+        return .{ .parameter = parameter, .start = function.find(start.value), .next = function.find(back.value), .step = step };
     }
 
     fn rangeAt(self: Analysis, value: ValueId, at: u32) IntegerRange {
+        return self.rangeAtDepth(value, at, 16);
+    }
+
+    fn rangeAtDepth(self: Analysis, value: ValueId, at: u32, depth: u32) IntegerRange {
         if (!self.immutable(value)) return .{};
         if (self.integerConstant(value)) |number| return .{ .lower = number, .upper = number };
-        var range: IntegerRange = .{};
+        var range = self.shiftedRange(value, at, depth);
         var block = at;
         while (block != self.function.entry) {
             block = self.graph.dominator[block];
@@ -134,15 +166,35 @@ pub const Analysis = struct {
         }
         return range;
     }
+
+    fn shiftedRange(self: Analysis, value: ValueId, at: u32, depth: u32) IntegerRange {
+        if (depth == 0) return .{};
+        const definition = self.function.definition(self.function.find(value)) orelse return .{};
+        if (definition != .numeric_binary) return .{};
+        const operation = definition.numeric_binary;
+        if (operation.type_id != .int or operation.overflow == .saturating) return .{};
+        const offset = self.integerConstant(operation.operands.rhs) orelse return .{};
+        const shift: i64 = switch (operation.operation) {
+            .add => offset,
+            .sub => -@as(i64, offset),
+            else => return .{},
+        };
+        const base = self.rangeAtDepth(operation.operands.lhs, at, depth - 1);
+        const lower = base.lower + shift;
+        const upper = base.upper + shift;
+        if (operation.overflow != .checked and (lower < std.math.minInt(i32) or upper > std.math.maxInt(i32))) return .{};
+        return .{ .lower = @max(lower, std.math.minInt(i32)), .upper = @min(upper, std.math.maxInt(i32)) };
+    }
 };
 
-const Induction = struct {
+pub const Induction = struct {
     parameter: ValueId,
     start: ValueId,
+    next: ValueId,
     step: i32,
 };
 
-const InductionExit = struct {
+pub const InductionExit = struct {
     induction: Induction,
     comparison: IntegerComparison,
 };
@@ -155,6 +207,14 @@ pub const ExitTest = struct {
 };
 
 pub fn exitTest(function: *const Function, loop: Loop) ?ExitTest {
+    const result = exitTestWithArguments(function, loop) orelse return null;
+    for (Function.edges(&function.blocks.items[loop.header].terminator)) |maybe_edge| if (maybe_edge) |edge| {
+        if (@backingInt(edge.target) == result.exit and edge.arguments.start != edge.arguments.end) return null;
+    };
+    return result;
+}
+
+pub fn exitTestWithArguments(function: *const Function, loop: Loop) ?ExitTest {
     const terminator = function.blocks.items[loop.header].terminator;
     if (terminator != .predicate_branch) return null;
     const predicate = terminator.predicate_branch;
@@ -162,7 +222,6 @@ pub fn exitTest(function: *const Function, loop: Loop) ?ExitTest {
     const else_target = @backingInt(predicate.else_branch.target);
     if (loop.contains(then_target) == loop.contains(else_target)) return null;
     const exit = if (loop.contains(then_target)) predicate.else_branch else predicate.then_branch;
-    if (exit.arguments.start != exit.arguments.end) return null;
     const stay = if (loop.contains(then_target)) predicate.then_branch else predicate.else_branch;
     const operation = if (loop.contains(then_target)) predicate.operation.negated() else predicate.operation;
     return .{ .operation = operation, .operands = predicate.operands, .exit = @backingInt(exit.target), .stay = @backingInt(stay.target) };

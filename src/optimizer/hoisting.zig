@@ -117,7 +117,8 @@ const Motion = struct {
     fn classify(self: *Motion, instruction: Instruction) ?Read {
         const roots = &self.memory.roots;
         switch (instruction) {
-            .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => return .pure,
+            .numeric_binary, .numeric_unary => return if (instruction.numericMayTrap()) null else .pure,
+            .const_numeric, .numeric_convert, .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => return .pure,
             .divsi, .shli, .shrsi => |operands| {
                 const rhs = self.function.definition(operands.rhs) orelse return null;
                 return if (rhs == .const_int and instruction.integerRhsIsValid(rhs.const_int)) .pure else null;

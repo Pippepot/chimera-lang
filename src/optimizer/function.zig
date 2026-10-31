@@ -203,7 +203,7 @@ pub const Function = struct {
         return switch (self.definitions.items[@backingInt(value)]) {
             .argument => |argument| argument.data.representation == .value and (argument.block == self.entry or self.direct(argument.data.type_id)),
             .instruction => |index| switch (self.instructions.items[index]) {
-                .const_int, .const_bool, .const_byte, .const_unit, .const_none, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .variant_tag, .field_access, .compare, .select, .aggregate, .function_ref, .borrow_address => true,
+                .const_numeric, .numeric_binary, .numeric_unary, .numeric_convert, .const_int, .const_bool, .const_byte, .const_unit, .const_none, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .variant_tag, .field_access, .compare, .select, .aggregate, .function_ref, .borrow_address => true,
                 inline .value_copy, .call, .variant_coerce, .variant_extract => |operation| operation.destination == null,
                 else => false,
             },
@@ -453,7 +453,7 @@ pub fn usesStorage(function: *const Function, instruction: *const Instruction) b
 }
 
 pub fn scalar(type_id: structures.TypeId) bool {
-    return type_id == .int or type_id == .bool or type_id == .byte;
+    return type_id.numericType() != null or type_id == .bool;
 }
 
 pub fn visitInstructionReferences(tables: anytype, instruction: *const Instruction, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
@@ -485,7 +485,7 @@ pub fn terminatorAllOperands(function: *Function, terminator: *Terminator, conte
 
 pub fn readOperands(function: *Function, instruction: *Instruction, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
     switch (instruction.*) {
-        .addi, .subi, .muli, .divsi, .shli, .shrsi => |*operands| {
+        .type_union, .addi, .subi, .muli, .divsi, .shli, .shrsi => |*operands| {
             visit(context, &operands.lhs);
             visit(context, &operands.rhs);
         },
@@ -498,6 +498,11 @@ pub fn readOperands(function: *Function, instruction: *Instruction, context: any
             visit(context, &operation.then_value);
             visit(context, &operation.else_value);
         },
+        .numeric_binary => |*operation| {
+            visit(context, &operation.operands.lhs);
+            visit(context, &operation.operands.rhs);
+        },
+        inline .numeric_unary, .numeric_convert => |*operation| visit(context, &operation.operand),
         .negi, .byte_to_int, .variant_tag => |*operand| visit(context, operand),
         .value_copy => |*operation| visit(context, &operation.source),
         inline .variant_coerce, .variant_extract => |*operation| visit(context, &operation.operand),

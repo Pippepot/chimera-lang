@@ -2,9 +2,8 @@
 # Source of truth for the language, but incomplete. ROADMAP.md tracks planned work.
 # Unspecified behavior remains open; parser or legacy behavior does not define it.
 # Examples are independent; undeclared names stand for surrounding context.
-# Sections marked planned and examples using float describe future behavior;
-# float types and literals are currently rejected. Other implementation gaps
-# are called out where relevant; ROADMAP.md owns priorities.
+# Sections marked planned describe future behavior. Implementation gaps are
+# called out where relevant; ROADMAP.md owns priorities.
 # Everything after '#' to the end of a line is a comment.
 # Delimited argument, parameter, element, and initializer lists may span lines.
 # Indentation at list boundaries is continuation whitespace; commas separate
@@ -15,28 +14,51 @@
 
 
 # Types and evaluation
-# int: signed 32-bit integer; +, -, *, /, and negation wrap modulo 2^32.
-# Signed division truncates toward zero, so min-int / -1 wraps to min-int.
-# Division by zero is an execution error; at compile time it is a source error
-# at the executed division.
-# Remainder (%) satisfies left == (left / right) * right + left % right under
-# wrapping: a nonzero remainder has the sign of its left operand, and
-# min-int % -1 is zero. Remainder by zero is an execution error, reported at
-# the executed operation at compile time.
-# int shifts: << discards high bits and wraps modulo 2^32; >> is arithmetic,
-# replicating the sign bit. Both take an int count in 0 through 31 inclusive.
-# A negative count or count >= 32 is an execution error, also at compile time
-# when the shift is executed. Both operands evaluate once, left to right.
-# byte: distinct unsigned 8-bit integer, values 0 through 255, size and
-# alignment 1. It has trivial move, copy, and drop, but no arithmetic or
-# comparison operations yet.
-# int_literal: compile-time-only type of decimal integer literals. A unary
-# minus applied directly to an integer literal belongs to the literal. Without
-# an expected type, an int_literal value defaults to int; values outside int's
-# range are source errors. std converts int_literal to byte for values 0
-# through 255; other values are source errors. No converter relates int and
-# byte values in either direction.
-# float (planned): floating-point number; representation and operations are open.
+# Signed integers: i8, i16, i32, i64; unsigned integers: u8, u16, u32, u64.
+# isize and usize are pointer-sized (64 bits on the current target).
+# int aliases i32, byte aliases u8, and float aliases IEEE 754 f64.
+# f32 and f64 use nearest-even arithmetic, support subnormals and signed zero,
+# overflow to signed infinity, and produce NaN for invalid operations.
+# NaN comparisons are false except <>, which is true.
+# f32.inf, f32.nan, f64.inf, and f64.nan are ordinary namespace constants.
+# Integer +, -, *, and unary negation check overflow in every build. A provable
+# checked overflow is a source error; a runtime overflow panics. Signed division
+# truncates toward zero; remainder has the dividend's sign. Zero divisors panic.
+# Signed MIN / -1 overflows; MIN % -1 is zero. Signed integers are two's complement.
+# Bitwise &, |, ^, ~, <<, and >> operate at the selected integer width. Left shifts
+# discard shifted-out bits; signed right shifts extend the sign, unsigned right
+# shifts insert zeros. Counts outside [0, width) panic. Shift counts use Self.
+# Integer literals support decimal, 0x, 0b, 0o, and underscores between digits.
+# Their magnitudes have arbitrary precision; direct negation precedes range
+# checking. An expected concrete numeric type is adopted when representable;
+# integer-to-float literals require exact representation. Otherwise literals
+# default to int. int_literal is a compile-time-only arbitrary-precision integer.
+# Numeric policy and overflow forms honor ordinary local/module declarations
+# of the same name; their absence is tracked during incremental compilation.
+# Float literals support decimal fractions and scientific notation. They default
+# to float and round directly to the destination format with nearest-even, avoiding
+# intermediate f64 rounding for f32. Overflow and nonzero underflow to zero are
+# source errors; representable subnormals are accepted.
+# Lossless numeric converters are ordinary public extern converter declarations
+# in std.primitives, imported by the prelude. They are available implicitly and
+# through constructors, e.g. i64(i32(42)).
+# Every source value must be exactly representable in the destination. Other
+# conversions use checked(T, x), wrap(T, x), saturate(T, x), round(T, x), or
+# truncate(T, x). checked returns T | none for an inexact or invalid conversion.
+# wrap converts integers modulo the destination width. saturate clamps to an
+# integer range; float inputs truncate toward zero after clamping and return
+# T | none, with none only for NaN. round uses nearest-even; truncate converts
+# floats to integers toward zero. Float-to-integer round/truncate return T | none
+# for invalid or out-of-range rounded results. Float-to-float round returns T,
+# including infinity on overflow. wrap requires integer source and destination;
+# saturate requires an integer destination; truncate requires a float source
+# and integer destination. round requires at least one floating-point type.
+# wrapping(expr) and saturating(expr) change each compiler-recognized integer
+# operation in expr. Nested contexts override outer ones. User-defined operators
+# and ordinary callees keep their bodies' own semantics. Primitive declarations
+# and signatures stay the same. Wrapping MIN / -1 yields MIN; saturation yields
+# MAX. Its remainder is zero in every mode. Division by zero always panics.
+# All concrete widths and policies apply equally during compile-time execution.
 # bool: true or false.
 # type: the type of compile-time type values.
 # unit: single-valued type; its value is unit, also written ().
@@ -61,24 +83,30 @@
 # No fallback to the right operand or implicit merging of same-named declarations
 # participates in selection. Explicit overload sets use the rules below.
 # Operands evaluate once, left to right.
-# Primitive type namespaces belong to the registered standard prelude. Their
+# Primitive type namespaces belong to the registered std.primitives module. Their
 # operations are qualified extern declarations, with compiler-provided bodies;
 # operator syntax, explicit calls, and callable values use the same declarations.
 pub extern func int.+(imm left: int, imm right: int) int
-# Only the registered prelude may extend primitive namespaces. Other modules
+# The prelude imports std.primitives. Only that registered module may extend
+# primitive namespaces. Other modules
 # cannot extend them, just as they cannot extend an imported struct namespace.
 # Comparisons and logical operators return bool in every expression position.
 # and/or skip the right operand when the left bool determines their result.
-# The operation-function inventory is +, -, *, /, %, ==, <>, <, >, <=, >=, unary
-# negation, <<, >>, and read/write indexing. Logical not is dedicated control flow.
+# The operation-function inventory is +, -, *, /, %, &, |, ^, ~, ==, <>,
+# <, >, <=, >=, unary negation, <<, >>, and read/write indexing. Logical not is
+# dedicated control flow. In expressions | also forms variants when its operands
+# are types. A caret followed by an operand is binary XOR; a trailing caret is
+# postfix ownership transfer. Parenthesize a negative XOR operand: a ^ (-b);
+# a^ - b retains transfer followed by subtraction. Prefix ^ retains
+# end-relative indexing semantics.
 # Unary and binary arithmetic minus
 # share the spelling -, distinguished only by runtime operand count. neg is an
 # ordinary identifier, with no compiler-defined meaning. Parentheses do not
 # change operator precedence.
 # For receiver type Self, the exact signatures are:
-# +, -, *, /, %, <<, >>: func (imm Self, imm Self) Self
+# +, -, *, /, %, &, |, ^, <<, >>: func (imm Self, imm Self) Self
 # ==, <>, <, >, <=, >=: func (imm Self, imm Right) bool
-# unary -: func (imm Self) Self
+# unary -, ~: func (imm Self) Self
 # []: func (imm Self, index: Index) Result; ref Self is also allowed
 # []=: func (mut Self, index: Index, var value: Element) unit
 # Inherited namespace static arguments and inferable static parameters use
@@ -127,8 +155,7 @@ const subtract: func(imm int, imm int) int = int.-
 # semantics and are not eager operation functions. Predicates over explicitly
 # typed compile-time-only int_literal values remain intrinsic and preserve their
 # wide literal range. Equality of compile-time type metadata remains compiler
-# identity comparison. Tokens with no language semantics yet (such as
-# bitwise operators) are not added by this contract. Later numeric types use the same operation signatures.
+# identity comparison. All concrete numeric types use these operation signatures.
 
 
 # Collection membership
@@ -146,12 +173,10 @@ if value in collection -> found()
 if not (value in collection) -> missing()
 
 
-# Numeric conversions (open)
-# Ordinary value converters are infallible. Conversions between numeric runtime
-# types that wrap, truncate, round, saturate, or widen are named functions instead.
-# Their names, overflow and failure behavior, other numeric widths, and float
-# literal typing remain open. Existing variant widening and type tests do
-# not define numeric conversion behavior.
+# Numeric conversions
+# The numeric rules above define lossless converters and explicit conversion
+# policies. Variant widening and type tests remain representation operations;
+# they do not perform numeric conversions or change an arithmetic result width.
 
 
 # Text and basic I/O
@@ -1524,7 +1549,7 @@ func S.read_a(imm value: S) int -> value.a
 # This qualified declaration form extends a non-parameterized named struct in
 # the same module. The struct and declaration may be in different files. Each
 # qualifier must name a declared struct namespace, or a primitive namespace in
-# its registered prelude; imported types cannot be extended. A function written
+# std.primitives; imported types cannot be extended. A function written
 # lexically inside a struct has the same namespace
 # meaning as this qualified form. Lexical declarations remain necessary for a
 # generated namespace because its identity includes the factory specialization.

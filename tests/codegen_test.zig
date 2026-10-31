@@ -156,12 +156,12 @@ test "conditional counting preserves wrapping and both predicate outcomes" {
     try test_sources.SourceFixture.expectParity(
         \\func run() int
         \\    var values: List(int) = [0, 1, -1]
-        \\    var wrapping = 2147483647
+        \\    var wrapped_value = 2147483647
         \\    var count = 40
         \\    for number in 0..values.len()
-        \\        if values[number] == 0 -> wrapping += 1
+        \\        if values[number] == 0 -> wrapped_value = wrapping(wrapped_value + 1)
         \\        if values[number] <> 0 -> count += 1
-        \\    if wrapping <> -2147483648 -> return 0
+        \\    if wrapped_value <> -2147483648 -> return 0
         \\    return count
     , 42);
 }
@@ -443,6 +443,28 @@ test "machine fixed register operands remain reserved" {
     };
 }
 
+test "machine syscalls preserve available argument registers across live ranges" {
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    for (0..10) |index| {
+        try function.immediate(.mov_eax, @intCast(index));
+        try function.register(.store_eax, @fromBackingInt(@intCast(index)), 0);
+    }
+    try function.immediate(.mov_eax, 39);
+    try function.emit(.syscall);
+    for (0..10) |index| try function.register(.load_eax, @fromBackingInt(@intCast(index)), 0);
+    try function.emit(.ret);
+    var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 10);
+    defer allocation.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 9), allocation.used.len);
+    for ([_]test_sources.x86_encoding.Register{ .r8, .r9, .r10 }) |preserved| {
+        try std.testing.expect(std.mem.indexOfScalar(test_sources.x86_encoding.Register, allocation.used, preserved) != null);
+    }
+    for (allocation.registers) |selected| if (selected) |register| {
+        try std.testing.expect(register != .r11);
+    };
+}
+
 test "machine live ranges reuse registers between separate definitions" {
     var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
     defer function.deinit();
@@ -468,7 +490,7 @@ test "machine division branches preserve live loop values and signed overflow" {
         \\    var index = 0
         \\    loop
         \\        if index == 3 -> break
-        \\        value /= divisor
+        \\        value = wrapping(value / divisor)
         \\        index += 1
         \\    return value
         \\func run() int -> calculate(-1) - calculate(1) + 42
@@ -482,14 +504,14 @@ test "in-place loop arithmetic preserves wrapping and operand order" {
         \\    var index = 0
         \\    loop
         \\        if index == 3 -> break
-        \\        value *= 3
-        \\        value += 1000
-        \\        value -= 1000
-        \\        value = index + value
-        \\        value -= index
+        \\        value = wrapping(value * 3)
+        \\        value = wrapping(value + 1000)
+        \\        value = wrapping(value - 1000)
+        \\        value = wrapping(index + value)
+        \\        value = wrapping(value - index)
         \\        index += 1
         \\    return value
-        \\func run() int -> calculate(1) + calculate(2147483647) - calculate(2147483647) + 15
+        \\func run() int -> wrapping(calculate(1) + calculate(2147483647) - calculate(2147483647) + 15)
     , 42);
 }
 
@@ -2033,4 +2055,20 @@ test "native shifts preserve variable counts incoming homes borrowed counts and 
     defer fixture.deinit();
     try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
     try fixture.expectExit(0, 42);
+}
+
+test "checked i32 arithmetic uses native width without sign extension" {
+    for ([_][]const u8{ "left + right", "left - right", "left * right", "left + 1", "left - 1", "left * 7", "-left" }) |expression| {
+        const source = try std.testing.allocator.print("func calculate(left: int, right: int) int -> {s}\nexit(42)", .{expression});
+        defer std.testing.allocator.free(source);
+        const fixture = try test_sources.SourceFixture.init(source);
+        defer fixture.deinit();
+        const scope = (try fixture.db.get(test_sources.queries.BuildModuleScope, 0)).*.?;
+        const artifact = (try fixture.db.get(test_sources.queries.CompileFunction, .{ .item = scope.resolveFunction("calculate").? })).*.?;
+        const assembly = try test_sources.disasm.disassemble(artifact.code, std.testing.allocator);
+        defer std.testing.allocator.free(assembly);
+        errdefer std.debug.print("{s}\n", .{assembly});
+        try std.testing.expect(std.mem.indexOf(u8, assembly, "movsxd") == null);
+        try std.testing.expect(std.mem.indexOf(u8, assembly, "jo ") != null);
+    }
 }

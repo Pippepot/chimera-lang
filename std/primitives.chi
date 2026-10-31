@@ -1,0 +1,257 @@
+extern func literal_byte(static value: int_literal) byte
+pub converter(static value: int_literal) byte where value >= 0 where value <= 255 -> literal_byte(value)
+
+pub extern func int.+(imm left: int, imm right: int) int
+pub extern func int.-(imm left: int, imm right: int) int
+pub extern func int.*(imm left: int, imm right: int) int
+pub extern func int./(imm left: int, imm right: int) int
+pub extern func int.%(imm left: int, imm right: int) int
+pub extern func int.<<(imm left: int, imm right: int) int
+pub extern func int.>>(imm left: int, imm right: int) int
+pub extern func int.-(imm self: int) int
+pub extern func int.==(imm left: int, imm right: int) bool
+pub extern func int.<>(imm left: int, imm right: int) bool
+pub extern func int.<(imm left: int, imm right: int) bool
+pub extern func int.>(imm left: int, imm right: int) bool
+pub extern func int.<=(imm left: int, imm right: int) bool
+pub extern func int.>=(imm left: int, imm right: int) bool
+pub extern func bool.==(imm left: bool, imm right: bool) bool
+pub extern func bool.<>(imm left: bool, imm right: bool) bool
+
+pub extern func byte.+(imm left: byte, imm right: byte) byte
+pub extern func byte.-(imm left: byte, imm right: byte) byte
+pub extern func byte.*(imm left: byte, imm right: byte) byte
+pub extern func byte./(imm left: byte, imm right: byte) byte
+pub extern func byte.==(imm left: byte, imm right: byte) bool
+pub extern func byte.<>(imm left: byte, imm right: byte) bool
+pub extern func byte.<(imm left: byte, imm right: byte) bool
+pub extern func byte.>(imm left: byte, imm right: byte) bool
+pub extern func byte.<=(imm left: byte, imm right: byte) bool
+pub extern func byte.>=(imm left: byte, imm right: byte) bool
+pub extern func byte.%(imm left: byte, imm right: byte) byte
+pub extern func byte.<<(imm left: byte, imm right: byte) byte
+pub extern func byte.>>(imm left: byte, imm right: byte) byte
+pub extern func byte.-(imm self: byte) byte
+pub extern func i8.+(imm left: i8, imm right: i8) i8
+pub extern func i8.-(imm left: i8, imm right: i8) i8
+pub extern func i8.*(imm left: i8, imm right: i8) i8
+pub extern func i8./(imm left: i8, imm right: i8) i8
+pub extern func i8.==(imm left: i8, imm right: i8) bool
+pub extern func i8.<>(imm left: i8, imm right: i8) bool
+pub extern func i8.<(imm left: i8, imm right: i8) bool
+pub extern func i8.>(imm left: i8, imm right: i8) bool
+pub extern func i8.<=(imm left: i8, imm right: i8) bool
+pub extern func i8.>=(imm left: i8, imm right: i8) bool
+pub extern func i8.%(imm left: i8, imm right: i8) i8
+pub extern func i8.<<(imm left: i8, imm right: i8) i8
+pub extern func i8.>>(imm left: i8, imm right: i8) i8
+pub extern func i8.-(imm self: i8) i8
+pub extern func i16.+(imm left: i16, imm right: i16) i16
+pub extern func i16.-(imm left: i16, imm right: i16) i16
+pub extern func i16.*(imm left: i16, imm right: i16) i16
+pub extern func i16./(imm left: i16, imm right: i16) i16
+pub extern func i16.==(imm left: i16, imm right: i16) bool
+pub extern func i16.<>(imm left: i16, imm right: i16) bool
+pub extern func i16.<(imm left: i16, imm right: i16) bool
+pub extern func i16.>(imm left: i16, imm right: i16) bool
+pub extern func i16.<=(imm left: i16, imm right: i16) bool
+pub extern func i16.>=(imm left: i16, imm right: i16) bool
+pub extern func i16.%(imm left: i16, imm right: i16) i16
+pub extern func i16.<<(imm left: i16, imm right: i16) i16
+pub extern func i16.>>(imm left: i16, imm right: i16) i16
+pub extern func i16.-(imm self: i16) i16
+pub extern func i64.+(imm left: i64, imm right: i64) i64
+pub extern func i64.-(imm left: i64, imm right: i64) i64
+pub extern func i64.*(imm left: i64, imm right: i64) i64
+pub extern func i64./(imm left: i64, imm right: i64) i64
+pub extern func i64.==(imm left: i64, imm right: i64) bool
+pub extern func i64.<>(imm left: i64, imm right: i64) bool
+pub extern func i64.<(imm left: i64, imm right: i64) bool
+pub extern func i64.>(imm left: i64, imm right: i64) bool
+pub extern func i64.<=(imm left: i64, imm right: i64) bool
+pub extern func i64.>=(imm left: i64, imm right: i64) bool
+pub extern func i64.%(imm left: i64, imm right: i64) i64
+pub extern func i64.<<(imm left: i64, imm right: i64) i64
+pub extern func i64.>>(imm left: i64, imm right: i64) i64
+pub extern func i64.-(imm self: i64) i64
+pub extern func u16.+(imm left: u16, imm right: u16) u16
+pub extern func u16.-(imm left: u16, imm right: u16) u16
+pub extern func u16.*(imm left: u16, imm right: u16) u16
+pub extern func u16./(imm left: u16, imm right: u16) u16
+pub extern func u16.==(imm left: u16, imm right: u16) bool
+pub extern func u16.<>(imm left: u16, imm right: u16) bool
+pub extern func u16.<(imm left: u16, imm right: u16) bool
+pub extern func u16.>(imm left: u16, imm right: u16) bool
+pub extern func u16.<=(imm left: u16, imm right: u16) bool
+pub extern func u16.>=(imm left: u16, imm right: u16) bool
+pub extern func u16.%(imm left: u16, imm right: u16) u16
+pub extern func u16.<<(imm left: u16, imm right: u16) u16
+pub extern func u16.>>(imm left: u16, imm right: u16) u16
+pub extern func u16.-(imm self: u16) u16
+pub extern func u32.+(imm left: u32, imm right: u32) u32
+pub extern func u32.-(imm left: u32, imm right: u32) u32
+pub extern func u32.*(imm left: u32, imm right: u32) u32
+pub extern func u32./(imm left: u32, imm right: u32) u32
+pub extern func u32.==(imm left: u32, imm right: u32) bool
+pub extern func u32.<>(imm left: u32, imm right: u32) bool
+pub extern func u32.<(imm left: u32, imm right: u32) bool
+pub extern func u32.>(imm left: u32, imm right: u32) bool
+pub extern func u32.<=(imm left: u32, imm right: u32) bool
+pub extern func u32.>=(imm left: u32, imm right: u32) bool
+pub extern func u32.%(imm left: u32, imm right: u32) u32
+pub extern func u32.<<(imm left: u32, imm right: u32) u32
+pub extern func u32.>>(imm left: u32, imm right: u32) u32
+pub extern func u32.-(imm self: u32) u32
+pub extern func u64.+(imm left: u64, imm right: u64) u64
+pub extern func u64.-(imm left: u64, imm right: u64) u64
+pub extern func u64.*(imm left: u64, imm right: u64) u64
+pub extern func u64./(imm left: u64, imm right: u64) u64
+pub extern func u64.==(imm left: u64, imm right: u64) bool
+pub extern func u64.<>(imm left: u64, imm right: u64) bool
+pub extern func u64.<(imm left: u64, imm right: u64) bool
+pub extern func u64.>(imm left: u64, imm right: u64) bool
+pub extern func u64.<=(imm left: u64, imm right: u64) bool
+pub extern func u64.>=(imm left: u64, imm right: u64) bool
+pub extern func u64.%(imm left: u64, imm right: u64) u64
+pub extern func u64.<<(imm left: u64, imm right: u64) u64
+pub extern func u64.>>(imm left: u64, imm right: u64) u64
+pub extern func u64.-(imm self: u64) u64
+pub extern func isize.+(imm left: isize, imm right: isize) isize
+pub extern func isize.-(imm left: isize, imm right: isize) isize
+pub extern func isize.*(imm left: isize, imm right: isize) isize
+pub extern func isize./(imm left: isize, imm right: isize) isize
+pub extern func isize.==(imm left: isize, imm right: isize) bool
+pub extern func isize.<>(imm left: isize, imm right: isize) bool
+pub extern func isize.<(imm left: isize, imm right: isize) bool
+pub extern func isize.>(imm left: isize, imm right: isize) bool
+pub extern func isize.<=(imm left: isize, imm right: isize) bool
+pub extern func isize.>=(imm left: isize, imm right: isize) bool
+pub extern func isize.%(imm left: isize, imm right: isize) isize
+pub extern func isize.<<(imm left: isize, imm right: isize) isize
+pub extern func isize.>>(imm left: isize, imm right: isize) isize
+pub extern func isize.-(imm self: isize) isize
+pub extern func usize.+(imm left: usize, imm right: usize) usize
+pub extern func usize.-(imm left: usize, imm right: usize) usize
+pub extern func usize.*(imm left: usize, imm right: usize) usize
+pub extern func usize./(imm left: usize, imm right: usize) usize
+pub extern func usize.==(imm left: usize, imm right: usize) bool
+pub extern func usize.<>(imm left: usize, imm right: usize) bool
+pub extern func usize.<(imm left: usize, imm right: usize) bool
+pub extern func usize.>(imm left: usize, imm right: usize) bool
+pub extern func usize.<=(imm left: usize, imm right: usize) bool
+pub extern func usize.>=(imm left: usize, imm right: usize) bool
+pub extern func usize.%(imm left: usize, imm right: usize) usize
+pub extern func usize.<<(imm left: usize, imm right: usize) usize
+pub extern func usize.>>(imm left: usize, imm right: usize) usize
+pub extern func usize.-(imm self: usize) usize
+pub extern func f32.+(imm left: f32, imm right: f32) f32
+pub extern func f32.-(imm left: f32, imm right: f32) f32
+pub extern func f32.*(imm left: f32, imm right: f32) f32
+pub extern func f32./(imm left: f32, imm right: f32) f32
+pub extern func f32.==(imm left: f32, imm right: f32) bool
+pub extern func f32.<>(imm left: f32, imm right: f32) bool
+pub extern func f32.<(imm left: f32, imm right: f32) bool
+pub extern func f32.>(imm left: f32, imm right: f32) bool
+pub extern func f32.<=(imm left: f32, imm right: f32) bool
+pub extern func f32.>=(imm left: f32, imm right: f32) bool
+pub extern func f32.-(imm self: f32) f32
+pub extern func f64.+(imm left: f64, imm right: f64) f64
+pub extern func f64.-(imm left: f64, imm right: f64) f64
+pub extern func f64.*(imm left: f64, imm right: f64) f64
+pub extern func f64./(imm left: f64, imm right: f64) f64
+pub extern func f64.==(imm left: f64, imm right: f64) bool
+pub extern func f64.<>(imm left: f64, imm right: f64) bool
+pub extern func f64.<(imm left: f64, imm right: f64) bool
+pub extern func f64.>(imm left: f64, imm right: f64) bool
+pub extern func f64.<=(imm left: f64, imm right: f64) bool
+pub extern func f64.>=(imm left: f64, imm right: f64) bool
+pub extern func f64.-(imm self: f64) f64
+
+pub extern converter(imm value: int) i64
+pub extern converter(imm value: int) isize
+pub extern converter(imm value: int) f64
+pub extern converter(imm value: byte) int
+pub extern converter(imm value: byte) i16
+pub extern converter(imm value: byte) i64
+pub extern converter(imm value: byte) u16
+pub extern converter(imm value: byte) u32
+pub extern converter(imm value: byte) u64
+pub extern converter(imm value: byte) isize
+pub extern converter(imm value: byte) usize
+pub extern converter(imm value: byte) f32
+pub extern converter(imm value: byte) f64
+pub extern converter(imm value: i8) int
+pub extern converter(imm value: i8) i16
+pub extern converter(imm value: i8) i64
+pub extern converter(imm value: i8) isize
+pub extern converter(imm value: i8) f32
+pub extern converter(imm value: i8) f64
+pub extern converter(imm value: i16) int
+pub extern converter(imm value: i16) i64
+pub extern converter(imm value: i16) isize
+pub extern converter(imm value: i16) f32
+pub extern converter(imm value: i16) f64
+pub extern converter(imm value: i64) isize
+pub extern converter(imm value: u16) int
+pub extern converter(imm value: u16) i64
+pub extern converter(imm value: u16) u32
+pub extern converter(imm value: u16) u64
+pub extern converter(imm value: u16) isize
+pub extern converter(imm value: u16) usize
+pub extern converter(imm value: u16) f32
+pub extern converter(imm value: u16) f64
+pub extern converter(imm value: u32) i64
+pub extern converter(imm value: u32) u64
+pub extern converter(imm value: u32) isize
+pub extern converter(imm value: u32) usize
+pub extern converter(imm value: u32) f64
+pub extern converter(imm value: u64) usize
+pub extern converter(imm value: isize) i64
+pub extern converter(imm value: usize) u64
+pub extern converter(imm value: f32) f64
+
+pub static f32.inf: f32 = f32(1.0) / f32(0.0)
+pub static f32.nan: f32 = f32(0.0) / f32(0.0)
+pub static f64.inf: f64 = 1.0 / 0.0
+pub static f64.nan: f64 = 0.0 / 0.0
+
+pub extern func int.&(imm left: int, imm right: int) int
+pub extern func int.|(imm left: int, imm right: int) int
+pub extern func int.^(imm left: int, imm right: int) int
+pub extern func int.~(imm self: int) int
+pub extern func byte.&(imm left: byte, imm right: byte) byte
+pub extern func byte.|(imm left: byte, imm right: byte) byte
+pub extern func byte.^(imm left: byte, imm right: byte) byte
+pub extern func byte.~(imm self: byte) byte
+pub extern func i8.&(imm left: i8, imm right: i8) i8
+pub extern func i8.|(imm left: i8, imm right: i8) i8
+pub extern func i8.^(imm left: i8, imm right: i8) i8
+pub extern func i8.~(imm self: i8) i8
+pub extern func i16.&(imm left: i16, imm right: i16) i16
+pub extern func i16.|(imm left: i16, imm right: i16) i16
+pub extern func i16.^(imm left: i16, imm right: i16) i16
+pub extern func i16.~(imm self: i16) i16
+pub extern func i64.&(imm left: i64, imm right: i64) i64
+pub extern func i64.|(imm left: i64, imm right: i64) i64
+pub extern func i64.^(imm left: i64, imm right: i64) i64
+pub extern func i64.~(imm self: i64) i64
+pub extern func u16.&(imm left: u16, imm right: u16) u16
+pub extern func u16.|(imm left: u16, imm right: u16) u16
+pub extern func u16.^(imm left: u16, imm right: u16) u16
+pub extern func u16.~(imm self: u16) u16
+pub extern func u32.&(imm left: u32, imm right: u32) u32
+pub extern func u32.|(imm left: u32, imm right: u32) u32
+pub extern func u32.^(imm left: u32, imm right: u32) u32
+pub extern func u32.~(imm self: u32) u32
+pub extern func u64.&(imm left: u64, imm right: u64) u64
+pub extern func u64.|(imm left: u64, imm right: u64) u64
+pub extern func u64.^(imm left: u64, imm right: u64) u64
+pub extern func u64.~(imm self: u64) u64
+pub extern func isize.&(imm left: isize, imm right: isize) isize
+pub extern func isize.|(imm left: isize, imm right: isize) isize
+pub extern func isize.^(imm left: isize, imm right: isize) isize
+pub extern func isize.~(imm self: isize) isize
+pub extern func usize.&(imm left: usize, imm right: usize) usize
+pub extern func usize.|(imm left: usize, imm right: usize) usize
+pub extern func usize.^(imm left: usize, imm right: usize) usize
+pub extern func usize.~(imm self: usize) usize

@@ -174,7 +174,12 @@ pub fn expectProgramExit(bytes: []const u8, status: u8) !void {
     const io = std.testing.io;
     defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     try runtime.writeProgram(io, bytes);
-    try std.testing.expectEqual(status, try runtime.runProg(io, std.testing.allocator, &.{}));
+    const result = try std.process.run(std.testing.allocator, io, .{ .argv = &.{"./prog"} });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    // Child stdout must not enter Zig's test-server control stream.
+    errdefer std.debug.print("program stdout:\n{s}program stderr:\n{s}", .{ result.stdout, result.stderr });
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = status }, result.term);
 }
 
 pub fn renderTemplate(allocator: std.mem.Allocator, source: []const u8, values: anytype) ![]u8 {

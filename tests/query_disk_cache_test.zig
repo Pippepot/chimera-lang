@@ -2241,3 +2241,32 @@ test "List pattern snapshots track counted transfer helper changes" {
         try fixture.expectExit(42);
     }
 }
+
+test "numeric snapshots retain concrete values conversions overflow modes and literal magnitudes" {
+    const source =
+        \\static maximum: u64 = 18446744073709551615
+        \\static fraction: f32 = 1.25
+        \\static literal: int_literal = 340282366920938463463374607431768211456
+        \\struct Marker
+        \\    copy = trivial
+        \\converter(static value: int_literal) Marker where value == 340282366920938463463374607431768211456 -> Marker{}
+        \\func calculate(value: u64, real: f32) int
+        \\    if saturating(value + 1) <> value -> return 90
+        \\    const converted = round(i8, real * 2.0)
+        \\    if not (converted is i8) -> return 91
+        \\    return 40 + i32(converted)
+        \\func run() int
+        \\    const marker: Marker = literal
+        \\    return calculate(maximum, fraction)
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "1.25", "1.75");
+    defer std.testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(44);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}

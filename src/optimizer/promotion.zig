@@ -24,7 +24,7 @@ pub fn promote(function: *Function) !bool {
     const slots = try collectSlots(function, graph);
     if (slots.len == 0) return false;
     const address_taken = try canonicalize.addressTaken(function);
-    var undefined_values: [3]?ValueId = .{ null, null, null };
+    var undefined_values: [@backingInt(structures.TypeId.f64) + 1]?ValueId = @splat(null);
     var shared_slots: std.ArrayList(Slot) = .empty;
     var shared_uses: std.ArrayList(std.ArrayList(Site)) = .empty;
     var changed = false;
@@ -149,7 +149,7 @@ fn localSites(sites: []const Site) bool {
     return true;
 }
 
-fn promoteLocal(function: *Function, address_taken: []const bool, slot: Slot, sites: []const Site, undefined_values: *[3]?ValueId) !bool {
+fn promoteLocal(function: *Function, address_taken: []const bool, slot: Slot, sites: []const Site, undefined_values: *[@backingInt(structures.TypeId.f64) + 1]?ValueId) !bool {
     var rewrite: Rewrite = .{ .slot = slot.storage, .current = slot.storage };
     if (sites.len != 0) {
         const stored_first = if (sites[0].instruction) |index| storedValue(function.instructions.items[index], slot.storage) != null else false;
@@ -219,7 +219,7 @@ const Renaming = struct {
     }
 };
 
-fn promoteShared(function: *Function, address_taken: []const bool, slots: []const Slot, uses: []const std.ArrayList(Site), undefined_values: *[3]?ValueId) !bool {
+fn promoteShared(function: *Function, address_taken: []const bool, slots: []const Slot, uses: []const std.ArrayList(Site), undefined_values: *[@backingInt(structures.TypeId.f64) + 1]?ValueId) !bool {
     const scratch = function.scratch;
     const graph = (try function.controlFlow()).*;
     const count = function.blocks.items.len;
@@ -369,19 +369,14 @@ fn rewriteSite(function: *Function, address_taken: []const bool, slot: Slot, sit
     function_ir.readOperands(function, instruction, rewrite, Rewrite.substitute);
 }
 
-fn undefinedValue(function: *Function, slot: Slot, cache: *[3]?ValueId) !ValueId {
-    const index: usize = switch (slot.type_id) {
-        .int => 0,
-        .bool => 1,
-        .byte => 2,
-        else => unreachable,
-    };
+fn undefinedValue(function: *Function, slot: Slot, cache: *[@backingInt(structures.TypeId.f64) + 1]?ValueId) !ValueId {
+    const index: usize = @backingInt(slot.type_id);
     if (cache[index]) |value| return value;
     const instruction: Instruction = switch (slot.type_id) {
         .int => .{ .const_int = 0 },
         .bool => .{ .const_bool = false },
         .byte => .{ .const_byte = 0 },
-        else => unreachable,
+        else => .{ .const_numeric = .{ .type_id = slot.type_id, .bits = 0 } },
     };
     const value = try function.insertInstruction(function.entry, 0, instruction, function.instructionSpan(slot.instruction), function.instructionFrame(slot.instruction));
     cache[index] = value;

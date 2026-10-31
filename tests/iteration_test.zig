@@ -1109,7 +1109,7 @@ test "for range endpoints empty ranges and signed boundaries have parity" {
             \\    var sum = 0
             \\    for value in $range
             \\        count += 1
-            \\        sum += value
+            \\        sum = wrapping(sum + value)
             \\        if count > 10 -> return 91
             \\    if count <> $count -> return 92
             \\    if sum <> $sum -> return 93

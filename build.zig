@@ -89,6 +89,7 @@ pub fn build(b: *std.Build) void {
         "tests/codegen_test.zig",
         "tests/language_test.zig",
         "tests/operation_test.zig",
+        "tests/numeric_test.zig",
         "tests/optimizer_test.zig",
         "tests/match_test.zig",
         "tests/membership_test.zig",

@@ -94,7 +94,7 @@ pub fn cost(body: *const Body) usize {
     var total = body.blocks.len;
     for (body.instructions) |instruction| {
         total += switch (instruction) {
-            .const_int, .const_bool, .const_byte, .const_unit, .const_none => 0,
+            .const_numeric, .const_int, .const_bool, .const_byte, .const_unit, .const_none => 0,
             else => @as(usize, 1),
         };
     }

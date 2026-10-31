@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIMERAQRY46";
+const format = "CHIMERAQRY48";
 const max_records = 1_000_000;
 // Snapshot records name their interner, input, or query boundary by type name.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
@@ -184,9 +184,19 @@ fn validRuntimeValue(db: *query.Database, value: structures.CompileTimeValue) !b
     if (value != .runtime) return true;
     if (value.runtime.value.scalarTypeId()) |type_id| {
         if (type_id != value.runtime.type_id) return false;
-    } else if (value.runtime.type_id.isPrimitive()) return false;
+    } else if (value.runtime.value != .numeric and value.runtime.type_id.isPrimitive()) return false;
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
     switch (value.runtime.value) {
+        .numeric => |bits| {
+            const kind = value.runtime.type_id.numericType() orelse return false;
+            if (value.runtime.type_id == .int or value.runtime.type_id == .byte) return false;
+            return kind.width() == 64 or bits >> @intCast(kind.width()) == 0;
+        },
+        .int_literal => |integer| {
+            if (integer.limbs.len == 0) return false;
+            if (integer.limbs.len == 1 and integer.limbs[0] == 0) return integer.positive;
+            return integer.limbs[integer.limbs.len - 1] != 0;
+        },
         .function_ref => return try types.callable(value.runtime.type_id) != null,
         .variant => |variant| return validVariantRuntime(db, value.runtime.type_id, variant),
         .structure => {},
@@ -294,6 +304,43 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
     for (body.instructions) |instruction| {
         if (!try validArrayStorageType(db, types, instruction.resultType())) return false;
         switch (instruction) {
+            .type_union => |operands| {
+                if (body.valueType(operands.lhs) != .type) return false;
+                if (body.valueType(operands.rhs) != .type) return false;
+            },
+            .const_numeric => |constant| {
+                const kind = constant.type_id.numericType() orelse return false;
+                if (constant.type_id == .int or constant.type_id == .byte) return false;
+                if (kind.width() < 64 and constant.bits >> @intCast(kind.width()) != 0) return false;
+            },
+            .const_int_literal => |value_id| {
+                const constant = (try db.lookupInternedAs(queries.CompileTimeValues, value_id)) orelse return false;
+                if (constant.* != .runtime or constant.runtime.type_id != .int_literal) return false;
+            },
+            .numeric_binary => |operation| {
+                const kind = operation.type_id.numericType() orelse return false;
+                if (!kind.supportsBinary(operation.operation)) return false;
+                if (kind.isFloat() and operation.overflow != .checked) return false;
+                if (body.valueType(operation.operands.lhs) != operation.type_id) return false;
+                if (body.valueType(operation.operands.rhs) != operation.type_id) return false;
+            },
+            .numeric_unary => |operation| {
+                const kind = operation.type_id.numericType() orelse return false;
+                if (!kind.supportsUnary(operation.operation)) return false;
+                if (kind.isFloat() and operation.overflow != .checked) return false;
+                if (body.valueType(operation.operand) != operation.type_id) return false;
+            },
+            .numeric_convert => |operation| {
+                const source = body.valueType(operation.operand).numericType() orelse return false;
+                const target = operation.destination_type.numericType() orelse return false;
+                if (!structures.numeric.validConversion(source, target, operation.policy)) return false;
+                if (structures.numeric.conversionIsOptional(source, target, operation.policy)) {
+                    const members = (try types.variantMembers(operation.result_type)) orelse return false;
+                    if (members.len != 2) return false;
+                    if (std.mem.indexOfScalar(structures.TypeId, members, operation.destination_type) == null) return false;
+                    if (std.mem.indexOfScalar(structures.TypeId, members, .none) == null) return false;
+                } else if (operation.result_type != operation.destination_type) return false;
+            },
             .static_conversion, .const_string_literal => return false,
             .const_storage_cursor => |cursor| {
                 if (try types.storageCursorAccess(cursor.type_id) == null and try types.borrowElement(cursor.type_id) == null) return false;
@@ -672,7 +719,7 @@ fn validCompiledFunction(artifact: structures.CompiledFunction) bool {
         if (site.stack_size > std.math.maxInt(i32) or site.label.len > std.math.maxInt(i32)) return false;
         previous_return = site.return_offset;
     }
-    if (artifact.panic_trace_offset) |offset| {
+    for (artifact.panic_trace_offsets) |offset| {
         if (offset == 0 or offset > artifact.code.len or artifact.code.len - offset < 4) return false;
         if (artifact.code[offset - 1] != 0xe9) return false;
     }
@@ -724,7 +771,7 @@ test "restoring scalar values rejects mismatched payload types" {
     const allocator = std.testing.allocator;
     const values = [_]structures.CompileTimeValue.RuntimeValue{
         .{ .int = 42 },
-        .{ .int_literal = 2147483648 },
+        .{ .int_literal = .{ .limbs = &.{2147483648}, .positive = true } },
         .{ .byte = 255 },
         .{ .bool = true },
         .unit,
@@ -1459,7 +1506,7 @@ test "cached panic metadata rejects out-of-range sites frames and patches" {
     const valid: structures.CompiledFunction = .{
         .code = &.{ 0xe9, 0, 0, 0, 0, 0xc3 },
         .required_alignment = 1,
-        .panic_trace_offset = 1,
+        .panic_trace_offsets = &.{1},
         .trace_sites = &.{.{ .return_offset = 5, .stack_size = 0, .label = "frame\n" }},
     };
     try std.testing.expect(validCompiledFunction(valid));
@@ -1469,7 +1516,7 @@ test "cached panic metadata rejects out-of-range sites frames and patches" {
     damaged.trace_sites = &.{.{ .return_offset = 5, .stack_size = std.math.maxInt(u32), .label = "" }};
     try std.testing.expect(!validCompiledFunction(damaged));
     damaged = valid;
-    damaged.panic_trace_offset = 3;
+    damaged.panic_trace_offsets = &.{3};
     try std.testing.expect(!validCompiledFunction(damaged));
 }
 

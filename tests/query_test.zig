@@ -1,4 +1,5 @@
 const std = @import("std");
+const standard_library = @import("standard_library");
 const test_sources = @import("test_sources");
 const codegen = test_sources.codegen;
 const query = test_sources.query;
@@ -93,8 +94,7 @@ fn testDatabase(worker_count: usize) !*Database {
     return testDatabaseWithPrelude(worker_count, true);
 }
 
-const minimal_prelude =
-    \\pub import std.exit.{exit}
+const minimal_primitives =
     \\extern func literal_byte(static value: int_literal) byte
     \\pub converter(static value: int_literal) byte where value >= 0 where value <= 255 -> literal_byte(value)
     \\pub extern func int.+(imm left: int, imm right: int) int
@@ -116,9 +116,10 @@ fn testDatabaseWithPrelude(worker_count: usize, enable_prelude: bool) !*Database
     const db = try Database.init(testing.allocator, .{ .worker_count = worker_count });
     errdefer db.deinit();
     try db.addInput(queries.InlineLimit, {}, 0);
-    const sources = [_]struct { path: []const u8, text: []const u8 }{
-        .{ .path = "std.exit", .text = "pub extern func exit(code: int) never" },
-        .{ .path = "std.prelude", .text = minimal_prelude },
+    const sources = [_]struct { path: []const u8, text: []const u8, file: standard_library.File }{
+        .{ .path = "std.exit", .text = "pub extern func exit(code: int) never", .file = .exit },
+        .{ .path = "std.prelude", .text = "pub import std.exit.{exit}\nimport std.primitives.{}", .file = .prelude },
+        .{ .path = "std.primitives", .text = minimal_primitives, .file = .primitives },
     };
     for (sources, 0..) |source, index| {
         const file_id: structures.FileId = 100_000 + index;
@@ -127,13 +128,13 @@ fn testDatabaseWithPrelude(worker_count: usize, enable_prelude: bool) !*Database
         try db.addInput(queries.SourceText, file_id, source.text);
         try db.addInput(queries.SourcePath, file_id, source.path);
         try db.addInput(queries.ModuleMembers, module, &.{file_id});
-        if (index == 0) try db.addInput(queries.StandardFile, queries.standardFileKey("exit.chi"), file_id);
-        if (index == 1) try db.addInput(queries.StandardFile, queries.standardFileKey("prelude.chi"), file_id);
-        if (index == 1 and enable_prelude) try db.addInput(queries.StandardPreludeModule, {}, module);
+        try db.addInput(queries.StandardFile, @backingInt(source.file), file_id);
+        if (source.file == .prelude and enable_prelude) try db.addInput(queries.StandardPreludeModule, {}, module);
     }
     try db.addInput(queries.ModuleCatalog, {}, &.{
         try db.intern(queries.ModulePaths, .{ .path = "std.exit" }),
         try db.intern(queries.ModulePaths, .{ .path = "std.prelude" }),
+        try db.intern(queries.ModulePaths, .{ .path = "std.primitives" }),
     });
     return db;
 }
@@ -238,16 +239,6 @@ fn expectDirectCallArtifact(artifact: structures.CompiledFunction, target: struc
     try testing.expectEqualSlices(structures.InstanceId, &.{.{ .item = target }}, artifact.referenced_instances);
 }
 
-fn expectPrimitiveCall(db: *Database, body: structures.FunctionBodyAnalysis, index: usize, name: []const u8, arguments: []const structures.FunctionValueId) !void {
-    try testing.expect(body.instructions[index] == .call);
-    const call = body.instructions[index].call;
-    try testing.expect(call.target == .direct);
-    try testing.expect(try isPrimitiveInstance(db, call.target.direct));
-    const location = try db.lookupInterned(queries.ItemLocations, call.target.direct.item);
-    try testing.expectEqualStrings(name, location.name.text());
-    try expectDirectCallArguments(arguments, body.call_arguments[call.arguments.start..call.arguments.end]);
-}
-
 fn isPrimitiveInstance(db: *Database, instance: structures.InstanceId) !bool {
     const location = try db.lookupInterned(queries.ItemLocations, instance.item);
     const owner = location.owner orelse return false;
@@ -287,15 +278,6 @@ fn expectDirectValueUses(expected: []const structures.FunctionValueId, actual: [
     for (expected, actual) |expected_value, actual_use| {
         try testing.expectEqual(expected_value, actual_use.value);
         try testing.expectEqual(@as(?structures.TypeId, null), actual_use.coerce_to);
-    }
-}
-
-fn expectDirectCallArguments(expected: []const structures.FunctionValueId, actual: []const structures.FunctionCallArgument) !void {
-    try testing.expectEqual(expected.len, actual.len);
-    for (expected, actual) |expected_value, argument| {
-        try testing.expect(argument == .prepared);
-        try testing.expectEqual(expected_value, argument.prepared.value);
-        try testing.expectEqual(@as(?structures.TypeId, null), argument.prepared.coerce_to);
     }
 }
 
@@ -2344,12 +2326,12 @@ test "byte literals, layout, calls, fields and static values" {
 
 test "byte literals reject out of range and int values do not convert implicitly" {
     const cases = [_]struct { source: []const u8, kind: DiagnosticKind }{
-        .{ .source = "func answer() byte -> return 256", .kind = .where_condition_failed },
-        .{ .source = "func answer() byte\n  var value: byte = 256\n  return value", .kind = .where_condition_failed },
-        .{ .source = "func identity(value: byte) byte -> return value\nfunc answer() byte -> return identity(256)", .kind = .where_condition_failed },
-        .{ .source = "static Pair = struct\n  field: byte\nfunc answer() byte -> return Pair{field = 256}.field", .kind = .where_condition_failed },
+        .{ .source = "func answer() byte -> return 256", .kind = .integer_literal_out_of_range },
+        .{ .source = "func answer() byte\n  var value: byte = 256\n  return value", .kind = .integer_literal_out_of_range },
+        .{ .source = "func identity(value: byte) byte -> return value\nfunc answer() byte -> return identity(256)", .kind = .integer_literal_out_of_range },
+        .{ .source = "static Pair = struct\n  field: byte\nfunc answer() byte -> return Pair{field = 256}.field", .kind = .integer_literal_out_of_range },
         .{ .source = "func answer() byte\n  const value = 255\n  return value", .kind = .return_type_mismatch },
-        .{ .source = "func answer() byte -> return -1", .kind = .where_condition_failed },
+        .{ .source = "func answer() byte -> return -1", .kind = .integer_literal_out_of_range },
     };
     for (cases) |case| {
         const db = try testDatabase(1);
@@ -2376,7 +2358,7 @@ test "static byte literal edits invalidate and recover" {
     const diagnostics = try db.transitiveAccumulatorValues(queries.ResolveStatic, high, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.where_condition_failed, diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
 
     try setSource(db, 1, "static high: byte = 0");
     try testing.expectEqual(@as(u8, 0), (try resolvedStaticValue(db, high)).runtime.value.byte);
@@ -2449,7 +2431,7 @@ test "static byte parameter rejects an out-of-range literal" {
     const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = answer }, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.where_condition_failed, diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
 }
 
 test "static byte parameter does not convert an int value" {
@@ -3727,7 +3709,7 @@ test "compile-time scalar interpreter executes control flow, locals, loops, and 
 
     try addSource(db, 1,
         \\static selected = if 2 < 3 -> 40 + 2 else 0
-        \\static wrapped = 2147483647 + 1
+        \\static wrapped = wrapping(2147483647 + 1)
         \\static looped = comptime
         \\  var value = 0
         \\  loop
@@ -5877,14 +5859,14 @@ test "function expressions analyze nested arithmetic and calls as one typed valu
     try testing.expectEqual(@as(usize, 11), body.instructions.len);
     try testing.expectEqual(@as(i32, 120), body.instructions[0].const_int);
     try testing.expectEqual(scope.resolve("leaf").?, body.instructions[1].call.target.direct.item);
-    try testing.expectEqualDeep(structures.FunctionInstruction{ .divsi = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1) } }, body.instructions[2]);
+    try testing.expectEqualDeep(structures.FunctionInstruction{ .numeric_binary = .{ .operation = .div, .type_id = .int, .operands = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(1) } } }, body.instructions[2]);
     try testing.expectEqual(@as(i32, 2), body.instructions[3].const_int);
     try testing.expectEqual(@as(i32, 3), body.instructions[4].const_int);
-    try testing.expectEqualDeep(structures.FunctionInstruction{ .addi = .{ .lhs = @fromBackingInt(3), .rhs = @fromBackingInt(4) } }, body.instructions[5]);
-    try testing.expectEqualDeep(structures.FunctionInstruction{ .muli = .{ .lhs = @fromBackingInt(5), .rhs = @fromBackingInt(6) } }, body.instructions[7]);
-    try testing.expectEqualDeep(structures.FunctionInstruction{ .subi = .{ .lhs = @fromBackingInt(2), .rhs = @fromBackingInt(7) } }, body.instructions[8]);
-    try expectPrimitiveCall(db, body, 9, "-", &.{@fromBackingInt(8)});
-    try expectPrimitiveCall(db, body, 10, "-", &.{@fromBackingInt(9)});
+    try testing.expectEqual(@as(i32, 5), body.instructions[5].const_int);
+    try testing.expectEqual(@as(i32, 5), body.instructions[7].const_int);
+    try testing.expectEqualDeep(structures.FunctionInstruction{ .numeric_binary = .{ .operation = .sub, .type_id = .int, .operands = .{ .lhs = @fromBackingInt(2), .rhs = @fromBackingInt(7) } } }, body.instructions[8]);
+    try testing.expectEqualDeep(structures.FunctionInstruction{ .numeric_unary = .{ .operation = .neg, .type_id = .int, .operand = @fromBackingInt(8) } }, body.instructions[9]);
+    try testing.expectEqualDeep(structures.FunctionInstruction{ .numeric_unary = .{ .operation = .neg, .type_id = .int, .operand = @fromBackingInt(9) } }, body.instructions[10]);
     try testing.expectEqual(@as(u32, 10), @backingInt(body.blocks[0].terminator.return_value.value));
     try expectCompiledFunctionResult(db, 1, "expression", &.{ "expression", "leaf" }, 15);
 }
@@ -7075,7 +7057,7 @@ test "local binding diagnostics follow lexical scope and declared type" {
     }{
         .{ .file_id = 1, .source = "static f = func() int\n  const duplicate = 1\n  const duplicate = 2\n  return 1", .marker = "duplicate", .kind = .duplicate_local_binding },
         .{ .file_id = 2, .source = "static f = func() int\n  const x = missing\n  return x", .marker = "missing", .kind = .unknown_value },
-        .{ .file_id = 3, .source = "static f = func() int\n  const x: float = 1\n  return x", .marker = "float", .kind = .float_type_not_supported },
+        .{ .file_id = 3, .source = "static f = func() int\n  const x: UnknownNumericType = 1\n  return x", .marker = "UnknownNumericType", .kind = .unknown_type },
         .{ .file_id = 4, .source = "static f = func() int\n  const leaf = 1\n  return leaf()", .marker = "leaf", .kind = .value_not_callable },
     };
     for (cases) |case| {
@@ -7142,7 +7124,7 @@ test "local initializer calls are typed through the callee signature" {
     defer db.deinit();
 
     try addSource(db, 1,
-        \\static bad = func() float -> return 1
+        \\static bad = func() UnknownNumericType -> return 1
         \\static user = func() int
         \\  const value = bad()
         \\  return value
@@ -7153,7 +7135,7 @@ test "local initializer calls are typed through the callee signature" {
     const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = user_id }, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
     try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.float_type_not_supported, diagnostics[0].kind);
+    try testing.expectEqual(structures.Diagnostic.Kind.unknown_type, diagnostics[0].kind);
 }
 
 test "body edits preserve signature consumers and update body analysis" {
@@ -7181,7 +7163,7 @@ test "function signature rejects invalid parameter and return types without dupl
 
     try addSource(db, 1, "static unknown = func() foo -> return 1");
     try addSource(db, 2, "static missing_param = func(x) int -> return 1");
-    try addSource(db, 3, "static bad_param = func(x: float) int -> return 1");
+    try addSource(db, 3, "static bad_param = func(x: UnknownNumericType) int -> return 1");
     try addSource(db, 4, "static duplicate = func(x: int, x: int) int -> return 1");
 
     for ([_]structures.FileId{ 1, 2, 3, 4 }) |file_id| {
@@ -7384,7 +7366,7 @@ test "function body analysis rejects unsupported expressions and literals" {
     defer db.deinit();
     try addSource(db, 1, "static unsupported = func() int -> return sizeof(int)");
     try addSource(db, 2, "static bare_return = func() int -> return");
-    try addSource(db, 4, "static float = func() int -> return 1.5");
+    try addSource(db, 4, "static decimal = func() int -> return 1.5");
     try addSource(db, 5, "static overflow = func() int -> return 2147483648");
 
     for ([_]structures.FileId{ 1, 2, 4, 5 }) |file_id| {
@@ -7393,7 +7375,7 @@ test "function body analysis rejects unsupported expressions and literals" {
         const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, .{ .item = function_id }, structures.Diagnostic, testing.allocator);
         defer freeDiagnostics(diagnostics);
         try testing.expectEqual(@as(usize, 1), diagnostics.len);
-        if (file_id == 4) try testing.expectEqual(structures.Diagnostic.Kind.float_literal_not_supported, diagnostics[0].kind);
+        if (file_id == 4) try testing.expectEqual(structures.Diagnostic.Kind.return_type_mismatch, std.meta.activeTag(diagnostics[0].kind));
         if (file_id == 5) try testing.expectEqual(structures.Diagnostic.Kind.integer_literal_out_of_range, diagnostics[0].kind);
     }
 }

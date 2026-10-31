@@ -163,8 +163,18 @@ Semantic construction validates syntax and lexical structure in a query-local
 expression graph. AST payload classification and child enumeration are shared by
 equality, rendering, and walkers; each walker retains its lexical boundary.
 Typing resolves names and operations, specializes calls, inserts conversions,
-and publishes one authoritative typed SSA CFG. All branch arguments and call
-destinations are explicit; downstream stages do not reconstruct source legality.
+and publishes one authoritative typed SSA CFG. Numeric arithmetic carries its
+concrete type and overflow mode; numeric conversions carry their destination and
+policy. The shared numeric semantics module owns constant execution and literal
+representability. Overflow contexts affect selected primitive operations in the
+current expression and never specialize an ordinary callee by caller mode. All
+branch arguments and call destinations are explicit; downstream stages do not
+reconstruct source legality.
+
+`std/primitives.chi` owns primitive operations, literal conversion, and lossless
+numeric converters. The prelude imports this module without declaring operations.
+Primitive namespace lookup and converter discovery use that registered defining
+module, independently of a user file's prelude imports.
 
 `AnalysisContext` owns source-dependent lookup, visibility, and specialization.
 `TypeFacts` supplies structural type and ownership facts; `HostTypes` adds host

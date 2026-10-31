@@ -162,13 +162,13 @@ fn canonical(function: *const Function, instruction: Instruction) Instruction {
 
 fn kind(roots: *const effects.Roots, instruction: Instruction) Kind {
     return switch (instruction) {
-        .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .compare, .select, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => .pure,
+        .const_numeric, .numeric_binary, .numeric_unary, .numeric_convert, .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .compare, .select, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => .pure,
         .field_access => |operation| read(roots, operation.operand),
         .variant_tag => |operand| read(roots, operand),
         .value_copy => |copy| if (copy.destination == null) read(roots, copy.source) else .write,
         inline .variant_extract, .variant_coerce => |operation| if (operation.destination == null) read(roots, operation.operand) else .write,
         .allocation_element => |element| read(roots, element.allocation),
-        .local_storage, .result_storage, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_type, .initializer_ref, .aggregate, .storage_cursor => .none,
+        .type_union, .local_storage, .result_storage, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_type, .initializer_ref, .aggregate, .storage_cursor => .none,
         .borrow_write, .call, .static_conversion, .fill, .move => .write,
     };
 }

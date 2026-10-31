@@ -132,6 +132,12 @@ pub fn validExternalSignature(facts: anytype, symbol: standard_library.External,
     if (signature.result_mode != expected_result) return false;
     switch (symbol) {
         .primitive_operation => return true,
+        .numeric_converter => {
+            if (!hasShape(signature, &.{.imm})) return false;
+            const source = signature.parameters[0].type_id.numericType() orelse return false;
+            const target = signature.return_type.numericType() orelse return false;
+            return source.losslessTo(target);
+        },
         .static_iteration_item => return hasShape(signature, &.{.imm}) and signature.return_type == .unit,
         .copy_value => return hasShape(signature, &.{.imm}) and signature.parameters[0].type_id == signature.return_type,
         .move_value => return hasShape(signature, &.{.deinit}) and signature.parameters[0].type_id == signature.return_type,

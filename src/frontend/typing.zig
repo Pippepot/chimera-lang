@@ -484,6 +484,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         options: BodyOptions = .{},
         type_check_only: bool = false,
+        numeric_overflow: structures.numeric.Overflow = .checked,
         values: flow_snapshot.Buffer(?Value, null) = .{},
         state: State = .{},
         initializer_regions: std.ArrayList(structures.FunctionBodyAnalysis) = .empty,
@@ -567,6 +568,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         current_block: ?structures.FunctionBlockId = null,
         current_boundary: ?BoundaryId = null,
         instruction_count: u32 = 0,
+        numeric_constants: std.ArrayList(?u64) = .empty,
         block_layout_count: u32 = 0,
 
         const CleanupCapture = struct {
@@ -978,6 +980,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (self.options.builtin_body) |builtin| {
                 switch (builtin.symbol) {
                     .primitive_operation => return self.buildPrimitiveOperation(builtin.operation.?),
+                    .numeric_converter => return self.returnValue(try self.appendInstruction(.{ .numeric_convert = .{ .operand = self.values.get(0).?.id, .destination_type = self.return_type, .policy = .lossless, .result_type = self.return_type } }), .{ .start = 0, .end = 0 }),
                     .copy_value => return self.buildOwnershipMember(.copy),
                     .move_value => return self.buildOwnershipMember(.move),
                     .unsafe_initialize, .initialize_collection_element => return self.buildInitializedTarget(2, .{ .allocation_element = .{
@@ -1008,34 +1011,107 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn buildPrimitiveOperation(self: *Self, operation: structures.Operation) !void {
-            switch (operation) {
-                .@"+", .@"-", .@"*", .@"/", .@"<<", .@">>" => return self.returnValue(try self.primitiveArithmetic(operation, .{ .lhs = self.values.get(0).?.id, .rhs = self.values.get(1).?.id }), .{ .start = 0, .end = 0 }),
-                .@"%" => return self.buildPrimitiveRemainder(),
-                .unary_minus => return self.returnValue(try self.appendInstruction(.{ .negi = self.values.get(0).?.id }), .{ .start = 0, .end = 0 }),
-                .@"==", .@"<>", .@"<", .@">", .@"<=", .@">=", .not => return self.buildPrimitivePredicate(operation),
-                .@"[]", .@"[]=" => unreachable,
+            const left = self.values.get(0).?;
+            if (left.type_id.numericType() != null) {
+                const result = try self.numericOperation(operation, left.type_id, left.id, if (operation.operandCount() == 2) self.values.get(1).?.id else null);
+                return self.returnValue(result, .{ .start = 0, .end = 0 });
+            }
+            return self.buildPrimitivePredicate(operation);
+        }
+
+        fn numericOperation(self: *Self, operation: structures.Operation, type_id: structures.TypeId, left: structures.FunctionValueId, right: ?structures.FunctionValueId) !Value {
+            const overflow: structures.numeric.Overflow = if (type_id.numericType().?.isFloat()) .checked else self.numeric_overflow;
+            if (operation.numericUnary()) |unary| return self.appendInstruction(.{ .numeric_unary = .{ .operation = unary, .type_id = type_id, .overflow = overflow, .operand = left } });
+            return self.appendInstruction(.{ .numeric_binary = .{ .operation = operation.numericBinary().?, .type_id = type_id, .overflow = overflow, .operands = .{ .lhs = left, .rhs = right.? } } });
+        }
+
+        fn pipeValue(self: *Self, operands: semantic.UnresolvedBody.BinaryOperands, span: structures.SourceSpan) !Value {
+            if ((try self.unevaluatedType(operands.lhs.value, null)) == .type) {
+                if (self.type_check_only) return self.localStorage(.type);
+                const lhs = try self.value(operands.lhs.value);
+                const rhs = try self.value(operands.rhs.value);
+                if (rhs.type_id != .type) return self.reject(span, .value_used_as_type);
+                return self.appendInstruction(.{ .type_union = .{ .lhs = lhs.id, .rhs = rhs.id } });
+            }
+            const call: semantic.UnresolvedBody.Call = .{ .target = .{ .operation = .@"|" }, .arguments = .{ .start = 0, .end = 0 }, .span = span };
+            switch (try self.resolveCall(call, span, &.{ operands.lhs, operands.rhs })) {
+                .diverged => |value_to_return| return value_to_return,
+                .callable => |callable| return self.resolvedCallValue(callable, call, span, null),
             }
         }
 
-        fn primitiveArithmetic(self: *Self, operation: structures.Operation, operands: structures.BinaryOperands) !Value {
-            const instruction: structures.FunctionInstruction = switch (operation) {
-                .@"+" => .{ .addi = operands },
-                .@"-" => .{ .subi = operands },
-                .@"*" => .{ .muli = operands },
-                .@"/" => .{ .divsi = operands },
-                .@"<<" => .{ .shli = operands },
-                .@">>" => .{ .shrsi = operands },
-                else => unreachable,
-            };
-            return self.appendInstruction(instruction);
+        fn unevaluatedPipeType(self: *Self, operands: semantic.UnresolvedBody.BinaryOperands, span: structures.SourceSpan) !?structures.TypeId {
+            const receiver = (try self.unevaluatedType(operands.lhs.value, null)) orelse return null;
+            if (receiver == .type or receiver == .never) return receiver;
+            const arguments = [_]semantic.UnresolvedBody.ValueUse{ operands.lhs, operands.rhs };
+            return self.unevaluatedTargetType(try self.operationTarget(receiver, .@"|", &arguments, span), &arguments);
         }
 
-        fn buildPrimitiveRemainder(self: *Self) !void {
-            const left = self.values.get(0).?.id;
-            const right = self.values.get(1).?.id;
-            const quotient = try self.appendInstruction(.{ .divsi = .{ .lhs = left, .rhs = right } });
-            const product = try self.appendInstruction(.{ .muli = .{ .lhs = quotient.id, .rhs = right } });
-            try self.returnValue(try self.appendInstruction(.{ .subi = .{ .lhs = left, .rhs = product.id } }), .{ .start = 0, .end = 0 });
+        fn overflowContext(self: *Self, expression: anytype, context: ValueContext) !Value {
+            const previous = self.numeric_overflow;
+            self.numeric_overflow = expression.mode;
+            defer self.numeric_overflow = previous;
+            return self.valueWithContext(expression.value, context);
+        }
+
+        fn numericConversionType(self: *Self, source: structures.TypeId, destination: structures.TypeId, policy: structures.numeric.Policy, span: structures.SourceSpan) !structures.TypeId {
+            const source_type = source.numericType() orelse return self.reject(span, .invalid_numeric_conversion);
+            const destination_type = destination.numericType() orelse return self.reject(span, .invalid_numeric_conversion);
+            if (!structures.numeric.validConversion(source_type, destination_type, policy)) return self.reject(span, .invalid_numeric_conversion);
+            if (structures.numeric.conversionIsOptional(source_type, destination_type, policy)) return self.analysis_context.facts().internVariant(&.{ destination, .none });
+            return destination;
+        }
+
+        fn numericConversion(self: *Self, conversion: anytype, span: structures.SourceSpan) !Value {
+            const source = try self.value(conversion.value);
+            const result_type = try self.numericConversionType(source.type_id, conversion.target, conversion.policy, span);
+            return self.appendInstruction(.{ .numeric_convert = .{ .operand = source.id, .destination_type = conversion.target, .policy = conversion.policy, .result_type = result_type } });
+        }
+
+        fn unevaluatedNumericConversionType(self: *Self, conversion: anytype, span: structures.SourceSpan) !?structures.TypeId {
+            const source = (try self.unevaluatedType(conversion.value, null)) orelse return null;
+            return try self.numericConversionType(source, conversion.target, conversion.policy, span);
+        }
+
+        fn numericConstant(self: *Self, type_id: structures.TypeId, bits: u64) !Value {
+            return self.appendInstruction(structures.FunctionInstruction.numericConstantInstruction(type_id, bits));
+        }
+
+        fn numericLiteralTarget(self: *Self, expected: ?structures.TypeId, default: structures.TypeId) !structures.TypeId {
+            return try semantic.numericLiteralTarget(self.analysis_context, expected orelse return default, default) orelse default;
+        }
+
+        fn integerLiteralType(self: *Self, value_id: structures.CompileTimeValueId, expected: ?structures.TypeId) !structures.TypeId {
+            if (expected == .int_literal) return .int_literal;
+            const target = try self.numericLiteralTarget(expected, .int);
+            if (target == .int) return .int;
+            const literal = (try self.analysis_context.lookupCompileTimeValue(value_id)).runtime.value.int_literal;
+            return if (literal.bits(target.numericType().?) != null) target else .int;
+        }
+
+        fn floatLiteralType(self: *Self, expected: ?structures.TypeId) !structures.TypeId {
+            const target = try self.numericLiteralTarget(expected, .f64);
+            return if (target.numericType().?.isFloat()) target else .f64;
+        }
+
+        fn integerLiteral(self: *Self, integer: structures.CompileTimeValueId, expected: ?structures.TypeId, span: structures.SourceSpan) !Value {
+            if (expected == .int_literal) return self.appendInstruction(.{ .const_int_literal = integer });
+            const target = try self.numericLiteralTarget(expected, .int);
+            if (self.type_check_only) return self.localStorage(target);
+            const constant = (try self.analysis_context.lookupCompileTimeValue(integer)).runtime.value.int_literal;
+            const bits = constant.bits(target.numericType().?) orelse return self.reject(span, .integer_literal_out_of_range);
+            return self.numericConstant(target, bits);
+        }
+
+        fn floatLiteral(self: *Self, literal: anytype, expected: ?structures.TypeId, span: structures.SourceSpan) !Value {
+            const target = try self.floatLiteralType(expected);
+            if (self.type_check_only) return self.localStorage(target);
+            const bits = structures.numeric.floatLiteral(self.gpa, literal.text, literal.negative, target.numericType().?) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                error.Overflow, error.Underflow => return self.reject(span, .float_literal_out_of_range),
+                else => return self.reject(span, .invalid_numeric_literal),
+            };
+            return self.numericConstant(target, bits);
         }
 
         fn buildPrimitivePredicate(self: *Self, operation: structures.Operation) !void {
@@ -1065,7 +1141,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const constant = try self.analysis_context.lookupCompileTimeValue(value_id);
             std.debug.assert(constant == .runtime);
             std.debug.assert(constant.runtime.value == .int_literal);
-            const byte = std.math.cast(u8, constant.runtime.value.int_literal) orelse return self.reject(span, .integer_literal_out_of_range);
+            const byte = constant.runtime.value.int_literal.toInt(u8) orelse return self.reject(span, .integer_literal_out_of_range);
             return self.appendInstruction(.{ .const_byte = byte });
         }
 
@@ -2610,10 +2686,12 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const scope = try self.openBoundary(expression.span);
             defer self.current_boundary = scope.parent;
             const resolved: Value = switch (expression.operation) {
-                .integer_literal, .int_literal_value => |integer| if (expected_type == .int_literal)
-                    try self.appendInstruction(.{ .const_int_literal = integer })
-                else
-                    try self.appendInstruction(.{ .const_int = std.math.cast(i32, integer) orelse return self.reject(expression.span, .integer_literal_out_of_range) }),
+                .integer_literal, .int_literal_value => |integer| try self.integerLiteral(integer, expected_type, expression.span),
+                .numeric => |constant| try self.numericConstant(constant.type_id, constant.bits),
+                .float_literal => |literal| try self.floatLiteral(literal, expected_type, expression.span),
+                .overflow_context => |overflow| try self.overflowContext(overflow, child_context),
+                .pipe => |pipe| try self.pipeValue(pipe, expression.span),
+                .numeric_conversion => |conversion| try self.numericConversion(conversion, expression.span),
                 .string_literal => |data| if (expected_type != null and expected_type.? != .string_literal and try semantic.canWidenTo(self.analysis_context, try self.analysis_context.staticStringType(), expected_type.?))
                     try self.staticStringValue(data)
                 else
@@ -2845,9 +2923,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn literalDefaultTarget(self: *Self, expected_type: ?structures.TypeId) !?structures.TypeId {
             const target = expected_type orelse return .int;
-            if (target == .int) return target;
-            const members = (try self.analysis_context.facts().variantMembers(target)) orelse return null;
-            return if (std.mem.indexOfScalar(structures.TypeId, members, .int) != null) target else null;
+            return if (try semantic.numericLiteralTarget(self.analysis_context, target, .int) != null) target else null;
         }
 
         fn stageStaticConversion(self: *Self, id: semantic.UnresolvedBody.ValueId, source_type: structures.TypeId, context: ValueContext, span: structures.SourceSpan) !Value {
@@ -3090,6 +3166,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             try self.recordUse(previous);
             var storage = try self.localStorage(previous.type_id);
             _ = try self.copyBits(rawValue(previous), storage);
+            if (!self.locals.items(.mutable)[index] and !self.locals.items(.reference)[index]) {
+                self.numeric_constants.items[@as(u31, @truncate(@backingInt(storage.id)))] = self.knownNumeric(previous.id);
+            }
             storage = try self.updateOwnedValue(previous, storage);
             storage.representation = .storage;
             storage.binding_identity = previous.binding_identity;
@@ -3859,6 +3938,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 // Infer the deferred value before choosing its construction destination.
                 .is_initializer_region = true,
                 .optional_collection_allocation = self.optional_collection_allocation,
+                .numeric_overflow = self.numeric_overflow,
                 .options = .{
                     .infer_reference_contract = self.options.infer_reference_contract,
                     .widen_reference_indices = self.options.widen_reference_indices,
@@ -5619,7 +5699,12 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (index < self.unresolved.parameter_count) return self.values.get(index).?.type_id;
             if (self.values.get(index)) |resolved| return resolved.type_id;
             return switch (self.unresolved.expressions[index - self.unresolved.parameter_count].operation) {
-                .integer_literal => if (expected_type == .int_literal) .int_literal else if (expected_type == .byte) .byte else .int,
+                .integer_literal => |integer| try self.integerLiteralType(integer, expected_type),
+                .numeric => |constant| constant.type_id,
+                .float_literal => try self.floatLiteralType(expected_type),
+                .overflow_context => |overflow| try self.unevaluatedType(overflow.value, expected_type),
+                .pipe => |pipe| try self.unevaluatedPipeType(pipe, self.valueSpan(id)),
+                .numeric_conversion => |conversion| try self.unevaluatedNumericConversionType(conversion, self.valueSpan(id)),
                 .int_literal_value => .int_literal,
                 .string_literal => if (expected_type == .string_literal)
                     .string_literal
@@ -7936,19 +8021,18 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             var callable = resolved;
             if (callable.operation.target == .direct) if (try self.analysis_context.inlineBuiltin(callable.operation.target.direct.item)) |builtin| {
                 switch (builtin.symbol) {
-                    .primitive_operation => switch (builtin.operation.?) {
-                        .@"+", .@"-", .@"*", .@"/", .@"<<", .@">>" => {
-                            const arguments = self.call_arguments.items[callable.operation.arguments.start..callable.operation.arguments.end];
-                            const result = try self.primitiveArithmetic(builtin.operation.?, .{ .lhs = arguments[0].valueId(), .rhs = arguments[1].valueId() });
+                    .primitive_operation => {
+                        const arguments = self.call_arguments.items[callable.operation.arguments.start..callable.operation.arguments.end];
+                        const signature = (try self.analysis_context.functionSignature(callable.operation.target.direct)) orelse return error.Unavailable;
+                        const type_id = signature.parameters[0].type_id;
+                        if (type_id.numericType() != null) {
+                            const result = try self.numericOperation(builtin.operation.?, type_id, arguments[0].valueId(), if (arguments.len == 2) arguments[1].valueId() else null);
                             return self.defineOwnedValue(result, span, false);
-                        },
-                        .@"==", .@"<>", .@"<", .@">", .@"<=", .@">=" => {
-                            const arguments = self.call_arguments.items[callable.operation.arguments.start..callable.operation.arguments.end];
-                            const signature = (try self.analysis_context.functionSignature(callable.operation.target.direct)) orelse return error.Unavailable;
-                            return self.appendInstruction(.{ .compare = .{ .operation = primitivePredicateOperation(builtin.operation.?, signature.parameters[0].type_id), .operands = .{ .lhs = arguments[0].valueId(), .rhs = arguments[1].valueId() } } });
-                        },
-                        else => {},
+                        }
+                        const predicate = primitivePredicateOperation(builtin.operation.?, type_id);
+                        return self.appendInstruction(.{ .compare = .{ .operation = predicate, .operands = .{ .lhs = arguments[0].valueId(), .rhs = arguments[1].valueId() } } });
                     },
+                    .numeric_converter => {},
                     .literal_byte => {
                         const arguments = try self.analysis_context.lookupCompileTimeTuple(callable.operation.target.direct.specialization.?);
                         std.debug.assert(arguments.len == 1);
@@ -8403,6 +8487,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     return self.referenceIndex(source, depth + 1);
                 },
                 .addi, .subi => |operands| return self.binaryReferenceIndex(operands, operation == .subi, depth + 1),
+                .numeric_binary => |binary| {
+                    if (binary.type_id != .int or binary.overflow == .saturating) return null;
+                    if (binary.operation != .add and binary.operation != .sub) return null;
+                    return self.binaryReferenceIndex(binary.operands, binary.operation == .sub, depth + 1);
+                },
                 else => return null,
             }
         }
@@ -9366,7 +9455,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const context: ValueContext = .{ .expected_type = if (literal_operands) .int_literal else null };
             const known_type = try self.unevaluatedType(comparison.operands.lhs.value, context.expected_type);
             const operation = comparison.operation;
-            if (known_type != null and (known_type.? == .int or known_type.? == .bool or !known_type.?.isPrimitive())) {
+            if (known_type != null and (known_type.?.numericType() != null or known_type.? == .bool or !known_type.?.isPrimitive())) {
                 const call: semantic.UnresolvedBody.Call = .{
                     .target = .{ .operation = operation },
                     .arguments = .{ .start = 0, .end = 0 },
@@ -10043,7 +10132,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn matchLiteral(self: *Self, raw: semantic.UnresolvedBody.ValueUse, members: []const structures.TypeId, subject_type: structures.TypeId) !MatchLiteral {
             const operation = self.expressionOperation(raw.value) orelse unreachable;
             const literal: @FieldType(MatchLiteral, "value") = switch (operation.*) {
-                .integer_literal, .int_literal_value => |integer| .{ .integer = integer },
+                .integer_literal, .int_literal_value => |integer| .{ .integer = (try self.analysis_context.lookupCompileTimeValue(integer)).runtime.value.int_literal.toInt(i64) orelse return self.reject(raw.span, .integer_literal_out_of_range) },
                 .boolean => |boolean| .{ .boolean = boolean },
                 .string_literal => |text| .{ .text = text },
                 .unit => .unit,
@@ -10443,7 +10532,12 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn matchIntegerConstant(self: *Self, type_id: structures.TypeId, integer: i64) !Value {
-            if (type_id == .int_literal) return self.appendInstruction(.{ .const_int_literal = integer });
+            if (type_id == .int_literal) {
+                const literal = try structures.numeric.Integer.fromInt(self.gpa, integer);
+                defer self.gpa.free(literal.limbs);
+                const value_id = try self.analysis_context.internCompileTimeValue(.{ .runtime = .{ .type_id = .int_literal, .value = .{ .int_literal = literal } } });
+                return self.appendInstruction(.{ .const_int_literal = value_id });
+            }
             return self.appendInstruction(.{ .const_int = @intCast(integer) });
         }
 
@@ -11174,9 +11268,50 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             return .maybe_transferred;
         }
 
-        fn appendInstruction(self: *Self, instruction: structures.FunctionInstruction) !Value {
+        fn knownNumeric(self: *const Self, id: structures.FunctionValueId) ?u64 {
+            const index = @backingInt(id);
+            if (index & (1 << 31) == 0) return null;
+            const instruction_index = index & 0x7fffffff;
+            // A captured input belongs to its enclosing analysis, not this graph.
+            if (instruction_index >= self.numeric_constants.items.len) return null;
+            return self.numeric_constants.items[instruction_index];
+        }
+
+        fn foldNumeric(self: *Self, instruction: structures.FunctionInstruction) !structures.FunctionInstruction {
+            if (self.type_check_only) return instruction;
+            switch (instruction) {
+                .numeric_binary => |operation| {
+                    const lhs = self.knownNumeric(operation.operands.lhs) orelse return instruction;
+                    const rhs = self.knownNumeric(operation.operands.rhs) orelse return instruction;
+                    const bits = structures.numeric.binary(operation.type_id.numericType().?, operation.operation, operation.overflow, lhs, rhs) catch |err| switch (err) {
+                        error.Overflow => return self.reject(self.activeLifetimeSpan(), .compile_time_integer_overflow),
+                        error.DivisionByZero, error.InvalidShift => return instruction,
+                    };
+                    if (operation.operation.isComparison()) return .{ .const_bool = bits != 0 };
+                    return structures.FunctionInstruction.numericConstantInstruction(operation.type_id, bits);
+                },
+                .numeric_unary => |operation| {
+                    const operand = self.knownNumeric(operation.operand) orelse return instruction;
+                    const bits = structures.numeric.unary(operation.type_id.numericType().?, operation.operation, operation.overflow, operand) catch |err| switch (err) {
+                        error.Overflow => return self.reject(self.activeLifetimeSpan(), .compile_time_integer_overflow),
+                        else => unreachable,
+                    };
+                    return structures.FunctionInstruction.numericConstantInstruction(operation.type_id, bits);
+                },
+                else => return instruction,
+            }
+        }
+
+        fn appendInstruction(self: *Self, original: structures.FunctionInstruction) !Value {
             std.debug.assert(self.current_block != null);
+            const instruction = try self.foldNumeric(original);
             const instruction_id = std.math.cast(u31, self.instruction_count) orelse return error.AnalysisTooLarge;
+            std.debug.assert(self.numeric_constants.items.len == self.instruction_count);
+            const constant = if (instruction.numericConstant()) |number| number.bits else switch (instruction) {
+                .value_copy => |copy| if (copy.destination == null) self.knownNumeric(copy.source) else null,
+                else => null,
+            };
+            try self.numeric_constants.append(self.gpa, constant);
             self.instruction_count += 1;
             try self.blocks.items[@backingInt(self.current_block.?)].items.append(self.gpa, .{
                 .instruction = .{

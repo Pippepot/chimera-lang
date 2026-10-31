@@ -86,9 +86,9 @@ pub struct RangeSequence
         if self.empty or factor == 1 -> return self
         if self.stride == 0 or not has_steps(self.first, self.last, self.stride, factor)
             return RangeSequence{first = self.first, last = self.first, stride = 1, descending = self.descending, empty = false}
-        const stride = self.stride * factor
+        const stride = wrapping(self.stride * factor)
         if self.stride > 2147483647 / factor
-            const last = if self.descending -> self.first - stride else self.first + stride
+            const last = if self.descending -> wrapping(self.first - stride) else wrapping(self.first + stride)
             return RangeSequence{first = self.first, last = last, stride = 0, descending = self.descending, empty = false}
         return RangeSequence{
             first = self.first,

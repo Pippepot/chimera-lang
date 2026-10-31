@@ -159,7 +159,7 @@ fn splitScalarVariant(function: *Function, block: u32, position: usize, edges: [
                     .int => .{ .const_int = 0 },
                     .bool => .{ .const_bool = false },
                     .byte => .{ .const_byte = 0 },
-                    else => unreachable,
+                    else => .{ .const_numeric = .{ .type_id = type_id, .bits = 0 } },
                 };
                 value = try function.insertInstruction(edge.block, function.blocks.items[edge.block].instructions.items.len, zero, source.span, source.frame);
             }

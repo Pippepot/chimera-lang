@@ -57,7 +57,7 @@ test "checked marking retains negative upper-bound and wrapping index panics" {
             \\    var values = List(int).filled(0, 16)
             \\    if not (values is List(int)) -> return
             \\    var index = first
-            \\    if first == 2147483647 -> index += 1
+            \\    if first == 2147483647 -> index = wrapping(index + 1)
             \\    loop
             \\        if index > 16 -> break
             \\        values[index] = 1
