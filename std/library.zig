@@ -13,6 +13,7 @@ pub const File = enum(u32) {
     iteration,
     math,
     primitives,
+    search,
 
     pub fn path(file: File) []const u8 {
         return switch (file) {
@@ -28,6 +29,7 @@ pub const File = enum(u32) {
             .iteration => "iteration.chi",
             .math => "math.chi",
             .primitives => "primitives.chi",
+            .search => "search.chi",
         };
     }
 

@@ -56,9 +56,9 @@ diagnostics, execution, ownership, and incremental/cache behavior.
 
 ## Deferred or independent
 
-- Result-correlated mutation provenance: preserve per-alternative output effects
-  through forwarding, saved results, later writes, loop joins, and cached contracts.
-  Until then, caller-visible output dependencies merge all ordinary return paths.
+- Finish result-correlated mutation provenance performance qualification: remove
+  cold-compilation regressions while retaining incremental typing reuse and
+  forwarding, saved-result, later-write, loop-join, and cached-contract behavior.
 - Contextual enum shorthand (`.Red`); define name resolution and inference.
 - Generator suspension/yield syntax only if ordinary cursor composition proves
   insufficient; preserve item ownership, lending lifetimes, and failure effects.

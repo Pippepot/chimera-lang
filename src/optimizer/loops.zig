@@ -81,6 +81,9 @@ pub const Analysis = struct {
         const counter = self.induction(loop, preheader_block, parameter) orelse return null;
         if (!self.graph.dominates(exit.stay, loop.latches[0])) return null;
         const comparison = IntegerComparison.init(self.function, exit.operation, exit.operands, parameter) orelse return null;
+        if (counter.terminal_bound) |bound| {
+            if (comparison.operation != .eqi or comparison.other != bound) return null;
+        }
         if (!self.invariant(loop, comparison.other, 16)) return null;
         return .{ .induction = counter, .comparison = comparison };
     }
@@ -106,13 +109,92 @@ pub const Analysis = struct {
     }
 
     pub fn iterationRange(self: Analysis, preheader_block: u32, counter: InductionExit) ?IterationRange {
+        return self.iterationRangeDepth(preheader_block, counter, 16);
+    }
+
+    fn iterationRangeDepth(self: Analysis, at: u32, counter: InductionExit, depth: u32) ?IterationRange {
+        if (depth == 0) return null;
         if (!self.immutable(counter.comparison.other)) return null;
+        const start = self.rangeAtDepth(counter.induction.start, at, depth - 1);
+        const bound = self.rangeAtDepth(counter.comparison.other, at, depth - 1);
+        if (counter.induction.terminal_bound != null) {
+            if (!self.immutable(counter.induction.start)) return null;
+            const ascending = counter.induction.step == 1;
+            const approaching = if (ascending) start.upper <= bound.lower else start.lower >= bound.upper;
+            if (!approaching and !self.orderedAt(counter.induction.start, counter.comparison.other, at, ascending)) return null;
+            return .{
+                .absolute = if (ascending) .{ .lower = start.lower, .upper = bound.upper } else .{ .lower = bound.lower, .upper = start.upper },
+                .relative = if (ascending) .{ .lower = start.lower - bound.upper, .upper = 0 } else .{ .lower = 0, .upper = start.upper - bound.lower },
+            };
+        }
         return IterationRange.init(
             counter.induction.step,
             counter.comparison.operation,
-            self.rangeAt(counter.induction.start, preheader_block),
-            self.rangeAt(counter.comparison.other, preheader_block),
+            start,
+            bound,
         );
+    }
+
+    fn orderedAt(self: Analysis, first: ValueId, last: ValueId, at: u32, ascending: bool) bool {
+        if (first == last) return true;
+        var block = at;
+        while (block != self.function.entry) {
+            block = self.graph.dominator[block];
+            const predicate = self.pathPredicate(block, at, null) orelse continue;
+            const comparison = IntegerComparison.init(self.function, predicate.operation, predicate.operands, first) orelse continue;
+            if (comparison.other != last) continue;
+            switch (comparison.operation) {
+                .eqi => return true,
+                .lti, .lei => if (ascending) return true,
+                .gti, .gei => if (!ascending) return true,
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    const PathPredicate = struct { operation: structures.PredicateOperation, operands: structures.BinaryOperands };
+
+    fn pathPredicate(self: Analysis, block: u32, at: u32, ordinal: ?u1) ?PathPredicate {
+        const terminator = self.function.blocks.items[block].terminator;
+        if (terminator != .predicate_branch) return null;
+        const predicate = terminator.predicate_branch;
+        const then_target = @backingInt(predicate.then_branch.target);
+        const else_target = @backingInt(predicate.else_branch.target);
+        const taken = if (ordinal) |edge|
+            edge == 0
+        else if (self.graph.incoming[then_target].items.len == 1 and self.graph.dominates(then_target, at))
+            true
+        else if (self.graph.incoming[else_target].items.len == 1 and self.graph.dominates(else_target, at))
+            false
+        else
+            return null;
+        return .{ .operation = if (taken) predicate.operation else predicate.operation.negated(), .operands = predicate.operands };
+    }
+
+    fn sameEquality(self: Analysis, first: structures.BinaryOperands, second: structures.BinaryOperands) bool {
+        const a = self.function.find(first.lhs);
+        const b = self.function.find(first.rhs);
+        const c = self.function.find(second.lhs);
+        const d = self.function.find(second.rhs);
+        return (a == c and b == d) or (a == d and b == c);
+    }
+
+    fn equalityAt(self: Analysis, operands: structures.BinaryOperands, at: u32, ordinal: ?u1) ?bool {
+        var block = at;
+        var edge = ordinal;
+        if (edge == null) {
+            if (block == self.function.entry) return null;
+            block = self.graph.dominator[block];
+        }
+        while (true) {
+            if (self.pathPredicate(block, at, edge)) |predicate| {
+                if ((predicate.operation == .eqi or predicate.operation == .nei) and self.sameEquality(operands, predicate.operands)) return predicate.operation == .eqi;
+            }
+            if (block == self.function.entry) return null;
+            block = self.graph.dominator[block];
+            edge = null;
+        }
     }
 
     /// Equality loops with unit strides terminate without overflowing only when
@@ -149,7 +231,10 @@ pub const Analysis = struct {
         const start = function.branchArguments(function.blocks.items[preheader_block].terminator.branch)[position];
         const back = function.branchArguments(latchBranch(function, loop) orelse return null)[position];
         if (start.coerce_to != null or back.coerce_to != null) return null;
-        const next_value = self.forwarded(back.value, 16);
+        const ending = exitTestAt(function, loop, loop.latches[0]);
+        const terminal = if (ending) |exit| if (exit.operation == .eqi) IntegerComparison.init(function, exit.operation, exit.operands, parameter) else null else null;
+        const next_value = self.forwardedAssuming(back.value, 16, if (terminal != null) ending else null);
+        if (!self.immutable(next_value)) return null;
         const next = function.definition(next_value) orelse return null;
         var step: i32 = undefined;
         switch (next) {
@@ -177,14 +262,37 @@ pub const Analysis = struct {
             else => return null,
         }
         if (step == 0) return null;
-        return .{ .parameter = parameter, .start = self.forwarded(start.value, 16), .next = next_value, .step = step };
+        var terminal_bound: ?ValueId = null;
+        if (terminal) |comparison| {
+            if (step != 1 and step != -1) return null;
+            // A terminal iteration keeps the current value. Its speculative
+            // modular update is harmless, but a checked producer must execute
+            // only on the nonterminal path, including at signed endpoints.
+            const producer = self.instruction_blocks[function.instructionIndex(next_value).?];
+            if (next == .numeric_binary and next.numeric_binary.overflow == .checked and self.equalityAt(ending.?.operands, producer, null) != false) return null;
+            terminal_bound = comparison.other;
+        }
+        return .{ .parameter = parameter, .start = self.forwarded(start.value, 16), .next = next_value, .step = step, .terminal_bound = terminal_bound };
     }
 
     fn forwarded(self: Analysis, value: ValueId, depth: u32) ValueId {
+        return self.forwardedAssuming(value, depth, null);
+    }
+
+    fn forwardedAssuming(self: Analysis, value: ValueId, depth: u32, terminal: ?ExitTest) ValueId {
         const resolved = self.function.find(value);
         if (depth == 0 or !self.immutable(resolved)) return resolved;
         const definition = self.function.definitions.items[@backingInt(resolved)];
-        if (definition != .argument) return resolved;
+        if (definition == .instruction) {
+            const instruction = self.function.instructions.items[definition.instruction];
+            if (terminal) |exit| if (instruction == .select) {
+                const condition = self.function.definition(self.function.find(instruction.select.condition)) orelse return resolved;
+                if (condition == .compare and (condition.compare.operation == .eqi or condition.compare.operation == .nei) and self.sameEquality(exit.operands, condition.compare.operands)) {
+                    return self.forwardedAssuming(if (condition.compare.operation == .eqi) instruction.select.else_value else instruction.select.then_value, depth - 1, terminal);
+                }
+            };
+            return resolved;
+        }
         const block = definition.argument.block;
         const incoming = self.graph.incoming[block].items;
         if (incoming.len == 0) return resolved;
@@ -192,15 +300,16 @@ pub const Analysis = struct {
         const position = std.mem.indexOfScalar(ValueId, self.function.blocks.items[block].parameters.items, resolved).?;
         var source: ?ValueId = null;
         for (incoming) |edge| {
+            if (terminal) |exit| if (self.equalityAt(exit.operands, edge.block, edge.ordinal) == true) continue;
             const branch = Function.edges(&self.function.blocks.items[edge.block].terminator)[edge.ordinal].?;
             const argument = self.function.branchArguments(branch.*)[position];
             if (argument.coerce_to != null or argument.variant_tag_mapping != null) return resolved;
-            const forwarded_value = self.forwarded(argument.value, depth - 1);
+            const forwarded_value = self.forwardedAssuming(argument.value, depth - 1, terminal);
             if (source) |previous| {
                 if (previous != forwarded_value) return resolved;
             } else source = forwarded_value;
         }
-        return source.?;
+        return source orelse resolved;
     }
 
     pub fn rangeAt(self: Analysis, value: ValueId, at: u32) IntegerRange {
@@ -244,12 +353,7 @@ pub const Analysis = struct {
                 if (!self.graph.dominates(exit.stay, at)) continue;
                 const counter = self.invariantInductionExit(loop, entry, exit, parameter) orelse continue;
                 if (!self.immutable(counter.comparison.other)) continue;
-                const range = IterationRange.init(
-                    counter.induction.step,
-                    counter.comparison.operation,
-                    self.rangeAtDepth(counter.induction.start, at, depth - 1),
-                    self.rangeAtDepth(counter.comparison.other, at, depth - 1),
-                ) orelse continue;
+                const range = self.iterationRangeDepth(at, counter, depth - 1) orelse continue;
                 return range.absolute;
             }
         }
@@ -347,6 +451,7 @@ pub const Induction = struct {
     start: ValueId,
     next: ValueId,
     step: i32,
+    terminal_bound: ?ValueId = null,
 };
 
 pub const InductionExit = struct {

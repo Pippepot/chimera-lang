@@ -44,15 +44,33 @@ fn optimizeInto(scratch: std.mem.Allocator, body: *const Body, context: anytype)
         return measured(.optimization_compaction, compaction.compact, .{ scratch, &function });
     try check(&function);
     const final = @hasDecl(@TypeOf(context), "inlineBody");
-    const inlined = final and try measured(.optimization_inline, inlining.inlineCalls, .{ &function, context });
-    if (inlined) try check(&function);
-    if (!final or inlined) try simplify(&function, context, &numbering_workspace, &field_layouts);
     if (final) {
-        const hoisted = try measured(.optimization_hoist, hoisting.hoist, .{&function});
+        // Pruning an inlined body can free room for later small callees. Keep
+        // the original caller's growth limit across rounds so simplification
+        // exposes opportunities without repeatedly multiplying that limit.
+        const budget = inlining.growthBudget(&function);
+        while (try measured(.optimization_inline, inlining.inlineCalls, .{ &function, context, budget })) {
+            try check(&function);
+            try simplify(&function, context, &numbering_workspace, &field_layouts);
+        }
+    } else {
+        try simplify(&function, context, &numbering_workspace, &field_layouts);
+    }
+    if (final) {
+        // Store identities survive cleanup even when fallback latch blocks merge.
+        // Keep them across rounds so bulk rewrites cannot version their fallback.
+        var bulk_fallbacks: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        var needs_simplification = try measured(.optimization_hoist, hoisting.hoist, .{&function});
         try check(&function);
-        const transformed = try measured(.optimization_idioms, idioms.transform, .{ &function, context });
-        try check(&function);
-        if (hoisted or transformed) try simplify(&function, context, &numbering_workspace, &field_layouts);
+        while (true) {
+            const transformed = try measured(.optimization_idioms, idioms.transform, .{ &function, context, &bulk_fallbacks });
+            try check(&function);
+            if (!needs_simplification and !transformed) break;
+            try simplify(&function, context, &numbering_workspace, &field_layouts);
+            // Simplifying joins left by an inner loop rewrite can expose its
+            // containing loop's counter and carried exit.
+            needs_simplification = false;
+        }
     }
     return measured(.optimization_compaction, compaction.compact, .{ scratch, &function });
 }

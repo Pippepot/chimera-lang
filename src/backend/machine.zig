@@ -34,6 +34,7 @@ pub const Encoded = struct {
 };
 
 pub const Function = struct {
+    const WriteWidth = enum { unwritten, narrow, wide };
     gpa: std.mem.Allocator,
     instructions: std.ArrayList(Instruction) = .empty,
 
@@ -128,6 +129,65 @@ pub const Function = struct {
         try self.immediate(.add_rax, std.math.cast(i32, value) orelse return error.FunctionTooLarge);
     }
 
+    pub fn coalesceAccumulatorCopies(self: *Function, value_count: usize) !void {
+        for (0..self.instructions.items.len) |index| {
+            if (self.accumulatorReload(index) != null) break;
+        } else return;
+        const accesses = try self.gpa.alloc(struct { reads: usize = 0, writes: usize = 0 }, value_count);
+        defer self.gpa.free(accesses);
+        @memset(accesses, .{});
+        for (self.instructions.items) |instruction| {
+            const access = instruction.registerAccess() orelse continue;
+            const counts = &accesses[@backingInt(access.value)];
+            if (access.write) counts.writes += 1 else counts.reads += 1;
+        }
+        for (0..self.instructions.items.len) |index| {
+            const reload = self.accumulatorReload(index) orelse continue;
+            const stored = self.instructions.items[index].register;
+            const counts = accesses[@backingInt(stored.value)];
+            if (counts.reads != 1 or counts.writes != 1) continue;
+            self.instructions.items[index] = .scratch_dead;
+            self.instructions.items[reload] = if (stored.operation == .store_rax or self.upperAccumulatorDead(reload + 1))
+                .scratch_dead
+            else
+                .{ .fixed = .{ .operation = .mov_eax_eax } };
+        }
+    }
+
+    fn accumulatorReload(self: *const Function, index: usize) ?usize {
+        const instruction = self.instructions.items[index];
+        if (instruction != .register) return null;
+        const stored = instruction.register;
+        if (stored.operation != .store_eax and stored.operation != .store_rax) return null;
+        var reload = index + 1;
+        while (reload < self.instructions.items.len and self.instructions.items[reload] == .scratch_dead) reload += 1;
+        if (reload == self.instructions.items.len) return null;
+        const loaded = self.instructions.items[reload];
+        if (loaded != .register or loaded.register.value != stored.value) return null;
+        const expected: x86.RegisterOperation = if (stored.operation == .store_eax) .load_eax else .load_rax;
+        return if (loaded.register.operation == expected) reload else null;
+    }
+
+    fn upperAccumulatorDead(self: *const Function, start: usize) bool {
+        for (self.instructions.items[start..]) |instruction| {
+            switch (instruction) {
+                .scratch_dead => return true,
+                .register => |operation| switch (operation.operation) {
+                    .load_eax, .load_rax, .add_eax, .sub_eax, .imul_eax => return true,
+                    .store_eax, .cmp_eax, .load_ecx => {},
+                    else => return false,
+                },
+                .fixed => |fixed| switch (fixed.operation) {
+                    .mov_eax, .mov_eax_rsp, .mov_rax, .mov_rax_rsp, .lea_rax_rsp, .mov_eax_eax, .call_relative => return true,
+                    .mov_rsp_eax, .mov_ecx_eax, .mov_edi_eax => {},
+                    else => return false,
+                },
+                .label, .parameter, .preserve => return false,
+            }
+        }
+        return false;
+    }
+
     pub fn encode(self: *const Function, registers: []const ?x86.Register, spills: []const u32, used: []const x86.Register) !Encoded {
         std.debug.assert(registers.len == spills.len);
         const positions = try self.gpa.alloc(u32, self.instructions.items.len + 1);
@@ -137,6 +197,17 @@ pub const Function = struct {
         };
         var encoded: Encoded = .{ .positions = positions, .fields = fields };
         errdefer encoded.deinit(self.gpa);
+        const widths = try self.gpa.alloc(WriteWidth, registers.len);
+        defer self.gpa.free(widths);
+        @memset(widths, .unwritten);
+        for (self.instructions.items) |instruction| {
+            const access = instruction.registerAccess() orelse continue;
+            if (!access.write) continue;
+            const width = &widths[@backingInt(access.value)];
+            if (instruction == .register and instruction.register.operation == .store_rax) {
+                width.* = .wide;
+            } else if (width.* == .unwritten) width.* = .narrow;
+        }
         var patches: std.ArrayList(struct { field: u32, target: u32 }) = .empty;
         defer patches.deinit(self.gpa);
         var skip_until: usize = 0;
@@ -145,11 +216,16 @@ pub const Function = struct {
             positions[index] = std.math.cast(u32, encoded.code.items.len) orelse return error.FunctionTooLarge;
             field.* = positions[index];
             if (index < skip_until) continue;
+            const direct_load = try self.encodeDirectIndexedLoad(&encoded.code, index, registers, widths);
+            if (direct_load != 0) {
+                skip_until = index + direct_load;
+                continue;
+            }
             if (try self.encodeIndex(&encoded.code, index, registers)) {
                 skip_until = index + 2;
                 continue;
             }
-            if (try self.encodeCopy(&encoded.code, index, registers)) {
+            if (try self.encodeCopy(&encoded.code, index, registers, widths)) {
                 skip_until = index + 2;
                 continue;
             }
@@ -157,7 +233,7 @@ pub const Function = struct {
                 skip_until = index + 2;
                 continue;
             }
-            const indexed_load = try self.encodeIndexedLoad(&encoded.code, index, registers);
+            const indexed_load = try self.encodeIndexedLoad(&encoded.code, index, registers, null);
             if (indexed_load != 0) {
                 skip_until = index + indexed_load;
                 continue;
@@ -204,18 +280,41 @@ pub const Function = struct {
         positions[self.instructions.items.len] = std.math.cast(u32, encoded.code.items.len) orelse return error.FunctionTooLarge;
         for (patches.items) |pending| {
             std.debug.assert(pending.target < positions.len);
-            const displacement = @as(i64, positions[pending.target]) - (@as(i64, pending.field) + @sizeOf(i32));
+            const target = self.branchTarget(pending.target, positions);
+            const displacement = @as(i64, positions[target]) - (@as(i64, pending.field) + @sizeOf(i32));
             const relative = std.math.cast(i32, displacement) orelse return error.RelocationOverflow;
             std.mem.writeInt(i32, encoded.code.items[pending.field..][0..4], relative, .little);
         }
         return encoded;
     }
 
+    fn branchTarget(self: *const Function, initial: u32, positions: []const u32) u32 {
+        var target = initial;
+        for (0..self.instructions.items.len) |_| {
+            if (target == self.instructions.items.len) return target;
+            // Coalescing can make all of an outlined edge's copies empty.
+            // Resolve its jump directly, but retain every actual encoded write.
+            if (positions[target] == positions[target + 1]) {
+                target += 1;
+                continue;
+            }
+            const instruction = self.instructions.items[target];
+            if (instruction == .fixed and instruction.fixed.operation == .jmp and instruction.fixed.target != 0) {
+                target = instruction.fixed.target;
+                continue;
+            }
+            return target;
+        }
+        return initial; // A jump cycle remains a cycle.
+    }
+
     fn encodeIndex(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !bool {
         const instructions = self.instructions.items[index..];
         if (instructions.len < 3) return false;
         if (instructions[0] != .register or instructions[0].register.operation != .load_eax) return false;
-        if (instructions[1] != .fixed or instructions[1].fixed.operation != .movsxd_rcx_eax) return false;
+        if (instructions[1] != .fixed) return false;
+        const operation = instructions[1].fixed.operation;
+        if (operation != .movsxd_rcx_eax and operation != .mov_ecx_eax) return false;
         // The original eax copy is dead only when the base load overwrites rax
         // immediately, without a label or a read of the old accumulator.
         switch (instructions[2]) {
@@ -226,11 +325,11 @@ pub const Function = struct {
             else => return false,
         }
         const source = registers[@backingInt(instructions[0].register.value)] orelse return false;
-        try x86.appendRegister(code, self.gpa, .sign_extend_rcx, source, 0);
+        try x86.appendRegister(code, self.gpa, if (operation == .movsxd_rcx_eax) .sign_extend_rcx else .load_ecx, source, 0);
         return true;
     }
 
-    fn encodeCopy(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !bool {
+    fn encodeCopy(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register, widths: []const WriteWidth) !bool {
         const instructions = self.instructions.items[index..];
         if (instructions.len < 3) return false;
         if (instructions[0] != .register or instructions[0].register.operation != .load_eax) return false;
@@ -238,7 +337,9 @@ pub const Function = struct {
         if (instructions[2] != .scratch_dead) return false;
         const source = registers[@backingInt(instructions[0].register.value)] orelse return false;
         const destination = registers[@backingInt(instructions[1].register.value)] orelse return false;
-        if (destination != source) try x86.appendRegisterBinary(code, self.gpa, .store_eax, destination, source);
+        // A coalesced 32-bit copy must still clear unknown upper bits before
+        // its result can supply a zero-extended address index.
+        if (destination != source or widths[@backingInt(instructions[0].register.value)] != .narrow) try x86.appendRegisterBinary(code, self.gpa, .store_eax, destination, source);
         return true;
     }
 
@@ -270,7 +371,18 @@ pub const Function = struct {
         return true;
     }
 
-    fn encodeIndexedLoad(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !usize {
+    fn encodeDirectIndexedLoad(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register, widths: []const WriteWidth) !usize {
+        const instructions = self.instructions.items[index..];
+        if (instructions.len < 7 or instructions[0] != .register or instructions[0].register.operation != .load_eax) return 0;
+        if (instructions[1] != .fixed or instructions[1].fixed.operation != .mov_ecx_eax) return 0;
+        const value = @backingInt(instructions[0].register.value);
+        if (widths[value] != .narrow) return 0;
+        const selected = registers[value] orelse return 0;
+        const consumed = try self.encodeIndexedLoad(code, index + 2, registers, selected);
+        return if (consumed == 0) 0 else consumed + 2;
+    }
+
+    fn encodeIndexedLoad(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register, selected_index: ?x86.Register) !usize {
         const instructions = self.instructions.items[index..];
         if (instructions.len < 5 or instructions[1] != .fixed or instructions[2] != .fixed) return 0;
         if (instructions[4] != .scratch_dead) return 0;
@@ -294,11 +406,11 @@ pub const Function = struct {
             .register => |source| {
                 if (source.operation != .load_rax) return 0;
                 const base = registers[@backingInt(source.value)] orelse return 0;
-                try x86.appendIndexedLoad(code, self.gpa, byte, base, destination_register, 0);
+                try x86.appendIndexedLoad(code, self.gpa, byte, base, destination_register, selected_index, 0);
             },
             .fixed => |source| {
                 if (source.operation != .lea_rax_rsp) return 0;
-                try x86.appendIndexedLoad(code, self.gpa, byte, null, destination_register, source.bits);
+                try x86.appendIndexedLoad(code, self.gpa, byte, null, destination_register, selected_index, source.bits);
             },
             else => return 0,
         }

@@ -2,6 +2,250 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const Fixture = test_sources.SourceFixture;
 
+test "collection search methods accept array literals and type-qualified calls" {
+    try Fixture.expectParity(
+        \\func is_at(imm result: int | none, expected: int) bool
+        \\    if not (result is int) -> return false
+        \\    return result == expected
+        \\func shifted(imm element: int, imm needle: int) bool -> element + 1 == needle
+        \\func run() int
+        \\    if not is_at([1, 2, 3].index_of(2), 1) -> return 90
+        \\    if not is_at([1, 2, 3].index_of(3, shifted), 1) -> return 91
+        \\    const values = [19, 23, 23]
+        \\    const needle = [23, 23]
+        \\    const shifted_needle = [24, 24]
+        \\    const empty: Array(int, 0) = []
+        \\    if not is_at(values.index_of(23), 1) -> return 92
+        \\    if not is_at(Array(int, 3).index_of(values, 23), 1) -> return 93
+        \\    if not is_at(values.index_of(24, shifted), 1) -> return 94
+        \\    if not is_at(Array(int, 3).index_of(values, 24, shifted), 1) -> return 95
+        \\    if not is_at(values.index_of_sequence(needle.span()), 1) -> return 96
+        \\    if not is_at([19, 23, 23].index_of_sequence(needle.span()), 1) -> return 97
+        \\    if not is_at(Array(int, 3).index_of_sequence(values, needle.span()), 1) -> return 98
+        \\    if not is_at(values.index_of_sequence(shifted_needle.span(), shifted), 1) -> return 99
+        \\    if not is_at(Array(int, 3).index_of_sequence(values, shifted_needle.span(), shifted), 1) -> return 100
+        \\    if values.index_of(42) is int or empty.index_of(23) is int -> return 101
+        \\    if not is_at(empty.index_of_sequence(empty.span()), 0) -> return 102
+        \\    return 42
+    , 42);
+}
+
+test "collection search methods accept list and span receivers and type-qualified calls" {
+    try Fixture.expectParity(
+        \\func is_at(imm result: int | none, expected: int) bool
+        \\    if not (result is int) -> return false
+        \\    return result == expected
+        \\func shifted(imm element: int, imm needle: int) bool -> element + 1 == needle
+        \\func run() int
+        \\    const values: List(int) = [19, 23, 23]
+        \\    const view = values.span()
+        \\    const needle = [23, 23]
+        \\    const shifted_needle = [24, 24]
+        \\    const empty = Span(int).empty()
+        \\    const empty_list: List(int) = []
+        \\    if not is_at(values.index_of(23), 1) -> return 90
+        \\    if not is_at(List(int).index_of(values, 23), 1) -> return 91
+        \\    if not is_at(values.index_of(24, shifted), 1) -> return 92
+        \\    if not is_at(List(int).index_of(values, 24, shifted), 1) -> return 93
+        \\    if not is_at(values.index_of_sequence(needle.span()), 1) -> return 94
+        \\    if not is_at(List(int).index_of_sequence(values, needle.span()), 1) -> return 95
+        \\    if not is_at(values.index_of_sequence(shifted_needle.span(), shifted), 1) -> return 96
+        \\    if not is_at(List(int).index_of_sequence(values, shifted_needle.span(), shifted), 1) -> return 97
+        \\    if not is_at(view.index_of(23), 1) -> return 98
+        \\    if not is_at(Span(int).index_of(view, 23), 1) -> return 99
+        \\    if not is_at(view.index_of(24, shifted), 1) -> return 100
+        \\    if not is_at(Span(int).index_of(view, 24, shifted), 1) -> return 101
+        \\    if not is_at(view.index_of_sequence(needle.span()), 1) -> return 102
+        \\    if not is_at(Span(int).index_of_sequence(view, needle.span()), 1) -> return 103
+        \\    if not is_at(view.index_of_sequence(shifted_needle.span(), shifted), 1) -> return 104
+        \\    if not is_at(Span(int).index_of_sequence(view, shifted_needle.span(), shifted), 1) -> return 105
+        \\    if values.index_of(42) is int or view.index_of(42) is int -> return 106
+        \\    if empty.index_of(23) is int or empty_list.index_of(23) is int -> return 107
+        \\    if not is_at(empty.index_of_sequence(empty), 0) -> return 108
+        \\    if not is_at(empty_list.index_of_sequence(empty), 0) -> return 109
+        \\    return 42
+    , 42);
+}
+
+test "borrowed span search finds first elements and subsequences in both engines" {
+    try Fixture.expectParity(
+        \\import std.search.{index_of, index_of_sequence, starts_with, ends_with}
+        \\func run() int
+        \\    const values = [19, 23, 23]
+        \\    const needle = [23, 23]
+        \\    const empty: Array(int, 0) = []
+        \\    const element = index_of(values.span(), 23)
+        \\    if not (element is int) -> return 90
+        \\    if element <> 1 -> return 91
+        \\    const sequence = index_of_sequence(values.span(), needle.span())
+        \\    if not (sequence is int) -> return 92
+        \\    if sequence <> 1 -> return 93
+        \\    if index_of(values.span(), 42) is int -> return 94
+        \\    if index_of(empty.span(), 23) is int -> return 95
+        \\    if index_of_sequence(empty.span(), needle.span()) is int -> return 96
+        \\    const empty_match = index_of_sequence(empty.span(), empty.span())
+        \\    if not (empty_match is int) -> return 97
+        \\    if empty_match <> 0 -> return 98
+        \\    if not starts_with(values.span(), values.span()) -> return 99
+        \\    if not ends_with(values.span(), needle.span()) -> return 100
+        \\    if starts_with(values.span(), needle.span()) -> return 101
+        \\    if not starts_with(empty.span(), empty.span()) -> return 102
+        \\    if not ends_with(empty.span(), empty.span()) -> return 103
+        \\    return 42
+    , 42);
+}
+
+test "collection search methods accept heterogeneous custom matchers without equality" {
+    try Fixture.expectParity(
+        \\struct Item
+        \\    copy = none
+        \\    pub value: int
+        \\func shifted(imm item: Item, imm needle: int) bool -> item.value + 19 == needle
+        \\func run() int
+        \\    const values = [Item{value = 19}, Item{value = 23}, Item{value = 23}]
+        \\    const shifted_needle = [42, 42]
+        \\    const direct = values.index_of(42, shifted)
+        \\    if not (direct is int) -> return 90
+        \\    if direct <> 1 -> return 91
+        \\    const direct_sequence = values.index_of_sequence(shifted_needle.span(), shifted)
+        \\    if not (direct_sequence is int) -> return 92
+        \\    if direct_sequence <> 1 -> return 93
+        \\    const view = values.span()
+        \\    const span_result = view.index_of(42, shifted)
+        \\    const span_sequence = view.index_of_sequence(shifted_needle.span(), shifted)
+        \\    if not (span_result is int) or not (span_sequence is int) -> return 94
+        \\    if span_result <> 1 or span_sequence <> 1 -> return 95
+        \\    const list: List(Item) = [Item{value = 19}, Item{value = 23}, Item{value = 23}]
+        \\    const list_result = list.index_of(42, shifted)
+        \\    const list_sequence = list.index_of_sequence(shifted_needle.span(), shifted)
+        \\    if not (list_result is int) or not (list_sequence is int) -> return 96
+        \\    if list_result <> 1 or list_sequence <> 1 -> return 97
+        \\    return values[0].value + values[1].value
+    , 42);
+}
+
+test "collection search methods preserve immovable owners and permit later list growth" {
+    try Fixture.expectParity(
+        \\struct Item
+        \\    move = none
+        \\    copy = none
+        \\    pub value: int
+        \\    drops: Ref(int)
+        \\    drop = func(deinit self: Item) -> self.drops.value += 1
+        \\    pub func ==(imm item: Item, imm needle: int) bool -> item.value == needle
+        \\func locate(ref drops: int) int
+        \\    const values = [Item{value = 19, drops = Ref.from(drops)}, Item{value = 23, drops = Ref.from(drops)}]
+        \\    const needle = [19, 23]
+        \\    const element = values.index_of(23)
+        \\    if not (element is int) -> return 90
+        \\    const sequence = values.index_of_sequence(needle.span())
+        \\    if not (sequence is int) -> return 91
+        \\    if element <> 1 or sequence <> 0 or drops <> 0 -> return 92
+        \\    const view = values.span()
+        \\    const span_element = view.index_of(23)
+        \\    const span_sequence = view.index_of_sequence(needle.span())
+        \\    if not (span_element is int) or not (span_sequence is int) -> return 100
+        \\    if span_element <> 1 or span_sequence <> 0 or drops <> 0 -> return 101
+        \\    return values[0].value + values[1].value
+        \\func locate_list(ref drops: int) int
+        \\    const values: List(Item) = [Item{value = 19, drops = Ref.from(drops)}, Item{value = 23, drops = Ref.from(drops)}]
+        \\    const needle = [19, 23]
+        \\    const element = values.index_of(23)
+        \\    const sequence = values.index_of_sequence(needle.span())
+        \\    if not (element is int) or not (sequence is int) -> return 102
+        \\    if element <> 1 or sequence <> 0 or drops <> 0 -> return 103
+        \\    return values[0].value + values[1].value
+        \\func run() int
+        \\    var drops = 0
+        \\    if locate(drops) <> 42 or drops <> 2 -> return 93
+        \\    var list_drops = 0
+        \\    if locate_list(list_drops) <> 42 or list_drops <> 2 -> return 104
+        \\    var list: List(int) = [19, 23]
+        \\    const result = list.index_of(23)
+        \\    if not (result is int) -> return 94
+        \\    if not (list.append(7) is unit) -> return 95
+        \\    list[0] = 8
+        \\    if list.len() <> 3 or list[1] <> 23 -> return 96
+        \\    const words = ["hello", "world"]
+        \\    const word: StringView = "world"
+        \\    const selected = words.index_of(word)
+        \\    if not (selected is int) -> return 97
+        \\    const phrase: Array(StringView, 1) = ["world"]
+        \\    const selected_sequence = words.index_of_sequence(phrase.span())
+        \\    if not (selected_sequence is int) -> return 98
+        \\    if selected <> 1 or selected_sequence <> 1 or words[1] <> "world" -> return 99
+        \\    return result + 41
+    , 42);
+}
+
+test "borrowed span search skips callbacks for impossible matches and accepts directional matching" {
+    try Fixture.expectParity(
+        \\import std.search.{index_of, index_of_sequence}
+        \\func forbidden(imm element: int, imm needle: int) bool -> panic "unexpected comparison"
+        \\func before(imm element: int, imm needle: int) bool -> element < needle
+        \\func run() int
+        \\    const empty: Array(int, 0) = []
+        \\    const values = [2, 4, 7]
+        \\    const needle = [3, 5]
+        \\    if index_of(empty.span(), 2, forbidden) is int -> return 90
+        \\    if index_of_sequence(empty.span(), needle.span(), forbidden) is int -> return 91
+        \\    const empty_match = index_of_sequence(values.span(), empty.span(), forbidden)
+        \\    if not (empty_match is int) -> return 92
+        \\    if empty_match <> 0 -> return 93
+        \\    const element = index_of(values.span(), 5, before)
+        \\    if not (element is int) -> return 94
+        \\    const sequence = index_of_sequence(values.span(), needle.span(), before)
+        \\    if not (sequence is int) -> return 95
+        \\    if element <> 0 or sequence <> 0 -> return 96
+        \\    return 42
+    , 42);
+}
+
+test "borrowed span search visits candidates and pairs in order and stops at the first match" {
+    const fixture = try Fixture.init(
+        \\import std.search.{index_of_sequence}
+        \\func traced(imm element: int, imm needle: int) bool
+        \\    print(element * 10 + needle)
+        \\    return element == needle
+        \\const values = [1, 1, 2, 9]
+        \\const needle = [1, 2]
+        \\const result = index_of_sequence(values.span(), needle.span(), traced)
+        \\if not (result is int) -> exit(90)
+        \\exit(result + 41)
+    );
+    defer fixture.deinit();
+    const result = try fixture.runIo("");
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, result.term);
+    try std.testing.expectEqualStrings("11\n12\n11\n22\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "collection search methods recompute after custom matcher edits" {
+    const entry =
+        \\const values = [19, 23]
+        \\const result = values.index_of(42, matches)
+        \\if not (result is int) -> exit(90)
+        \\const view = values.span()
+        \\const span_result = Span(int).index_of(view, 42, matches)
+        \\if not (span_result is int) -> exit(91)
+        \\const list: List(int) = [19, 23]
+        \\const list_result = List(int).index_of(list, 42, matches)
+        \\if not (list_result is int) -> exit(92)
+        \\if span_result <> result or list_result <> result -> exit(93)
+        \\exit(result + 42)
+    ;
+    const original = "pub func matches(imm element: int, imm needle: int) bool -> element + 19 == needle";
+    const fixture = try Fixture.initFiles(entry, &.{.{ .path = "matcher.chi", .module_path = "", .source = original }});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 43);
+    try fixture.db.setInput(test_sources.queries.SourceText, 1, "pub func matches(imm element: int, imm needle: int) bool -> element + 23 == needle");
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(test_sources.queries.SourceText, 1, original);
+    try fixture.expectExit(0, 43);
+}
+
 test "static comprehensions select shape while elements retain runtime evaluation" {
     try Fixture.expectParity(
         \\func element(mut calls: int, value: int) int

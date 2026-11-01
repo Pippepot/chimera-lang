@@ -21,6 +21,14 @@ python3 benchmarks/key-gen-face-five/run.py --cpu 4
 
 ## Recording Results
 
+The focused [provenance benchmark](results/provenance/README.md) measures cold
+compilation, incremental alternative/effect contract edits, and generated runtime:
+
+```sh
+zig build provenance-benchmark --seed=0 -j1
+zig build provenance-benchmark --seed=0 -j1 -- --shape=serial --size=32
+```
+
 [history.py](history.py) records exact snapshots and updates the static report at
 `.history/index.html`. It requires Linux, Python 3.12+, Git, Zig, Clang, and Matplotlib:
 

@@ -2,6 +2,88 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const SourceFixture = test_sources.SourceFixture;
 
+test "text search accepts owned strings views static strings and direct literals" {
+    try SourceFixture.expectParity(
+        \\static literal = "aé\0é!"
+        \\func is_at(imm result: int | none, expected: int) bool
+        \\    if not (result is int) -> return false
+        \\    return result == expected
+        \\func run() int
+        \\    var text = "aé\0é"
+        \\    if not (text.append("!") is unit) -> return 90
+        \\    const capacity = text.capacity()
+        \\    const view = text.view()
+        \\    const permanent: StaticString = "aé\0é!"
+        \\    const owned_needle = "é"
+        \\    const view_needle: StringView = "é"
+        \\    const static_needle: StaticString = "é"
+        \\    if not is_at(text.find(owned_needle), 1) -> return 91
+        \\    if not is_at(view.find(view_needle), 1) -> return 92
+        \\    if not is_at(permanent.find(static_needle), 1) -> return 93
+        \\    if not is_at(literal.find("é"), 1) -> return 94
+        \\    if not is_at("aé\0é!".find("é"), 1) -> return 95
+        \\    if not text.contains(view_needle) or not view.contains(static_needle) -> return 96
+        \\    if not permanent.contains(owned_needle) or not "aé\0é!".contains("é") -> return 97
+        \\    if not text.starts_with("aé") or not view.starts_with("aé") -> return 98
+        \\    if not permanent.starts_with("aé") or not literal.starts_with("aé") -> return 99
+        \\    if not "aé\0é!".starts_with("aé") -> return 100
+        \\    if not text.ends_with("é!") or not view.ends_with("é!") -> return 101
+        \\    if not permanent.ends_with("é!") or not literal.ends_with("é!") -> return 102
+        \\    if not "aé\0é!".ends_with("é!") -> return 103
+        \\    if text.capacity() <> capacity -> return 104
+        \\    if text <> "aé\0é!" or owned_needle <> "é" -> return 105
+        \\    return 42
+    , 42);
+}
+
+test "text search uses exact UTF-8 byte offsets and handles empty or absent needles" {
+    try SourceFixture.expectParity(
+        \\func is_at(imm result: int | none, expected: int) bool
+        \\    if not (result is int) -> return false
+        \\    return result == expected
+        \\func run() int
+        \\    const text: StringView = "é\0é😀"
+        \\    if not is_at(text.find("é"), 0) -> return 90
+        \\    if not is_at(text.find("\0"), 2) -> return 91
+        \\    if not is_at(text.find("é😀"), 3) -> return 92
+        \\    if not is_at(text.find("😀"), 5) -> return 93
+        \\    if not is_at(text.find(""), 0) or not is_at("".find(""), 0) -> return 94
+        \\    if text.find("missing") is int or "".find("é") is int -> return 95
+        \\    if text.contains("e\u{301}") or text.contains("éé") -> return 96
+        \\    if not text.contains("") or not "".contains("") -> return 97
+        \\    if not text.starts_with("") or not text.ends_with("") -> return 98
+        \\    if not "".starts_with("") or not "".ends_with("") -> return 99
+        \\    if "".starts_with("é") or "".ends_with("é") -> return 100
+        \\    if text.starts_with("😀") or text.ends_with("é") -> return 101
+        \\    if text.starts_with("é\0é😀!") or text.ends_with("é\0é😀!") -> return 102
+        \\    if not text.starts_with(text) or not text.ends_with(text) -> return 103
+        \\    if not is_at("aaaaab".find("aaab"), 2) -> return 104
+        \\    return 42
+    , 42);
+}
+
+test "text search reuses bundled std and recomputes after needle edits" {
+    const source =
+        \\var text = "hé\0world"
+        \\if not (text.append("!") is unit) -> exit(90)
+        \\if not ("world" in text) or not text.starts_with("hé") or not text.ends_with("!") -> exit(91)
+        \\const result = text.find("world")
+        \\if not (result is int) -> exit(92)
+        \\exit(result + 38)
+    ;
+    const fixture = try SourceFixture.init(source);
+    defer fixture.deinit();
+    const loader = try test_sources.standard_bundle_loader.install(fixture.db, test_sources.standard_bundle);
+    try fixture.expectExit(0, 42);
+    try std.testing.expect(loader.stats().functions > 0);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "text.find(\"world\")", "text.find(\"\\0\")");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, changed);
+    try fixture.expectExit(0, 41);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+}
+
 test "scalar string converters format decimal limits booleans and empty values in both engines" {
     try SourceFixture.expectParity(
         \\func run() int

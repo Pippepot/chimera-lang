@@ -1,0 +1,196 @@
+{
+  "base_revision": "e11253e28acb40f60845f0226007e011d576e7a8",
+  "cpu": 4,
+  "cpu_model": "AMD Ryzen 9 3900X",
+  "last": 10,
+  "zig": "0.17.0",
+  "clang": "clang version 22.1.8",
+  "sha256": {
+    "chimera": "65ccde95ff7a7bf69c2a6e98a4c01a5622e0861013694cbc991c814988900d36",
+    "branch": "fe001c8704418ffcc15d2f24aff827cb616822f2e85dc5dc161eb1521f4f1399",
+    "address": "b8269bf4ea246fb2ccc501c85d6695ef4c41732b5d9a407f0e74128a18c59284",
+    "both": "c615f6fa899a7f87f1c6517d69b9ac56f8f1fcee2529559ca7d00d39c0659892",
+    "clang-O3": "799ea111b195215462abbde56b4278e8f10ea50a58372103c3523a6094fa572d"
+  },
+  "samples": {
+    "chimera": [
+      2.9641633269999943,
+      3.0145646640000336
+    ],
+    "branch": [
+      1.7013928629999668,
+      1.7701003999999898,
+      1.7563134309999668,
+      1.7479905310000277,
+      1.8886251490000063
+    ],
+    "address": [
+      3.029103145000022,
+      2.9603274500000225,
+      3.3132900289999725,
+      2.9969605160000015,
+      3.3258256459999984
+    ],
+    "both": [
+      1.702523659999997,
+      1.7752189320000298,
+      1.919389754000008,
+      1.7286708369999815,
+      1.7163410289999774
+    ],
+    "clang-O3": [
+      1.3605071630000225,
+      1.6219883429999982,
+      1.5817001429999777,
+      1.450990661999981,
+      1.3743102270000236
+    ]
+  },
+  "sequence": [
+    {
+      "name": "chimera",
+      "round": 0,
+      "seconds": 2.9641633269999943
+    },
+    {
+      "name": "branch",
+      "round": 0,
+      "seconds": 1.7013928629999668
+    },
+    {
+      "name": "address",
+      "round": 0,
+      "seconds": 3.029103145000022
+    },
+    {
+      "name": "both",
+      "round": 0,
+      "seconds": 1.702523659999997
+    },
+    {
+      "name": "clang-O3",
+      "round": 0,
+      "seconds": 1.3605071630000225
+    },
+    {
+      "name": "clang-O3",
+      "round": 1,
+      "seconds": 1.6219883429999982
+    },
+    {
+      "name": "both",
+      "round": 1,
+      "seconds": 1.7752189320000298
+    },
+    {
+      "name": "address",
+      "round": 1,
+      "seconds": 2.9603274500000225
+    },
+    {
+      "name": "branch",
+      "round": 1,
+      "seconds": 1.7701003999999898
+    },
+    {
+      "name": "chimera",
+      "round": 1,
+      "seconds": 3.0145646640000336
+    },
+    {
+      "name": "branch",
+      "round": 2,
+      "seconds": 1.7563134309999668
+    },
+    {
+      "name": "address",
+      "round": 2,
+      "seconds": 3.3132900289999725
+    },
+    {
+      "name": "both",
+      "round": 2,
+      "seconds": 1.919389754000008
+    },
+    {
+      "name": "clang-O3",
+      "round": 2,
+      "seconds": 1.5817001429999777
+    },
+    {
+      "name": "clang-O3",
+      "round": 3,
+      "seconds": 1.450990661999981
+    },
+    {
+      "name": "both",
+      "round": 3,
+      "seconds": 1.7286708369999815
+    },
+    {
+      "name": "address",
+      "round": 3,
+      "seconds": 2.9969605160000015
+    },
+    {
+      "name": "branch",
+      "round": 3,
+      "seconds": 1.7479905310000277
+    },
+    {
+      "name": "branch",
+      "round": 4,
+      "seconds": 1.8886251490000063
+    },
+    {
+      "name": "address",
+      "round": 4,
+      "seconds": 3.3258256459999984
+    },
+    {
+      "name": "both",
+      "round": 4,
+      "seconds": 1.7163410289999774
+    },
+    {
+      "name": "clang-O3",
+      "round": 4,
+      "seconds": 1.3743102270000236
+    }
+  ],
+  "warmup_seconds": {
+    "chimera": 2.9837908260000177,
+    "branch": 1.7570133369999894,
+    "address": 2.9420312170000216,
+    "both": 1.760051777000001,
+    "clang-O3": 1.3878896290000284
+  },
+  "validation": "All five lanes: reference prefixes 3..7, invalid inputs, warm-up endpoint 10. Clang -O0: prefixes and invalid inputs.",
+  "summary": {
+    "chimera": {
+      "median_seconds": 2.989363995500014,
+      "stable": true,
+      "full_range_fraction_of_median": 0.01686022079476106
+    },
+    "branch": {
+      "median_seconds": 1.7563134309999668,
+      "stable": false,
+      "full_range_fraction_of_median": 0.10660528052412475
+    },
+    "address": {
+      "median_seconds": 3.029103145000022,
+      "stable": false,
+      "full_range_fraction_of_median": 0.12066218233713308
+    },
+    "both": {
+      "median_seconds": 1.7286708369999815,
+      "stable": false,
+      "full_range_fraction_of_median": 0.1254525091522749
+    },
+    "clang-O3": {
+      "median_seconds": 1.450990661999981,
+      "stable": false,
+      "full_range_fraction_of_median": 0.18020872693940126
+    }
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "before": {
+    "prefix_indices": [
+      3,
+      4,
+      5,
+      6,
+      7,
+      10
+    ],
+    "invalid_input_hex": [
+      "",
+      "00",
+      "02",
+      "0d",
+      "ff"
+    ],
+    "passed": true
+  },
+  "after": {
+    "prefix_indices": [
+      3,
+      4,
+      5,
+      6,
+      7,
+      10
+    ],
+    "invalid_input_hex": [
+      "",
+      "00",
+      "02",
+      "0d",
+      "ff"
+    ],
+    "passed": true
+  },
+  "clang": {
+    "prefix_indices": [
+      3,
+      4,
+      5,
+      6,
+      7,
+      10
+    ],
+    "invalid_input_hex": [
+      "",
+      "00",
+      "02",
+      "0d",
+      "ff"
+    ],
+    "passed": true
+  }
+}

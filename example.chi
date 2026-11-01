@@ -1,6 +1,6 @@
-func foo(x: int | bool) int
-  if x is int -> return x
-  return if x == 10 -> 10 else 20
+func foo(static T: type, bar: func(T) T) func(T) T
+  return bar
 
-print(foo(false))
-print(foo(true))
+func id(static T: type, x: T) T
+  return x + 10
+exit(foo(int, id)(20))

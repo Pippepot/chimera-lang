@@ -69,7 +69,7 @@ every control-flow edge carries explicit branch arguments.
 
 ```text
 prepare:  sroa -> promote -> (joins -> canonicalize)* -> number -> dead -> cleanup
-optimize: inline -> prepare passes again -> hoist -> loop idioms -> prepare passes
+optimize: (inline -> prepare passes)* -> hoist -> (loop idioms -> prepare passes)*
 ```
 
 | Pass | Owner | Main Facts |
@@ -115,11 +115,19 @@ Incoming edges retain source block and ordinal, never mutable-array pointers.
 
 ## Inlining
 
+Canonicalization promotes an indirect call when its resolved, unexposed SSA value
+is a concrete function reference. Copies, scalar replacement, and common joins
+can expose that fact, including after a forwarding callee is inlined. Unknown
+or differently selected targets remain indirect. Promotion preserves arguments,
+destinations, and effects; ordinary inlining and dependency tracking consume the
+result without special-casing function names or bodies.
+
 The inline cost limit is `InlineLimit` (48 by default). Eligible callees must have
 a natively valid typed body and lie outside the caller's recursive component.
 `CallComponent` finds SCCs only when query cycle detection requires them; acyclic
 instances retain the cheap query path. Component discovery may schedule sibling
-direct-callee work, but component queries stay demand-driven.
+direct-callee work, but component queries stay demand-driven. An optimization
+query cycle exposed only after call promotion keeps that call out of line.
 
 Optimization hints start unrequested callees from prepared IR, including
 initializer regions, without observing their results. Ordinary inliner reads own
@@ -130,6 +138,9 @@ Directly passed aggregate arguments make primitive constants free in callee cost
 because they expose scalar-replacement opportunities. Caller growth still counts
 every inserted instruction. No std identity or speculative specialization is
 needed. Within one pass, repeated calls reuse resolution and eligibility facts.
+Inlining revisits remaining calls after local simplification frees growth
+capacity. Every round retains the original caller's budget; pruning cannot
+repeatedly multiply its permitted size.
 `InlineFunctionFacts` shares immutable callee analysis and depends on its optimized
 body, including integer-argument ranges valid on every normal return;
 initializer-region facts stay local.
@@ -175,8 +186,13 @@ Mixed variants used only by tags and primitive payload reads may split into tag
 and scalar parameters. Inactive scalar payloads use valid zero values; aggregate,
 reference, owning, or addressable uses retain their normal representation. Use
 facts are indexed once, parameters removed together, and incoming arguments
-rebuilt once per block. A known incoming predicate may bypass an empty join to an
-independent terminal exit, never skipping cleanup or fabricating a payload.
+rebuilt once per block. A known incoming predicate may bypass an empty join when
+the selected continuation does not use its parameters before re-entering the
+join. Outgoing arguments substitute the incoming values; cleanup is never skipped
+and no payload is fabricated. A boolean join in a diamond may select operands
+already available at the fork without speculating either arm's effects or traps.
+Branch arguments select the matching arm when their branch already determines
+the condition, preserving the other arm's observable exit state.
 
 ## Loops
 
@@ -184,6 +200,12 @@ Backedges in the dominator tree identify loops, canonicalized with a preheader
 and single latch. `loops.zig` owns read-only instruction, counter, exit, and range
 facts; `idioms.zig` owns transformations. Successful rewrites invalidate relevant
 facts and restart analysis. Loop-free functions skip this work.
+Local simplification after a rewrite can expose containing loops, so loop
+transformations resume after their joins and predicates simplify.
+Completed fill/move rewrites retain their fallback store instruction IDs across
+all of those rounds, preventing a rewrite from repeatedly versioning its own
+fallback. Instruction IDs survive cleanup until final compaction; latch block
+IDs do not.
 
 Counter matching alone proves neither monotonicity nor termination. Range proofs
 must bound the latch update, including the final increment, in widened arithmetic.
@@ -217,6 +239,18 @@ Carried boolean exits rotate either flag polarity into the latch predicate.
 Explicit exit parameters preserve bound-exit and collision-exit state, including
 shared exits and existing branch arguments. Latch effects still execute before
 the exit decision; a final overflowing increment remains a panic.
+An exit shared with outside predecessors can rotate when all state already
+escapes through explicit edge arguments, without adding fictitious values on
+outside paths.
+
+Unit-stride terminal counters can retain their last value on the exiting path
+and advance only on the repeating path. Range proofs follow their acyclic joins
+and selects under the backedge's inequality, require an approaching start, and
+include the terminal iteration. A checked update becomes modular only when its
+own dominating guard excludes that terminal value. This preserves inclusive
+iteration at signed endpoints and unconditional final-update panics. Ordered
+dynamic starts also follow dominating relational guards, allowing nested ranges
+to share an invariant limit.
 
 Ranges intersect dominating predicates only where one successor dominates
 the proof site; a guard on one path through a join is insufficient. Body proofs
@@ -236,25 +270,39 @@ Fixed operands reserve conflicts and calls exclude caller-saved crossing ranges.
 Syscall argument setup reserves the registers it writes. Linux preserves
 `r8`-`r10`; a syscall itself reserves/clobbers `r11`, so a cold panic syscall
 does not exclude the other three from the entire function.
-Eligible locals retain the backward-positioned-edge gate; repeated unaddressed
-scalar parameters are separate candidates with incoming ABI spill homes.
+Eligible locals retain the backward-positioned-edge gate, except single-use
+scalar call results; repeated unaddressed scalar parameters are separate
+candidates with incoming ABI spill homes.
 Temporaries allocate first, then parameters use spare caller-saved registers.
 Unallocated parameters need no entry load; addressed values retain storage.
 
 The weighted allocator tracks separate definitions and expanded edge-copy uses.
 Reads precede definitions, permitting last-use reuse. Disjoint ranges can reuse
 registers across calls, but there is no general call-site splitting or reload
-insertion. Frames reserve preservation capacity before allocation; only used
-preserved registers are saved and restored.
+insertion. Uninterrupted single-use accumulator store/reload pairs coalesce before
+allocation, retaining 32-bit zero-extension when upper bits can be observed.
+Labels, other uses, and intervening instructions prevent this rewrite.
+
+Frames finalize after allocation. Unused private spill homes disappear; retained
+objects keep alignment and internal offsets. Explicit machine stack accesses pin
+their slots regardless of virtual register allocation. Incoming accesses, initializer
+captures, and panic-trace frame sizes relocate together. Only used preserved
+registers need save slots, and functions without SSA return paths omit saves even
+when outlined panic helpers return internally.
 
 Loop-weighted preferences favor sharing registers across scalar copies and
-in-place arithmetic operands/results. Preferences never override interference,
+in-place arithmetic operands/results. Weights follow cycles in the expanded
+machine CFG; returning from an outlined edge stub is not itself a loop.
+Preferences never override interference,
 fixed-register reservations, call clobbers, or parameter restrictions. Native
 blocks start in reverse postorder, with unreachable components afterward. Empty
 two-block loop tests follow their bodies so the conditional backedge replaces
 the body's jump to the test. This changes physical layout without moving executed
-effects or relying on IR block numbering. Edge copies, branch targets,
-relocations, and panic metadata retain their ordinary mappings.
+effects or relying on IR block numbering. Non-fallthrough conditional edges with
+parameter copies use out-of-line edge stubs, leaving the sibling edge free to
+fall through. Their labels, copies, and jumps participate in expanded machine
+liveness before allocation, including parallel-copy cycles. Edge copies, branch
+targets, relocations, and panic metadata retain their ordinary mappings.
 
 Arithmetic may reuse a legal operand register when scratch results are dead;
 subtraction reuses only its left operand. Direct register/stack arithmetic avoids
@@ -285,6 +333,13 @@ pointers, retained addresses, and unsupported layouts keep ordinary lowering.
 An allocated signed index extends directly into `rcx` when the following base
 load independently overwrites `rax`, eliminating the intermediate `eax` copy.
 Labels, retained accumulator values, and spilled indices keep ordinary lowering.
+Valid array/allocation positions zero-extend instead. When every definition of
+their allocated index writes 32 bits, byte and 32-bit loads can use that register
+directly in the memory operand. This proof includes ABI parameter loads and
+preserves narrowing writes in coalesced copies; wide or unknown definitions keep
+the explicit extension. Cursor offsets retain signed extension.
+Final branch relocation bypasses edge stubs whose copies encode to nothing, while
+retaining every actual write and preserving jump cycles.
 Allocated results load directly into their assigned registers; spilled result
 stores remain explicit. Bounds and numeric traps are unchanged.
 

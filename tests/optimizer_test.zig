@@ -545,6 +545,72 @@ test "carried exit rotation preserves empty and final range iterations" {
     try testing.expectEqual(@as(usize, 0), count(body, &.{.select}));
 }
 
+test "terminal range counters prove guarded array bounds and withdraw edited guards" {
+    for ([_][]const u8{ "first..=limit", "(first..=limit).reversed()" }) |range| {
+        const program = try test_sources.renderTemplate(testing.allocator,
+            \\func scan(first: int, limit: int) int
+            \\    if first < 0 or limit >= 8 -> return 0
+            \\    var values: Array(int, 8) = [0, 1, 2, 3, 4, 5, 6, 7]
+            \\    var sum = 0
+            \\    for index in $range
+            \\        sum += values[index]
+            \\    return sum
+            \\func run() int -> scan(1, 4) + scan(3, 3) + scan(9, 2) + scan(0, -1) + 29
+        , .{ .range = range });
+        defer testing.allocator.free(program);
+        try Fixture.expectParity(program, 42);
+        const checked = try testing.allocator.print("{s}\nexit(scan(0, 8))", .{program});
+        defer testing.allocator.free(checked);
+        const fixture = try Fixture.init(checked);
+        defer fixture.deinit();
+        try fixture.expectExit(0, 0);
+        const before = (try optimizedBody(fixture, "scan")).*.?;
+        try testing.expectEqual(@as(usize, 0), countCalls(before));
+        const edited = try std.mem.replaceOwned(u8, testing.allocator, checked, "limit >= 8", "limit > 8");
+        defer testing.allocator.free(edited);
+        try fixture.db.setInput(queries.SourceText, 0, edited);
+        const after = (try optimizedBody(fixture, "scan")).*.?;
+        try testing.expect(countCalls(after) != 0);
+        try fixture.expectExit(0, 134);
+    }
+}
+
+test "carried exit rotation preserves a conditional backedge and its separate return" {
+    const program =
+        \\func scan(first: int, limit: int, empty: bool) int
+        \\    var value = first
+        \\    var finished = empty
+        \\    var count = 0
+        \\    loop
+        \\        if finished -> break
+        \\        if value == limit -> finished = true else value += 1
+        \\        count += 1
+        \\        if value < 0 -> return 9
+        \\    return count + 10 * value
+        \\func run() int -> scan(0, 2, false) + scan(2, 2, false) + scan(-1, -1, false) + scan(3, 1, true) - 41
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "scan")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{.select}));
+}
+
+test "terminal counter proofs preserve unconditional final overflow" {
+    const fixture = try Fixture.init(
+        \\func scan(first: int, limit: int) int
+        \\    var index = first
+        \\    loop
+        \\        const next = index + 1
+        \\        if index == limit -> break
+        \\        index = next
+        \\    return 42
+        \\exit(scan(2147483647, 2147483647))
+    );
+    defer fixture.deinit();
+    try fixture.expectExit(0, 134);
+}
+
 test "carried exit rotation preserves observable cursor and finished state" {
     try Fixture.expectParity(
         \\func walk(limit: int) int
@@ -1198,6 +1264,35 @@ const pipeline_source =
     \\    return 90
 ;
 
+test "bulk loop fallbacks converge across simplification within bounded memory" {
+    const program =
+        \\func calculate(count: int) int | none
+        \\    var values = List(int).filled(7, count)
+        \\    if not (values is List(int)) -> return none
+        \\    if not (values.reserve(count + 2) is unit) -> return none
+        \\    if count == 0 -> return 0
+        \\    return values[0] + values[count - 1] + values.capacity()
+        \\func run() int
+        \\    if not (calculate(-1) is none) -> return 90
+        \\    const empty = calculate(0)
+        \\    if not (empty is int) -> return 91
+        \\    if empty <> 0 -> return 92
+        \\    match calculate(2)
+        \\        result and result is int -> return result + 24
+        \\        _ -> return 93
+        \\exit(run())
+    ;
+    // A regression must report OutOfMemory without exhausting the machine.
+    const memory = try testing.allocator.alloc(u8, 64 * 1024 * 1024);
+    defer testing.allocator.free(memory);
+    var bounded: std.heap.FixedBufferAllocator = .init(memory);
+    const allocator = bounded.allocator();
+    const fixture: Fixture = .{ .db = try test_sources.query.Database.init(allocator, .{ .worker_count = 0 }) };
+    defer fixture.deinit();
+    try test_sources.modules.registerSources(fixture.db, allocator, program, &.{}, &.{});
+    try fixture.expectExit(0, 42);
+}
+
 test "inlining exposes callee bodies to scalar replacement selects and loop idioms" {
     try Fixture.expectParity(pipeline_source, 42);
     const program = try testing.allocator.print("{s}\nexit(run())", .{pipeline_source});
@@ -1344,6 +1439,93 @@ test "parallel callee optimization keeps fresh leaf edits to one typed body" {
     }
 }
 
+test "known indirect calls promote after forwarding and preserve incremental callees" {
+    const program =
+        \\func bump(value: int) int -> value + 2
+        \\func forward(callback: func(int) int) func(int) int -> callback
+        \\func unknown(callback: func(int) int, value: int) int -> callback(value)
+        \\func recursive(value: int) int
+        \\    if value <= 0 -> return 0
+        \\    const callback = recursive
+        \\    return callback(value - 1) + 1
+        \\func run() int -> forward(bump)(40)
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const run = (try optimizedBody(fixture, "run")).*.?;
+    try testing.expectEqual(@as(usize, 0), countCalls(run));
+    const unknown = (try optimizedBody(fixture, "unknown")).*.?;
+    try testing.expectEqual(@as(usize, 1), countCalls(unknown));
+    for (unknown.instructions) |instruction| {
+        if (instruction == .call) try testing.expect(instruction.call.target == .indirect);
+    }
+    const recursive = (try optimizedBody(fixture, "recursive")).*.?;
+    try testing.expectEqual(@as(usize, 1), try countCallsTo(recursive, "recursive", fixture));
+
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, program, "value + 2", "value + 3");
+    defer testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(0, 43);
+    try testing.expectEqual(@as(usize, 0), countCalls((try optimizedBody(fixture, "run")).*.?));
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 43);
+    try testing.expectEqual(@as(usize, 2), countCalls((try optimizedBody(fixture, "run")).*.?));
+}
+
+test "known indirect calls recover immutable fields and common joins but retain different targets" {
+    const program =
+        \\struct Callbacks
+        \\    callback: func(int) int
+        \\func bump(value: int) int -> value + 2
+        \\func other(value: int) int -> value + 5
+        \\func forward(callback: func(int) int) func(int) int -> callback
+        \\func field(value: int) int
+        \\    const callbacks = Callbacks{callback = forward(bump)}
+        \\    return callbacks.callback(value)
+        \\func common(flag: bool, value: int) int
+        \\    var callback = forward(bump)
+        \\    if flag -> callback = forward(bump)
+        \\    return callback(value)
+        \\func different(flag: bool, value: int) int
+        \\    var callback = forward(bump)
+        \\    if flag -> callback = forward(other)
+        \\    return callback(value)
+        \\func run() int -> field(39) + common(false, 39) + common(true, 39) + different(false, 39) + different(true, 39) - 166
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    for ([_][]const u8{ "field", "common" }) |name| {
+        try testing.expectEqual(@as(usize, 0), countCalls((try optimizedBody(fixture, name)).*.?));
+    }
+    const different = (try optimizedBody(fixture, "different")).*.?;
+    try testing.expectEqual(@as(usize, 1), countCalls(different));
+    for (different.instructions) |instruction| {
+        if (instruction == .call) try testing.expect(instruction.call.target == .indirect);
+    }
+}
+
+test "known indirect calls through forwarding keep mutual recursion out of line" {
+    const program =
+        \\func forward(callback: func(int) int) func(int) int -> callback
+        \\func left(value: int) int
+        \\    if value <= 0 -> return 0
+        \\    return forward(right)(value - 1) + 1
+        \\func right(value: int) int
+        \\    if value <= 0 -> return 0
+        \\    return forward(left)(value - 1) + 1
+        \\func run() int -> left(4) + 38
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try testing.expect(countCalls((try optimizedBody(fixture, "left")).*.?) != 0);
+    try testing.expect(countCalls((try optimizedBody(fixture, "right")).*.?) != 0);
+}
+
 test "a zero inline limit keeps calls out of line" {
     const program = try testing.allocator.print("{s}\nexit(run())", .{pipeline_source});
     defer testing.allocator.free(program);
@@ -1354,6 +1536,59 @@ test "a zero inline limit keeps calls out of line" {
     const run = (try optimizedBody(fixture, "run")).*.?;
     try testing.expectEqual(@as(usize, 0), run.inline_frames.len);
     try testing.expect(countCalls(run) >= 6);
+}
+
+test "inlining reuses pruned growth capacity without multiplying the caller budget" {
+    const batch_calls = block: {
+        const line = "    sum += choose(true, value)\n";
+        var text: [line.len * 48]u8 = undefined;
+        for (0..48) |index| @memcpy(text[index * line.len ..][0..line.len], line);
+        break :block text;
+    };
+    const growing_calls = block: {
+        const line = "    sum = choose(flag, sum)\n";
+        var text: [line.len * 48]u8 = undefined;
+        for (0..48) |index| @memcpy(text[index * line.len ..][0..line.len], line);
+        break :block text;
+    };
+    const program =
+        \\func choose(flag: bool, value: int) int
+        \\    if flag -> return value
+        \\    var result = value
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    result += 1
+        \\    return result
+        \\func batch(value: int) int
+        \\    var sum = 0
+    ++ "\n" ++ batch_calls ++
+        \\    return sum
+        \\func growing(flag: bool, value: int) int
+        \\    var sum = value
+    ++ "\n" ++ growing_calls ++
+        \\    return sum
+        \\func run() int -> batch(1) + growing(false, 0) + growing(true, 3) - 777
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const batch = (try optimizedBody(fixture, "batch")).*.?;
+    try testing.expectEqual(@as(usize, 0), try countCallsTo(batch, "choose", fixture));
+    const growing = (try optimizedBody(fixture, "growing")).*.?;
+    try testing.expect(try countCallsTo(growing, "choose", fixture) != 0);
 }
 
 test "power of two division rewrites to signed shifts and preserves truncation" {

@@ -113,7 +113,81 @@ test "match snapshots preserve cleanup and reference-valued result joins" {
     }
 }
 
-test "List mutation snapshots preserve conservative captures and recompute removal edits" {
+test "result correlated mutation snapshots restore and invalidate alternative effects" {
+    const declarations =
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+        \\func forward(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    return replace(slot, source, selected)
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const result = forward(slot, source, true)
+        \\    const success = result is unit
+        \\    if not success -> return 90
+        \\    slot.value += 2
+        \\    return source
+    ;
+    for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)" }) |entry| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "{s}\n{s}", .{ declarations, entry });
+        defer std.testing.allocator.free(source);
+        const fixture = try Fixture.restore(source);
+        defer fixture.db.deinit();
+        try fixture.expectExit(42);
+        const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "if not selected -> return none\n    slot = Ref.from(source)\n    return ()", "if selected -> return ()\n    slot = Ref.from(source)\n    return none");
+        defer std.testing.allocator.free(changed);
+        try fixture.db.setInput(queries.SourceText, 0, changed);
+        try fixture.expectDiagnostic(.reference_not_writable);
+        try fixture.db.setInput(queries.SourceText, 0, source);
+        try fixture.expectExit(42);
+    }
+}
+
+test "result correlated empty mutation snapshots release selected captures" {
+    for ([_]bool{ false, true }) |indirect| {
+        const target = if (indirect) "slot.value" else "slot";
+        const declarations = try std.fmt.allocPrint(std.testing.allocator,
+            \\func clear({s}, selected: bool) unit | none
+            \\    if not selected -> return none
+            \\    {s} = none
+            \\    return ()
+            \\func checked(slot: Ref(int) | none) int
+            \\    if slot is none -> return 42
+            \\    return 91
+            \\func run() int
+            \\    var slot: Ref(int) | none = none
+            \\    if 1 == 1
+            \\        var temporary = 7
+            \\        slot = Ref.from(temporary)
+            \\        const result = clear({s}, true)
+            \\        if not (result is unit) -> return 90
+            \\    return checked(slot)
+        , .{ if (indirect) "slot: Ref(Ref(int) | none)" else "mut slot: Ref(int) | none", target, if (indirect) "Ref(Ref(int) | none).from(slot)" else "slot" });
+        defer std.testing.allocator.free(declarations);
+        const original = try std.fmt.allocPrint(std.testing.allocator, "if not selected -> return none\n    {s} = none\n    return ()", .{target});
+        defer std.testing.allocator.free(original);
+        const inverted = try std.fmt.allocPrint(std.testing.allocator, "if selected -> return ()\n    {s} = none\n    return none", .{target});
+        defer std.testing.allocator.free(inverted);
+        for ([_][]const u8{ "exit(run())", "static answer = run()\nexit(answer)" }) |entry| {
+            const source = try std.fmt.allocPrint(std.testing.allocator, "{s}\n{s}", .{ declarations, entry });
+            defer std.testing.allocator.free(source);
+            const fixture = try Fixture.restore(source);
+            defer fixture.db.deinit();
+            try fixture.expectExit(42);
+            const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, original, inverted);
+            defer std.testing.allocator.free(changed);
+            try fixture.db.setInput(queries.SourceText, 0, changed);
+            try fixture.expectDiagnostic(.borrow_outlives_source);
+            try fixture.db.setInput(queries.SourceText, 0, source);
+            try fixture.expectExit(42);
+        }
+    }
+}
+
+test "List mutation snapshots preserve selected captures and recompute removal edits" {
     const declarations =
         \\func remove(mut values: List(Ref(int)), index: int) Ref(int) | none -> values.remove(index)
         \\func calculate() int | none
@@ -124,7 +198,7 @@ test "List mutation snapshots preserve conservative captures and recompute remov
         \\        values[0] = Ref.from(source)
         \\        const removed = remove(values, 0)
         \\        if not (removed is Ref(int)) -> return none
-        \\        if removed.value <> source -> return 90
+        \\        if removed.value <> source and removed.value <> temporary -> return 90
         \\    return values[0].value * 2
         \\func run() int
         \\    match calculate()
@@ -141,7 +215,7 @@ test "List mutation snapshots preserve conservative captures and recompute remov
         const retained = try std.mem.replaceOwned(u8, std.testing.allocator, source, "values[0] = Ref.from(source)", "values[0] = Ref.from(temporary)");
         defer std.testing.allocator.free(retained);
         try fixture.db.setInput(queries.SourceText, 0, retained);
-        try fixture.expectDiagnostic(.borrow_outlives_source);
+        try fixture.expectExit(42);
         const wrong = try std.mem.replaceOwned(u8, std.testing.allocator, retained, "remove(values, 0)", "remove(values, 1)");
         defer std.testing.allocator.free(wrong);
         try fixture.db.setInput(queries.SourceText, 0, wrong);

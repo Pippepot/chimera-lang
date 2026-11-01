@@ -2,6 +2,12 @@ const std = @import("std");
 const x86 = @import("x86_encoding.zig");
 const Pattern = x86.Encoding;
 
+pub const Symbol = struct {
+    offset: usize,
+    name: []const u8,
+    addend: i64 = 0,
+};
+
 fn matchPattern(code: []const u8) ?Pattern {
     for (x86.patterns) |pat| {
         if (code.len < pat.length()) continue;
@@ -15,7 +21,7 @@ fn relativeTarget(code: []const u8, cursor: usize, pattern: Pattern) i64 {
     return @as(i64, @intCast(cursor + pattern.length())) + relative;
 }
 
-fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(i64, usize) {
+fn collectTargets(code: []const u8, symbols: *const std.AutoHashMap(usize, Symbol), gpa: std.mem.Allocator) !std.AutoHashMap(i64, usize) {
     var targets = std.AutoHashMap(i64, usize).init(gpa);
     errdefer targets.deinit();
     var next_label: usize = 0;
@@ -28,7 +34,7 @@ fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(i64
     cursor = 0;
     while (cursor < code.len) {
         const pat = matchPattern(code[cursor..]) orelse break;
-        if (pat.operand == .rel) {
+        if (pat.operand == .rel and !symbols.contains(cursor + pat.prefix.len)) {
             const target = relativeTarget(code, cursor, pat);
             if (targets.getPtr(target)) |label| if (label.* == std.math.maxInt(usize)) {
                 label.* = next_label;
@@ -41,9 +47,20 @@ fn collectTargets(code: []const u8, gpa: std.mem.Allocator) !std.AutoHashMap(i64
 }
 
 pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
+    return disassembleWithSymbols(code, &.{}, gpa);
+}
+
+pub fn disassembleWithSymbols(code: []const u8, named_operands: []const Symbol, gpa: std.mem.Allocator) ![]const u8 {
+    var symbols = std.AutoHashMap(usize, Symbol).init(gpa);
+    defer symbols.deinit();
+    for (named_operands) |symbol| {
+        const entry = try symbols.getOrPut(symbol.offset);
+        std.debug.assert(!entry.found_existing);
+        entry.value_ptr.* = symbol;
+    }
     var out = try std.ArrayList(u8).initCapacity(gpa, 4096);
     errdefer out.deinit(gpa);
-    var targets = try collectTargets(code, gpa);
+    var targets = try collectTargets(code, &symbols, gpa);
     defer targets.deinit();
     var cursor: usize = 0;
     while (cursor < code.len) {
@@ -54,6 +71,14 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
             for (code[cursor..]) |byte| try out.print(gpa, "  db 0x{x:0>2}\n", .{byte});
             break;
         };
+        if (symbols.get(cursor + pat.prefix.len)) |symbol| {
+            std.debug.assert(pat.operand == .rel or pat.operand == .u64);
+            try out.print(gpa, "  {s}{s}", .{ pat.asm_prefix, symbol.name });
+            if (symbol.addend != 0) try out.print(gpa, "{s}{d}", .{ if (symbol.addend > 0) "+" else "", symbol.addend });
+            try out.print(gpa, "{s}\n", .{pat.asm_suffix});
+            cursor += pat.length();
+            continue;
+        }
         switch (pat.operand) {
             .none => try out.print(gpa, "  {s}{s}\n", .{ pat.asm_prefix, pat.asm_suffix }),
             .i8 => {
@@ -86,6 +111,28 @@ pub fn disassemble(code: []const u8, gpa: std.mem.Allocator) ![]const u8 {
         cursor += pat.length();
     }
     return out.toOwnedSlice(gpa);
+}
+
+test "disassembly resolves calls and addresses without inventing local labels" {
+    const code = [_]u8{
+        0xe8, 0,    0,    0,    0,
+        0x48, 0xb8, 0,    0,    0,
+        0,    0,    0,    0,    0,
+        0x48, 0xb8, 0,    0,    0,
+        0,    0,    0,    0,    0,
+        0xe9, 0xfb, 0xff, 0xff, 0xff,
+    };
+    const symbols = [_]Symbol{
+        .{ .offset = 1, .name = "std.io.print_value(int)" },
+        .{ .offset = 7, .name = "$entry.id(int)" },
+        .{ .offset = 17, .name = ".data0", .addend = -4 },
+    };
+    const rendered = try disassembleWithSymbols(&code, &symbols, std.testing.allocator);
+    defer std.testing.allocator.free(rendered);
+    try std.testing.expectEqualStrings(
+        "  call std.io.print_value(int)\n  mov rax, $entry.id(int)\n  mov rax, .data0-4\nL0:\n  jmp L0\n",
+        rendered,
+    );
 }
 
 test "disassembly handles truncated instructions and external branch targets" {

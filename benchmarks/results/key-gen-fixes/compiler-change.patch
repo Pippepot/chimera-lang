@@ -1,0 +1,1389 @@
+diff --git i/src/backend/codegen.zig w/src/backend/codegen.zig
+index f8b752b..1b6b1ae 100644
+--- i/src/backend/codegen.zig
++++ w/src/backend/codegen.zig
+@@ -582,6 +582,7 @@ fn placeLoopTestsAfterBodies(ssa: *const structures.FunctionBodyAnalysis, order:
+ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+     return struct {
+         const Self = @This();
++        const IndexKind = enum { element, offset };
+         const JumpPatch = struct {
+             field_offset: u32,
+             target: structures.FunctionBlockId,
+@@ -591,6 +592,12 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+             span: ?structures.SourceSpan,
+             frame: structures.InlineFrameId,
+         };
++        const EdgeStub = struct {
++            field_offset: u32,
++            branch: structures.FunctionBranch,
++            span: ?structures.SourceSpan,
++            frame: structures.InlineFrameId,
++        };
+ 
+         gpa: std.mem.Allocator,
+         ssa: *const structures.FunctionBodyAnalysis,
+@@ -603,6 +610,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+         constant_data: std.ArrayList(structures.ByteString) = .empty,
+         trace_sites: std.ArrayList(structures.CompiledFunction.TraceSite) = .empty,
+         numeric_traps: std.ArrayList(NumericTrap) = .empty,
++        edge_stubs: std.ArrayList(EdgeStub) = .empty,
+         panic_trace_offsets: std.ArrayList(u32) = .empty,
+         current_span: ?structures.SourceSpan = null,
+         current_frame: structures.InlineFrameId = .root,
+@@ -627,6 +635,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+         fn deinit(self: *Self) void {
+             self.gpa.free(self.block_offsets);
+             self.numeric_traps.deinit(self.gpa);
++            self.edge_stubs.deinit(self.gpa);
+             self.panic_trace_offsets.deinit(self.gpa);
+             self.jump_patches.deinit(self.gpa);
+             self.initializer_patches.deinit(self.gpa);
+@@ -678,6 +687,17 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+                 const fallthrough = if (position + 1 < order.len) order[position + 1] else null;
+                 try self.emitBlock(block, fallthrough);
+             }
++            // Edge copies execute only on their selected edge. Keeping the
++            // non-fallthrough copies here lets the other edge fall through even
++            // when its sibling needs parameter setup. These labels and uses
++            // enter the expanded machine CFG before register allocation.
++            for (self.edge_stubs.items) |stub| {
++                try self.encoder.patchHere(stub.field_offset);
++                self.current_span = stub.span;
++                self.current_frame = stub.frame;
++                try self.emitBranchCopies(stub.branch);
++                try self.emitJump(stub.branch.target, null);
++            }
+             if (self.numeric_traps.items.len != 0) {
+                 // Successful arithmetic falls through. Cold calls retain a
+                 // return address and the source context of each failed check.
+@@ -760,7 +780,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+             if (size != 1 and size != 4) return false;
+             switch (self.ssa.instructions[index]) {
+                 .allocation_element => |element| try self.emitAllocationElementAddress(element),
+-                .array_element => |element| try self.emitElementAddress(self.valueLocation(element.array), true, element.index, element.type_id),
++                .array_element => |element| try self.emitElementAddress(self.valueLocation(element.array), true, element.index, element.type_id, .element),
+                 else => unreachable,
+             }
+             if (reading) {
+@@ -856,7 +876,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+                     try self.bindIndirect(destination);
+                 },
+                 .array_element => |operation| if (destination != .discarded) {
+-                    try self.emitElementAddress(self.valueLocation(operation.array), true, operation.index, operation.type_id);
++                    try self.emitElementAddress(self.valueLocation(operation.array), true, operation.index, operation.type_id, .element);
+                     try self.bindIndirect(destination);
+                 },
+                 .borrow_address => |operation| try self.emitBorrowAddress(operation, destination),
+@@ -1465,10 +1485,12 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+             if (early.arguments.start == early.arguments.end) {
+                 try self.emitConditionalJump(operation.negated(), early.target);
+             } else {
+-                const final_field = try self.encoder.conditionalJump(operation);
+-                try self.emitBranchCopies(early);
+-                try self.emitJump(early.target, null);
+-                try self.encoder.patchHere(final_field);
++                try self.edge_stubs.append(self.gpa, .{
++                    .field_offset = try self.encoder.conditionalJump(operation.negated()),
++                    .branch = early,
++                    .span = self.current_span,
++                    .frame = self.current_frame,
++                });
+             }
+             try self.emitBranchCopies(final);
+             try self.emitJump(final.target, fallthrough);
+@@ -1782,12 +1804,12 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+                 .{ .register = @fromBackingInt(@intCast(index)) }
+             else
+                 self.valueLocation(operation.allocation);
+-            try self.emitElementAddress(base, false, operation.index, operation.type_id);
++            try self.emitElementAddress(base, false, operation.index, operation.type_id, .element);
+         }
+ 
+         /// Leaves the address of element `index` in rax. The elements start at
+         /// the address `base` holds, or at `base` itself when `base_is_value`.
+-        fn emitElementAddress(self: *Self, base: ValueLocation, base_is_value: bool, index: structures.FunctionValueId, element_type: structures.TypeId) !void {
++        fn emitElementAddress(self: *Self, base: ValueLocation, base_is_value: bool, index: structures.FunctionValueId, element_type: structures.TypeId, kind: IndexKind) !void {
+             const byte_size = (try self.types.layout(element_type)).byte_size;
+             if (byte_size > std.math.maxInt(i32)) return error.UnsupportedElementLayout;
+             const add_scaled_index: x86.Operation = switch (byte_size) {
+@@ -1798,7 +1820,9 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+             };
+             if (byte_size != 0) {
+                 try self.loadComponent(u32, self.valueLocation(index), 0);
+-                try self.encoder.emit(.movsxd_rcx_eax);
++                // Array/allocation projections require valid nonnegative
++                // indices. Cursor offsets independently permit negatives.
++                try self.encoder.emit(if (kind == .element) .mov_ecx_eax else .movsxd_rcx_eax);
+                 if (byte_size != 1 and add_scaled_index == .add_rax_rcx) try self.encoder.immediate(.imul_rcx, @intCast(byte_size));
+             }
+             if (base_is_value) try self.loadValueAddress(base) else try self.loadAddress(base);
+@@ -1808,7 +1832,7 @@ fn FunctionEmitter(comptime Types: type, comptime buffered: bool) type {
+         fn emitCursorElement(self: *Self, operation: structures.CursorElement, destination: ValueLocation) !void {
+             if (destination == .discarded) return;
+             const element = (try self.types.facts().borrowElement(operation.type_id)) orelse (try self.types.facts().storageCursorAccess(operation.type_id)).?;
+-            try self.emitElementAddress(self.valueLocation(operation.cursor), false, operation.index, element);
++            try self.emitElementAddress(self.valueLocation(operation.cursor), false, operation.index, element, .offset);
+             try self.storeAddress(destination);
+         }
+ 
+diff --git i/src/backend/machine.zig w/src/backend/machine.zig
+index 278b88d..1c8f0f0 100644
+--- i/src/backend/machine.zig
++++ w/src/backend/machine.zig
+@@ -34,6 +34,7 @@ pub const Encoded = struct {
+ };
+ 
+ pub const Function = struct {
++    const WriteWidth = enum { unwritten, narrow, wide };
+     gpa: std.mem.Allocator,
+     instructions: std.ArrayList(Instruction) = .empty,
+ 
+@@ -137,6 +138,17 @@ pub const Function = struct {
+         };
+         var encoded: Encoded = .{ .positions = positions, .fields = fields };
+         errdefer encoded.deinit(self.gpa);
++        const widths = try self.gpa.alloc(WriteWidth, registers.len);
++        defer self.gpa.free(widths);
++        @memset(widths, .unwritten);
++        for (self.instructions.items) |instruction| {
++            const access = instruction.registerAccess() orelse continue;
++            if (!access.write) continue;
++            const width = &widths[@backingInt(access.value)];
++            if (instruction == .register and instruction.register.operation == .store_rax) {
++                width.* = .wide;
++            } else if (width.* == .unwritten) width.* = .narrow;
++        }
+         var patches: std.ArrayList(struct { field: u32, target: u32 }) = .empty;
+         defer patches.deinit(self.gpa);
+         var skip_until: usize = 0;
+@@ -145,11 +157,16 @@ pub const Function = struct {
+             positions[index] = std.math.cast(u32, encoded.code.items.len) orelse return error.FunctionTooLarge;
+             field.* = positions[index];
+             if (index < skip_until) continue;
++            const direct_load = try self.encodeDirectIndexedLoad(&encoded.code, index, registers, widths);
++            if (direct_load != 0) {
++                skip_until = index + direct_load;
++                continue;
++            }
+             if (try self.encodeIndex(&encoded.code, index, registers)) {
+                 skip_until = index + 2;
+                 continue;
+             }
+-            if (try self.encodeCopy(&encoded.code, index, registers)) {
++            if (try self.encodeCopy(&encoded.code, index, registers, widths)) {
+                 skip_until = index + 2;
+                 continue;
+             }
+@@ -157,7 +174,7 @@ pub const Function = struct {
+                 skip_until = index + 2;
+                 continue;
+             }
+-            const indexed_load = try self.encodeIndexedLoad(&encoded.code, index, registers);
++            const indexed_load = try self.encodeIndexedLoad(&encoded.code, index, registers, null);
+             if (indexed_load != 0) {
+                 skip_until = index + indexed_load;
+                 continue;
+@@ -204,18 +221,41 @@ pub const Function = struct {
+         positions[self.instructions.items.len] = std.math.cast(u32, encoded.code.items.len) orelse return error.FunctionTooLarge;
+         for (patches.items) |pending| {
+             std.debug.assert(pending.target < positions.len);
+-            const displacement = @as(i64, positions[pending.target]) - (@as(i64, pending.field) + @sizeOf(i32));
++            const target = self.branchTarget(pending.target, positions);
++            const displacement = @as(i64, positions[target]) - (@as(i64, pending.field) + @sizeOf(i32));
+             const relative = std.math.cast(i32, displacement) orelse return error.RelocationOverflow;
+             std.mem.writeInt(i32, encoded.code.items[pending.field..][0..4], relative, .little);
+         }
+         return encoded;
+     }
+ 
++    fn branchTarget(self: *const Function, initial: u32, positions: []const u32) u32 {
++        var target = initial;
++        for (0..self.instructions.items.len) |_| {
++            if (target == self.instructions.items.len) return target;
++            // Coalescing can make all of an outlined edge's copies empty.
++            // Resolve its jump directly, but retain every actual encoded write.
++            if (positions[target] == positions[target + 1]) {
++                target += 1;
++                continue;
++            }
++            const instruction = self.instructions.items[target];
++            if (instruction == .fixed and instruction.fixed.operation == .jmp and instruction.fixed.target != 0) {
++                target = instruction.fixed.target;
++                continue;
++            }
++            return target;
++        }
++        return initial; // A jump cycle remains a cycle.
++    }
++
+     fn encodeIndex(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !bool {
+         const instructions = self.instructions.items[index..];
+         if (instructions.len < 3) return false;
+         if (instructions[0] != .register or instructions[0].register.operation != .load_eax) return false;
+-        if (instructions[1] != .fixed or instructions[1].fixed.operation != .movsxd_rcx_eax) return false;
++        if (instructions[1] != .fixed) return false;
++        const operation = instructions[1].fixed.operation;
++        if (operation != .movsxd_rcx_eax and operation != .mov_ecx_eax) return false;
+         // The original eax copy is dead only when the base load overwrites rax
+         // immediately, without a label or a read of the old accumulator.
+         switch (instructions[2]) {
+@@ -226,11 +266,11 @@ pub const Function = struct {
+             else => return false,
+         }
+         const source = registers[@backingInt(instructions[0].register.value)] orelse return false;
+-        try x86.appendRegister(code, self.gpa, .sign_extend_rcx, source, 0);
++        try x86.appendRegister(code, self.gpa, if (operation == .movsxd_rcx_eax) .sign_extend_rcx else .load_ecx, source, 0);
+         return true;
+     }
+ 
+-    fn encodeCopy(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !bool {
++    fn encodeCopy(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register, widths: []const WriteWidth) !bool {
+         const instructions = self.instructions.items[index..];
+         if (instructions.len < 3) return false;
+         if (instructions[0] != .register or instructions[0].register.operation != .load_eax) return false;
+@@ -238,7 +278,9 @@ pub const Function = struct {
+         if (instructions[2] != .scratch_dead) return false;
+         const source = registers[@backingInt(instructions[0].register.value)] orelse return false;
+         const destination = registers[@backingInt(instructions[1].register.value)] orelse return false;
+-        if (destination != source) try x86.appendRegisterBinary(code, self.gpa, .store_eax, destination, source);
++        // A coalesced 32-bit copy must still clear unknown upper bits before
++        // its result can supply a zero-extended address index.
++        if (destination != source or widths[@backingInt(instructions[0].register.value)] != .narrow) try x86.appendRegisterBinary(code, self.gpa, .store_eax, destination, source);
+         return true;
+     }
+ 
+@@ -270,7 +312,18 @@ pub const Function = struct {
+         return true;
+     }
+ 
+-    fn encodeIndexedLoad(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register) !usize {
++    fn encodeDirectIndexedLoad(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register, widths: []const WriteWidth) !usize {
++        const instructions = self.instructions.items[index..];
++        if (instructions.len < 7 or instructions[0] != .register or instructions[0].register.operation != .load_eax) return 0;
++        if (instructions[1] != .fixed or instructions[1].fixed.operation != .mov_ecx_eax) return 0;
++        const value = @backingInt(instructions[0].register.value);
++        if (widths[value] != .narrow) return 0;
++        const selected = registers[value] orelse return 0;
++        const consumed = try self.encodeIndexedLoad(code, index + 2, registers, selected);
++        return if (consumed == 0) 0 else consumed + 2;
++    }
++
++    fn encodeIndexedLoad(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register, selected_index: ?x86.Register) !usize {
+         const instructions = self.instructions.items[index..];
+         if (instructions.len < 5 or instructions[1] != .fixed or instructions[2] != .fixed) return 0;
+         if (instructions[4] != .scratch_dead) return 0;
+@@ -294,11 +347,11 @@ pub const Function = struct {
+             .register => |source| {
+                 if (source.operation != .load_rax) return 0;
+                 const base = registers[@backingInt(source.value)] orelse return 0;
+-                try x86.appendIndexedLoad(code, self.gpa, byte, base, destination_register, 0);
++                try x86.appendIndexedLoad(code, self.gpa, byte, base, destination_register, selected_index, 0);
+             },
+             .fixed => |source| {
+                 if (source.operation != .lea_rax_rsp) return 0;
+-                try x86.appendIndexedLoad(code, self.gpa, byte, null, destination_register, source.bits);
++                try x86.appendIndexedLoad(code, self.gpa, byte, null, destination_register, selected_index, source.bits);
+             },
+             else => return 0,
+         }
+diff --git i/src/backend/registers.zig w/src/backend/registers.zig
+index 50eb22f..db7c4f9 100644
+--- i/src/backend/registers.zig
++++ w/src/backend/registers.zig
+@@ -64,6 +64,17 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
+     const block_count = starts.items.len - 1;
+     const block_at = try scratch.alloc(u32, instructions.len);
+     for (0..block_count) |block| @memset(block_at[starts.items[block]..starts.items[block + 1]], @intCast(block));
++    const successors = try scratch.alloc([2]?u32, block_count);
++    for (successors, 0..) |*targets, block| {
++        targets.* = .{ null, null };
++        const last = instructions[starts.items[block + 1] - 1];
++        var falls_through = true;
++        if (last == .fixed and isBranch(last.fixed.operation)) {
++            if (last.fixed.target != 0 and last.fixed.target < instructions.len) targets[0] = block_at[last.fixed.target];
++            falls_through = last.fixed.operation != .jmp and last.fixed.operation != .ret and last.fixed.operation != .ud2;
++        }
++        if (falls_through and block + 1 < block_count) targets[1] = @intCast(block + 1);
++    }
+ 
+     const mapping = try scratch.alloc(?u32, value_count);
+     @memset(mapping, null);
+@@ -82,16 +93,8 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
+         parameters[mapping[@backingInt(instruction.parameter.value)].?] = true;
+     };
+     const depth = try scratch.alloc(u32, instructions.len);
+-    @memset(depth, 0);
+-    for (instructions, 0..) |instruction, index| {
+-        if (instruction != .fixed) continue;
+-        if (!isBranch(instruction.fixed.operation)) continue;
+-        if (instruction.fixed.target != 0) {
+-            const target = instruction.fixed.target;
+-            if (target > index) continue;
+-            for (depth[target .. index + 1]) |*covered| covered.* +|= 1;
+-        }
+-    }
++    const block_depths = try loopDepths(scratch, successors);
++    for (block_depths, 0..) |block_depth, block| @memset(depth[starts.items[block]..starts.items[block + 1]], block_depth);
+     const weights = try scratch.alloc(u64, candidate_count);
+     @memset(weights, 0);
+     const uses = try scratch.alloc(BitSet, block_count);
+@@ -126,18 +129,7 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
+         while (order > 0) {
+             order -= 1;
+             const block = order;
+-            const last = instructions[starts.items[block + 1] - 1];
+-            var falls_through = true;
+-            if (last == .fixed and isBranch(last.fixed.operation)) {
+-                if (last.fixed.target != 0) {
+-                    const target = last.fixed.target;
+-                    if (target < instructions.len) live_out[block].setUnion(live_in[block_at[target]]);
+-                }
+-                falls_through = last.fixed.operation != .jmp and last.fixed.operation != .ret and last.fixed.operation != .ud2;
+-            }
+-            if (falls_through and block + 1 < block_count) {
+-                live_out[block].setUnion(live_in[block + 1]);
+-            }
++            for (successors[block]) |target| if (target) |successor| live_out[block].setUnion(live_in[successor]);
+             next.unsetAll();
+             next.setUnion(live_out[block]);
+             var definitions = defines[block].iterator(.{});
+@@ -227,6 +219,72 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
+     return .{ .registers = registers, .used = try used.toOwnedSlice(gpa) };
+ }
+ 
++// A backward physical jump can simply return from an outlined edge stub.
++// Weight actual cycles found by DFS, including their expanded edge copies,
++// rather than all instructions between the jump and its earlier target.
++fn loopDepths(scratch: std.mem.Allocator, successors: []const [2]?u32) ![]u32 {
++    const count = successors.len;
++    const incoming = try scratch.alloc(std.ArrayList(u32), count);
++    @memset(incoming, .empty);
++    for (successors, 0..) |targets, block| for (targets) |target| if (target) |next| {
++        try incoming[next].append(scratch, @intCast(block));
++    };
++    const depths = try scratch.alloc(u32, count);
++    @memset(depths, 0);
++    const visited = try scratch.alloc(bool, count);
++    @memset(visited, false);
++    const active = try scratch.alloc(bool, count);
++    @memset(active, false);
++    const members = try scratch.alloc(bool, count);
++    const pending = try scratch.alloc(u32, count);
++    const Frame = struct { block: u32, next: u2 = 0 };
++    const stack = try scratch.alloc(Frame, count);
++    for (0..count) |root| {
++        if (visited[root]) continue;
++        stack[0] = .{ .block = @intCast(root) };
++        visited[root] = true;
++        active[root] = true;
++        var size: usize = 1;
++        while (size != 0) {
++            const frame = &stack[size - 1];
++            if (frame.next == 2) {
++                active[frame.block] = false;
++                size -= 1;
++                continue;
++            }
++            const target = successors[frame.block][frame.next];
++            frame.next += 1;
++            const next = target orelse continue;
++            if (!visited[next]) {
++                visited[next] = true;
++                active[next] = true;
++                stack[size] = .{ .block = next };
++                size += 1;
++                continue;
++            }
++            if (!active[next]) continue;
++            @memset(members, false);
++            members[next] = true;
++            pending[0] = frame.block;
++            var pending_count: usize = @intFromBool(frame.block != next);
++            members[frame.block] = true;
++            while (pending_count != 0) {
++                pending_count -= 1;
++                for (incoming[pending[pending_count]].items) |previous| {
++                    if (members[previous]) continue;
++                    members[previous] = true;
++                    pending[pending_count] = previous;
++                    pending_count += 1;
++                }
++            }
++            for (members, depths) |member, *depth| if (member) {
++                depth.* +|= 1;
++            };
++        }
++    }
++    return depths;
++}
++
+ // These are allocation preferences, not aliases: every choice still has to
+ // satisfy the complete expanded-stream liveness and fixed-register constraints.
+ fn collectPreferences(allocator: std.mem.Allocator, instructions: []const machine.Instruction, mapping: []const ?u32, depth: []const u32, preferences: []std.ArrayList(Preference)) !void {
+diff --git i/src/backend/x86_encoding.zig w/src/backend/x86_encoding.zig
+index 7d0fa64..7fb7b59 100644
+--- i/src/backend/x86_encoding.zig
++++ w/src/backend/x86_encoding.zig
+@@ -446,34 +446,35 @@ pub fn appendRegisterBinary(code: *std.ArrayList(u8), allocator: std.mem.Allocat
+     try appendPattern(code, allocator, binary_register_patterns[operation_index][destination_index][source_index], 0);
+ }
+ 
+-fn indexedLoadEncoding(comptime byte: bool, comptime base: ?Register, comptime destination: ?Register) Encoding {
++fn indexedLoadEncoding(comptime byte: bool, comptime base: ?Register, comptime destination: ?Register, comptime index: ?Register) Encoding {
+     const base_low = if (base) |selected| selected.low() else 4;
+     const destination_low = if (destination) |selected| selected.low() else 0;
+-    const rex: u8 = 0x40 | (if (destination != null and destination.?.extended()) @as(u8, 4) else 0) | (if (base != null and base.?.extended()) @as(u8, 1) else 0);
++    const rex: u8 = 0x40 | (if (destination != null and destination.?.extended()) @as(u8, 4) else 0) | (if (index != null and index.?.extended()) @as(u8, 2) else 0) | (if (base != null and base.?.extended()) @as(u8, 1) else 0);
+     const mode: u8 = if (base == null) 0x80 else if (base_low == 5) 0x40 else 0;
+     return .{
+         .prefix = (if (rex == 0x40) &[_]u8{} else &[_]u8{rex}) ++
+             (if (byte) &[_]u8{ 0x0f, 0xb6 } else &[_]u8{0x8b}) ++
+-            &[_]u8{ mode | (destination_low << 3) | 4, (if (byte) @as(u8, 0x08) else 0x88) | base_low } ++
++            &[_]u8{ mode | (destination_low << 3) | 4, (if (byte) @as(u8, 0) else 0x80) | ((if (index) |selected| selected.low() else 1) << 3) | base_low } ++
+             (if (base != null and base_low == 5) &[_]u8{0} else &[_]u8{}),
+         .operand = if (base == null) .u32 else .none,
+         .compact = if (base == null) .displacement else .none,
+         .asm_prefix = (if (byte) "movzx " else "mov ") ++ (if (destination) |selected| selected.name32() else "eax") ++
+             (if (byte) ", byte [" else ", [") ++ (if (base) |selected| @tagName(selected) else "rsp") ++
+-            (if (byte) "+rcx" else "+rcx*4") ++ (if (base == null) "+" else "]"),
++            "+" ++ (if (index) |selected| @tagName(selected) else "rcx") ++ (if (byte) "" else "*4") ++ (if (base == null) "+" else "]"),
+         .asm_suffix = if (base == null) "]" else "",
+     };
+ }
+ 
+ const indexed_load_forms = blk: {
+-    @setEvalBranchQuota(30000);
++    @setEvalBranchQuota(500000);
+     const registers = std.enums.values(Register);
+-    var result: [2][registers.len + 1][registers.len + 1]Forms = undefined;
+-    for (0..2) |width| for (0..registers.len + 1) |base_index| for (0..registers.len + 1) |destination_index| {
++    var result: [2][registers.len + 1][registers.len + 1][registers.len + 1]Forms = undefined;
++    for (0..2) |width| for (0..registers.len + 1) |base_index| for (0..registers.len + 1) |destination_index| for (0..registers.len + 1) |index_register| {
+         const base: ?Register = if (base_index < registers.len) registers[base_index] else null;
+         const destination: ?Register = if (destination_index < registers.len) registers[destination_index] else null;
+-        const full = indexedLoadEncoding(width == 1, base, destination);
+-        const form = &result[width][base_index][destination_index];
++        const selected_index: ?Register = if (index_register < registers.len) registers[index_register] else null;
++        const full = indexedLoadEncoding(width == 1, base, destination, selected_index);
++        const form = &result[width][base_index][destination_index][index_register];
+         form.* = .{ .full = full };
+         if (base == null) {
+             form.small = displacementEncoding(full, .u8);
+@@ -483,21 +484,22 @@ const indexed_load_forms = blk: {
+     break :blk result;
+ };
+ 
+-pub fn appendIndexedLoad(code: *std.ArrayList(u8), allocator: std.mem.Allocator, byte: bool, base: ?Register, destination: ?Register, offset: u64) !void {
++pub fn appendIndexedLoad(code: *std.ArrayList(u8), allocator: std.mem.Allocator, byte: bool, base: ?Register, destination: ?Register, index: ?Register, offset: u64) !void {
+     const registers = std.enums.values(Register);
+     const base_index = if (base) |selected| std.mem.indexOfScalar(Register, registers, selected).? else registers.len;
+     const destination_index = if (destination) |selected| std.mem.indexOfScalar(Register, registers, selected).? else registers.len;
+-    const form = indexed_load_forms[@intFromBool(byte)][base_index][destination_index];
++    const index_register = if (index) |selected| std.mem.indexOfScalar(Register, registers, selected).? else registers.len;
++    const form = indexed_load_forms[@intFromBool(byte)][base_index][destination_index][index_register];
+     const selected = if (base != null) form.full else if (offset == 0) form.zero.? else if (offset <= std.math.maxInt(i8)) form.small.? else form.full;
+     try appendPattern(code, allocator, selected, offset);
+ }
+ 
+ /// Every encodable form, each operation's forms in order full, small, zero.
+ pub const patterns = blk: {
+-    @setEvalBranchQuota(20000);
++    @setEvalBranchQuota(500000);
+     const register_count = std.enums.values(RegisterOperation).len * std.enums.values(Register).len;
+     const binary_count = binary_operations.len * std.enums.values(Register).len * std.enums.values(Register).len;
+-    const indexed_count = 2 * (std.enums.values(Register).len + 1) * (std.enums.values(Register).len + 1);
++    const indexed_count = 2 * (std.enums.values(Register).len + 1) * (std.enums.values(Register).len + 1) * (std.enums.values(Register).len + 1);
+     var result: [3 * (forms.len + register_count + indexed_count) + binary_count]Encoding = undefined;
+     var count: usize = 0;
+     for (forms) |form| for ([_]?Encoding{ form.full, form.small, form.zero }) |maybe_pattern| if (maybe_pattern) |pattern| {
+@@ -512,7 +514,7 @@ pub const patterns = blk: {
+         result[count] = pattern;
+         count += 1;
+     };
+-    for (indexed_load_forms) |width| for (width) |bases| for (bases) |form| for ([_]?Encoding{ form.full, form.small, form.zero }) |maybe_pattern| if (maybe_pattern) |pattern| {
++    for (indexed_load_forms) |width| for (width) |bases| for (bases) |destinations| for (destinations) |form| for ([_]?Encoding{ form.full, form.small, form.zero }) |maybe_pattern| if (maybe_pattern) |pattern| {
+         result[count] = pattern;
+         count += 1;
+     };
+diff --git i/src/optimizer/cleanup.zig w/src/optimizer/cleanup.zig
+index b6e5333..64bab1f 100644
+--- i/src/optimizer/cleanup.zig
++++ w/src/optimizer/cleanup.zig
+@@ -299,6 +299,7 @@ const ParameterSimplifier = struct {
+                     changed = true;
+                 }
+             }
++            if (function.find(parameter) == parameter and try self.selectParameter(block, position)) changed = true;
+         }
+         if (changed) {
+             const parameters = function.blocks.items[block].parameters.items;
+@@ -322,6 +323,65 @@ const ParameterSimplifier = struct {
+         }
+         return changed;
+     }
++
++    const Arm = struct { fork: u32, ordinal: u1 };
++
++    fn armOrigin(self: *ParameterSimplifier, edge: Incoming) ?Arm {
++        const source = self.function.blocks.items[edge.block];
++        if (source.terminator == .predicate_branch) return .{ .fork = edge.block, .ordinal = edge.ordinal };
++        if (source.terminator != .branch or self.incoming[edge.block].items.len != 1) return null;
++        const before = self.incoming[edge.block].items[0];
++        if (self.function.blocks.items[before.block].terminator != .predicate_branch) return null;
++        return .{ .fork = before.block, .ordinal = before.ordinal };
++    }
++
++    fn availableAt(self: *ParameterSimplifier, graph: @import("graph.zig").Graph, value: ValueId, at: u32) bool {
++        const function = self.function;
++        switch (function.definitions.items[@backingInt(value)]) {
++            .argument => |argument| return graph.dominates(argument.block, at),
++            .instruction => |index| {
++                for (graph.order) |block| {
++                    if (std.mem.indexOfScalar(u32, function.blocks.items[block].instructions.items, index) != null) return graph.dominates(block, at);
++                }
++                unreachable;
++            },
++        }
++    }
++
++    // A scalar join can select values already available at the fork without
++    // speculating either arm's instructions. In particular, checked updates
++    // remain conditional while their independently carried flags simplify.
++    fn selectParameter(self: *ParameterSimplifier, block: u32, position: usize) !bool {
++        const function = self.function;
++        const incoming = self.incoming[block].items;
++        if (incoming.len != 2) return false;
++        const parameter = function.blocks.items[block].parameters.items[position];
++        if (function.valueType(parameter) != .bool or !try self.stable(parameter)) return false;
++        const first = self.armOrigin(incoming[0]) orelse return false;
++        const second = self.armOrigin(incoming[1]) orelse return false;
++        if (first.fork != second.fork or first.ordinal == second.ordinal or first.fork == block) return false;
++        const fork = first.fork;
++        const predicate = function.blocks.items[fork].terminator.predicate_branch;
++        if (predicate.operation == .eqt or predicate.operation == .net) return false;
++        var values: [2]ValueId = undefined;
++        const graph = (try function.controlFlow()).*;
++        if (!graph.dominates(fork, block)) return false;
++        for (incoming, [_]Arm{ first, second }) |edge, arm| {
++            const argument = function.branchArguments(edge.branch(function).*)[position];
++            if (argument.coerce_to != null or argument.variant_tag_mapping != null) return false;
++            const value = function.find(argument.value);
++            if (!try self.stable(value) or !self.availableAt(graph, value, fork)) return false;
++            values[arm.ordinal] = value;
++        }
++        const source = function.blocks.items[fork];
++        const condition = try function.insertInstruction(fork, source.instructions.items.len, .{ .compare = .{ .operation = predicate.operation, .operands = predicate.operands } }, source.span, source.frame);
++        const selected = if (boolean(function, values[0]) == true and boolean(function, values[1]) == false)
++            condition
++        else
++            try function.insertInstruction(fork, function.blocks.items[fork].instructions.items.len, .{ .select = .{ .condition = condition, .then_value = values[0], .else_value = values[1], .type_id = .bool } }, source.span, source.frame);
++        function.replace(parameter, selected);
++        return true;
++    }
+ };
+ 
+ const Sweep = struct {
+@@ -353,7 +413,48 @@ const Sweep = struct {
+         return true;
+     }
+ 
+-    fn threadExit(self: *Sweep, block: u32) bool {
++    fn selectEdgeArguments(self: *Sweep, block: u32) !bool {
++        const function = self.function;
++        const terminator = &function.blocks.items[block].terminator;
++        if (terminator.* != .predicate_branch) return false;
++        const predicate = terminator.predicate_branch;
++        var changed = false;
++        for (Function.edges(terminator), 0..) |maybe_edge, ordinal| {
++            const edge = maybe_edge orelse continue;
++            const arguments = function.branchArguments(edge.*);
++            var replacements: ?[]structures.FunctionValueUse = null;
++            for (arguments, 0..) |argument, index| {
++                const value = function.find(argument.value);
++                if (@backingInt(value) >= self.address_taken.len or self.address_taken[@backingInt(value)]) continue;
++                const definition = function.definition(value) orelse continue;
++                if (definition != .select) continue;
++                const select = definition.select;
++                const condition = function.find(select.condition);
++                const taken = if ((predicate.operation == .eqb or predicate.operation == .neb) and function.find(predicate.operands.lhs) == condition) flag: {
++                    const expected = boolean(function, function.find(predicate.operands.rhs)) orelse continue;
++                    break :flag expected == ((predicate.operation == .eqb) == (ordinal == 0));
++                } else compared: {
++                    const comparison = function.definition(condition) orelse continue;
++                    if (comparison != .compare or !std.meta.eql(comparison.compare.operands, predicate.operands)) continue;
++                    if (comparison.compare.operation == predicate.operation) break :compared ordinal == 0;
++                    if (comparison.compare.operation == predicate.operation.negated()) break :compared ordinal != 0;
++                    continue;
++                };
++                const selected = function.find(if (taken) select.then_value else select.else_value);
++                if (!function.plainValue(selected) or @backingInt(selected) >= self.address_taken.len or self.address_taken[@backingInt(selected)]) continue;
++                if (replacements == null) replacements = try function.scratch.dupe(structures.FunctionValueUse, arguments);
++                replacements.?[index].value = selected;
++            }
++            if (replacements) |values| {
++                edge.arguments = try function.appendBranchArguments(values);
++                changed = true;
++            }
++        }
++        if (changed) self.touch(block);
++        return changed;
++    }
++
++    fn threadExit(self: *Sweep, block: u32) !bool {
+         const function = self.function;
+         for (Function.edges(&function.blocks.items[block].terminator)) |maybe_edge| {
+             const edge = maybe_edge orelse continue;
+@@ -367,27 +468,55 @@ const Sweep = struct {
+             const rhs = self.incomingValue(join, edge.*, predicate.operands.rhs) orelse continue;
+             const order = if (lhs == rhs) .eq else std.math.order(scalarConstant(function, lhs) orelse continue, scalarConstant(function, rhs) orelse continue);
+             const selected = if (predicate.operation.holds(order)) predicate.then_branch else predicate.else_branch;
+-            if (selected.arguments.start != selected.arguments.end) continue;
+-            const exit = function.blocks.items[@backingInt(selected.target)];
+-            switch (exit.terminator) {
+-                .return_unit, .return_value, .diverge => {},
+-                else => continue,
+-            }
++            if (@backingInt(selected.target) == target) continue;
+             if (self.dirty[@backingInt(selected.target)]) continue;
+-            var uses: ParameterUses = .{ .function = function, .parameters = join.parameters.items };
+-            const tables = function_ir.tableView(function);
+-            for (exit.instructions.items) |index| {
+-                if (!function.removed.items[index]) function_ir.visitInstructionReferences(tables, &function.instructions.items[index], &uses, ParameterUses.reference);
++            for (join.parameters.items) |parameter| {
++                if (!function.valueType(parameter).isPrimitive() or !function.plainValue(parameter) or self.address_taken[@backingInt(parameter)]) break;
++            } else {
++                if (!try self.independentExit(target, @backingInt(selected.target), join.parameters.items)) continue;
++                var arguments: std.ArrayList(structures.FunctionValueUse) = .empty;
++                for (function.branchArguments(selected)) |argument| {
++                    var forwarded = argument;
++                    forwarded.value = self.incomingValue(join, edge.*, argument.value) orelse break;
++                    try arguments.append(function.scratch, forwarded);
++                } else {
++                    edge.* = .{ .target = selected.target, .arguments = try function.appendBranchArguments(arguments.items) };
++                    self.touch(block);
++                    return true;
++                }
+             }
+-            function_ir.visitTerminatorReferences(tables, &exit.terminator, &uses, ParameterUses.reference);
+-            if (uses.found) continue;
+-            edge.* = selected;
+-            self.touch(block);
+-            return true;
+         }
+         return false;
+     }
+ 
++    // Bypassing a join cannot leave its parameters in use along the selected
++    // continuation. Re-entering the join defines them again, so it is a barrier
++    // rather than a reason to reject loop exits and outer-loop continuations.
++    fn independentExit(self: *Sweep, join: u32, start: u32, parameters: []const ValueId) !bool {
++        const function = self.function;
++        var visited = try std.DynamicBitSetUnmanaged.initEmpty(function.scratch, function.blocks.items.len);
++        var pending: std.ArrayList(u32) = .empty;
++        try pending.append(function.scratch, start);
++        visited.set(start);
++        visited.set(join);
++        var uses: ParameterUses = .{ .function = function, .parameters = parameters };
++        const tables = function_ir.tableView(function);
++        while (pending.pop()) |block| {
++            const continuation = &function.blocks.items[block];
++            for (continuation.instructions.items) |index| {
++                if (!function.removed.items[index]) function_ir.visitInstructionReferences(tables, &function.instructions.items[index], &uses, ParameterUses.reference);
++            }
++            function_ir.visitTerminatorReferences(tables, &continuation.terminator, &uses, ParameterUses.reference);
++            if (uses.found) return false;
++            for (function.successors(block)) |successor| if (successor) |target| {
++                if (visited.isSet(target)) continue;
++                visited.set(target);
++                try pending.append(function.scratch, target);
++            };
++        }
++        return true;
++    }
++
+     fn incomingValue(self: *Sweep, join: function_ir.Block, edge: structures.FunctionBranch, operand: ValueId) ?ValueId {
+         const position = std.mem.indexOfScalar(ValueId, join.parameters.items, operand) orelse return operand;
+         const argument = self.function.branchArguments(edge)[position];
+@@ -571,7 +700,7 @@ fn sweep(function: *Function) !bool {
+     var changed = false;
+     for (function.order.items) |block| {
+         if (!reachable[block] or state.dirty[block]) continue;
+-        if (state.foldSameTarget(block) or state.threadExit(block) or try state.formSelect(block) or try state.merge(block) or try state.forward(block)) changed = true;
++        if (state.foldSameTarget(block) or try state.selectEdgeArguments(block) or try state.threadExit(block) or try state.formSelect(block) or try state.merge(block) or try state.forward(block)) changed = true;
+     }
+     return changed;
+ }
+diff --git i/src/optimizer/idioms.zig w/src/optimizer/idioms.zig
+index 658dcba..548e486 100644
+--- i/src/optimizer/idioms.zig
++++ w/src/optimizer/idioms.zig
+@@ -122,8 +122,10 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
+     for (loop.blocks) |block| if (block != loop.header and !graph.dominates(body, block)) return false;
+     const latch = loop.latches[0];
+     const terminator = function.blocks.items[latch].terminator;
+-    if (terminator != .branch or @backingInt(terminator.branch.target) != loop.header) return false;
+-    const back = function.branchArguments(terminator.branch);
++    const back_branch = for (Function.edges(&function.blocks.items[latch].terminator)) |maybe_edge| {
++        if (maybe_edge) |edge| if (@backingInt(edge.target) == loop.header) break edge.*;
++    } else return false;
++    const back = function.branchArguments(back_branch);
+     for (back) |argument| if (argument.coerce_to != null or argument.variant_tag_mapping != null) return false;
+     const carried = function.definition(function.find(back[flag_position].value)) orelse return false;
+     if (carried != .select or boolean(function, carried.select.then_value) != exit_value or function.find(carried.select.else_value) != flag) return false;
+@@ -142,9 +144,12 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
+         if (!function.valueType(parameter).isPrimitive() or taken[@backingInt(parameter)]) return false;
+     }
+     const edges = (try function.controlFlowEdges()).incoming[test_result.exit].items;
+-    for (edges) |edge| if (!loop.contains(edge.block)) return false;
++    const private_exit = for (edges) |edge| {
++        if (!loop.contains(edge.block)) break false;
++    } else true;
+     for (function.blocks.items, 0..) |*block, index| {
+-        if (index == loop.header or graph.dominates(body, @intCast(index)) or graph.dominates(test_result.exit, @intCast(index))) continue;
++        if (index == loop.header or graph.dominates(body, @intCast(index))) continue;
++        if (private_exit and graph.dominates(test_result.exit, @intCast(index))) continue;
+         var uses: LoopParameters = .{ .function = function, .from = header.parameters.items };
+         for (block.instructions.items) |instruction| {
+             if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &uses, LoopParameters.check);
+@@ -152,14 +157,24 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
+         function_ir.terminatorAllOperands(function, &block.terminator, &uses, LoopParameters.check);
+         if (uses.found) return false;
+     }
++    if (terminator != .branch) {
++        // Only this selected backedge needs the flag decision. Leave the
++        // latch's other continuation intact, with no invented phi inputs.
++        const split = try function.addBlock(.{ .branch = back_branch }, header.span, header.frame);
++        for (Function.edges(&function.blocks.items[latch].terminator)) |maybe_edge| if (maybe_edge) |edge| {
++            if (@backingInt(edge.target) == loop.header) edge.* = .{ .target = @fromBackingInt(split), .arguments = .{ .start = 0, .end = 0 } };
++        };
++        try function.placeAfter(split, latch);
++        return true;
++    }
+     const original = try function.scratch.dupe(ValueId, header.parameters.items);
+     const replacements = try function.scratch.alloc(ValueId, original.len);
+-    const exit_parameters = try function.scratch.alloc(ValueId, original.len);
++    const exit_parameters = try function.scratch.alloc(ValueId, if (private_exit) original.len else 0);
+     const inactive = try function.insertInstruction(loop.header, 0, .{ .const_bool = !exit_value }, header.span, header.frame);
+     var initial: std.ArrayList(structures.FunctionValueUse) = .empty;
+     for (original, 0..) |parameter, position| {
+         const argument = function.definitions.items[@backingInt(parameter)].argument.data;
+-        exit_parameters[position] = try function.addParameter(test_result.exit, argument);
++        if (private_exit) exit_parameters[position] = try function.addParameter(test_result.exit, argument);
+         if (position == flag_position) {
+             replacements[position] = inactive;
+             continue;
+@@ -169,12 +184,14 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
+     }
+     const active = carried.select.then_value;
+     var escaped: LoopParameters = .{ .function = function, .from = original, .to = exit_parameters };
+-    for (function.blocks.items, 0..) |*block, index| {
+-        if (!graph.dominates(test_result.exit, @intCast(index))) continue;
+-        for (block.instructions.items) |instruction| {
+-            if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &escaped, LoopParameters.replace);
++    if (private_exit) {
++        for (function.blocks.items, 0..) |*block, index| {
++            if (!graph.dominates(test_result.exit, @intCast(index))) continue;
++            for (block.instructions.items) |instruction| {
++                if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &escaped, LoopParameters.replace);
++            }
++            function_ir.terminatorAllOperands(function, &block.terminator, &escaped, LoopParameters.replace);
+         }
+-        function_ir.terminatorAllOperands(function, &block.terminator, &escaped, LoopParameters.replace);
+     }
+     var rewritten: LoopParameters = .{ .function = function, .from = original, .to = replacements };
+     for (function.blocks.items, 0..) |*block, index| {
+@@ -184,13 +201,13 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
+         }
+         function_ir.terminatorAllOperands(function, &block.terminator, &rewritten, LoopParameters.replace);
+         for (Function.edges(&block.terminator)) |maybe_branch| if (maybe_branch) |branch| {
+-            if (@backingInt(branch.target) == test_result.exit) try appendExitValues(function, branch, replacements);
++            if (private_exit and @backingInt(branch.target) == test_result.exit) try appendExitValues(function, branch, replacements);
+         };
+     }
+     var exiting: std.ArrayList(structures.FunctionValueUse) = .empty;
+     var repeating: std.ArrayList(structures.FunctionValueUse) = .empty;
+     const next_condition = if (std.mem.indexOfScalar(ValueId, original, condition)) |position| replacements[position] else condition;
+-    for (function.branchArguments(terminator.branch), 0..) |argument, position| {
++    for (function.branchArguments(back_branch), 0..) |argument, position| {
+         try exiting.append(function.scratch, .{ .value = if (position == flag_position) active else selectArm(function, argument.value, next_condition, true) });
+         if (position != flag_position) try repeating.append(function.scratch, .{ .value = selectArm(function, argument.value, next_condition, false) });
+     }
+@@ -200,11 +217,11 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
+         if (std.mem.indexOfScalar(ValueId, original, function.find(argument.value))) |position| replacement.value = exiting.items[position].value;
+         try collision.append(function.scratch, replacement);
+     }
+-    try collision.appendSlice(function.scratch, exiting.items);
++    if (private_exit) try collision.appendSlice(function.scratch, exiting.items);
+     const initial_arguments = try function.appendBranchArguments(initial.items);
+     for (Function.edges(&function.blocks.items[loop.header].terminator)) |maybe_edge| if (maybe_edge) |edge| {
+         if (@backingInt(edge.target) == body) edge.arguments = initial_arguments;
+-        if (@backingInt(edge.target) == test_result.exit) try appendExitValues(function, edge, original);
++        if (private_exit and @backingInt(edge.target) == test_result.exit) try appendExitValues(function, edge, original);
+     };
+     function.blocks.items[latch].terminator = .{ .predicate_branch = .{
+         .operation = .eqb,
+diff --git i/src/optimizer/inline.zig w/src/optimizer/inline.zig
+index 7f2e756..683dc6a 100644
+--- i/src/optimizer/inline.zig
++++ w/src/optimizer/inline.zig
+@@ -89,10 +89,14 @@ pub fn analyzeCallee(scratch: std.mem.Allocator, body: *const Body) !Facts {
+     return .{ .eligible = true, .entry_taken = entry_taken, .normal_return_ranges = if (narrowed) ranges else &.{} };
+ }
+ 
+-pub fn inlineCalls(function: *Function, context: anytype) !bool {
++pub fn growthBudget(function: *const Function) usize {
++    const size = liveInstructions(function);
++    return @max(size * 4, size + 512);
++}
++
++pub fn inlineCalls(function: *Function, context: anytype, budget: usize) !bool {
+     var cache: Cache = .{};
+     var size = liveInstructions(function);
+-    const budget = @max(size * 4, size + 512);
+     const reachable = (try function.controlFlowEdges()).reachable;
+     var changed = false;
+     var block: u32 = 0;
+diff --git i/src/optimizer/loops.zig w/src/optimizer/loops.zig
+index 20080e4..2ea3d31 100644
+--- i/src/optimizer/loops.zig
++++ w/src/optimizer/loops.zig
+@@ -81,6 +81,9 @@ pub const Analysis = struct {
+         const counter = self.induction(loop, preheader_block, parameter) orelse return null;
+         if (!self.graph.dominates(exit.stay, loop.latches[0])) return null;
+         const comparison = IntegerComparison.init(self.function, exit.operation, exit.operands, parameter) orelse return null;
++        if (counter.terminal_bound) |bound| {
++            if (comparison.operation != .eqi or comparison.other != bound) return null;
++        }
+         if (!self.invariant(loop, comparison.other, 16)) return null;
+         return .{ .induction = counter, .comparison = comparison };
+     }
+@@ -106,15 +109,94 @@ pub const Analysis = struct {
+     }
+ 
+     pub fn iterationRange(self: Analysis, preheader_block: u32, counter: InductionExit) ?IterationRange {
++        return self.iterationRangeDepth(preheader_block, counter, 16);
++    }
++
++    fn iterationRangeDepth(self: Analysis, at: u32, counter: InductionExit, depth: u32) ?IterationRange {
++        if (depth == 0) return null;
+         if (!self.immutable(counter.comparison.other)) return null;
++        const start = self.rangeAtDepth(counter.induction.start, at, depth - 1);
++        const bound = self.rangeAtDepth(counter.comparison.other, at, depth - 1);
++        if (counter.induction.terminal_bound != null) {
++            if (!self.immutable(counter.induction.start)) return null;
++            const ascending = counter.induction.step == 1;
++            const approaching = if (ascending) start.upper <= bound.lower else start.lower >= bound.upper;
++            if (!approaching and !self.orderedAt(counter.induction.start, counter.comparison.other, at, ascending)) return null;
++            return .{
++                .absolute = if (ascending) .{ .lower = start.lower, .upper = bound.upper } else .{ .lower = bound.lower, .upper = start.upper },
++                .relative = if (ascending) .{ .lower = start.lower - bound.upper, .upper = 0 } else .{ .lower = 0, .upper = start.upper - bound.lower },
++            };
++        }
+         return IterationRange.init(
+             counter.induction.step,
+             counter.comparison.operation,
+-            self.rangeAt(counter.induction.start, preheader_block),
+-            self.rangeAt(counter.comparison.other, preheader_block),
++            start,
++            bound,
+         );
+     }
+ 
++    fn orderedAt(self: Analysis, first: ValueId, last: ValueId, at: u32, ascending: bool) bool {
++        if (first == last) return true;
++        var block = at;
++        while (block != self.function.entry) {
++            block = self.graph.dominator[block];
++            const predicate = self.pathPredicate(block, at, null) orelse continue;
++            const comparison = IntegerComparison.init(self.function, predicate.operation, predicate.operands, first) orelse continue;
++            if (comparison.other != last) continue;
++            switch (comparison.operation) {
++                .eqi => return true,
++                .lti, .lei => if (ascending) return true,
++                .gti, .gei => if (!ascending) return true,
++                else => {},
++            }
++        }
++        return false;
++    }
++
++    const PathPredicate = struct { operation: structures.PredicateOperation, operands: structures.BinaryOperands };
++
++    fn pathPredicate(self: Analysis, block: u32, at: u32, ordinal: ?u1) ?PathPredicate {
++        const terminator = self.function.blocks.items[block].terminator;
++        if (terminator != .predicate_branch) return null;
++        const predicate = terminator.predicate_branch;
++        const then_target = @backingInt(predicate.then_branch.target);
++        const else_target = @backingInt(predicate.else_branch.target);
++        const taken = if (ordinal) |edge|
++            edge == 0
++        else if (self.graph.incoming[then_target].items.len == 1 and self.graph.dominates(then_target, at))
++            true
++        else if (self.graph.incoming[else_target].items.len == 1 and self.graph.dominates(else_target, at))
++            false
++        else
++            return null;
++        return .{ .operation = if (taken) predicate.operation else predicate.operation.negated(), .operands = predicate.operands };
++    }
++
++    fn sameEquality(self: Analysis, first: structures.BinaryOperands, second: structures.BinaryOperands) bool {
++        const a = self.function.find(first.lhs);
++        const b = self.function.find(first.rhs);
++        const c = self.function.find(second.lhs);
++        const d = self.function.find(second.rhs);
++        return (a == c and b == d) or (a == d and b == c);
++    }
++
++    fn equalityAt(self: Analysis, operands: structures.BinaryOperands, at: u32, ordinal: ?u1) ?bool {
++        var block = at;
++        var edge = ordinal;
++        if (edge == null) {
++            if (block == self.function.entry) return null;
++            block = self.graph.dominator[block];
++        }
++        while (true) {
++            if (self.pathPredicate(block, at, edge)) |predicate| {
++                if ((predicate.operation == .eqi or predicate.operation == .nei) and self.sameEquality(operands, predicate.operands)) return predicate.operation == .eqi;
++            }
++            if (block == self.function.entry) return null;
++            block = self.graph.dominator[block];
++            edge = null;
++        }
++    }
++
+     /// Equality loops with unit strides terminate without overflowing only when
+     /// the initial counter is on the approaching side of the bound.
+     pub fn equalityRecurrenceSafe(self: Analysis, preheader_block: u32, counter: InductionExit) bool {
+@@ -149,7 +231,10 @@ pub const Analysis = struct {
+         const start = function.branchArguments(function.blocks.items[preheader_block].terminator.branch)[position];
+         const back = function.branchArguments(latchBranch(function, loop) orelse return null)[position];
+         if (start.coerce_to != null or back.coerce_to != null) return null;
+-        const next_value = self.forwarded(back.value, 16);
++        const ending = exitTestAt(function, loop, loop.latches[0]);
++        const terminal = if (ending) |exit| if (exit.operation == .eqi) IntegerComparison.init(function, exit.operation, exit.operands, parameter) else null else null;
++        const next_value = self.forwardedAssuming(back.value, 16, if (terminal != null) ending else null);
++        if (!self.immutable(next_value)) return null;
+         const next = function.definition(next_value) orelse return null;
+         var step: i32 = undefined;
+         switch (next) {
+@@ -177,14 +262,37 @@ pub const Analysis = struct {
+             else => return null,
+         }
+         if (step == 0) return null;
+-        return .{ .parameter = parameter, .start = self.forwarded(start.value, 16), .next = next_value, .step = step };
++        var terminal_bound: ?ValueId = null;
++        if (terminal) |comparison| {
++            if (step != 1 and step != -1) return null;
++            // A terminal iteration keeps the current value. Its speculative
++            // modular update is harmless, but a checked producer must execute
++            // only on the nonterminal path, including at signed endpoints.
++            const producer = self.instruction_blocks[function.instructionIndex(next_value).?];
++            if (next == .numeric_binary and next.numeric_binary.overflow == .checked and self.equalityAt(ending.?.operands, producer, null) != false) return null;
++            terminal_bound = comparison.other;
++        }
++        return .{ .parameter = parameter, .start = self.forwarded(start.value, 16), .next = next_value, .step = step, .terminal_bound = terminal_bound };
+     }
+ 
+     fn forwarded(self: Analysis, value: ValueId, depth: u32) ValueId {
++        return self.forwardedAssuming(value, depth, null);
++    }
++
++    fn forwardedAssuming(self: Analysis, value: ValueId, depth: u32, terminal: ?ExitTest) ValueId {
+         const resolved = self.function.find(value);
+         if (depth == 0 or !self.immutable(resolved)) return resolved;
+         const definition = self.function.definitions.items[@backingInt(resolved)];
+-        if (definition != .argument) return resolved;
++        if (definition == .instruction) {
++            const instruction = self.function.instructions.items[definition.instruction];
++            if (terminal) |exit| if (instruction == .select) {
++                const condition = self.function.definition(self.function.find(instruction.select.condition)) orelse return resolved;
++                if (condition == .compare and (condition.compare.operation == .eqi or condition.compare.operation == .nei) and self.sameEquality(exit.operands, condition.compare.operands)) {
++                    return self.forwardedAssuming(if (condition.compare.operation == .eqi) instruction.select.else_value else instruction.select.then_value, depth - 1, terminal);
++                }
++            };
++            return resolved;
++        }
+         const block = definition.argument.block;
+         const incoming = self.graph.incoming[block].items;
+         if (incoming.len == 0) return resolved;
+@@ -192,15 +300,16 @@ pub const Analysis = struct {
+         const position = std.mem.indexOfScalar(ValueId, self.function.blocks.items[block].parameters.items, resolved).?;
+         var source: ?ValueId = null;
+         for (incoming) |edge| {
++            if (terminal) |exit| if (self.equalityAt(exit.operands, edge.block, edge.ordinal) == true) continue;
+             const branch = Function.edges(&self.function.blocks.items[edge.block].terminator)[edge.ordinal].?;
+             const argument = self.function.branchArguments(branch.*)[position];
+             if (argument.coerce_to != null or argument.variant_tag_mapping != null) return resolved;
+-            const forwarded_value = self.forwarded(argument.value, depth - 1);
++            const forwarded_value = self.forwardedAssuming(argument.value, depth - 1, terminal);
+             if (source) |previous| {
+                 if (previous != forwarded_value) return resolved;
+             } else source = forwarded_value;
+         }
+-        return source.?;
++        return source orelse resolved;
+     }
+ 
+     pub fn rangeAt(self: Analysis, value: ValueId, at: u32) IntegerRange {
+@@ -244,12 +353,7 @@ pub const Analysis = struct {
+                 if (!self.graph.dominates(exit.stay, at)) continue;
+                 const counter = self.invariantInductionExit(loop, entry, exit, parameter) orelse continue;
+                 if (!self.immutable(counter.comparison.other)) continue;
+-                const range = IterationRange.init(
+-                    counter.induction.step,
+-                    counter.comparison.operation,
+-                    self.rangeAtDepth(counter.induction.start, at, depth - 1),
+-                    self.rangeAtDepth(counter.comparison.other, at, depth - 1),
+-                ) orelse continue;
++                const range = self.iterationRangeDepth(at, counter, depth - 1) orelse continue;
+                 return range.absolute;
+             }
+         }
+@@ -347,6 +451,7 @@ pub const Induction = struct {
+     start: ValueId,
+     next: ValueId,
+     step: i32,
++    terminal_bound: ?ValueId = null,
+ };
+ 
+ pub const InductionExit = struct {
+diff --git i/src/optimizer/optimizer.zig w/src/optimizer/optimizer.zig
+index ba98097..148817c 100644
+--- i/src/optimizer/optimizer.zig
++++ w/src/optimizer/optimizer.zig
+@@ -44,15 +44,30 @@ fn optimizeInto(scratch: std.mem.Allocator, body: *const Body, context: anytype)
+         return measured(.optimization_compaction, compaction.compact, .{ scratch, &function });
+     try check(&function);
+     const final = @hasDecl(@TypeOf(context), "inlineBody");
+-    const inlined = final and try measured(.optimization_inline, inlining.inlineCalls, .{ &function, context });
+-    if (inlined) try check(&function);
+-    if (!final or inlined) try simplify(&function, context, &numbering_workspace, &field_layouts);
+     if (final) {
+-        const hoisted = try measured(.optimization_hoist, hoisting.hoist, .{&function});
++        // Pruning an inlined body can free room for later small callees. Keep
++        // the original caller's growth limit across rounds so simplification
++        // exposes opportunities without repeatedly multiplying that limit.
++        const budget = inlining.growthBudget(&function);
++        while (try measured(.optimization_inline, inlining.inlineCalls, .{ &function, context, budget })) {
++            try check(&function);
++            try simplify(&function, context, &numbering_workspace, &field_layouts);
++        }
++    } else {
++        try simplify(&function, context, &numbering_workspace, &field_layouts);
++    }
++    if (final) {
++        var needs_simplification = try measured(.optimization_hoist, hoisting.hoist, .{&function});
+         try check(&function);
+-        const transformed = try measured(.optimization_idioms, idioms.transform, .{ &function, context });
+-        try check(&function);
+-        if (hoisted or transformed) try simplify(&function, context, &numbering_workspace, &field_layouts);
++        while (true) {
++            const transformed = try measured(.optimization_idioms, idioms.transform, .{ &function, context });
++            try check(&function);
++            if (!needs_simplification and !transformed) break;
++            try simplify(&function, context, &numbering_workspace, &field_layouts);
++            // Simplifying joins left by an inner loop rewrite can expose its
++            // containing loop's counter and carried exit.
++            needs_simplification = false;
++        }
+     }
+     return measured(.optimization_compaction, compaction.compact, .{ scratch, &function });
+ }
+diff --git i/tests/codegen_test.zig w/tests/codegen_test.zig
+index 735a5e2..fd13a86 100644
+--- i/tests/codegen_test.zig
++++ w/tests/codegen_test.zig
+@@ -227,6 +227,37 @@ test "machine indexed stack loads preserve compact displacements and spilled res
+     }
+ }
+ 
++test "machine direct indices preserve narrow writes signed offsets and spill fallbacks" {
++    for (std.enums.values(test_sources.x86_encoding.Register)) |selected| for ([_]bool{ false, true }) |byte| for (0..7) |mode| {
++        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
++        defer function.deinit();
++        try function.immediate(.mov_eax, 3);
++        try function.register(if (mode == 1) .store_rax else .store_eax, @fromBackingInt(0), 0);
++        const start = try function.position();
++        try function.register(.load_eax, @fromBackingInt(0), 0);
++        if (mode == 3) _ = try function.position();
++        try function.emit(if (mode == 2) .movsxd_rcx_eax else .mov_ecx_eax);
++        if (mode == 4 or mode == 5) try function.register(.load_rax, @fromBackingInt(1), 0) else try function.offset(.lea_rax_rsp, 128);
++        try function.emit(if (byte) .add_rax_rcx else .lea_rax_rax_rcx_4);
++        try function.offset(if (byte) .movzx_eax_rax else .mov_eax_rax, 0);
++        try function.register(.store_eax, @fromBackingInt(2), 0);
++        try function.instructions.append(std.testing.allocator, .scratch_dead);
++        var encoded = try function.encode(&.{ if (mode == 6) null else selected, if (mode == 4) null else .r13, selected }, &.{ 256, 264, 272 }, &.{});
++        defer encoded.deinit(std.testing.allocator);
++        const listing = try test_sources.disasm.disassemble(encoded.code.items[encoded.positions[start]..], std.testing.allocator);
++        defer std.testing.allocator.free(listing);
++        try std.testing.expect(std.mem.indexOf(u8, listing, "  db ") == null);
++        if (mode == 0 or mode == 5) {
++            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, listing, "\n"));
++            const index = try std.fmt.allocPrint(std.testing.allocator, "+{s}{s}{s}", .{ @tagName(selected), if (byte) "" else "*4", if (mode == 0) "+128]" else "]" });
++            defer std.testing.allocator.free(index);
++            try std.testing.expect(std.mem.indexOf(u8, listing, index) != null);
++        } else {
++            try std.testing.expect(std.mem.indexOf(u8, listing, if (mode == 2) "movsxd rcx" else "mov ecx") != null);
++        }
++    };
++}
++
+ test "loop byte array element copies preserve zero extension and aliases" {
+     try test_sources.SourceFixture.expectParity(
+         \\func check(limit: int) int
+@@ -363,6 +394,30 @@ test "machine symbolic positions resolve after register and spill encoding" {
+     }
+ }
+ 
++test "machine branches bypass coalesced edge stubs and preserve actual copies" {
++    for ([_]bool{ false, true }) |coalesced| {
++        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
++        defer function.deinit();
++        try function.immediate(.mov_eax, 3);
++        try function.register(.store_eax, @fromBackingInt(0), 0);
++        const edge = try function.patchable(.jne);
++        const continuation = try function.position();
++        try function.emit(.ret);
++        const stub = try function.position();
++        try function.patch(edge, stub);
++        try function.register(.load_eax, @fromBackingInt(0), 0);
++        try function.register(.store_eax, @fromBackingInt(1), 0);
++        try function.instructions.append(std.testing.allocator, .scratch_dead);
++        const back = try function.patchable(.jmp);
++        try function.patch(back, continuation);
++        var encoded = try function.encode(&.{ .r12, if (coalesced) .r12 else .rbx }, &.{ 0, 4 }, &.{});
++        defer encoded.deinit(std.testing.allocator);
++        const field = encoded.fields[edge];
++        const relative = std.mem.readInt(i32, encoded.code.items[field..][0..4], .little);
++        try std.testing.expectEqual(@as(i64, encoded.positions[if (coalesced) continuation else stub]), @as(i64, field) + 4 + relative);
++    }
++}
++
+ test "machine register copies forward only when scratch is dead" {
+     for (0..5) |mode| {
+         var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+@@ -375,7 +430,7 @@ test "machine register copies forward only when scratch is dead" {
+         defer encoded.deinit(std.testing.allocator);
+         const expected: []const u8 = switch (mode) {
+             0 => &.{ 0x41, 0x8B, 0xDC },
+-            1 => &.{},
++            1 => &.{ 0x45, 0x8b, 0xe4 },
+             2, 3 => &.{ 0x44, 0x89, 0xE0, 0x89, 0xC3 },
+             else => &.{ 0x8B, 0x04, 0x24, 0x89, 0xC3 },
+         };
+@@ -630,8 +685,8 @@ test "machine live ranges reuse registers between separate definitions" {
+     try std.testing.expect(!allocation.registers[0].?.calleeSaved());
+ }
+ 
+-test "machine loop counter preferences remove copies without overwriting retained inputs" {
+-    for ([_]bool{ false, true }) |retained| {
++test "machine loop counter preferences preserve retained inputs and outlined backedges" {
++    for ([_]bool{ false, true }) |retained| for ([_]bool{ false, true }) |outlined| {
+         var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+         defer function.deinit();
+         const counter: test_sources.machine.ValueId = @fromBackingInt(0);
+@@ -651,8 +706,13 @@ test "machine loop counter preferences remove copies without overwriting retaine
+         try function.immediate(.cmp_eax, 5);
+         try function.instructions.append(std.testing.allocator, .scratch_dead);
+         const backedge = try function.patchable(.jne);
+-        try function.patch(backedge, header);
++        if (!outlined) try function.patch(backedge, header);
+         try function.emit(.ret);
++        if (outlined) {
++            try function.patchHere(backedge);
++            const back = try function.patchable(.jmp);
++            try function.patch(back, header);
++        }
+         var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 2);
+         defer allocation.deinit(std.testing.allocator);
+         try std.testing.expect(allocation.registers[0] != null);
+@@ -667,7 +727,7 @@ test "machine loop counter preferences remove copies without overwriting retaine
+             const start = encoded.positions[header];
+             try std.testing.expectEqualSlices(u8, expected.items, encoded.code.items[start..][0..expected.items.len]);
+         }
+-    }
++    };
+ }
+ 
+ test "machine division branches preserve live loop values and signed overflow" {
+@@ -1623,6 +1683,42 @@ test "native predicate branches without edge copies use one conditional jump" {
+     }
+ }
+ 
++test "native conditional edge copies leave the other edge as fallthrough" {
++    for ([_]bool{ false, true }) |taken| {
++        var arguments = [_]structures.FunctionBlockArgument{ .{ .type_id = .int }, .{ .type_id = .int } };
++        var uses = [_]structures.FunctionValueUse{ .{ .value = @fromBackingInt(4) }, .{ .value = @fromBackingInt(5) } };
++        var instructions = [_]structures.FunctionInstruction{
++            integerConstant(if (taken) -1 else 1),                                                                                                     integerConstant(0),                                                                                                                        integerConstant(42), integerConstant(7),
++            .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } }, .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 1, .end = 2 }, .return_type = .never } },
++        };
++        var calls = [_]structures.FunctionCallArgument{ .{ .prepared = .{ .value = @fromBackingInt(0) } }, .{ .prepared = .{ .value = @fromBackingInt(1) } } };
++        var blocks = [_]structures.FunctionBlock{
++            .{ .instruction_start = 0, .instruction_end = 4, .terminator = .{ .predicate_branch = .{
++                .operation = .lti,
++                .operands = .{ .lhs = @fromBackingInt(2), .rhs = @fromBackingInt(3) },
++                .then_branch = .{ .target = @fromBackingInt(1), .arguments = .{ .start = 0, .end = 1 } },
++                .else_branch = .{ .target = @fromBackingInt(2), .arguments = .{ .start = 1, .end = 2 } },
++            } } },
++            .{ .argument_end = 1, .instruction_start = 4, .instruction_end = 5, .terminator = .diverge },
++            .{ .argument_start = 1, .argument_end = 2, .instruction_start = 5, .instruction_end = 6, .terminator = .diverge },
++        };
++        var body = functionSsa(&instructions, &blocks);
++        body.block_arguments = &arguments;
++        body.branch_arguments = &uses;
++        body.call_arguments = &calls;
++        var artifact = try codegen.compileFunction(&body, TestTypes{}, std.testing.allocator);
++        defer artifact.deinit(std.testing.allocator);
++        const listing = try test_sources.disasm.disassemble(artifact.code, std.testing.allocator);
++        defer std.testing.allocator.free(listing);
++        const jump = std.mem.indexOf(u8, listing, "  jl ").?;
++        const end = std.mem.indexOfScalarPos(u8, listing, jump, '\n').?;
++        const label = try std.fmt.allocPrint(std.testing.allocator, "{s}:\n", .{listing[jump + 5 .. end]});
++        defer std.testing.allocator.free(label);
++        try std.testing.expect(std.mem.indexOf(u8, listing, label).? > std.mem.lastIndexOf(u8, listing, "  ud2").?);
++        try expectArtifactExitCode(artifact, if (taken) 42 else 7);
++    }
++}
++
+ test "loop layout preserves skipped bodies and state on both exits" {
+     try test_sources.SourceFixture.expectParity(
+         \\func scan(limit: int, needle: int) int
+diff --git i/tests/optimizer_test.zig w/tests/optimizer_test.zig
+index 0466f2a..646aaf2 100644
+--- i/tests/optimizer_test.zig
++++ w/tests/optimizer_test.zig
+@@ -545,6 +545,72 @@ test "carried exit rotation preserves empty and final range iterations" {
+     try testing.expectEqual(@as(usize, 0), count(body, &.{.select}));
+ }
+ 
++test "terminal range counters prove guarded array bounds and withdraw edited guards" {
++    for ([_][]const u8{ "first..=limit", "(first..=limit).reversed()" }) |range| {
++        const program = try test_sources.renderTemplate(testing.allocator,
++            \\func scan(first: int, limit: int) int
++            \\    if first < 0 or limit >= 8 -> return 0
++            \\    var values: Array(int, 8) = [0, 1, 2, 3, 4, 5, 6, 7]
++            \\    var sum = 0
++            \\    for index in $range
++            \\        sum += values[index]
++            \\    return sum
++            \\func run() int -> scan(1, 4) + scan(3, 3) + scan(9, 2) + scan(0, -1) + 29
++        , .{ .range = range });
++        defer testing.allocator.free(program);
++        try Fixture.expectParity(program, 42);
++        const checked = try testing.allocator.print("{s}\nexit(scan(0, 8))", .{program});
++        defer testing.allocator.free(checked);
++        const fixture = try Fixture.init(checked);
++        defer fixture.deinit();
++        try fixture.expectExit(0, 0);
++        const before = (try optimizedBody(fixture, "scan")).*.?;
++        try testing.expectEqual(@as(usize, 0), countCalls(before));
++        const edited = try std.mem.replaceOwned(u8, testing.allocator, checked, "limit >= 8", "limit > 8");
++        defer testing.allocator.free(edited);
++        try fixture.db.setInput(queries.SourceText, 0, edited);
++        const after = (try optimizedBody(fixture, "scan")).*.?;
++        try testing.expect(countCalls(after) != 0);
++        try fixture.expectExit(0, 134);
++    }
++}
++
++test "carried exit rotation preserves a conditional backedge and its separate return" {
++    const program =
++        \\func scan(first: int, limit: int, empty: bool) int
++        \\    var value = first
++        \\    var finished = empty
++        \\    var count = 0
++        \\    loop
++        \\        if finished -> break
++        \\        if value == limit -> finished = true else value += 1
++        \\        count += 1
++        \\        if value < 0 -> return 9
++        \\    return count + 10 * value
++        \\func run() int -> scan(0, 2, false) + scan(2, 2, false) + scan(-1, -1, false) + scan(3, 1, true) - 41
++    ;
++    try Fixture.expectParity(program, 42);
++    const fixture = try Fixture.init(program);
++    defer fixture.deinit();
++    const body = (try optimizedBody(fixture, "scan")).*.?;
++    try testing.expectEqual(@as(usize, 0), count(body, &.{.select}));
++}
++
++test "terminal counter proofs preserve unconditional final overflow" {
++    const fixture = try Fixture.init(
++        \\func scan(first: int, limit: int) int
++        \\    var index = first
++        \\    loop
++        \\        const next = index + 1
++        \\        if index == limit -> break
++        \\        index = next
++        \\    return 42
++        \\exit(scan(2147483647, 2147483647))
++    );
++    defer fixture.deinit();
++    try fixture.expectExit(0, 134);
++}
++
+ test "carried exit rotation preserves observable cursor and finished state" {
+     try Fixture.expectParity(
+         \\func walk(limit: int) int
+@@ -1356,6 +1422,59 @@ test "a zero inline limit keeps calls out of line" {
+     try testing.expect(countCalls(run) >= 6);
+ }
+ 
++test "inlining reuses pruned growth capacity without multiplying the caller budget" {
++    const batch_calls = block: {
++        const line = "    sum += choose(true, value)\n";
++        var text: [line.len * 48]u8 = undefined;
++        for (0..48) |index| @memcpy(text[index * line.len ..][0..line.len], line);
++        break :block text;
++    };
++    const growing_calls = block: {
++        const line = "    sum = choose(flag, sum)\n";
++        var text: [line.len * 48]u8 = undefined;
++        for (0..48) |index| @memcpy(text[index * line.len ..][0..line.len], line);
++        break :block text;
++    };
++    const program =
++        \\func choose(flag: bool, value: int) int
++        \\    if flag -> return value
++        \\    var result = value
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    result += 1
++        \\    return result
++        \\func batch(value: int) int
++        \\    var sum = 0
++    ++ "\n" ++ batch_calls ++
++        \\    return sum
++        \\func growing(flag: bool, value: int) int
++        \\    var sum = value
++    ++ "\n" ++ growing_calls ++
++        \\    return sum
++        \\func run() int -> batch(1) + growing(false, 0) + growing(true, 3) - 777
++    ;
++    try Fixture.expectParity(program, 42);
++    const fixture = try Fixture.init(program);
++    defer fixture.deinit();
++    const batch = (try optimizedBody(fixture, "batch")).*.?;
++    try testing.expectEqual(@as(usize, 0), try countCallsTo(batch, "choose", fixture));
++    const growing = (try optimizedBody(fixture, "growing")).*.?;
++    try testing.expect(try countCallsTo(growing, "choose", fixture) != 0);
++}
++
+ test "power of two division rewrites to signed shifts and preserves truncation" {
+     for ([_]i32{ 2, -2, 4, -4, 8, -8, 1024, -1024, 1073741824, -1073741824, -2147483648 }) |divisor| {
+         const program = try testing.allocator.print(

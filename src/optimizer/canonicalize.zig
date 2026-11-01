@@ -29,9 +29,11 @@ pub fn canonicalize(function: *Function) !function_ir.Changes {
                     var instruction = original;
                     if (try rules.simplify(&instruction, result)) {
                         function.instructions.items[index] = instruction;
-                        changed = true;
+                        changes.changed = true;
+                        changed = changed or original != .call;
                         changes.storage = changes.storage or switch (original) {
                             .borrow_read, .borrow_write, .borrow_address => true,
+                            .call => false,
                             else => function_ir.usesStorage(function, &original) or function_ir.usesStorage(function, &instruction),
                         };
                     }
@@ -103,8 +105,21 @@ const Rules = struct {
             .compare => |operation| return self.simplifyCompare(instruction, operation, result),
             .borrow_write => |operation| return self.simplifyBorrowWrite(instruction, operation),
             .select => |operation| return self.simplifySelect(operation, result),
+            .call => |*call| return self.simplifyCall(call),
             else => return false,
         }
+    }
+
+    fn simplifyCall(self: *Rules, call: *structures.FunctionCall) bool {
+        const target = switch (call.target) {
+            .indirect => |value| self.function.find(value),
+            .direct, .initializer => return false,
+        };
+        if (self.isAddressTaken(target) or !self.function.plainValue(target)) return false;
+        const definition = self.function.definition(target) orelse return false;
+        if (definition != .function_ref) return false;
+        call.target = .{ .direct = definition.function_ref.instance() };
+        return true;
     }
 
     /// Bounds describe successful i32 results. A trapping producer remains live

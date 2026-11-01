@@ -299,6 +299,7 @@ const ParameterSimplifier = struct {
                     changed = true;
                 }
             }
+            if (function.find(parameter) == parameter and try self.selectParameter(block, position)) changed = true;
         }
         if (changed) {
             const parameters = function.blocks.items[block].parameters.items;
@@ -321,6 +322,65 @@ const ParameterSimplifier = struct {
             function.blocks.items[block].parameters.shrinkRetainingCapacity(kept);
         }
         return changed;
+    }
+
+    const Arm = struct { fork: u32, ordinal: u1 };
+
+    fn armOrigin(self: *ParameterSimplifier, edge: Incoming) ?Arm {
+        const source = self.function.blocks.items[edge.block];
+        if (source.terminator == .predicate_branch) return .{ .fork = edge.block, .ordinal = edge.ordinal };
+        if (source.terminator != .branch or self.incoming[edge.block].items.len != 1) return null;
+        const before = self.incoming[edge.block].items[0];
+        if (self.function.blocks.items[before.block].terminator != .predicate_branch) return null;
+        return .{ .fork = before.block, .ordinal = before.ordinal };
+    }
+
+    fn availableAt(self: *ParameterSimplifier, graph: @import("graph.zig").Graph, value: ValueId, at: u32) bool {
+        const function = self.function;
+        switch (function.definitions.items[@backingInt(value)]) {
+            .argument => |argument| return graph.dominates(argument.block, at),
+            .instruction => |index| {
+                for (graph.order) |block| {
+                    if (std.mem.indexOfScalar(u32, function.blocks.items[block].instructions.items, index) != null) return graph.dominates(block, at);
+                }
+                unreachable;
+            },
+        }
+    }
+
+    // A scalar join can select values already available at the fork without
+    // speculating either arm's instructions. In particular, checked updates
+    // remain conditional while their independently carried flags simplify.
+    fn selectParameter(self: *ParameterSimplifier, block: u32, position: usize) !bool {
+        const function = self.function;
+        const incoming = self.incoming[block].items;
+        if (incoming.len != 2) return false;
+        const parameter = function.blocks.items[block].parameters.items[position];
+        if (function.valueType(parameter) != .bool or !try self.stable(parameter)) return false;
+        const first = self.armOrigin(incoming[0]) orelse return false;
+        const second = self.armOrigin(incoming[1]) orelse return false;
+        if (first.fork != second.fork or first.ordinal == second.ordinal or first.fork == block) return false;
+        const fork = first.fork;
+        const predicate = function.blocks.items[fork].terminator.predicate_branch;
+        if (predicate.operation == .eqt or predicate.operation == .net) return false;
+        var values: [2]ValueId = undefined;
+        const graph = (try function.controlFlow()).*;
+        if (!graph.dominates(fork, block)) return false;
+        for (incoming, [_]Arm{ first, second }) |edge, arm| {
+            const argument = function.branchArguments(edge.branch(function).*)[position];
+            if (argument.coerce_to != null or argument.variant_tag_mapping != null) return false;
+            const value = function.find(argument.value);
+            if (!try self.stable(value) or !self.availableAt(graph, value, fork)) return false;
+            values[arm.ordinal] = value;
+        }
+        const source = function.blocks.items[fork];
+        const condition = try function.insertInstruction(fork, source.instructions.items.len, .{ .compare = .{ .operation = predicate.operation, .operands = predicate.operands } }, source.span, source.frame);
+        const selected = if (boolean(function, values[0]) == true and boolean(function, values[1]) == false)
+            condition
+        else
+            try function.insertInstruction(fork, function.blocks.items[fork].instructions.items.len, .{ .select = .{ .condition = condition, .then_value = values[0], .else_value = values[1], .type_id = .bool } }, source.span, source.frame);
+        function.replace(parameter, selected);
+        return true;
     }
 };
 
@@ -353,7 +413,48 @@ const Sweep = struct {
         return true;
     }
 
-    fn threadExit(self: *Sweep, block: u32) bool {
+    fn selectEdgeArguments(self: *Sweep, block: u32) !bool {
+        const function = self.function;
+        const terminator = &function.blocks.items[block].terminator;
+        if (terminator.* != .predicate_branch) return false;
+        const predicate = terminator.predicate_branch;
+        var changed = false;
+        for (Function.edges(terminator), 0..) |maybe_edge, ordinal| {
+            const edge = maybe_edge orelse continue;
+            const arguments = function.branchArguments(edge.*);
+            var replacements: ?[]structures.FunctionValueUse = null;
+            for (arguments, 0..) |argument, index| {
+                const value = function.find(argument.value);
+                if (@backingInt(value) >= self.address_taken.len or self.address_taken[@backingInt(value)]) continue;
+                const definition = function.definition(value) orelse continue;
+                if (definition != .select) continue;
+                const select = definition.select;
+                const condition = function.find(select.condition);
+                const taken = if ((predicate.operation == .eqb or predicate.operation == .neb) and function.find(predicate.operands.lhs) == condition) flag: {
+                    const expected = boolean(function, function.find(predicate.operands.rhs)) orelse continue;
+                    break :flag expected == ((predicate.operation == .eqb) == (ordinal == 0));
+                } else compared: {
+                    const comparison = function.definition(condition) orelse continue;
+                    if (comparison != .compare or !std.meta.eql(comparison.compare.operands, predicate.operands)) continue;
+                    if (comparison.compare.operation == predicate.operation) break :compared ordinal == 0;
+                    if (comparison.compare.operation == predicate.operation.negated()) break :compared ordinal != 0;
+                    continue;
+                };
+                const selected = function.find(if (taken) select.then_value else select.else_value);
+                if (!function.plainValue(selected) or @backingInt(selected) >= self.address_taken.len or self.address_taken[@backingInt(selected)]) continue;
+                if (replacements == null) replacements = try function.scratch.dupe(structures.FunctionValueUse, arguments);
+                replacements.?[index].value = selected;
+            }
+            if (replacements) |values| {
+                edge.arguments = try function.appendBranchArguments(values);
+                changed = true;
+            }
+        }
+        if (changed) self.touch(block);
+        return changed;
+    }
+
+    fn threadExit(self: *Sweep, block: u32) !bool {
         const function = self.function;
         for (Function.edges(&function.blocks.items[block].terminator)) |maybe_edge| {
             const edge = maybe_edge orelse continue;
@@ -367,25 +468,53 @@ const Sweep = struct {
             const rhs = self.incomingValue(join, edge.*, predicate.operands.rhs) orelse continue;
             const order = if (lhs == rhs) .eq else std.math.order(scalarConstant(function, lhs) orelse continue, scalarConstant(function, rhs) orelse continue);
             const selected = if (predicate.operation.holds(order)) predicate.then_branch else predicate.else_branch;
-            if (selected.arguments.start != selected.arguments.end) continue;
-            const exit = function.blocks.items[@backingInt(selected.target)];
-            switch (exit.terminator) {
-                .return_unit, .return_value, .diverge => {},
-                else => continue,
-            }
+            if (@backingInt(selected.target) == target) continue;
             if (self.dirty[@backingInt(selected.target)]) continue;
-            var uses: ParameterUses = .{ .function = function, .parameters = join.parameters.items };
-            const tables = function_ir.tableView(function);
-            for (exit.instructions.items) |index| {
-                if (!function.removed.items[index]) function_ir.visitInstructionReferences(tables, &function.instructions.items[index], &uses, ParameterUses.reference);
+            for (join.parameters.items) |parameter| {
+                if (!function.valueType(parameter).isPrimitive() or !function.plainValue(parameter) or self.address_taken[@backingInt(parameter)]) break;
+            } else {
+                if (!try self.independentExit(target, @backingInt(selected.target), join.parameters.items)) continue;
+                var arguments: std.ArrayList(structures.FunctionValueUse) = .empty;
+                for (function.branchArguments(selected)) |argument| {
+                    var forwarded = argument;
+                    forwarded.value = self.incomingValue(join, edge.*, argument.value) orelse break;
+                    try arguments.append(function.scratch, forwarded);
+                } else {
+                    edge.* = .{ .target = selected.target, .arguments = try function.appendBranchArguments(arguments.items) };
+                    self.touch(block);
+                    return true;
+                }
             }
-            function_ir.visitTerminatorReferences(tables, &exit.terminator, &uses, ParameterUses.reference);
-            if (uses.found) continue;
-            edge.* = selected;
-            self.touch(block);
-            return true;
         }
         return false;
+    }
+
+    // Bypassing a join cannot leave its parameters in use along the selected
+    // continuation. Re-entering the join defines them again, so it is a barrier
+    // rather than a reason to reject loop exits and outer-loop continuations.
+    fn independentExit(self: *Sweep, join: u32, start: u32, parameters: []const ValueId) !bool {
+        const function = self.function;
+        var visited = try std.DynamicBitSetUnmanaged.initEmpty(function.scratch, function.blocks.items.len);
+        var pending: std.ArrayList(u32) = .empty;
+        try pending.append(function.scratch, start);
+        visited.set(start);
+        visited.set(join);
+        var uses: ParameterUses = .{ .function = function, .parameters = parameters };
+        const tables = function_ir.tableView(function);
+        while (pending.pop()) |block| {
+            const continuation = &function.blocks.items[block];
+            for (continuation.instructions.items) |index| {
+                if (!function.removed.items[index]) function_ir.visitInstructionReferences(tables, &function.instructions.items[index], &uses, ParameterUses.reference);
+            }
+            function_ir.visitTerminatorReferences(tables, &continuation.terminator, &uses, ParameterUses.reference);
+            if (uses.found) return false;
+            for (function.successors(block)) |successor| if (successor) |target| {
+                if (visited.isSet(target)) continue;
+                visited.set(target);
+                try pending.append(function.scratch, target);
+            };
+        }
+        return true;
     }
 
     fn incomingValue(self: *Sweep, join: function_ir.Block, edge: structures.FunctionBranch, operand: ValueId) ?ValueId {
@@ -571,7 +700,7 @@ fn sweep(function: *Function) !bool {
     var changed = false;
     for (function.order.items) |block| {
         if (!reachable[block] or state.dirty[block]) continue;
-        if (state.foldSameTarget(block) or state.threadExit(block) or try state.formSelect(block) or try state.merge(block) or try state.forward(block)) changed = true;
+        if (state.foldSameTarget(block) or try state.selectEdgeArguments(block) or try state.threadExit(block) or try state.formSelect(block) or try state.merge(block) or try state.forward(block)) changed = true;
     }
     return changed;
 }

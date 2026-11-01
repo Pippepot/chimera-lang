@@ -1,0 +1,34 @@
+--- a/build.zig
++++ b/build.zig
+@@ -35,6 +35,9 @@
+     compiler.build_id = .sha1;
+     b.installArtifact(compiler);
+ 
++    const performance_tools = b.step("build-performance-tools", "Build compiler and history driver without sampling");
++    performance_tools.dependOn(b.getInstallStep());
++
+     const run = b.addRunArtifact(compiler);
+     run.addPassthruArgs();
+     const run_step = b.step("run", "Compile and run a Chimera program");
+@@ -50,6 +53,7 @@
+         .{ .name = "conversion_benchmark", .source = "benchmarks/conversion_benchmark.zig", .step = "conversion-benchmark", .description = "Measure converter discovery and repeated matching" },
+         .{ .name = "std_benchmark", .source = "benchmarks/std_benchmark.zig", .step = "std-benchmark", .description = "Compare fresh compilation with source and precompiled std", .bundled_std = true },
+         .{ .name = "history_benchmark", .source = "benchmarks/history_benchmark.zig", .step = "history-benchmark", .description = "Measure versioned end-to-end compiler workloads", .optimize = .fast, .bundled_std = true },
++        .{ .name = "provenance_benchmark", .source = "benchmarks/provenance_benchmark.zig", .step = "provenance-benchmark", .description = "Measure result-correlated mutation provenance", .optimize = .fast, .bundled_std = true },
+     }) |benchmark| {
+         const benchmark_optimize = benchmark.optimize orelse optimize;
+         const benchmark_module = b.createModule(.{
+@@ -61,8 +65,12 @@
+         if (benchmark.bundled_std)
+             benchmark_module.addAnonymousImport("standard_bundle", .{ .root_source_file = standard_bundle });
+         const executable = b.addExecutable(.{ .name = benchmark.name, .root_module = benchmark_module, .use_llvm = benchmark_optimize == .fast });
++        if (std.mem.eql(u8, benchmark.name, "history_benchmark")) {
++            const install_benchmark = b.addInstallArtifact(executable, .{});
++            performance_tools.dependOn(&install_benchmark.step);
++        }
+         const benchmark_run = b.addRunArtifact(executable);
+-        if (std.mem.eql(u8, benchmark.name, "history_benchmark")) {
++        if (std.mem.eql(u8, benchmark.name, "history_benchmark") or std.mem.eql(u8, benchmark.name, "provenance_benchmark")) {
+             benchmark_run.addPassthruArgs();
+         }
+         b.step(benchmark.step, benchmark.description).dependOn(&benchmark_run.step);

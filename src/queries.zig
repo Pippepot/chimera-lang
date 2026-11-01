@@ -971,6 +971,7 @@ pub fn AnalysisContext(comptime Context: type) type {
         prior_static_arguments: ?[]const structures.CompileTimeValueId = null,
         public_annotation: bool = false,
         reference_inference: ?*ReferenceInference = null,
+        merged_reference_effects: ?*bool = null,
         static_bindings: []const structures.StaticBinding = &.{},
 
         pub fn withStaticBindings(self: @This(), bindings: []const structures.StaticBinding) @This() {
@@ -1127,7 +1128,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             return semanticValue(self.ctx, declaration.resolved.file_id, instance, semantic.analyzer(&declaration.parsed, declaration.source, declaration.analysis, self.ctx.allocator()).run("analyzeIndependentParameterType", .{ declaration.resolved.declaration, runtime_index }));
         }
 
-        pub fn inferStaticArguments(self: @This(), instance: structures.InstanceId, argument_types: []const structures.TypeId) !semantic.StaticInference {
+        pub fn inferStaticArguments(self: @This(), instance: structures.InstanceId, argument_types: anytype) !semantic.StaticInference {
             const declaration = try self.declarationContext(instance, &.{});
             const inherited_from = if (try self.needsInheritedInference(instance)) blk: {
                 const location = try self.ctx.lookupInterned(ItemLocations, instance.item);
@@ -1426,11 +1427,20 @@ pub fn AnalysisContext(comptime Context: type) type {
             }
             if (!needs_contract) return .{};
             if (self.reference_inference) |inference| return inference.request(self.ctx, instance);
+            if (self.merged_reference_effects) |precise| {
+                const effects = (try self.ctx.get(InferReferenceEffects, instance)).* orelse return null;
+                precise.* = precise.* and effects.precise;
+                return effects.contract;
+            }
             return (try self.ctx.get(InferReferenceContract, instance)).*;
         }
 
         pub fn functionSignature(self: @This(), instance: structures.InstanceId) !?structures.FunctionSignature {
             return lookupFunctionSignature(self.ctx, instance);
+        }
+
+        pub fn returnedCallableReferenceContract(self: @This(), instance: structures.InstanceId) !?ReturnedCallableReferenceContract {
+            return (try self.ctx.get(InferReturnedCallableReferenceContract, instance)).*;
         }
 
         pub fn functionShape(self: @This(), item_id: structures.ItemId) !?structures.FunctionShape {
@@ -1439,6 +1449,10 @@ pub fn AnalysisContext(comptime Context: type) type {
 
         pub fn functionOverloads(self: @This(), overload: structures.FunctionOverloadId) !structures.FunctionOverloadSet {
             return (try self.ctx.lookupInterned(FunctionOverloads, overload)).*;
+        }
+
+        pub fn genericFunctionReference(self: @This(), instance: structures.InstanceId) !structures.FunctionOverloadId {
+            return try self.ctx.intern(FunctionOverloads, .{ .candidates = &.{instance} });
         }
 
         pub fn overloadOperation(self: @This(), overload: structures.FunctionOverloadId) !?structures.Operation {
@@ -1641,12 +1655,7 @@ pub fn AnalysisContext(comptime Context: type) type {
                 .type => |type_id| type_id,
                 .runtime => |runtime| if (runtime.value == .variant) runtime.value.variant.member_type else runtime.type_id,
             };
-            const members = (try self.facts().variantMembers(source_type)) orelse &.{source_type};
-            const accepted = (try self.facts().variantMembers(target)) orelse &.{target};
-            for (members) |member| {
-                if (std.mem.indexOfScalar(structures.TypeId, accepted, member) == null) return false;
-            }
-            return true;
+            return try semantic.canWidenTo(self, source_type, target);
         }
 
         pub fn structIdentityType(self: @This(), identity: structures.StructIdentity) !structures.TypeId {
@@ -3364,7 +3373,7 @@ fn resolveStaticInstance(ctx: anytype, instance: structures.InstanceId) anyerror
         .exit => return null,
     };
     const expected_type = runtime_annotation orelse return value_id;
-    var value = (try ctx.lookupInterned(CompileTimeValues, value_id)).*;
+    const value = (try ctx.lookupInterned(CompileTimeValues, value_id)).*;
     if (value == .type) {
         try typing.emitSemanticIssue(ctx, resolved.file_id, .{
             .span = nodeSpan(&parsed, initializer),
@@ -3383,22 +3392,8 @@ fn resolveStaticInstance(ctx: anytype, instance: structures.InstanceId) anyerror
         });
         return null;
     }
-    if (typed_runtime.type_id != expected_type) {
-        if (try typePayload(ctx, expected_type, .variant)) |variant| {
-            const members = variant.members;
-            const active_type = if (typed_runtime.value == .variant) typed_runtime.value.variant.member_type else typed_runtime.type_id;
-            const payload = if (typed_runtime.value == .variant) typed_runtime.value.variant.payload else value_id;
-            const tag = (try semantic.widenedVariantTag(analysis_context, active_type, members)) orelse unreachable;
-            value.runtime.value = .{ .variant = .{ .member_type = members[tag], .payload = payload } };
-        } else {
-            std.debug.assert(try typePayload(ctx, expected_type, .callable) != null);
-            var reference = value.runtime.value.function_ref;
-            reference.type_id = expected_type;
-            value.runtime.value = .{ .function_ref = reference };
-        }
-    }
-    value.runtime.type_id = expected_type;
-    return try ctx.intern(CompileTimeValues, value);
+    std.debug.assert(typed_runtime.type_id == expected_type);
+    return value_id;
 }
 
 pub const AnalyzeComptimeThunk = CompilerQuery("AnalyzeComptimeThunk", .body_overhead, analyzeComptimeThunk, .{});
@@ -4070,6 +4065,29 @@ fn referenceComponent(ctx: anytype, instance: structures.InstanceId) !?[]const s
 
 pub const InferReferenceContract = CompilerQuery("InferReferenceContract", .type_facts, inferReferenceContract, .{ .disk_boundary = true });
 
+pub const ReturnedCallableReferenceContract = union(enum) {
+    references: structures.ReferenceContract,
+    parameter: u32,
+
+    pub const eql = value_operations.Owned(@This()).eql;
+    pub const deinit = value_operations.Owned(@This()).deinit;
+};
+
+pub const InferReturnedCallableReferenceContract = CompilerQuery("InferReturnedCallableReferenceContract", .type_facts, inferReturnedCallableReferenceContract, .{});
+
+fn inferReturnedCallableReferenceContract(ctx: anytype, instance: structures.InstanceId) anyerror!?ReturnedCallableReferenceContract {
+    const body = (try ctx.get(AnalyzeFunctionInstance, instance)).* orelse return null;
+    const source = typing.returnedCallableSource(body) orelse return null;
+    switch (source) {
+        .instance => |target| {
+            const analysis_context: AnalysisContext(@TypeOf(ctx)) = .{ .ctx = ctx };
+            const references = (try analysis_context.functionReferenceContract(target)) orelse return null;
+            return .{ .references = references };
+        },
+        .parameter => |parameter| return .{ .parameter = parameter },
+    }
+}
+
 fn inferReferenceContract(ctx: anytype, instance: structures.InstanceId) anyerror!?structures.ReferenceContract {
     if (!try hasReferenceContractBody(ctx, instance)) return .{};
     const analyzed = ctx.get(AnalyzeFunctionInstance, instance) catch |err| switch (err) {
@@ -4128,7 +4146,209 @@ fn inferReferenceContract(ctx: anytype, instance: structures.InstanceId) anyerro
 pub const AnalyzeFunctionInstance = CompilerQuery("AnalyzeFunctionInstance", .body_overhead, analyzeFunctionInstance, .{ .disk_boundary = true });
 
 fn analyzeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?structures.FunctionBodyAnalysis {
+    const reusable = ctx.get(TypeFunctionInstance, instance) catch |err| switch (err) {
+        error.QueryCycle, error.Unavailable, error.SourceRejected => null,
+        else => return err,
+    };
+    if (reusable) |cached| if (cached.*) |validated| {
+        const body = validated.body;
+        if (validated.precise or structures.ReferenceContract.equivalent(body.reference_contract, .{}))
+            return body;
+        if (try forwardingReferenceContract(ctx, instance, &body)) |contract| {
+            var result = body;
+            result.reference_contract = contract;
+            return result;
+        }
+    };
     return analyzeFunctionBody(ctx, false, instance, false, null);
+}
+
+fn forwardingParameter(body: *const structures.FunctionBodyAnalysis, value: structures.FunctionValueId, used: []bool) ?u32 {
+    var current = value;
+    while (@backingInt(current) >= body.block_arguments.len) {
+        const index = @backingInt(current) - body.block_arguments.len;
+        used[index] = true;
+        const instruction = body.instructions[index];
+        const previous: structures.FunctionValueId = switch (instruction) {
+            .borrow_read => instruction.borrow_read.source,
+            .borrow_address => instruction.borrow_address.source,
+            .value_copy => if (instruction.value_copy.destination == null) instruction.value_copy.source else return null,
+            else => return null,
+        };
+        if (@backingInt(previous) >= @backingInt(current)) return null;
+        current = previous;
+    }
+    return @backingInt(current);
+}
+
+fn forwardingReferenceContract(ctx: anytype, instance: structures.InstanceId, body: *const structures.FunctionBodyAnalysis) !?structures.ReferenceContract {
+    if (body.blocks.len != 1 or body.initializer_regions.len != 0) return null;
+    const terminator = body.blocks[0].terminator;
+    if (terminator != .return_value) return null;
+    if (terminator.return_value.coerce_to != null or terminator.return_value.variant_tag_mapping != null) return null;
+    var selected: ?structures.FunctionCall = null;
+    var returned: ?structures.FunctionValueId = null;
+    for (body.instructions, 0..) |instruction, index| {
+        switch (instruction) {
+            .call => {
+                if (selected != null or instruction.call.target != .direct) return null;
+                selected = instruction.call;
+                returned = instruction.call.destination orelse body.instructionValue(index);
+            },
+            .value_copy => {
+                if (instruction.value_copy.destination != null) return null;
+            },
+            .borrow_read, .borrow_address, .result_storage => {},
+            else => return null,
+        }
+    }
+    const call = selected orelse return null;
+    if (returned.? != terminator.return_value.value) return null;
+    const signature = (try lookupFunctionSignature(ctx, instance)) orelse return null;
+    const callee = (try lookupFunctionSignature(ctx, call.target.direct)) orelse return null;
+    if (!value_operations.equal(structures.FunctionSignature, signature, callee)) return null;
+    const arguments = body.call_arguments[call.arguments.start..call.arguments.end];
+    if (arguments.len != signature.parameters.len or body.block_arguments.len != arguments.len) return null;
+    const used = try ctx.allocator().alloc(bool, body.instructions.len);
+    @memset(used, false);
+    for (arguments, 0..) |argument, index| {
+        if (argument == .initializer or argument == .deinit) return null;
+        const use = argument.valueUse();
+        if (use.coerce_to != null or use.variant_tag_mapping != null) return null;
+        if ((forwardingParameter(body, use.value, used) orelse return null) != index) return null;
+    }
+    for (body.instructions, 0..) |instruction, index| {
+        if (instruction == .call or used[index]) continue;
+        if (instruction == .result_storage and call.destination == body.instructionValue(index)) continue;
+        return null;
+    }
+    const contract = (try ctx.get(InferReferenceContract, call.target.direct)).* orelse return null;
+    return contract;
+}
+
+pub const InferReferenceEffects = CompilerQuery("InferReferenceEffects", .type_facts, inferReferenceEffects, .{});
+
+const ReferenceEffects = struct {
+    contract: structures.ReferenceContract,
+    precise: bool,
+
+    pub fn eql(left: @This(), right: @This()) bool {
+        return left.precise == right.precise and structures.ReferenceContract.equivalent(left.contract, right.contract);
+    }
+};
+
+fn inferReferenceEffects(ctx: anytype, instance: structures.InstanceId) anyerror!?ReferenceEffects {
+    const typed = ctx.get(TypeFunctionInstance, instance) catch |err| switch (err) {
+        error.QueryCycle, error.Unavailable, error.SourceRejected => null,
+        else => return err,
+    };
+    const body = if (typed) |cached| cached.* else null;
+    var contract = if (body) |validated| validated.body.reference_contract else (try ctx.get(InferReferenceContract, instance)).* orelse return null;
+    if (contract.outputs.len == 0) return .{ .contract = contract, .precise = if (body) |validated| validated.precise else true };
+    const signature = (try lookupFunctionSignature(ctx, instance)) orelse return null;
+    const facts = TypeFacts(@TypeOf(ctx)){ .ctx = ctx };
+    for (contract.outputs) |output| {
+        std.debug.assert(output.parameter < signature.parameters.len);
+        const parameter = signature.parameters[output.parameter];
+        if (parameter.mode != .mut) return null;
+        const element = (try facts.borrowElement(parameter.type_id)) orelse element: {
+            const definition = (try facts.structDefinition(parameter.type_id)) orelse return null;
+            if (definition.fields.len != 1 or definition.fields[0].kind != .reference) return null;
+            break :element definition.fields[0].type_id;
+        };
+        if (try facts.canStoreBorrow(element)) return null;
+    }
+    var origins: std.ArrayList(structures.ReferenceOriginContract) = .empty;
+    try origins.appendSlice(ctx.allocator(), contract.origins);
+    for (contract.outputs) |output| {
+        for (output.origins) |entry| {
+            var origin = entry;
+            origin.output_parameter = output.parameter;
+            for (origins.items) |existing| {
+                if (structures.ReferenceContract.equivalent(.{ .origins = &.{existing}, .paths = contract.paths }, .{ .origins = &.{origin}, .paths = contract.paths })) break;
+            } else try origins.append(ctx.allocator(), origin);
+        }
+    }
+    contract.origins = origins.items;
+    contract.outputs = &.{};
+    return .{ .contract = contract, .precise = false };
+}
+
+fn ReferenceProbeContext(comptime Context: type) type {
+    return struct {
+        ctx: Context,
+        diagnostic: *bool,
+
+        pub fn allocator(self: @This()) std.mem.Allocator {
+            return self.ctx.allocator();
+        }
+
+        pub fn get(self: @This(), comptime Query: type, key: Query.Input) @TypeOf(self.ctx.get(Query, key)) {
+            return self.ctx.get(Query, key);
+        }
+
+        pub fn input(self: @This(), comptime Input: type, key: Input.Key) @TypeOf(self.ctx.input(Input, key)) {
+            return self.ctx.input(Input, key);
+        }
+
+        pub fn intern(self: @This(), comptime Interner: type, payload: Interner.Value) @TypeOf(self.ctx.intern(Interner, payload)) {
+            return self.ctx.intern(Interner, payload);
+        }
+
+        pub fn lookupInterned(self: @This(), comptime Interner: type, id: Interner.Id) @TypeOf(self.ctx.lookupInterned(Interner, id)) {
+            return self.ctx.lookupInterned(Interner, id);
+        }
+
+        pub fn emit(self: @This(), comptime Accumulator: type, _: Accumulator) !void {
+            self.diagnostic.* = true;
+        }
+    };
+}
+
+pub const TypeFunctionInstance = CompilerQuery("TypeFunctionInstance", .body_overhead, typeFunctionInstance, .{});
+
+const FunctionTyping = struct {
+    body: structures.FunctionBodyAnalysis,
+    precise: bool,
+
+    pub const eql = value_operations.Owned(@This()).eql;
+};
+
+fn typeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?FunctionTyping {
+    const loc = try ctx.lookupInterned(ItemLocations, instance.item);
+    if (loc.kind == .static or loc.kind == .structure) return null;
+    const signature: structures.FunctionSignature = if (loc.kind == .function)
+        (try lookupFunctionSignature(ctx, instance)) orelse return null
+    else
+        .{ .parameters = &.{}, .return_type = .unit };
+    const facts = TypeFacts(@TypeOf(ctx)){ .ctx = ctx };
+    if (signature.return_type == .type) return null;
+    for (signature.parameters) |parameter| {
+        if (parameter.mode == .imm or parameter.mode == .ref or parameter.mode == .mut) continue;
+        const capabilities = (try facts.ownershipCapabilities(parameter.type_id)) orelse return null;
+        if (capabilities.needs_automatic_drop or capabilities.requires_explicit_drop) return null;
+    }
+    const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
+    const symbol = (try ctx.get(ExternalSymbol, instance.item)).*;
+    const builtin_body: ?typing.BuiltinBody = if (symbol != null and intrinsics.hasTypedBody(symbol.?)) .{
+        .symbol = symbol.?,
+        .operation = if (symbol == .primitive_operation) loc.name.operation else null,
+    } else null;
+    var diagnostic = false;
+    const probe: ReferenceProbeContext(@TypeOf(ctx)) = .{ .ctx = ctx, .diagnostic = &diagnostic };
+    const construction = (try ctx.get(ConstructFunctionBody, instance)).* orelse return null;
+    if (construction != .success) return null;
+    const unresolved = construction.success;
+    var precise = true;
+    const analysis_context: AnalysisContext(@TypeOf(probe)) = .{
+        .ctx = probe,
+        .file_id = resolved.file_id,
+        .instance = instance,
+        .merged_reference_effects = &precise,
+    };
+    const body = (try typing.resolveBody(false, probe, instance, resolved.file_id, signature.parameters, signature.return_type, .{ .publish_instruction_spans = true, .is_entry = loc.kind == .top_level_entry, .builtin_body = builtin_body, .result_mode = signature.result_mode, .reference_independent_ownership = true }, analysis_context, unresolved)) orelse return null;
+    if (diagnostic) return null;
+    return .{ .body = body, .precise = precise };
 }
 
 pub const AnalyzeComptimeFunctionBody = CompilerQuery("AnalyzeComptimeFunctionBody", .body_overhead, analyzeComptimeFunctionBody, .{});
@@ -4137,7 +4357,11 @@ fn analyzeComptimeFunctionBody(ctx: anytype, instance: structures.InstanceId) an
     return analyzeFunctionBody(ctx, false, instance, true, null);
 }
 
-fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: structures.InstanceId, allow_type_values: bool, reference_inference: ?*ReferenceInference) !?if (contract_only) structures.ReferenceContract else structures.FunctionBodyAnalysis {
+pub const ConstructFunctionBody = CompilerQuery("ConstructFunctionBody", .body_overhead, constructFunctionBody, .{ .content_equality = true });
+
+const FunctionBodyConstruction = union(enum) { success: semantic.UnresolvedBody, unsupported: semantic.Issue };
+
+fn constructFunctionBody(ctx: anytype, instance: structures.InstanceId) anyerror!?FunctionBodyConstruction {
     const loc = try ctx.lookupInterned(ItemLocations, instance.item);
     if (loc.kind == .static or loc.kind == .structure) return null;
     if (loc.kind != .function) std.debug.assert(instance.specialization == null);
@@ -4145,7 +4369,6 @@ fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: str
         (try lookupFunctionSignature(ctx, instance)) orelse return null
     else
         .{ .parameters = &.{}, .return_type = .unit };
-    if (!allow_type_values and signature.return_type == .type) return null;
     const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
     if ((try ctx.get(BuildModuleScope, resolved.file_id)).* == null) return null;
     const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
@@ -4160,14 +4383,42 @@ fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: str
         .ctx = ctx,
         .file_id = resolved.file_id,
         .instance = instance,
-        .reference_inference = reference_inference,
     };
-    var unresolved = (try availableSemanticValue(ctx, resolved.file_id, instance, semantic.analyzer(&parsed, source, analysis_context, ctx.allocator()).buildUnresolvedBody(switch (loc.kind) {
+    const construction = semantic.analyzer(&parsed, source, analysis_context, ctx.allocator()).buildUnresolvedBody(switch (loc.kind) {
         .function => .{ .function = .{ .declaration = resolved.declaration, .parameters = signature.parameters } },
         .top_level_entry => .{ .entry = resolved.declaration },
         .static, .structure, .primitive, .overload => unreachable,
-    }))) orelse return null;
-    defer unresolved.deinit(ctx.allocator());
+    }) catch |err| switch (err) {
+        error.Unavailable => return null,
+        else => return err,
+    };
+    if (construction == .unsupported) return .{ .unsupported = construction.unsupported };
+    return .{ .success = construction.success };
+}
+
+fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: structures.InstanceId, allow_type_values: bool, reference_inference: ?*ReferenceInference) !?if (contract_only) structures.ReferenceContract else structures.FunctionBodyAnalysis {
+    const loc = try ctx.lookupInterned(ItemLocations, instance.item);
+    if (loc.kind == .static or loc.kind == .structure) return null;
+    if (loc.kind != .function) std.debug.assert(instance.specialization == null);
+    const signature: structures.FunctionSignature = if (loc.kind == .function)
+        (try lookupFunctionSignature(ctx, instance)) orelse return null
+    else
+        .{ .parameters = &.{}, .return_type = .unit };
+    if (!allow_type_values and signature.return_type == .type) return null;
+    const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
+    const symbol = (try ctx.get(ExternalSymbol, instance.item)).*;
+    const builtin_body: ?typing.BuiltinBody = if (symbol != null and intrinsics.hasTypedBody(symbol.?)) .{
+        .symbol = symbol.?,
+        .operation = if (symbol == .primitive_operation) loc.name.operation else null,
+    } else null;
+    const construction = (try ctx.get(ConstructFunctionBody, instance)).* orelse return null;
+    const unresolved = (try availableSemanticValue(ctx, resolved.file_id, instance, @as(anyerror!FunctionBodyConstruction, construction))) orelse return null;
+    const analysis_context: AnalysisContext(@TypeOf(ctx)) = .{
+        .ctx = ctx,
+        .file_id = resolved.file_id,
+        .instance = instance,
+        .reference_inference = reference_inference,
+    };
 
     return typing.resolveBody(
         contract_only,
@@ -4249,7 +4500,11 @@ fn OptimizationContext(comptime Context: type) type {
             if ((try self.ctx.get(ExternalSymbol, callee.item)).*) |symbol| if (!intrinsics.hasTypedBody(symbol)) return null;
             if (((try self.ctx.get(CallComponent, callee)).* orelse return null).members.len != 0) return null;
             if (!(try self.ctx.get(ValidateRuntimeFunction, callee)).*) return null;
-            return if ((try self.ctx.get(OptimizeFunctionInstance, callee)).*) |*body| body else null;
+            const optimized = self.ctx.get(OptimizeFunctionInstance, callee) catch |err| switch (err) {
+                error.QueryCycle => return null,
+                else => return err,
+            };
+            return if (optimized.*) |*body| body else null;
         }
 
         pub fn inlineFacts(self: @This(), callee: structures.InstanceId) !?@import("optimizer/inline.zig").Facts {

@@ -270,7 +270,7 @@ fn compileAndRun(
 
     if (input.debug_flags.ssa) try debug.renderReachableSsa(queries.AnalyzeFunctionInstance, db, file_id, render_sources.items, output);
     if (input.debug_flags.optimized) try debug.renderReachableSsa(queries.OptimizeFunctionInstance, db, file_id, render_sources.items, output);
-    if (input.debug_flags.@"asm") try debug.renderAssembly(db, file_id, render_sources.items, executable, gpa, output);
+    if (input.debug_flags.@"asm") try debug.renderAssembly(db, file_id, render_sources.items, gpa, output);
     try output.flush();
     timings.mark(io, "debug output");
 

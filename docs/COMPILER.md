@@ -22,6 +22,12 @@ compiler. `safe` is optimized with safety checks; `fast` disables them and uses
 LLVM. These modes build the compiler, not an optimization mode for generated
 Chimera code. There is no independent backend option.
 
+The std precompiler always builds in `debug` mode with the self-hosted backend
+to minimize rebuild time, independently of compiler and test optimization modes.
+When rebuilding the std bundle, it reports `Precompiled std in ... ms` on stderr.
+This measures bundle creation and writing, not compilation of the precompiler
+executable. Cached builds do not repeat the report.
+
 ```sh
 zig build run -Doptimize=fast -- --debug=timing example.chi
 ```
@@ -56,6 +62,8 @@ zig build run -- --debug=ast,ssa,optimized,asm,timing program.chi
 
 AST, SSA, optimized SSA, and assembly views demand ordinary analysis and bypass bundled std
 results. Labels and diagnostics use source-style names with static arguments.
+Assembly shows each compiled function with named relocation targets and escaped
+constant declarations, excluding the executable's startup code and panic-trace tables.
 Native panic traces retain read-only call-site metadata, walk at most 1024 known
 frames, and add no tracing instructions to successful calls.
 
@@ -107,11 +115,14 @@ executed checks from cached successful runs.
 ```sh
 zig build test --seed=0 -Dtest-source=tests/operation_test.zig
 zig build test --seed=0 -Dtest-source=tests/query_engine_test.zig
-zig build test --seed=0 -Dtest-source=test_sources.zig -Dtest-filter=tokenizer
+zig build test --seed=0 -Dtest-filter=tokenizer
 zig build test --seed=0 -Doptimize=safe -Dtest-source=tests/query_test.zig -Dtest-filter="name fragment"
 ```
 
-`-Dtest-source` selects one root; `-Dtest-filter` selects names within it. Use
+`-Dtest-source` selects one root. Without it, `-Dtest-filter` discovers matching
+test names in each suite and its local imports, then builds only matching roots;
+no matching roots is an error. Zig applies the name filter within those roots.
+Unfiltered runs still build every suite. Use
 these build entrypoints rather than bare `zig test`, which can lack required
 imports. The default suite list is maintained in [build.zig](../build.zig).
 Standalone suites run in separate binary directories. The full suite builds

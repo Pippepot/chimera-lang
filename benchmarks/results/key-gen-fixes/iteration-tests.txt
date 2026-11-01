@@ -1,0 +1,9 @@
+Build Summary: 6/6 steps succeeded
+test success
++- run test cached
+   +- compile test safe native cached 12ms MaxRSS:40M
+   |  +- options cached
+   |  +- run exe precompile-std (std.chimera-artifact) cached
+   |     +- compile exe precompile-std safe native cached 108ms MaxRSS:38M
+   +- compile test safe native (+2 more reused dependencies)
+

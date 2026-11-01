@@ -43,6 +43,22 @@ This standalone workload does not modify the history suite or its graphs.
 
 ## Runtime Findings
 
+The [compiler fixes following that investigation](../results/key-gen-fixes/README.md)
+outline collision-edge copies, use direct index addressing, finish accessor
+inlining, and simplify nested terminal ranges with proofs. The common scan now
+has six instructions and one taken branch; the executable is 23.8% smaller.
+Fresh runtime sampling was deferred because other builds/tests were active when
+the user requested wrap-up; no new Clang speed comparison is claimed.
+
+A [2026-11-01 assembly investigation](../results/key-gen-assembly/README.md)
+isolates the remaining Clang gap with temporary executable patches and hardware
+counters. Moving collision-edge copies out of the scan's fallthrough path reduces
+user cycles by 42.4%, explaining 79.1% of the cycle gap. Removing the index sign
+extension alone has little cycle benefit here. Sum generation accounts for most
+of the remaining gap. Wall-time probes hit the noise cap for the experimental
+lanes and Clang; these are diagnostic results, not stable acceptance measurements.
+Compiler and workload sources are unchanged.
+
 The runner now uses Clang explicitly. The GCC measurements below retain their
 original toolchain labels and describe the earlier comparison.
 

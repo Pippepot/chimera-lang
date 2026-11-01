@@ -1,0 +1,9 @@
+case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable
+serial_selected-128,normal,cold,0,26190791,23966,3,false
+serial_selected-128,normal,cold,1,24588276,23966,3,false
+serial_selected-128,normal,cold,2,22810273,23966,3,false
+serial_selected-128,normal,contract-edit,0,4703816,23966,3,false
+serial_selected-128,normal,contract-edit,1,4366410,23966,3,false
+serial_selected-128,normal,contract-edit,2,5104950,23966,3,false
+serial_selected-128,normal,runtime,0,45212509,23966,2,true
+serial_selected-128,normal,runtime,1,44467926,23966,2,true

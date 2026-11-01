@@ -1,0 +1,10 @@
+case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable
+forwarding-128,normal,cold,0,18814732,1146,2,true
+forwarding-128,normal,cold,1,18744120,1146,2,true
+forwarding-128,normal,contract-edit,0,5322707,1146,2,true
+forwarding-128,normal,contract-edit,1,5241765,1146,2,true
+forwarding-128,normal,runtime,0,1955787,1146,5,false
+forwarding-128,normal,runtime,1,1481815,1146,5,false
+forwarding-128,normal,runtime,2,1483187,1146,5,false
+forwarding-128,normal,runtime,3,1459815,1146,5,false
+forwarding-128,normal,runtime,4,1681316,1146,5,false

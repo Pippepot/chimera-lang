@@ -1,6 +1,7 @@
 import std.memory.{Allocation, Span, List, Box, Ref, allocate, deallocate, unsafe_initialize}
 import std.array.{Array, collection_literal}
 import std.range.{Range, FromEnd}
+import std.search
 
 pub extern func byte_int(value: byte) int
 extern func io_write(descriptor: int, imm data: Span(byte)) int | none
@@ -80,6 +81,10 @@ pub struct StringView
     pub func <>(imm left: StringView, imm right: StringView) bool -> not equal_bytes(left.bytes, right.bytes)
     pub func byte_length(imm self: StringView) int -> self.bytes.byte_length()
     pub func as_bytes(imm self: StringView) BytesView -> self.bytes
+    pub func find(imm self: StringView, imm needle: StringView) int | none -> std.search.index_of_sequence(self.bytes.as_span(), needle.bytes.as_span())
+    pub func contains(imm self: StringView, imm needle: StringView) bool -> self.find(needle) is int
+    pub func starts_with(imm self: StringView, imm needle: StringView) bool -> std.search.starts_with(self.bytes.as_span(), needle.bytes.as_span())
+    pub func ends_with(imm self: StringView, imm needle: StringView) bool -> std.search.ends_with(self.bytes.as_span(), needle.bytes.as_span())
     func slice_at(imm self: StringView, bounds: Range) StringView
         const view = self.slice(bounds)
         if not (view is StringView) -> panic "StringView slice out of bounds"
@@ -106,6 +111,10 @@ pub struct StaticString
     pub func byte_length(imm self: StaticString) int -> self.bytes.len()
     pub func as_bytes(imm self: StaticString) BytesView -> BytesView{data = self.bytes}
     pub func view(imm self: StaticString) StringView -> StringView{bytes = self.as_bytes()}
+    pub func find(imm self: StaticString, imm needle: StringView) int | none -> self.view().find(needle)
+    pub func contains(imm self: StaticString, imm needle: StringView) bool -> self.view().contains(needle)
+    pub func starts_with(imm self: StaticString, imm needle: StringView) bool -> self.view().starts_with(needle)
+    pub func ends_with(imm self: StaticString, imm needle: StringView) bool -> self.view().ends_with(needle)
 
 struct OwnedBytes
     copy = none
@@ -143,6 +152,10 @@ pub struct String
             return bytes
         panic "invalid String storage"
     pub func view(imm self: String) StringView -> StringView{bytes = self.as_bytes()}
+    pub func find(imm self: String, imm needle: StringView) int | none -> self.view().find(needle)
+    pub func contains(imm self: String, imm needle: StringView) bool -> self.view().contains(needle)
+    pub func starts_with(imm self: String, imm needle: StringView) bool -> self.view().starts_with(needle)
+    pub func ends_with(imm self: String, imm needle: StringView) bool -> self.view().ends_with(needle)
     pub func reserve(mut self: String, minimum_capacity: int) unit | none
         if minimum_capacity < 0 -> return none
         if minimum_capacity <= self.capacity() -> return unit

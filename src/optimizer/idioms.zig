@@ -10,15 +10,14 @@ const Instruction = structures.FunctionInstruction;
 const Function = function_ir.Function;
 const Loop = loops.Loop;
 
-pub fn transform(function: *Function, context: anytype) !bool {
+pub fn transform(function: *Function, context: anytype, bulk_fallbacks: *std.AutoHashMapUnmanaged(u32, void)) !bool {
     var changed = false;
-    var filled: std.AutoHashMapUnmanaged(u32, void) = .empty;
-    while (try once(function, context, &filled)) changed = true;
+    while (try once(function, context, bulk_fallbacks)) changed = true;
     if (changed) function.resolveReferences();
     return changed;
 }
 
-fn once(function: *Function, context: anytype, filled: *std.AutoHashMapUnmanaged(u32, void)) !bool {
+fn once(function: *Function, context: anytype, bulk_fallbacks: *std.AutoHashMapUnmanaged(u32, void)) !bool {
     while (try loops.canonicalize(function)) {}
     function.resolveReferences();
     const graph = (try function.controlFlow()).*;
@@ -29,7 +28,7 @@ fn once(function: *Function, context: anytype, filled: *std.AutoHashMapUnmanaged
     for (found) |loop| {
         const preheader = loops.preheader(function, graph, loop) orelse continue;
         if (loop.latches.len != 1) continue;
-        if (try rewriteLoop(function, &analysis, loop, preheader, filled)) {
+        if (try rewriteLoop(function, &analysis, loop, preheader, bulk_fallbacks)) {
             function.invalidateControlFlow();
             return true;
         }
@@ -65,12 +64,18 @@ fn successfulCallArguments(function: *Function, context: anytype) ![]const loops
     return ranges.items;
 }
 
-fn rewriteLoop(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32, filled: *std.AutoHashMapUnmanaged(u32, void)) !bool {
+fn rewriteLoop(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32, bulk_fallbacks: *std.AutoHashMapUnmanaged(u32, void)) !bool {
     if (try rotateCarriedExit(function, analysis.graph, loop)) return true;
     if (removeDeadLoop(function, analysis, loop, preheader)) return true;
-    if (!filled.contains(loop.latches[0]) and (try fill(function, analysis, loop, preheader) or try move(function, analysis, loop, preheader))) {
-        try filled.put(function.scratch, loop.latches[0], {});
-        return true;
+    const store = for (function.blocks.items[loop.latches[0]].instructions.items) |index| {
+        const instruction = function.instructions.items[index];
+        if (!function.removed.items[index] and instruction == .value_copy and instruction.value_copy.destination != null) break index;
+    } else null;
+    if (store) |index| {
+        if (!bulk_fallbacks.contains(index) and (try fill(function, analysis, loop, preheader) or try move(function, analysis, loop, preheader))) {
+            try bulk_fallbacks.put(function.scratch, index, {});
+            return true;
+        }
     }
     return boundsChecks(function, analysis, loop, preheader);
 }
@@ -122,8 +127,10 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
     for (loop.blocks) |block| if (block != loop.header and !graph.dominates(body, block)) return false;
     const latch = loop.latches[0];
     const terminator = function.blocks.items[latch].terminator;
-    if (terminator != .branch or @backingInt(terminator.branch.target) != loop.header) return false;
-    const back = function.branchArguments(terminator.branch);
+    const back_branch = for (Function.edges(&function.blocks.items[latch].terminator)) |maybe_edge| {
+        if (maybe_edge) |edge| if (@backingInt(edge.target) == loop.header) break edge.*;
+    } else return false;
+    const back = function.branchArguments(back_branch);
     for (back) |argument| if (argument.coerce_to != null or argument.variant_tag_mapping != null) return false;
     const carried = function.definition(function.find(back[flag_position].value)) orelse return false;
     if (carried != .select or boolean(function, carried.select.then_value) != exit_value or function.find(carried.select.else_value) != flag) return false;
@@ -142,9 +149,12 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
         if (!function.valueType(parameter).isPrimitive() or taken[@backingInt(parameter)]) return false;
     }
     const edges = (try function.controlFlowEdges()).incoming[test_result.exit].items;
-    for (edges) |edge| if (!loop.contains(edge.block)) return false;
+    const private_exit = for (edges) |edge| {
+        if (!loop.contains(edge.block)) break false;
+    } else true;
     for (function.blocks.items, 0..) |*block, index| {
-        if (index == loop.header or graph.dominates(body, @intCast(index)) or graph.dominates(test_result.exit, @intCast(index))) continue;
+        if (index == loop.header or graph.dominates(body, @intCast(index))) continue;
+        if (private_exit and graph.dominates(test_result.exit, @intCast(index))) continue;
         var uses: LoopParameters = .{ .function = function, .from = header.parameters.items };
         for (block.instructions.items) |instruction| {
             if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &uses, LoopParameters.check);
@@ -152,14 +162,24 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
         function_ir.terminatorAllOperands(function, &block.terminator, &uses, LoopParameters.check);
         if (uses.found) return false;
     }
+    if (terminator != .branch) {
+        // Only this selected backedge needs the flag decision. Leave the
+        // latch's other continuation intact, with no invented phi inputs.
+        const split = try function.addBlock(.{ .branch = back_branch }, header.span, header.frame);
+        for (Function.edges(&function.blocks.items[latch].terminator)) |maybe_edge| if (maybe_edge) |edge| {
+            if (@backingInt(edge.target) == loop.header) edge.* = .{ .target = @fromBackingInt(split), .arguments = .{ .start = 0, .end = 0 } };
+        };
+        try function.placeAfter(split, latch);
+        return true;
+    }
     const original = try function.scratch.dupe(ValueId, header.parameters.items);
     const replacements = try function.scratch.alloc(ValueId, original.len);
-    const exit_parameters = try function.scratch.alloc(ValueId, original.len);
+    const exit_parameters = try function.scratch.alloc(ValueId, if (private_exit) original.len else 0);
     const inactive = try function.insertInstruction(loop.header, 0, .{ .const_bool = !exit_value }, header.span, header.frame);
     var initial: std.ArrayList(structures.FunctionValueUse) = .empty;
     for (original, 0..) |parameter, position| {
         const argument = function.definitions.items[@backingInt(parameter)].argument.data;
-        exit_parameters[position] = try function.addParameter(test_result.exit, argument);
+        if (private_exit) exit_parameters[position] = try function.addParameter(test_result.exit, argument);
         if (position == flag_position) {
             replacements[position] = inactive;
             continue;
@@ -169,12 +189,14 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
     }
     const active = carried.select.then_value;
     var escaped: LoopParameters = .{ .function = function, .from = original, .to = exit_parameters };
-    for (function.blocks.items, 0..) |*block, index| {
-        if (!graph.dominates(test_result.exit, @intCast(index))) continue;
-        for (block.instructions.items) |instruction| {
-            if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &escaped, LoopParameters.replace);
+    if (private_exit) {
+        for (function.blocks.items, 0..) |*block, index| {
+            if (!graph.dominates(test_result.exit, @intCast(index))) continue;
+            for (block.instructions.items) |instruction| {
+                if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &escaped, LoopParameters.replace);
+            }
+            function_ir.terminatorAllOperands(function, &block.terminator, &escaped, LoopParameters.replace);
         }
-        function_ir.terminatorAllOperands(function, &block.terminator, &escaped, LoopParameters.replace);
     }
     var rewritten: LoopParameters = .{ .function = function, .from = original, .to = replacements };
     for (function.blocks.items, 0..) |*block, index| {
@@ -184,13 +206,13 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
         }
         function_ir.terminatorAllOperands(function, &block.terminator, &rewritten, LoopParameters.replace);
         for (Function.edges(&block.terminator)) |maybe_branch| if (maybe_branch) |branch| {
-            if (@backingInt(branch.target) == test_result.exit) try appendExitValues(function, branch, replacements);
+            if (private_exit and @backingInt(branch.target) == test_result.exit) try appendExitValues(function, branch, replacements);
         };
     }
     var exiting: std.ArrayList(structures.FunctionValueUse) = .empty;
     var repeating: std.ArrayList(structures.FunctionValueUse) = .empty;
     const next_condition = if (std.mem.indexOfScalar(ValueId, original, condition)) |position| replacements[position] else condition;
-    for (function.branchArguments(terminator.branch), 0..) |argument, position| {
+    for (function.branchArguments(back_branch), 0..) |argument, position| {
         try exiting.append(function.scratch, .{ .value = if (position == flag_position) active else selectArm(function, argument.value, next_condition, true) });
         if (position != flag_position) try repeating.append(function.scratch, .{ .value = selectArm(function, argument.value, next_condition, false) });
     }
@@ -200,11 +222,11 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
         if (std.mem.indexOfScalar(ValueId, original, function.find(argument.value))) |position| replacement.value = exiting.items[position].value;
         try collision.append(function.scratch, replacement);
     }
-    try collision.appendSlice(function.scratch, exiting.items);
+    if (private_exit) try collision.appendSlice(function.scratch, exiting.items);
     const initial_arguments = try function.appendBranchArguments(initial.items);
     for (Function.edges(&function.blocks.items[loop.header].terminator)) |maybe_edge| if (maybe_edge) |edge| {
         if (@backingInt(edge.target) == body) edge.arguments = initial_arguments;
-        if (@backingInt(edge.target) == test_result.exit) try appendExitValues(function, edge, original);
+        if (private_exit and @backingInt(edge.target) == test_result.exit) try appendExitValues(function, edge, original);
     };
     function.blocks.items[latch].terminator = .{ .predicate_branch = .{
         .operation = .eqb,

@@ -334,8 +334,8 @@ test "List removal returns captured references independently of the old allocati
     , 42);
 }
 
-test "List conditional removal conservatively retains possible captures" {
-    try Fixture.expectSourceDiagnostic(
+test "List selected removal discharges only removed captures" {
+    try expectCalculation(
         \\func calculate() int | none
         \\    var source = 21
         \\    var values: List(Ref(int)) = [Ref.from(source), Ref.from(source)]
@@ -346,7 +346,19 @@ test "List conditional removal conservatively retains possible captures" {
         \\        if not (removed is Ref(int)) -> return none
         \\        if removed.value <> 7 -> return 90
         \\    return values[0].value * 2
-        \\_ = calculate()
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func invalid() int | none
+        \\    var source = 21
+        \\    var values: List(Ref(int)) = [Ref.from(source), Ref.from(source)]
+        \\    if 1 == 1
+        \\        var temporary = 7
+        \\        values[0] = Ref.from(temporary)
+        \\        values[1] = Ref.from(temporary)
+        \\        const removed = values.remove(0)
+        \\        if not (removed is Ref(int)) -> return none
+        \\    return values[0].value
+        \\_ = invalid()
     , .borrow_outlives_source);
 }
 
@@ -385,14 +397,16 @@ test "List writes before ordinary failure replace the caller capture" {
     , 42);
 }
 
-test "List conditional replacement conservatively retains possible captures" {
-    try Fixture.expectSourceDiagnostic(
+test "List selected replacement discharges only overwritten captures" {
+    const declarations =
         \\func replace(mut values: List(Ref(int)), index: int, ref source: int) unit | none
         \\    const checked_value_1 = values.get(index)
         \\    if not (checked_value_1 is Ref(int)) -> return none
         \\    ref slot = checked_value_1
         \\    slot = Ref.from(source)
         \\    return ()
+    ;
+    try expectCalculation(declarations ++ "\n" ++
         \\func calculate() int | none
         \\    var source = 42
         \\    var values: List(Ref(int)) = [Ref.from(source)]
@@ -403,7 +417,17 @@ test "List conditional replacement conservatively retains possible captures" {
         \\        const checked_value_3 = replace(values, 0, source)
         \\        if not (checked_value_3 is unit) -> return none
         \\    return values[0].value
-        \\_ = calculate()
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() int | none
+        \\    var source = 42
+        \\    var values: List(Ref(int)) = [Ref.from(source), Ref.from(source)]
+        \\    if 1 == 1
+        \\        var temporary = 7
+        \\        if not (replace(values, 0, temporary) is unit) -> return none
+        \\        if not (replace(values, 1, source) is unit) -> return none
+        \\    return values[0].value
+        \\_ = invalid()
     , .borrow_outlives_source);
 }
 
@@ -426,8 +450,8 @@ test "indexed reference outputs remap selectors through forwarded handles" {
         \\    var values = [Ref.from(source), Ref.from(source)]
         \\    if 1 == 1
         \\        var temporary = 7
-        \\        forward(values, -1, temporary)
-        \\        forward(values, -1, source)
+        \\        if not (forward(values, -1, temporary) is unit) -> return none
+        \\        if not (forward(values, -1, source) is unit) -> return none
         \\    return values[0].value + values[1].value
     , 42);
     try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
@@ -437,6 +461,7 @@ test "indexed reference outputs remap selectors through forwarded handles" {
         \\    if 1 == 1
         \\        var temporary = 7
         \\        forward(values, -1, temporary)
+        \\        forward(values, -1, source)
         \\    print(values[0].value)
         \\    return ()
         \\if (invalid() is unit) -> ()

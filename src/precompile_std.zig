@@ -4,7 +4,10 @@ const standard_artifact = @import("standard_artifact.zig");
 pub fn main(init: std.process.Init) !void {
     const arguments = try init.minimal.args.toSlice(init.arena.allocator());
     if (arguments.len != 2) return error.MissingOutputPath;
+    const started = std.Io.Clock.awake.now(init.io);
     const bytes = try standard_artifact.build(init.gpa);
     defer init.gpa.free(bytes);
     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = arguments[1], .data = bytes });
+    const elapsed_ns = started.durationTo(std.Io.Clock.awake.now(init.io)).toNanoseconds();
+    std.debug.print("Precompiled std in {d:.3} ms\n", .{@as(f64, @floatFromInt(elapsed_ns)) / std.time.ns_per_ms});
 }

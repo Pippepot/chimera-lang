@@ -64,6 +64,17 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
     const block_count = starts.items.len - 1;
     const block_at = try scratch.alloc(u32, instructions.len);
     for (0..block_count) |block| @memset(block_at[starts.items[block]..starts.items[block + 1]], @intCast(block));
+    const successors = try scratch.alloc([2]?u32, block_count);
+    for (successors, 0..) |*targets, block| {
+        targets.* = .{ null, null };
+        const last = instructions[starts.items[block + 1] - 1];
+        var falls_through = true;
+        if (last == .fixed and isBranch(last.fixed.operation)) {
+            if (last.fixed.target != 0 and last.fixed.target < instructions.len) targets[0] = block_at[last.fixed.target];
+            falls_through = last.fixed.operation != .jmp and last.fixed.operation != .ret and last.fixed.operation != .ud2;
+        }
+        if (falls_through and block + 1 < block_count) targets[1] = @intCast(block + 1);
+    }
 
     const mapping = try scratch.alloc(?u32, value_count);
     @memset(mapping, null);
@@ -82,16 +93,8 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
         parameters[mapping[@backingInt(instruction.parameter.value)].?] = true;
     };
     const depth = try scratch.alloc(u32, instructions.len);
-    @memset(depth, 0);
-    for (instructions, 0..) |instruction, index| {
-        if (instruction != .fixed) continue;
-        if (!isBranch(instruction.fixed.operation)) continue;
-        if (instruction.fixed.target != 0) {
-            const target = instruction.fixed.target;
-            if (target > index) continue;
-            for (depth[target .. index + 1]) |*covered| covered.* +|= 1;
-        }
-    }
+    const block_depths = try loopDepths(scratch, successors);
+    for (block_depths, 0..) |block_depth, block| @memset(depth[starts.items[block]..starts.items[block + 1]], block_depth);
     const weights = try scratch.alloc(u64, candidate_count);
     @memset(weights, 0);
     const uses = try scratch.alloc(BitSet, block_count);
@@ -126,18 +129,7 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
         while (order > 0) {
             order -= 1;
             const block = order;
-            const last = instructions[starts.items[block + 1] - 1];
-            var falls_through = true;
-            if (last == .fixed and isBranch(last.fixed.operation)) {
-                if (last.fixed.target != 0) {
-                    const target = last.fixed.target;
-                    if (target < instructions.len) live_out[block].setUnion(live_in[block_at[target]]);
-                }
-                falls_through = last.fixed.operation != .jmp and last.fixed.operation != .ret and last.fixed.operation != .ud2;
-            }
-            if (falls_through and block + 1 < block_count) {
-                live_out[block].setUnion(live_in[block + 1]);
-            }
+            for (successors[block]) |target| if (target) |successor| live_out[block].setUnion(live_in[successor]);
             next.unsetAll();
             next.setUnion(live_out[block]);
             var definitions = defines[block].iterator(.{});
@@ -225,6 +217,72 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
     defer used.deinit(gpa);
     for (available, allocated) |register, taken| if (taken) try used.append(gpa, register);
     return .{ .registers = registers, .used = try used.toOwnedSlice(gpa) };
+}
+
+// A backward physical jump can simply return from an outlined edge stub.
+// Weight actual cycles found by DFS, including their expanded edge copies,
+// rather than all instructions between the jump and its earlier target.
+fn loopDepths(scratch: std.mem.Allocator, successors: []const [2]?u32) ![]u32 {
+    const count = successors.len;
+    const incoming = try scratch.alloc(std.ArrayList(u32), count);
+    @memset(incoming, .empty);
+    for (successors, 0..) |targets, block| for (targets) |target| if (target) |next| {
+        try incoming[next].append(scratch, @intCast(block));
+    };
+    const depths = try scratch.alloc(u32, count);
+    @memset(depths, 0);
+    const visited = try scratch.alloc(bool, count);
+    @memset(visited, false);
+    const active = try scratch.alloc(bool, count);
+    @memset(active, false);
+    const members = try scratch.alloc(bool, count);
+    const pending = try scratch.alloc(u32, count);
+    const Frame = struct { block: u32, next: u2 = 0 };
+    const stack = try scratch.alloc(Frame, count);
+    for (0..count) |root| {
+        if (visited[root]) continue;
+        stack[0] = .{ .block = @intCast(root) };
+        visited[root] = true;
+        active[root] = true;
+        var size: usize = 1;
+        while (size != 0) {
+            const frame = &stack[size - 1];
+            if (frame.next == 2) {
+                active[frame.block] = false;
+                size -= 1;
+                continue;
+            }
+            const target = successors[frame.block][frame.next];
+            frame.next += 1;
+            const next = target orelse continue;
+            if (!visited[next]) {
+                visited[next] = true;
+                active[next] = true;
+                stack[size] = .{ .block = next };
+                size += 1;
+                continue;
+            }
+            if (!active[next]) continue;
+            @memset(members, false);
+            members[next] = true;
+            pending[0] = frame.block;
+            var pending_count: usize = @intFromBool(frame.block != next);
+            members[frame.block] = true;
+            while (pending_count != 0) {
+                pending_count -= 1;
+                for (incoming[pending[pending_count]].items) |previous| {
+                    if (members[previous]) continue;
+                    members[previous] = true;
+                    pending[pending_count] = previous;
+                    pending_count += 1;
+                }
+            }
+            for (members, depths) |member, *depth| if (member) {
+                depth.* +|= 1;
+            };
+        }
+    }
+    return depths;
 }
 
 // These are allocation preferences, not aliases: every choice still has to

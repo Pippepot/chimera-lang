@@ -1,0 +1,21 @@
+{
+  "base_revision": "e11253e28acb40f60845f0226007e011d576e7a8",
+  "zig": "0.17.0",
+  "clang": "clang version 22.1.8",
+  "study": "/tmp/chimera-key-fix-e3281m6h",
+  "native": {
+    "before": {
+      "bytes": 30152,
+      "sha256": "51e1db82e70250d3d759a1cd1f40920b15232c7478856a779617de835cabd99c"
+    },
+    "after": {
+      "bytes": 22979,
+      "sha256": "039f7a68a19125aea920bc36cf1ff61c3ece3bba6d3035c7794834845c62443a"
+    },
+    "clang": {
+      "bytes": 16184,
+      "sha256": "799ea111b195215462abbde56b4278e8f10ea50a58372103c3523a6094fa572d"
+    }
+  },
+  "runtime_measurement": "Not sampled: concurrent builds/tests; user requested prompt wrap-up."
+}

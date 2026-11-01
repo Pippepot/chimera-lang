@@ -1,0 +1,188 @@
+{
+  "baseline_control": {
+    "chimera": {
+      "cycles": {
+        "raw": 12620602256,
+        "enabled_ns": 2929293142,
+        "running_ns": 2929293142,
+        "scaled": 12620602256.0
+      },
+      "instructions": {
+        "raw": 44368743302,
+        "enabled_ns": 2929293142,
+        "running_ns": 2929293142,
+        "scaled": 44368743302.0
+      },
+      "branches": {
+        "raw": 12140192635,
+        "enabled_ns": 2929293142,
+        "running_ns": 2929293142,
+        "scaled": 12140192635.0
+      },
+      "branch_misses": {
+        "raw": 6481457,
+        "enabled_ns": 2929293142,
+        "running_ns": 2929293142,
+        "scaled": 6481457.0
+      }
+    },
+    "clang-O3": {
+      "cycles": {
+        "raw": 5845848661,
+        "enabled_ns": 1351090575,
+        "running_ns": 1351090575,
+        "scaled": 5845848661.0
+      },
+      "instructions": {
+        "raw": 33368699960,
+        "enabled_ns": 1351090575,
+        "running_ns": 1351090575,
+        "scaled": 33368699960.0
+      },
+      "branches": {
+        "raw": 11002814297,
+        "enabled_ns": 1351090575,
+        "running_ns": 1351090575,
+        "scaled": 11002814297.0
+      },
+      "branch_misses": {
+        "raw": 2947307,
+        "enabled_ns": 1351090575,
+        "running_ns": 1351090575,
+        "scaled": 2947307.0
+      }
+    }
+  },
+  "factorial": {
+    "chimera": {
+      "cycles": {
+        "raw": 12626390656,
+        "enabled_ns": 2938489494,
+        "running_ns": 2938489494,
+        "scaled": 12626390656.0
+      },
+      "instructions": {
+        "raw": 44368743363,
+        "enabled_ns": 2938489494,
+        "running_ns": 2938489494,
+        "scaled": 44368743363.0
+      },
+      "branches": {
+        "raw": 12140192696,
+        "enabled_ns": 2938489494,
+        "running_ns": 2938489494,
+        "scaled": 12140192696.0
+      },
+      "branch_misses": {
+        "raw": 6472814,
+        "enabled_ns": 2938489494,
+        "running_ns": 2938489494,
+        "scaled": 6472814.0
+      }
+    },
+    "branch": {
+      "cycles": {
+        "raw": 7266613496,
+        "enabled_ns": 1691559113,
+        "running_ns": 1691559113,
+        "scaled": 7266613496.0
+      },
+      "instructions": {
+        "raw": 44371228482,
+        "enabled_ns": 1691559113,
+        "running_ns": 1691559113,
+        "scaled": 44371228482.0
+      },
+      "branches": {
+        "raw": 12142677937,
+        "enabled_ns": 1691559113,
+        "running_ns": 1691559113,
+        "scaled": 12142677937.0
+      },
+      "branch_misses": {
+        "raw": 6485974,
+        "enabled_ns": 1691559113,
+        "running_ns": 1691559113,
+        "scaled": 6485974.0
+      }
+    },
+    "address": {
+      "cycles": {
+        "raw": 12613370893,
+        "enabled_ns": 2922285216,
+        "running_ns": 2922285216,
+        "scaled": 12613370893.0
+      },
+      "instructions": {
+        "raw": 38953063103,
+        "enabled_ns": 2922285216,
+        "running_ns": 2922285216,
+        "scaled": 38953063103.0
+      },
+      "branches": {
+        "raw": 12140192617,
+        "enabled_ns": 2922285216,
+        "running_ns": 2922285216,
+        "scaled": 12140192617.0
+      },
+      "branch_misses": {
+        "raw": 6464784,
+        "enabled_ns": 2922285216,
+        "running_ns": 2922285216,
+        "scaled": 6464784.0
+      }
+    },
+    "both": {
+      "cycles": {
+        "raw": 7293987378,
+        "enabled_ns": 1690281386,
+        "running_ns": 1690281386,
+        "scaled": 7293987378.0
+      },
+      "instructions": {
+        "raw": 38955547930,
+        "enabled_ns": 1690281386,
+        "running_ns": 1690281386,
+        "scaled": 38955547930.0
+      },
+      "branches": {
+        "raw": 12142677810,
+        "enabled_ns": 1690281386,
+        "running_ns": 1690281386,
+        "scaled": 12142677810.0
+      },
+      "branch_misses": {
+        "raw": 6523139,
+        "enabled_ns": 1690281386,
+        "running_ns": 1690281386,
+        "scaled": 6523139.0
+      }
+    },
+    "clang-O3": {
+      "cycles": {
+        "raw": 5850008776,
+        "enabled_ns": 1354297048,
+        "running_ns": 1354297048,
+        "scaled": 5850008776.0
+      },
+      "instructions": {
+        "raw": 33368699960,
+        "enabled_ns": 1354297048,
+        "running_ns": 1354297048,
+        "scaled": 33368699960.0
+      },
+      "branches": {
+        "raw": 11002814297,
+        "enabled_ns": 1354297048,
+        "running_ns": 1354297048,
+        "scaled": 11002814297.0
+      },
+      "branch_misses": {
+        "raw": 2960232,
+        "enabled_ns": 1354297048,
+        "running_ns": 1354297048,
+        "scaled": 2960232.0
+      }
+    }
+  }
+}

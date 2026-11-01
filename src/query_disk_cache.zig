@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIMERAQRY48";
+const format = "CHIMERAQRY49";
 const max_records = 1_000_000;
 // Snapshot records name their interner, input, or query boundary by type name.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
@@ -436,22 +436,14 @@ fn validReferenceContractTypes(db: *query.Database, types: anytype, body: struct
         }
     }
     for (contract.origins) |origin| {
-        if (origin.readonly_owned) |type_id| {
-            if (origin.readonly or type_id.isPrimitive()) return false;
-            if (try types.borrowElement(type_id) != null or try types.storageAccess(type_id) != null) return false;
+        if (!try validReferenceOriginTypes(db, types, body, origin, false)) return false;
+    }
+    for (contract.outputs) |output| {
+        const members = (try types.variantMembers(body.return_type)) orelse return false;
+        if (std.mem.indexOfScalar(structures.TypeId, members, output.result_type) == null) return false;
+        for (output.origins) |origin| {
+            if (!try validReferenceOriginTypes(db, types, body, origin, true)) return false;
         }
-        const output_type = if (origin.output_parameter) |parameter| body.block_arguments[parameter].type_id else body.return_type;
-        if (!try validReferencePath(db, types, output_type, contract.paths[origin.result_path.start..origin.result_path.end])) return false;
-        if (origin.output_parameter) |parameter| if (body.parameter_modes[parameter] != .mut and body.parameter_modes[parameter] != .ref) {
-            var through_referent = false;
-            for (contract.paths[origin.result_path.start..origin.result_path.end]) |step| {
-                if (step == .referent) through_referent = true;
-            }
-            if (!through_referent) return false;
-        };
-        if (origin.parameter) |parameter| {
-            if (!try validReferencePath(db, types, body.block_arguments[parameter].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
-        } else if (origin.source_path.start != origin.source_path.end or origin.storage_depth != 0 or origin.recursive_storage or origin.after_write) return false;
     }
     for (contract.requirements) |requirement| {
         if (!try validReferencePath(db, types, body.block_arguments[requirement.parameter].type_id, contract.paths[requirement.path.start..requirement.path.end])) return false;
@@ -462,6 +454,29 @@ fn validReferenceContractTypes(db: *query.Database, types: anytype, body: struct
             if (!try validReferencePath(db, types, body.block_arguments[origin.parameter.?].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
         }
     }
+    return true;
+}
+
+fn validReferenceOriginTypes(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis, origin: structures.ReferenceOriginContract, conditional: bool) anyerror!bool {
+    const contract = body.reference_contract;
+    if (origin.readonly_owned) |type_id| {
+        if (origin.readonly or type_id.isPrimitive()) return false;
+        if (try types.borrowElement(type_id) != null or try types.storageAccess(type_id) != null) return false;
+    }
+    const output_type = if (origin.output_parameter) |parameter| body.block_arguments[parameter].type_id else body.return_type;
+    if (!try validReferencePath(db, types, output_type, contract.paths[origin.result_path.start..origin.result_path.end])) return false;
+    if (!conditional) {
+        if (origin.output_parameter) |parameter| if (body.parameter_modes[parameter] != .mut and body.parameter_modes[parameter] != .ref) {
+            var through_referent = false;
+            for (contract.paths[origin.result_path.start..origin.result_path.end]) |step| {
+                if (step == .referent) through_referent = true;
+            }
+            if (!through_referent) return false;
+        };
+    }
+    if (origin.parameter) |parameter| {
+        if (!try validReferencePath(db, types, body.block_arguments[parameter].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
+    } else if (origin.source_path.start != origin.source_path.end or origin.storage_depth != 0 or origin.recursive_storage or origin.after_write) return false;
     return true;
 }
 
@@ -615,6 +630,17 @@ fn validReferenceContract(contract: structures.ReferenceContract, parameter_coun
         if (origin.output_parameter) |parameter| if (parameter >= parameter_count) return false;
         if (origin.parameter) |parameter| if (parameter >= parameter_count) return false;
         if (!validRange(origin.source_path, contract.paths.len) or !validRange(origin.result_path, contract.paths.len)) return false;
+    }
+    for (contract.outputs, 0..) |output, index| {
+        if (output.parameter >= parameter_count) return false;
+        for (contract.outputs[0..index]) |previous| {
+            if (previous.parameter == output.parameter and previous.result_type == output.result_type) return false;
+        }
+        for (output.origins) |origin| {
+            if (origin.output_parameter != output.parameter) return false;
+            if (origin.parameter) |parameter| if (parameter >= parameter_count) return false;
+            if (!validRange(origin.source_path, contract.paths.len) or !validRange(origin.result_path, contract.paths.len)) return false;
+        }
     }
     for (contract.requirements) |requirement| {
         if (requirement.parameter >= parameter_count or !validRange(requirement.path, contract.paths.len)) return false;
@@ -857,12 +883,40 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
         \\    const view = input.first.value.view()
         \\    input.second.value.append("x")
         \\    return view.byte_length()
+        \\func conditional(mut target: Ref(int), ref source: int, chosen: bool) unit | none
+        \\    if not chosen -> return none
+        \\    target = Ref.from(source)
+        \\    return ()
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
-    for ([_][]const u8{ "nested", "copied", "selected", "install", "retained", "element" }) |name| {
+    for ([_][]const u8{ "nested", "copied", "selected", "install", "retained", "element", "conditional" }) |name| {
         errdefer std.debug.print("rejected analyzed reference contract: {s}\n", .{name});
-        const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction(name).? })).*.?;
+        const instance: structures.InstanceId = .{ .item = scope.resolveFunction(name).? };
+        const body = (try db.get(queries.AnalyzeFunctionInstance, instance)).* orelse {
+            const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, instance, structures.Diagnostic, std.testing.allocator);
+            defer std.testing.allocator.free(diagnostics);
+            for (diagnostics) |diagnostic| std.debug.print("{any}\n", .{diagnostic});
+            return error.MissingAnalysis;
+        };
         try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
+        if (std.mem.eql(u8, name, "conditional")) {
+            var invalid = body;
+            var outputs = [_]structures.ReferenceOutputContract{body.reference_contract.outputs[0]};
+            var origins = [_]structures.ReferenceOriginContract{outputs[0].origins[0]};
+            outputs[0].origins = &origins;
+            invalid.reference_contract.outputs = &outputs;
+            outputs[0].result_type = .bool;
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            outputs[0].result_type = body.reference_contract.outputs[0].result_type;
+            outputs[0].parameter = @intCast(body.parameter_modes.len);
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            outputs[0].parameter = body.reference_contract.outputs[0].parameter;
+            origins[0].output_parameter = 1;
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            origins[0] = body.reference_contract.outputs[0].origins[0];
+            origins[0].source_path.end = std.math.maxInt(u32);
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+        }
         if (std.mem.eql(u8, name, "element")) {
             var invalid = body;
             const paths = try std.testing.allocator.dupe(structures.ReferencePathStep, body.reference_contract.paths);
@@ -1389,7 +1443,9 @@ test "deinit bodies restore and invalidate when parameter modes change" {
     try modules.registerSources(cold, allocator, edited_source, &.{}, &.{});
     const rebuilt = (try cold.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualSlices(u8, rebuilt.bytes, edited.bytes);
-    try std.testing.expect(!std.mem.eql(u8, original.bytes, edited.bytes));
+    const edited_take = (try third.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("take").?;
+    const edited_body = (try third.get(queries.AnalyzeFunctionInstance, .{ .item = edited_take })).*.?;
+    try std.testing.expectEqual(structures.ParameterMode.imm, edited_body.parameter_modes[0]);
     try runtime.writeProgram(io, edited.bytes);
     try std.testing.expectEqual(@as(u8, 42), try runtime.runProg(io, allocator, &.{}));
 }

@@ -225,6 +225,30 @@ if not (value in collection) -> missing()
 # to views by borrowing, and literal operands can construct permanent views.
 # String/StringView/literal comparisons therefore work in either order without
 # copying or allocating text. Each implementation compares borrowed bytes.
+# std.search supplies index_of and index_of_sequence over readonly Span inputs.
+# Element and needle types infer independently. Both return the first matching
+# element index as int | none. Default matching evaluates element == needle;
+# a third argument supplies a plain func(imm Element, imm Needle) bool matcher.
+# There is no callback-context argument. Candidates and their element pairs are
+# visited in ascending index order, stopping at the first mismatching pair or
+# complete match. No symmetry, transitivity, copying, or allocation is required.
+# An empty sequence needle matches at zero, including in empty input. Empty
+# element searches and needles longer than the input have no match; these cases
+# and empty sequence needles do not call the matcher. Generic starts_with and
+# ends_with compare corresponding elements with ==; empty prefixes/suffixes match.
+# Array, List, and Span expose index_of and index_of_sequence as ordinary
+# borrowed methods forwarding to std.search, with the same matching overloads.
+# Receiver calls use values.index_of(needle); type-qualified calls pass the
+# receiver explicitly, as in Array(int, 3).index_of(values, needle). Direct
+# collection literals support these methods, as in [1, 2, 3].index_of(2).
+# Sequence methods accept borrowed Span needles, as in
+# values.index_of_sequence(needle.span()). No new call grammar is required.
+# String, StringView, and StaticString expose find, contains, starts_with, and
+# ends_with, including direct literal receivers. Needles borrow-convert to
+# StringView. Matching is exact UTF-8 byte matching, including NUL, without
+# normalization or allocation. find returns the first byte offset as int | none;
+# an empty needle matches at zero and empty prefixes/suffixes match. contains
+# also supplies ordinary substring membership through needle in text.
 # The named byte_int function widens a byte to int without failure. Numeric
 # runtime types are still not related by converters.
 # Standard String converters format int and byte in decimal, bool as true/false,
@@ -286,6 +310,17 @@ if not (value in collection) -> missing()
 # to structs. An expected tuple type supplies member types and storage kinds;
 # otherwise each element infers its ordinary value type and owned storage.
 # This applies recursively, including tuple types returned by type factories.
+# Equal arity and identical ordered member types and storage kinds identify the
+# same tuple type. Equal-arity tuples are covariant in owned member types:
+# (A, C) is a subtype of (A | B, C), recursively. There is no width subtyping.
+# Reference-member pointees are invariant, as are root references:
+# ref (A, C) does not widen to ref (A | B, C). ref A may inject into ref A | ref B
+# without changing its pointee representation, authority, or origins.
+# Initializing an expected tuple constructs its elements using ordinary implicit
+# conversions. Converters do not establish subtyping or run during type tests.
+# Rebuilding a value obeys ordinary copy, move, in-place construction, and cleanup
+# rules; it grants no ownership capability and never reinterprets an alias.
+# Unions of tuples preserve correlations; they are not tuples of independent unions.
 const pair = (1, true)
 const singleton: (int,) = (42,)
 
@@ -751,8 +786,14 @@ func invalid_state() never -> panic "invalid state"
 # parameter and return types may refer to static type parameters. Static
 # arguments are available as constants in the instantiated body but are not
 # evaluated or passed at runtime. An unspecialized function with static
-# parameters is not a value; partial application and indirect generic calls
-# remain open. Static arguments can be arbitrary
+# parameters is not a value. In a concrete callable type context, a generic
+# function reference specializes from that callable's parameter types; its full
+# signature must then match exactly. The callable's result type does not infer
+# static arguments. A context-dependent callable argument supplies no evidence
+# for the enclosing call's static inference; other arguments must determine
+# those statics before its callable context becomes available. Without a
+# callable context, the reference is an error. Partial application and indirect
+# generic calls remain open. Static arguments can be arbitrary
 # publishable compile-time expressions; ordinary functions may return type values.
 func identity(static T: type, static N: int, value: T) T
     _ = N
@@ -804,10 +845,14 @@ func add1(mut a: int)
 # reference arguments retain their backing owners through that preparation too.
 # This retains ownership without granting additional reference access; explicit
 # transfers and writes still have their ordinary effects and alias restrictions.
-# Caller-visible stored-reference dependencies conservatively merge all ordinary
-# return paths. Selecting a returned alternative does not narrow mutation effects;
-# an early return can retain the previous capture even after selecting another
-# alternative. Unconditional replacement can remove a previous capture.
+# Caller-visible stored-reference dependencies are correlated with ordinary
+# returned alternatives. Testing a result, a saved copy, or a saved alternative
+# predicate selects the corresponding output dependencies, including forwarded
+# results. Paths returning the same alternative still merge; an untested result
+# retains all possible dependencies. Early failure can retain the previous capture.
+# Later writes do not restore old captures or authority when an older result is
+# tested. Loop joins include previous-iteration effects. These proofs do not undo
+# ownership transfers, lifetime ends, or other writes.
 var mutable_value = 41
 add1(mutable_value)
 
@@ -1789,7 +1834,7 @@ where T is String or T.String is func(imm T) String -> 1
 # Conversion applies only where the expected type is already known: bindings,
 # assignments, arguments, returns, struct initializer fields, and the results
 # propagated to them, such as conditional branches. A value whose type equals
-# the expected type is not converted. Built-in variant widening also takes
+# the expected type is not converted. Built-in subtyping also takes
 # precedence over converters, preserving an already compatible value.
 # Otherwise the candidates are the built-in literal defaults, a
 # converter from the source to the expected type, and, for an expected variant,

@@ -89,10 +89,14 @@ pub fn analyzeCallee(scratch: std.mem.Allocator, body: *const Body) !Facts {
     return .{ .eligible = true, .entry_taken = entry_taken, .normal_return_ranges = if (narrowed) ranges else &.{} };
 }
 
-pub fn inlineCalls(function: *Function, context: anytype) !bool {
+pub fn growthBudget(function: *const Function) usize {
+    const size = liveInstructions(function);
+    return @max(size * 4, size + 512);
+}
+
+pub fn inlineCalls(function: *Function, context: anytype, budget: usize) !bool {
     var cache: Cache = .{};
     var size = liveInstructions(function);
-    const budget = @max(size * 4, size + 512);
     const reachable = (try function.controlFlowEdges()).reachable;
     var changed = false;
     var block: u32 = 0;

@@ -514,6 +514,18 @@ const EntryCallParent = struct {
     }
 };
 
+const ReturnedCallableContractParent = struct {
+    pub const Input = structures.InstanceId;
+    pub const Output = ?queries.ReturnedCallableReferenceContract;
+
+    var executions: Counter = .{};
+
+    pub fn run(ctx: *Context, instance: Input) anyerror!Output {
+        executions.increment();
+        return (try ctx.get(queries.InferReturnedCallableReferenceContract, instance)).*;
+    }
+};
+
 test "module paths intern by contents and files map to modules" {
     const db = try testDatabase(1);
     defer db.deinit();
@@ -9460,6 +9472,331 @@ test "reference contracts reuse acyclic bodies and recover after recursive edits
                     try testing.expect(!std.mem.eql(u8, entry.*.type_identity.name, @typeName(queries.ReferenceCallees)));
                 }
             }
+        }
+    }
+}
+
+test "numeric indirect typing does not demand a factory body for reference recovery" {
+    const db = try Database.init(testing.allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    try test_sources.modules.registerSources(db, testing.allocator,
+        \\func factory() func(int) int -> false
+        \\func run() int
+        \\    const callback = factory()
+        \\    return callback(42)
+        \\exit(run())
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const instance: structures.InstanceId = .{ .item = scope.resolve("run").? };
+    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, instance)).* != null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, instance, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+    try testing.expect((try db.get(queries.BuildExecutable, 0)).* == null);
+    try db.setInput(queries.SourceText, 0,
+        \\func identity(value: int) int -> value
+        \\func factory() func(int) int -> identity
+        \\func run() int
+        \\    const callback = factory()
+        \\    return callback(42)
+        \\exit(run())
+    );
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, @as(u8, 42));
+}
+
+test "returned callable contracts invalidate dependents only for changed effects" {
+    ReturnedCallableContractParent.executions.reset();
+    const db = try Database.init(testing.allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try test_sources.modules.registerSources(db, testing.allocator, "exit(42)", &.{.{ .path = "helper.chi", .source = "", .module_path = "helper" }}, &.{});
+    const targets = [_][]const u8{ "first", "second", "write", "first" };
+    const executions = [_]usize{ 1, 1, 2, 3 };
+    for (targets, executions) |target, expected| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\pub func first(ref source: int) ref int -> source
+            \\pub func second(ref source: int) ref int -> source
+            \\pub func write(ref source: int) ref int
+            \\    source = 42
+            \\    return source
+            \\pub func factory() func(ref int) ref int -> $target
+        , .{ .target = target });
+        defer testing.allocator.free(source);
+        try db.setInput(queries.SourceText, 1, source);
+        const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+        const instance: structures.InstanceId = .{ .item = scope.resolve("factory").? };
+        const contract = (try db.get(ReturnedCallableContractParent, instance)).*.?;
+        try testing.expect(contract == .references);
+        try testing.expectEqual(std.mem.eql(u8, target, "write"), contract.references.requirements.len != 0);
+        try ReturnedCallableContractParent.executions.expect(expected);
+    }
+}
+
+test "reference contracts recover after cleanup and callback target edits" {
+    const cleanup =
+        \\pub struct Install
+        \\    pub target: Ref(Ref(int))
+        \\    pub source: Ref(int)
+        \\    pub fallback: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.source
+    ;
+    const unchanged =
+        \\pub struct Install
+        \\    pub target: Ref(Ref(int))
+        \\    pub source: Ref(int)
+        \\    pub fallback: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.fallback
+    ;
+    const callbacks =
+        \\pub func identity(ref source: int) ref int -> source
+        \\pub func write(ref source: int) ref int
+        \\    source = 42
+        \\    return source
+        \\pub func factory() func(ref int) ref int -> identity
+    ;
+    const writing =
+        \\pub func identity(ref source: int) ref int -> source
+        \\pub func write(ref source: int) ref int
+        \\    source = 42
+        \\    return source
+        \\pub func factory() func(ref int) ref int -> write
+    ;
+    const cases = [_]struct { entry: []const u8, original: []const u8, changed: []const u8 }{
+        .{ .entry =
+        \\import helper.{Install}
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    const install = Install{target = Ref.from(slot), source = Ref.from(source), fallback = Ref.from(original)}
+        \\    _ = install
+        \\    slot.value += 1
+        \\    return source
+        \\exit(run())
+        , .original = cleanup, .changed = unchanged },
+        .{ .entry =
+        \\import helper.{factory}
+        \\func run() int
+        \\    const source = 42
+        \\    const callback = factory()
+        \\    return callback(source)
+        \\exit(run())
+        , .original = callbacks, .changed = writing },
+    };
+    for (cases) |case| {
+        const db = try Database.init(testing.allocator, .{ .worker_count = 1 });
+        defer db.deinit();
+        try test_sources.modules.registerSources(db, testing.allocator, case.entry, &.{.{ .path = "helper.chi", .source = case.original, .module_path = "helper" }}, &.{});
+        const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+        const instance: structures.InstanceId = .{ .item = scope.resolve("run").? };
+        const original_body = try db.get(queries.AnalyzeFunctionInstance, instance);
+        try testing.expect(original_body.* != null);
+        try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, @as(u8, 42));
+        try db.setInput(queries.SourceText, 1, case.changed);
+        try testing.expect((try db.get(queries.AnalyzeFunctionInstance, instance)).* == null);
+        const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, instance, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        var rejected = false;
+        for (diagnostics) |diagnostic| rejected = rejected or diagnostic.kind == .reference_not_writable;
+        try testing.expect(rejected);
+        try db.setInput(queries.SourceText, 1, case.original);
+        try testing.expect((try db.get(queries.AnalyzeFunctionInstance, instance)).* != null);
+        try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, @as(u8, 42));
+    }
+}
+
+test "reference contracts preserve result correlated output dependencies" {
+    const db = try Database.init(testing.allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    try test_sources.modules.registerSources(db, testing.allocator,
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const instance: structures.InstanceId = .{ .item = scope.resolve("replace").? };
+    for ([_][]const u8{ "", "()", "" }) |returned| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+            \\    if not selected -> return none
+            \\    slot = Ref.from(source)
+            \\    return $returned
+        , .{ .returned = returned });
+        defer testing.allocator.free(source);
+        try db.setInput(queries.SourceText, 0, source);
+        const contract = (try db.get(queries.InferReferenceContract, instance)).*.?;
+        try testing.expectEqual(@as(usize, 2), contract.outputs.len);
+        for (contract.outputs) |output| {
+            try testing.expectEqual(@as(u32, 0), output.parameter);
+            try testing.expectEqual(@as(usize, 1), output.origins.len);
+            try testing.expectEqual(@as(?u32, if (output.result_type == .unit) 1 else 0), output.origins[0].parameter);
+        }
+    }
+    for ([_]bool{ false, true, false }) |inverted| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+            \\    if not selected -> return $unchanged
+            \\    slot = Ref.from(source)
+            \\    return $written
+        , .{ .unchanged = if (inverted) "()" else "none", .written = if (inverted) "none" else "()" });
+        defer testing.allocator.free(source);
+        try db.setInput(queries.SourceText, 0, source);
+        const contract = (try db.get(queries.InferReferenceContract, instance)).*.?;
+        try testing.expectEqual(@as(usize, 2), contract.outputs.len);
+        const written_result: structures.TypeId = if (inverted) .none else .unit;
+        for (contract.outputs) |output| {
+            try testing.expectEqual(@as(u32, 0), output.parameter);
+            try testing.expectEqual(@as(usize, 1), output.origins.len);
+            try testing.expectEqual(@as(?u32, if (output.result_type == written_result) 1 else 0), output.origins[0].parameter);
+        }
+    }
+}
+
+test "reference provenance edits retain forwarding typing and update exported effects" {
+    const db = try Database.init(testing.allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    const original =
+        \\pub func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+    ;
+    const changed =
+        \\pub func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return ()
+        \\    slot = Ref.from(source)
+        \\    return none
+    ;
+    try test_sources.modules.registerSources(db, testing.allocator,
+        \\import helper.{replace}
+        \\func forward(mut slot: Ref(int), ref source: int, selected: bool) unit | none -> replace(slot, source, selected)
+    , &.{.{ .path = "helper.chi", .source = original, .module_path = "helper" }}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const instance: structures.InstanceId = .{ .item = scope.resolve("forward").? };
+    const typed = try db.get(queries.TypeFunctionInstance, instance);
+    try testing.expect(typed.* != null);
+    try testing.expect(!typed.*.?.precise);
+    const helper_scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const helper_typed = (try db.get(queries.TypeFunctionInstance, .{ .item = helper_scope.resolve("replace").? })).*.?;
+    try testing.expect(helper_typed.precise);
+    for ([_][]const u8{ original, changed, original }, 0..) |source, index| {
+        try db.setInput(queries.SourceText, 1, source);
+        try testing.expect(typed == try db.get(queries.TypeFunctionInstance, instance));
+        const contract = (try db.get(queries.InferReferenceContract, instance)).*.?;
+        const written_result: structures.TypeId = if (index == 1) .none else .unit;
+        try testing.expectEqual(@as(usize, 2), contract.outputs.len);
+        for (contract.outputs) |output| {
+            try testing.expectEqual(@as(usize, 1), output.origins.len);
+            try testing.expectEqual(@as(?u32, if (output.result_type == written_result) 1 else 0), output.origins[0].parameter);
+        }
+    }
+}
+
+test "reference provenance edits retain universally valid typed bodies" {
+    const db = try Database.init(testing.allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    const original =
+        \\pub func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+    ;
+    const changed =
+        \\pub func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return ()
+        \\    slot = Ref.from(source)
+        \\    return none
+    ;
+    try test_sources.modules.registerSources(db, testing.allocator,
+        \\import helper.{replace}
+        \\func run() int
+        \\    var original = 40
+        \\    var source = 42
+        \\    var slot = Ref.from(original)
+        \\    const result = replace(slot, source, true)
+        \\    if result is unit -> slot.value += 0
+        \\    return slot.value
+        \\exit(run())
+    , &.{.{ .path = "helper.chi", .source = original, .module_path = "helper" }}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const instance: structures.InstanceId = .{ .item = scope.resolve("run").? };
+    const typed = try db.get(queries.TypeFunctionInstance, instance);
+    try testing.expect(typed.* != null);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, @as(u8, 42));
+    for ([_][]const u8{ changed, original }) |source| {
+        try db.setInput(queries.SourceText, 1, source);
+        try testing.expect(typed == try db.get(queries.TypeFunctionInstance, instance));
+        try testing.expect((try db.get(queries.AnalyzeFunctionInstance, instance)).* != null);
+        try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, @as(u8, 42));
+    }
+}
+
+test "reference provenance edits reuse construction and revalidate selected captures" {
+    const db = try Database.init(testing.allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    const original =
+        \\pub func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+    ;
+    const changed =
+        \\pub func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return ()
+        \\    slot = Ref.from(source)
+        \\    return none
+    ;
+    try test_sources.modules.registerSources(db, testing.allocator,
+        \\import helper.{replace}
+        \\func run() int
+        \\    const source = 42
+        \\    var slot = Ref.from(source)
+        \\    if true
+        \\        const temporary = 40
+        \\        slot = Ref.from(temporary)
+        \\        const result = replace(slot, source, true)
+        \\        if result is none -> return 0
+        \\    return slot.value
+        \\exit(run())
+    , &.{.{ .path = "helper.chi", .source = original, .module_path = "helper" }}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const instance: structures.InstanceId = .{ .item = scope.resolve("run").? };
+    const construction = try db.get(queries.ConstructFunctionBody, instance);
+    try testing.expect(construction.* != null);
+    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, instance)).* != null);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, @as(u8, 42));
+    try db.setInput(queries.SourceText, 1, changed);
+    try testing.expect(construction == try db.get(queries.ConstructFunctionBody, instance));
+    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, instance)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, instance, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    var rejected = false;
+    for (diagnostics) |diagnostic| rejected = rejected or diagnostic.kind == .borrow_outlives_source;
+    try testing.expect(rejected);
+    try db.setInput(queries.SourceText, 1, original);
+    try testing.expect(construction == try db.get(queries.ConstructFunctionBody, instance));
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, @as(u8, 42));
+}
+
+test "reference contracts retain empty result correlated output groups" {
+    const db = try Database.init(testing.allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    try test_sources.modules.registerSources(db, testing.allocator,
+        \\func clear(mut slot: Ref(int) | none, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = none
+        \\    return ()
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const instance: structures.InstanceId = .{ .item = scope.resolve("clear").? };
+    const contract = (try db.get(queries.InferReferenceContract, instance)).*.?;
+    try testing.expectEqual(@as(usize, 2), contract.outputs.len);
+    for (contract.outputs) |output| {
+        try testing.expectEqual(@as(u32, 0), output.parameter);
+        if (output.result_type == .unit) {
+            try testing.expectEqual(@as(usize, 0), output.origins.len);
+        } else {
+            try testing.expect(output.origins.len != 0);
         }
     }
 }

@@ -1,0 +1,8 @@
+case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable
+serial_selected-512,normal,cold,0,488181516,92323,2,true
+serial_selected-512,normal,cold,1,489252857,92323,2,true
+serial_selected-512,normal,contract-edit,0,24458151,92323,3,false
+serial_selected-512,normal,contract-edit,1,22514187,92323,3,false
+serial_selected-512,normal,contract-edit,2,22449868,92323,3,false
+serial_selected-512,normal,runtime,0,200012108,92323,2,true
+serial_selected-512,normal,runtime,1,202231293,92323,2,true

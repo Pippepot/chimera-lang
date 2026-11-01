@@ -1,5 +1,6 @@
 import std.memory.{Span, SpanIterator}
 import std.range.{Range, FromEnd}
+import std.search
 
 pub struct collection_literal(T: type, N: int)
     move = none
@@ -9,6 +10,12 @@ pub struct Array(T: type, N: int)
     pub func filled(imm value: T) Array(T, N) where T.copy is func(imm T) T -> array_filled(T, N, value)
     pub func len(imm self: Array(T, N)) int -> N
     pub func span(ref self: Array(T, N)) Span(T) -> Span(T).from_array(N, self)
+    func index_of_equal(static Needle: type, imm self: Array(T, N), imm needle: Needle) int | none -> std.search.index_of(self.span(), needle)
+    func index_of_by(static Needle: type, imm self: Array(T, N), imm needle: Needle, matches: func(imm T, imm Needle) bool) int | none -> std.search.index_of(self.span(), needle, matches)
+    pub overload index_of(index_of_equal, index_of_by)
+    func index_of_sequence_equal(static Needle: type, imm self: Array(T, N), imm needle: Span(Needle)) int | none -> std.search.index_of_sequence(self.span(), needle)
+    func index_of_sequence_by(static Needle: type, imm self: Array(T, N), imm needle: Span(Needle), matches: func(imm T, imm Needle) bool) int | none -> std.search.index_of_sequence(self.span(), needle, matches)
+    pub overload index_of_sequence(index_of_sequence_equal, index_of_sequence_by)
     pub func iter(ref self: Array(T, N)) SpanIterator(T)
         var view = self.span()
         return view.iter()

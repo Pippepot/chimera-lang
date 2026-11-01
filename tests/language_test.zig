@@ -5099,7 +5099,7 @@ test "returned Ref origins distinguish inferred contracts from indirect calls" {
     const source =
         \\func select(imm first: Ref(int), mut output: Ref(int)) Ref(int) -> first
         \\func run() int
-        \\  const first = Box.new(42)
+        \\  $binding first = Box.new(42)
         \\  if not (first is Box(int)) -> panic "unexpected allocation refusal"
         \\  var other = Box.new(17)
         \\  if not (other is Box(int)) -> panic "unexpected allocation refusal"
@@ -5117,7 +5117,7 @@ test "returned Ref origins distinguish inferred contracts from indirect calls" {
             .{ .invalidate = "const moved = other^\n  _ = moved", .diagnostic = .use_after_transfer },
             .{ .invalidate = "other = ((match Box.new(23)\n    _selected_result_0 and _selected_result_0 is Box(int) -> _selected_result_0^\n    _ -> panic \"unexpected none\"))", .diagnostic = .borrow_outlives_source },
         }) |case| {
-            const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .callee = callee, .invalidate = case.invalidate });
+            const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .binding = "var", .callee = callee, .invalidate = case.invalidate });
             defer testing.allocator.free(entry);
             const fixture = try Fixture.initFiles(entry, &.{});
             defer fixture.deinit();
@@ -5128,6 +5128,15 @@ test "returned Ref origins distinguish inferred contracts from indirect calls" {
                 try fixture.expectExit(0, 42);
             }
         }
+    }
+    for ([_][]const u8{ "select", "function" }) |callee| {
+        const entry = try test_sources.renderTemplate(testing.allocator, source, .{ .binding = "const", .callee = callee, .invalidate = "_ = output.value" });
+        defer testing.allocator.free(entry);
+        const fixture = try Fixture.initFiles(entry, &.{});
+        defer fixture.deinit();
+        if (std.mem.eql(u8, callee, "function")) {
+            try fixture.expectDiagnostic(0, .reference_not_writable);
+        } else try fixture.expectExit(0, 42);
     }
 }
 

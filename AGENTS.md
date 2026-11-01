@@ -2,6 +2,8 @@
 
 Build clear, correct code with the least total machinery.
 
+- No arbitrary retry limits; finish unless genuinely blocked.
+
 ## Design
 
 - [syntax&semantics.txt](syntax&semantics.txt) is the incomplete language source of truth; [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) owns compiler/query boundaries and [ROADMAP.md](ROADMAP.md) owns priorities. State broader semantic interpretations before implementing them.

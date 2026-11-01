@@ -25,6 +25,13 @@ their owning boundary. Source rejection emits diagnostics, unavailable or stale
 state remains distinct, infrastructure failures are errors, and broken compiler
 invariants use assertions.
 
+Unchecked IR array and allocation projections require in-bounds storage
+positions. Their indices are nonnegative; standard accessors validate bounds and
+raw allocation callers supply the required proofs. Initialization requirements
+belong to the operation using that position. Cursor offsets are
+a separate operation and can be negative. Native addressing trusts these
+contracts rather than repeating source checks.
+
 Published results are deeply immutable. Construction graphs, mutable analyses,
 and finalization views remain local to their computation; neither source pointers
 nor interpreter frame pointers may escape into cached results.
@@ -50,6 +57,26 @@ validate imports, exports, duplicate names, and converter declarations without
 analyzing unused bodies. A file's top-level statements form an ordinary unit
 entry; a function named `main` has no special role.
 
+`ConstructFunctionBody` caches deep-owned semantic construction independently of
+callee provenance. `TypeFunctionInstance` consumes that cache and publishes fully
+validated SSA under merged reference-effect dependencies. It publishes only when
+the captures pass reference/lifetime checks and there are no ownership generations or
+initializer regions. Repartitioning that unchanged capture set cannot invalidate
+this stronger proof. `InferReferenceEffects` derives the merged summary from an
+available conservative typed callee, otherwise from its precise contract. It
+unions ordinary and per-alternative origins, including incoming no-write captures.
+Both results track whether any precision was actually lost. An attempt consuming
+only exact effects can publish its precise exported contract without retyping.
+Reuse supports mutable flat references and single-reference-field carriers whose
+referent cannot contain borrows; layered references, aggregate slots, and captured
+variable effects retain precise analysis. A conservative body exporting effects
+is reused only for transparent single-call forwarding with matching signatures
+and unchanged argument sources;
+`AnalyzeFunctionInstance` derives their precise contract from the callee.
+Rejected conservative attempts fall back to full precise analysis; probe-local
+diagnostics are not published. Cleanup-sensitive bodies retain full analysis.
+Construction, typing, and cached-body reuse return views to the query engine's
+deep publication copy rather than making redundant query-local copies.
 `AnalyzeFunctionInstance` publishes typed SSA only after reference analysis and
 lifetime planning. `CompileFunction` emits one artifact without compiling callees.
 Reachability follows callable references from the designated entry, and linking
@@ -86,6 +113,12 @@ owned/reference storage kinds are independent. Arrays use structural element and
 length identity, not generated fields. `ResolveTypeNamespace` associates types
 with source namespaces independently of struct identity; visibility remains a
 use-site decision.
+
+Structural subtyping is shared by static constraints, runtime type tests, and
+value typing. The frontend constructs changed tuple representations with ordinary
+field and variant operations before publishing IR, preserving ownership and
+reference origins. Logical compatibility never permits reusing incompatible
+destination storage; annotated static results are materialized by typed thunks.
 
 Primitive operations use registered namespace members and ordinary callable
 identities. Explicit overload sets own their membership; imports do not merge
@@ -225,8 +258,38 @@ Reference contracts preserve source/result paths, write requirements, and tempor
 exclusions through calls, converters, and hooks. Acyclic contracts derive from
 cached typed bodies. Cycles activate direct-callee discovery and fixed-point
 inference within the recursive component. Equal contracts stop unrelated body
-changes propagating. Caller substitution checks aliases and authority; result
-alternatives do not narrow the merged mutation effects of ordinary return paths.
+changes propagating. Per-alternative parameter outputs are part of the same cached
+contract; unchanged alternatives retain their incoming capture. Caller substitution
+checks aliases and authority and attaches result proofs to installed dependencies.
+An explicit empty output group installs no captures; an absent group uses the
+merged fallback. For indirect writes, explicit target contents override opaque
+ancestor contents; storage addresses alone do not imply retained referent captures.
+Incoming branches filter dependencies before joins discard branch-specific facts.
+Each ordinary exit supplies its own returned alternatives and proof identity;
+bare returns supply `unit` independently of previously analyzed branches.
+Copies and forwarding retain proof identity, while joins preserve conservative
+loop history. Result tests filter dependencies, never restore storage or undo
+ownership effects. Paths with equal alternatives and untested results still merge.
+Typing shares AND/OR conditions between identical origin payloads rather than
+enumerating call histories. Selection uses dense guard-ID memos scoped to one
+incoming refinement snapshot and preserves origin heads for unchanged selections.
+Immutable, non-reference whole-value copies with matching result domains and no
+explicit physical flow origins reuse their existing result proof. Match captures
+with physical origins retain their narrowing and ownership identity. Physical
+places remain separately indexed for write invalidation. Loop rebasing removes
+iteration-local proofs before applying header correlation.
+
+Immutable callable projections recover known targets. Unambiguous factory returns
+derive returned reference effects from cached body analysis through a separate
+query boundary: equal effects retain caller analysis even when target identity
+changes. Immutable forwarded parameters retain their source-parameter identity.
+Reassigned storage and disagreeing return paths retain conservative callable
+effects. Opaque calls inspect captured writable references even inside immutable
+carriers; carrier immutability grants no write authority over the carrier itself.
+Recovery follows identities until a target, an unknown source, or an actual cycle;
+deterministic identity walks detect cycles in constant space without a source-depth
+limit. Callable body recovery is demanded only
+when executable typing needs a reference contract.
 
 Address-passed values construct in their consumer's explicit destination. Locals,
 results, fields, variant payloads, and array elements use the same machinery;
@@ -243,9 +306,33 @@ return their own value or diverge, but cannot exit an enclosing caller or escape
 as first-class handles. Skipped regions leave captures untouched; completed
 writes and transfers do not roll back.
 
-Typing records effects at stable body-local checkpoints. The lifetime solver
-produces one path-sensitive ending plan; typing rejects abandonment and lowers
-accepted cleanup to ordinary operations. Nominal hooks remain authoritative.
+Typing records effects at stable body-local checkpoints. Output-bearing cleanup
+first retains prospective referents for lifetime planning, then substitutes hook
+outputs at the scheduled boundaries and CFG edges. Fresh carrier reads resolve
+against those ordered writes; prior aliases and copied handles retain their
+captures. Outputs follow the remaining owned cleanup shape and reverse destruction
+order, including individually indexed array elements. Guarded cleanup preserves
+the untouched alternative. Final authority and lifetime checks precede lowering
+accepted cleanup to ordinary operations.
+Nominal hooks remain authoritative.
+Prospective candidates are grouped by target root and retain only paths and
+captures; temporal locations belong to scheduled writes. Equivalent whole-owner
+nominal-hook captures are collected once per value, generation, type, and resolved
+origins only when substitution is snapshot-only. Partial shapes, content loads,
+and read-version captures remain conservative. Empty places that cannot
+store borrows and own no resource require no deferred content reads.
+Reference-bearing slots retain initial captures and ordered ordinary writes,
+including writes before cleanup discovery. A hook's captured-slot dereferences
+resolve at its scheduled cursor rather than the already-unbound live state.
+Mutable parameter outputs resolve at the return terminator after cleanup;
+ordinary returned copies retain their earlier captures.
+Pending reads use indexed stable checkpoints and resolve in reverse insertion
+order. Final lifetime effects replace provisional effects; unchanged effects keep
+the planned endings while authority checks still run.
+Cleanup output collection and deferred reads share one CFG. Reaching-content
+lookups index ordered writes by root and block and memoize acyclic cursors within
+each read, including known-empty results. Cycle-dependent results retain the
+incoming fallback and are not shared across different traversal contexts.
 Partial-field obligations, stored-member restrictions, and reference provenance
 survive refinement and forwarding. Cleanup snapshots are selected at the latest
 reaching point on each path, including known-empty contents. Block splitting does

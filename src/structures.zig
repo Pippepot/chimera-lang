@@ -1679,8 +1679,15 @@ pub const ReferenceExclusion = struct {
     invalidation: ReferenceOriginContract,
 };
 
+pub const ReferenceOutputContract = struct {
+    result_type: TypeId,
+    parameter: u32,
+    origins: []const ReferenceOriginContract,
+};
+
 pub const ReferenceContract = struct {
     origins: []const ReferenceOriginContract = &.{},
+    outputs: []const ReferenceOutputContract = &.{},
     requirements: []const ReferenceRequirement = &.{},
     exclusions: []const ReferenceExclusion = &.{},
     paths: []const ReferencePathStep = &.{},
@@ -1690,6 +1697,18 @@ pub const ReferenceContract = struct {
 
     /// Inference joins sets of dependencies; their discovery order is irrelevant.
     pub fn equivalent(left: @This(), right: @This()) bool {
+        if (left.outputs.len != right.outputs.len) return false;
+        for (left.outputs) |output| {
+            for (right.outputs) |candidate| {
+                if (output.result_type != candidate.result_type or output.parameter != candidate.parameter) continue;
+                if (output.origins.len != candidate.origins.len) continue;
+                for (output.origins) |origin| {
+                    for (candidate.origins) |other| {
+                        if (sameOrigin(left, origin, right, other)) break;
+                    } else break;
+                } else break;
+            } else return false;
+        }
         inline for (.{ "origins", "requirements", "exclusions" }, .{ sameOrigin, sameRequirement, sameExclusion }) |name, same| {
             const first = @field(left, name);
             const second = @field(right, name);

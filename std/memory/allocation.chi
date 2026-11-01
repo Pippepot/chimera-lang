@@ -3,6 +3,7 @@ import std.array.{Array, collection_literal}
 import std.iteration.{End}
 import std.range.{Range, FromEnd}
 import std.memory
+import std.search
 
 pub struct Allocation(T: type)
     storage: HostStorage
@@ -66,6 +67,12 @@ pub struct List(T: type)
     pub func len(imm self: List(T)) int -> self.initialized
     pub func capacity(imm self: List(T)) int -> self.storage.capacity()
     pub func span(ref self: List(T)) Span(T) -> Span(T){data = allocation_cursor(T, self.storage), size = self.initialized}
+    func index_of_equal(static Needle: type, imm self: List(T), imm needle: Needle) int | none -> std.search.index_of(self.span(), needle)
+    func index_of_by(static Needle: type, imm self: List(T), imm needle: Needle, matches: func(imm T, imm Needle) bool) int | none -> std.search.index_of(self.span(), needle, matches)
+    pub overload index_of(index_of_equal, index_of_by)
+    func index_of_sequence_equal(static Needle: type, imm self: List(T), imm needle: Span(Needle)) int | none -> std.search.index_of_sequence(self.span(), needle)
+    func index_of_sequence_by(static Needle: type, imm self: List(T), imm needle: Span(Needle), matches: func(imm T, imm Needle) bool) int | none -> std.search.index_of_sequence(self.span(), needle, matches)
+    pub overload index_of_sequence(index_of_sequence_equal, index_of_sequence_by)
     pub func iter(ref self: List(T)) SpanIterator(T)
         var view = self.span()
         return view.iter()
@@ -245,6 +252,12 @@ pub struct Span(T: type)
         if initialized < 0 or initialized > allocation.capacity() -> return none
         return Span(T){data = allocation_cursor(T, allocation), size = initialized}
     pub func len(imm self: Span(T)) int -> self.size
+    func index_of_equal(static Needle: type, imm self: Span(T), imm needle: Needle) int | none -> std.search.index_of(self, needle)
+    func index_of_by(static Needle: type, imm self: Span(T), imm needle: Needle, matches: func(imm T, imm Needle) bool) int | none -> std.search.index_of(self, needle, matches)
+    pub overload index_of(index_of_equal, index_of_by)
+    func index_of_sequence_equal(static Needle: type, imm self: Span(T), imm needle: Span(Needle)) int | none -> std.search.index_of_sequence(self, needle)
+    func index_of_sequence_by(static Needle: type, imm self: Span(T), imm needle: Span(Needle), matches: func(imm T, imm Needle) bool) int | none -> std.search.index_of_sequence(self, needle, matches)
+    pub overload index_of_sequence(index_of_sequence_equal, index_of_sequence_by)
     pub func iter(ref self: Span(T)) SpanIterator(T) -> SpanIterator(T){source = self, position = 0}
     func get_at(ref self: Span(T), index: int) ref T | none
         if index < 0 or index >= self.size -> return none

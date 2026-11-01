@@ -98,6 +98,72 @@ test "overload callable context selects and specializes a single implementation"
     , 42);
 }
 
+test "generic callable references specialize after outer static inference" {
+    try Fixture.expectParity(
+        \\func foo(static T: type, value: T, operation: func(T) T) T -> operation(value)
+        \\func reversed(static T: type, operation: func(T) T, value: T) T -> operation(value)
+        \\func identity(static T: type, value: T) T -> value
+        \\func apply(operation: func(int) int) int -> operation(42)
+        \\func run() int
+        \\    const selected: func(int) int = identity
+        \\    if foo(10, identity) <> 10 -> return 90
+        \\    if foo(int, 20, identity) <> 20 -> return 91
+        \\    if reversed(identity, 30) <> 30 -> return 92
+        \\    if apply(identity) <> 42 -> return 93
+        \\    return selected(42)
+    , 42);
+}
+
+test "generic callable references retain inference and signature diagnostics" {
+    try Fixture.expectSourceDiagnostic(
+        \\func identity(static T: type, value: T) T -> value
+        \\const unresolved = identity
+    , .static_parameter_requires_specialization);
+    try Fixture.expectSourceDiagnostic(
+        \\func foo(static T: type, operation: func(T) T) T -> operation(42)
+        \\func identity(static T: type, value: T) T -> value
+        \\exit(foo(identity))
+    , .static_argument_cannot_be_inferred);
+    try Fixture.expectSourceDiagnostic(
+        \\func foo(static T: type, left: T, right: T, operation: func(T) T) T -> operation(left)
+        \\func identity(static T: type, value: T) T -> value
+        \\exit(foo(42, true, identity))
+    , .static_argument_inference_conflict);
+    try Fixture.expectSourceDiagnostic(
+        \\func identity(static T: type, mut value: T) T -> value
+        \\const selected: func(int) int = identity
+    , .no_matching_overload);
+    try Fixture.expectSourceDiagnostic(
+        \\func identity(static T: type, value: T) bool -> true
+        \\const selected: func(int) int = identity
+    , .no_matching_overload);
+    try Fixture.expectSourceDiagnostic(
+        \\func produce(static T: type) T -> 42
+        \\const selected: func() int = produce
+    , .no_matching_overload);
+    try Fixture.expectSourceDiagnostic(
+        \\func identity(static T: type, value: T) T where false -> value
+        \\const selected: func(int) int = identity
+    , .where_condition_failed);
+}
+
+test "generic callable references recompute after edits and recover" {
+    const caller =
+        \\func foo(static T: type, value: T, operation: func(T) T) T -> operation(value)
+        \\exit(foo(42, identity))
+    ;
+    const source = "func identity(static T: type, value: T) T -> value\n" ++ caller;
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(queries.SourceText, 0, "func identity(static T: type, value: T) T -> value + 1\n" ++ caller);
+    try fixture.expectExit(0, 43);
+    try fixture.db.setInput(queries.SourceText, 0, "func identity(static T: type, mut value: T) T -> value\n" ++ caller);
+    try fixture.expectDiagnostic(null, .no_matching_overload);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+}
+
 test "overload methods and custom index types share ordinary selection" {
     try Fixture.expectParity(
         \\struct Key

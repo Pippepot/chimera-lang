@@ -1,0 +1,45 @@
+import std.memory.{Span}
+
+pub overload index_of(index_of_equal, index_of_by)
+pub overload index_of_sequence(index_of_sequence_equal, index_of_sequence_by)
+
+func index_of_equal(static Element: type, static Needle: type, imm values: Span(Element), imm needle: Needle) int | none
+    for index in 0..values.len()
+        if values[index] == needle -> return index
+    return none
+func index_of_by(static Element: type, static Needle: type, imm values: Span(Element), imm needle: Needle, matches: func(imm Element, imm Needle) bool) int | none
+    for index in 0..values.len()
+        if matches(values[index], needle) -> return index
+    return none
+
+func matches_at(static Element: type, static Needle: type, imm values: Span(Element), imm needle: Span(Needle), start: int, matches: func(imm Element, imm Needle) bool) bool
+    for index in 0..needle.len()
+        if not matches(values[start + index], needle[index]) -> return false
+    return true
+
+func equal_at(static Element: type, static Needle: type, imm values: Span(Element), imm needle: Span(Needle), start: int) bool
+    for index in 0..needle.len()
+        if not (values[start + index] == needle[index]) -> return false
+    return true
+
+func index_of_sequence_equal(static Element: type, static Needle: type, imm values: Span(Element), imm needle: Span(Needle)) int | none
+    if needle.len() == 0 -> return 0
+    if needle.len() > values.len() -> return none
+    const last = values.len() - needle.len()
+    for start in 0..=last
+        if equal_at(values, needle, start) -> return start
+    return none
+func index_of_sequence_by(static Element: type, static Needle: type, imm values: Span(Element), imm needle: Span(Needle), matches: func(imm Element, imm Needle) bool) int | none
+    if needle.len() == 0 -> return 0
+    if needle.len() > values.len() -> return none
+    const last = values.len() - needle.len()
+    for start in 0..=last
+        if matches_at(values, needle, start, matches) -> return start
+    return none
+
+pub func starts_with(static Element: type, static Needle: type, imm values: Span(Element), imm needle: Span(Needle)) bool
+    if needle.len() > values.len() -> return false
+    return equal_at(values, needle, 0)
+pub func ends_with(static Element: type, static Needle: type, imm values: Span(Element), imm needle: Span(Needle)) bool
+    if needle.len() > values.len() -> return false
+    return equal_at(values, needle, values.len() - needle.len())

@@ -1,6 +1,5 @@
 const std = @import("std");
 const ast = @import("frontend/parser.zig");
-const codegen = @import("backend/codegen.zig");
 const disasm = @import("backend/disasm.zig");
 const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
@@ -49,16 +48,20 @@ fn renderFunctionSource(db: *query.Database, instance: structures.InstanceId, so
     for (sources) |source| {
         if (source.file_id != resolved.file_id) continue;
         try writer.print("source {s} :: ", .{source.path});
-        const location = try db.lookupInterned(queries.ItemLocations, instance.item);
-        if (location.origin == .module) {
-            const module = try db.lookupInterned(queries.ModulePaths, location.origin.module);
-            try writer.print("{s}.", .{if (module.path.len == 0) "$entry" else module.path});
-        }
-        try diagnostics.writeFunctionName(queries.TypeFacts(*query.Database){ .ctx = db }, writer, instance);
+        try renderQualifiedFunctionName(db, instance, writer);
         try writer.writeByte('\n');
         return;
     }
     unreachable; // The driver supplies every registered source.
+}
+
+fn renderQualifiedFunctionName(db: *query.Database, instance: structures.InstanceId, writer: *std.Io.Writer) !void {
+    const location = try db.lookupInterned(queries.ItemLocations, instance.item);
+    if (location.origin == .module) {
+        const module = try db.lookupInterned(queries.ModulePaths, location.origin.module);
+        try writer.print("{s}.", .{if (module.path.len == 0) "$entry" else module.path});
+    }
+    try diagnostics.writeFunctionName(queries.TypeFacts(*query.Database){ .ctx = db }, writer, instance);
 }
 
 fn renderSsaFunction(
@@ -259,17 +262,60 @@ pub fn renderAssembly(
     db: *query.Database,
     file_id: structures.FileId,
     sources: []const diagnostics.DiagnosticSource,
-    executable: structures.Executable,
     gpa: std.mem.Allocator,
     writer: *std.Io.Writer,
 ) !void {
-    const assembly = try disasm.disassemble(codegen.executableCode(executable), gpa);
-    defer gpa.free(assembly);
     try writer.writeAll("ASM\n");
     const reachable = (try db.get(queries.CollectReachableInstances, file_id)).* orelse unreachable;
-    for (reachable.instances) |instance| try renderFunctionSource(db, instance, sources, writer);
+    for (reachable.instances) |instance| {
+        const compiled = (try db.get(queries.CompileFunction, instance)).* orelse unreachable;
+        try renderFunctionSource(db, instance, sources, writer);
+        try renderQualifiedFunctionName(db, instance, writer);
+        try writer.writeAll(":\n");
+        try renderCompiledAssembly(db, compiled, gpa, writer);
+    }
+}
+
+fn renderCompiledAssembly(db: *query.Database, compiled: structures.CompiledFunction, gpa: std.mem.Allocator, writer: *std.Io.Writer) !void {
+    var symbols: std.ArrayList(disasm.Symbol) = .empty;
+    defer {
+        for (symbols.items) |symbol| gpa.free(symbol.name);
+        symbols.deinit(gpa);
+    }
+    try symbols.ensureTotalCapacity(gpa, compiled.relocations.len + compiled.panic_trace_offsets.len);
+    for (compiled.relocations) |relocation| {
+        const name = try assemblyRelocationName(db, compiled, relocation.reference, gpa);
+        symbols.appendAssumeCapacity(.{ .offset = relocation.offset, .name = name, .addend = relocation.addend });
+    }
+    for (compiled.panic_trace_offsets) |offset| {
+        symbols.appendAssumeCapacity(.{ .offset = offset, .name = try gpa.dupe(u8, "<panic trace>") });
+    }
+    const assembly = try disasm.disassembleWithSymbols(compiled.code, symbols.items, gpa);
+    defer gpa.free(assembly);
     try writer.writeAll(assembly);
+    for (compiled.constant_data, 0..) |data, index| {
+        try writer.print("  .data{d} = \"{f}\"\n", .{ index, std.zig.fmtString(data.bytes) });
+    }
     try writer.writeByte('\n');
+}
+
+fn assemblyRelocationName(
+    db: *query.Database,
+    compiled: structures.CompiledFunction,
+    reference: @FieldType(structures.CompiledFunction.Relocation, "reference"),
+    gpa: std.mem.Allocator,
+) ![]const u8 {
+    switch (reference) {
+        .function => |index| return assemblyFunctionName(db, compiled.referenced_instances[@backingInt(index)], gpa),
+        .data => |index| return std.fmt.allocPrint(gpa, ".data{d}", .{index}),
+    }
+}
+
+fn assemblyFunctionName(db: *query.Database, instance: structures.InstanceId, gpa: std.mem.Allocator) ![]const u8 {
+    var name: std.Io.Writer.Allocating = .init(gpa);
+    defer name.deinit();
+    try renderQualifiedFunctionName(db, instance, &name.writer);
+    return name.toOwnedSlice();
 }
 
 test "SSA debug renders nested array types and indexed array projections" {

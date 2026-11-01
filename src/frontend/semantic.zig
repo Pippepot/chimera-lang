@@ -106,7 +106,7 @@ fn Analyzer(comptime AnalysisServices: type) type {
             return self.analyzeShapedFunctionSignature(declaration, &.{}, shape);
         }
 
-        pub fn inferStaticArguments(self: *const @This(), declaration: u32, argument_types: []const structures.TypeId, inherited_from: ?u32) !StaticInference {
+        pub fn inferStaticArguments(self: *const @This(), declaration: u32, argument_types: anytype, inherited_from: ?u32) !StaticInference {
             const parameters = functionParameters(self.ast, declaration);
             var inferred: std.ArrayList(InferredParameter) = .empty;
             defer inferred.deinit(self.gpa);
@@ -117,10 +117,11 @@ fn Analyzer(comptime AnalysisServices: type) type {
             for (parameters) |parameter_index| {
                 const parameter = self.ast.nodes[parameter_index.index()];
                 if (parameterMode(self.ast, parameter).? == .static) continue;
-                const actual_type = argument_types[runtime_index];
+                const actual_type: ?structures.TypeId = argument_types[runtime_index];
                 runtime_index += 1;
+                const known_type = actual_type orelse continue;
                 const annotation = parameter.data.parameter.annotation.unwrap().?;
-                if (!try self.bindInferredType(inferred.items, annotation, actual_type)) return .conflict;
+                if (!try self.bindInferredType(inferred.items, annotation, known_type)) return .conflict;
             }
             std.debug.assert(runtime_index == argument_types.len);
             return finishStaticInference(inferred.items, self.gpa);
@@ -1602,7 +1603,9 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         fn appendDeclarationReference(self: *Self, index: structures.Node.Index, instance: structures.InstanceId) !ValueId {
             if (try self.analysis_context.functionShape(instance.item)) |shape| {
                 for (shape.parameters) |parameter| {
-                    if (parameter.mode == .static) return self.reject(index, .static_parameter_requires_specialization);
+                    if (parameter.mode == .static) return self.appendExpression(index, .{
+                        .overloaded_function = try self.analysis_context.genericFunctionReference(instance),
+                    });
                 }
                 const function = (try self.analysis_context.functionItemReference(instance)) orelse return self.reject(index, .unknown_value);
                 return self.appendExpression(index, .{ .function_ref = function });
@@ -2919,16 +2922,34 @@ pub fn numericLiteralTarget(analysis_context: anytype, expected: structures.Type
 
 pub fn canWidenTo(analysis_context: anytype, actual: structures.TypeId, expected: structures.TypeId) !bool {
     if (actual == expected or actual == .never) return true;
-    const expected_members = try analysis_context.facts().variantMembers(expected) orelse return false;
-    const actual_members = try analysis_context.facts().variantMembers(actual) orelse &.{actual};
-    for (actual_members) |member| {
-        if (try widenedVariantTag(analysis_context, member, expected_members) == null) return false;
+    if (try analysis_context.facts().variantMembers(actual)) |actual_members| {
+        for (actual_members) |member| if (!try canWidenTo(analysis_context, member, expected)) return false;
+        return true;
+    }
+    if (try analysis_context.facts().variantMembers(expected)) |expected_members| {
+        for (expected_members) |member| if (try canWidenTo(analysis_context, actual, member)) return true;
+        return false;
+    }
+    const expected_elements = try analysis_context.facts().tupleMembers(expected) orelse return false;
+    const actual_elements = try analysis_context.facts().tupleMembers(actual) orelse return false;
+    if (actual_elements.len != expected_elements.len) return false;
+    for (actual_elements, expected_elements) |actual_element, expected_element| {
+        if (actual_element.kind != expected_element.kind) return false;
+        if (actual_element.kind == .reference) {
+            if (actual_element.type_id != expected_element.type_id) return false;
+        } else if (!try canWidenTo(analysis_context, actual_element.type_id, expected_element.type_id)) return false;
     }
     return true;
 }
 
-pub fn widenedVariantTag(_: anytype, actual: structures.TypeId, members: []const structures.TypeId) !?u32 {
-    return if (std.mem.indexOfScalar(structures.TypeId, members, actual)) |index| @intCast(index) else null;
+pub fn widenedVariantTag(analysis_context: anytype, actual: structures.TypeId, members: []const structures.TypeId) !?u32 {
+    if (std.mem.indexOfScalar(structures.TypeId, members, actual)) |index| return @intCast(index);
+    var selected: ?u32 = null;
+    for (members, 0..) |member, index| if (try canWidenTo(analysis_context, actual, member)) {
+        if (selected != null) return null;
+        selected = @intCast(index);
+    };
+    return selected;
 }
 
 fn functionParts(ast: *const structures.Ast, declaration: u32) FunctionParts {
@@ -3493,6 +3514,10 @@ const TestAnalysisContext = struct {
     }
 
     pub fn functionShape(_: @This(), _: structures.ItemId) !?structures.FunctionShape {
+        unreachable;
+    }
+
+    pub fn genericFunctionReference(_: @This(), _: structures.InstanceId) !structures.FunctionOverloadId {
         unreachable;
     }
 

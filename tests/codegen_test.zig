@@ -5,6 +5,42 @@ const runtime = test_sources.runtime;
 const structures = test_sources.structures;
 const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 
+test "assembly debug renders named functions and constants without data dumps" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\func foo(static T: type, bar: func(T) T) func(T) T
+        \\    return bar
+        \\func id(static T: type, value: T) T
+        \\    return value
+        \\print(foo(int, id)(20))
+        \\print("assembly text")
+    ;
+    const db = try test_sources.query.Database.init(allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    var registry: test_sources.modules.SourceRegistry = .{ .entry_path = "test.chi" };
+    defer registry.deinit(allocator);
+    try registry.update(db, allocator, source, &.{}, &.{});
+    try db.addInput(test_sources.queries.InlineLimit, {}, 0);
+    const entry: structures.FileId = 0;
+    try std.testing.expect((try db.get(test_sources.queries.BuildExecutable, entry)).* != null);
+
+    var sources: [test_sources.modules.standard_sources.len + 1]test_sources.diagnostic_rendering.DiagnosticSource = undefined;
+    sources[0] = .{ .file_id = entry, .path = "test.chi", .source = source };
+    for (test_sources.modules.standard_sources, sources[1..]) |standard, *registered| {
+        registered.* = .{ .file_id = registry.fileId(standard.registry_path).?, .path = standard.display_path, .source = standard.source };
+    }
+    var output: std.Io.Writer.Allocating = .init(allocator);
+    defer output.deinit();
+    try test_sources.debug.renderAssembly(db, entry, &sources, allocator, &output.writer);
+    const assembly = output.writer.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, assembly, "ASM\nsource test.chi :: <entry>\n<entry>:\n"));
+    try std.testing.expect(std.mem.indexOf(u8, assembly, "source std/io.chi :: std.io.print_value(int)\nstd.io.print_value(int):\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembly, "call std.io.print_value(int)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembly, " $entry.id(int)\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembly, ".data0 = \"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembly, "db 0x") == null);
+}
+
 test "machine encoding is available before native allocation" {
     var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
     defer function.deinit();
@@ -104,6 +140,43 @@ test "machine parameter caching does not displace local values" {
         try std.testing.expectEqual(@as(?test_sources.x86_encoding.Register, null), allocation.registers[0]);
         try std.testing.expectEqual(local_count, allocation.used.len);
         for (allocation.registers[1..]) |register| try std.testing.expect(register != null);
+    }
+}
+
+test "machine accumulator copies coalesce only private uninterrupted single uses" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var instructions = [_]test_sources.machine.Instruction{.{ .fixed = .{ .operation = .ret } }};
+    var candidate_free: test_sources.machine.Function = .{
+        .gpa = failing.allocator(),
+        .instructions = .fromOwnedSlice(&instructions),
+    };
+    try candidate_free.coalesceAccumulatorCopies(1);
+    for (0..6) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.absolute(.mov_rax, 0x123456780000002a);
+        try function.register(if (mode == 2) .store_rax else .store_eax, @fromBackingInt(0), 0);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        switch (mode) {
+            3 => _ = try function.position(),
+            4 => try function.immediate(.mov_eax, 7),
+            else => {},
+        }
+        try function.register(if (mode == 2) .load_rax else .load_eax, @fromBackingInt(0), 0);
+        try function.offset(if (mode == 0) .mov_rsp_eax else .mov_rsp_rax, 0);
+        if (mode == 5) try function.register(.load_eax, @fromBackingInt(0), 0);
+        _ = try function.patchable(.call_relative);
+        try function.emit(.ret);
+        try function.coalesceAccumulatorCopies(1);
+        function.verify(1);
+        var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 1);
+        defer allocation.deinit(std.testing.allocator);
+        try std.testing.expectEqual(mode >= 3, allocation.registers[0] != null);
+        var encoded = try function.encode(allocation.registers, &.{8}, allocation.used);
+        defer encoded.deinit(std.testing.allocator);
+        const listing = try test_sources.disasm.disassemble(encoded.code.items, std.testing.allocator);
+        defer std.testing.allocator.free(listing);
+        try std.testing.expectEqual(mode == 1, std.mem.indexOf(u8, listing, "mov eax, eax") != null);
     }
 }
 
@@ -225,6 +298,37 @@ test "machine indexed stack loads preserve compact displacements and spilled res
         try std.testing.expectEqualSlices(u8, expected, encoded.code.items[0..expected.len]);
         try std.testing.expectEqualSlices(u8, &.{ 0x89, 0x84, 0x24, 0, 1, 0, 0 }, encoded.code.items[expected.len..]);
     }
+}
+
+test "machine direct indices preserve narrow writes signed offsets and spill fallbacks" {
+    for (std.enums.values(test_sources.x86_encoding.Register)) |selected| for ([_]bool{ false, true }) |byte| for (0..7) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.immediate(.mov_eax, 3);
+        try function.register(if (mode == 1) .store_rax else .store_eax, @fromBackingInt(0), 0);
+        const start = try function.position();
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        if (mode == 3) _ = try function.position();
+        try function.emit(if (mode == 2) .movsxd_rcx_eax else .mov_ecx_eax);
+        if (mode == 4 or mode == 5) try function.register(.load_rax, @fromBackingInt(1), 0) else try function.offset(.lea_rax_rsp, 128);
+        try function.emit(if (byte) .add_rax_rcx else .lea_rax_rax_rcx_4);
+        try function.offset(if (byte) .movzx_eax_rax else .mov_eax_rax, 0);
+        try function.register(.store_eax, @fromBackingInt(2), 0);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{ if (mode == 6) null else selected, if (mode == 4) null else .r13, selected }, &.{ 256, 264, 272 }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const listing = try test_sources.disasm.disassemble(encoded.code.items[encoded.positions[start]..], std.testing.allocator);
+        defer std.testing.allocator.free(listing);
+        try std.testing.expect(std.mem.indexOf(u8, listing, "  db ") == null);
+        if (mode == 0 or mode == 5) {
+            try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, listing, "\n"));
+            const index = try std.fmt.allocPrint(std.testing.allocator, "+{s}{s}{s}", .{ @tagName(selected), if (byte) "" else "*4", if (mode == 0) "+128]" else "]" });
+            defer std.testing.allocator.free(index);
+            try std.testing.expect(std.mem.indexOf(u8, listing, index) != null);
+        } else {
+            try std.testing.expect(std.mem.indexOf(u8, listing, if (mode == 2) "movsxd rcx" else "mov ecx") != null);
+        }
+    };
 }
 
 test "loop byte array element copies preserve zero extension and aliases" {
@@ -363,6 +467,30 @@ test "machine symbolic positions resolve after register and spill encoding" {
     }
 }
 
+test "machine branches bypass coalesced edge stubs and preserve actual copies" {
+    for ([_]bool{ false, true }) |coalesced| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        try function.immediate(.mov_eax, 3);
+        try function.register(.store_eax, @fromBackingInt(0), 0);
+        const edge = try function.patchable(.jne);
+        const continuation = try function.position();
+        try function.emit(.ret);
+        const stub = try function.position();
+        try function.patch(edge, stub);
+        try function.register(.load_eax, @fromBackingInt(0), 0);
+        try function.register(.store_eax, @fromBackingInt(1), 0);
+        try function.instructions.append(std.testing.allocator, .scratch_dead);
+        const back = try function.patchable(.jmp);
+        try function.patch(back, continuation);
+        var encoded = try function.encode(&.{ .r12, if (coalesced) .r12 else .rbx }, &.{ 0, 4 }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const field = encoded.fields[edge];
+        const relative = std.mem.readInt(i32, encoded.code.items[field..][0..4], .little);
+        try std.testing.expectEqual(@as(i64, encoded.positions[if (coalesced) continuation else stub]), @as(i64, field) + 4 + relative);
+    }
+}
+
 test "machine register copies forward only when scratch is dead" {
     for (0..5) |mode| {
         var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
@@ -375,7 +503,7 @@ test "machine register copies forward only when scratch is dead" {
         defer encoded.deinit(std.testing.allocator);
         const expected: []const u8 = switch (mode) {
             0 => &.{ 0x41, 0x8B, 0xDC },
-            1 => &.{},
+            1 => &.{ 0x45, 0x8b, 0xe4 },
             2, 3 => &.{ 0x44, 0x89, 0xE0, 0x89, 0xC3 },
             else => &.{ 0x8B, 0x04, 0x24, 0x89, 0xC3 },
         };
@@ -630,8 +758,8 @@ test "machine live ranges reuse registers between separate definitions" {
     try std.testing.expect(!allocation.registers[0].?.calleeSaved());
 }
 
-test "machine loop counter preferences remove copies without overwriting retained inputs" {
-    for ([_]bool{ false, true }) |retained| {
+test "machine loop counter preferences preserve retained inputs and outlined backedges" {
+    for ([_]bool{ false, true }) |retained| for ([_]bool{ false, true }) |outlined| {
         var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
         defer function.deinit();
         const counter: test_sources.machine.ValueId = @fromBackingInt(0);
@@ -651,8 +779,13 @@ test "machine loop counter preferences remove copies without overwriting retaine
         try function.immediate(.cmp_eax, 5);
         try function.instructions.append(std.testing.allocator, .scratch_dead);
         const backedge = try function.patchable(.jne);
-        try function.patch(backedge, header);
+        if (!outlined) try function.patch(backedge, header);
         try function.emit(.ret);
+        if (outlined) {
+            try function.patchHere(backedge);
+            const back = try function.patchable(.jmp);
+            try function.patch(back, header);
+        }
         var allocation = try test_sources.registers.allocate(std.testing.allocator, &function, 2);
         defer allocation.deinit(std.testing.allocator);
         try std.testing.expect(allocation.registers[0] != null);
@@ -667,7 +800,7 @@ test "machine loop counter preferences remove copies without overwriting retaine
             const start = encoded.positions[header];
             try std.testing.expectEqualSlices(u8, expected.items, encoded.code.items[start..][0..expected.items.len]);
         }
-    }
+    };
 }
 
 test "machine division branches preserve live loop values and signed overflow" {
@@ -700,6 +833,43 @@ test "in-place loop arithmetic preserves wrapping and operand order" {
         \\    return value
         \\func run() int -> wrapping(calculate(1) + calculate(2147483647) - calculate(2147483647) + 15)
     , 42);
+}
+
+test "native frames compact call results and omit nonreturning register saves" {
+    const source =
+        \\func increment(value: int) int -> value + 1
+        \\func chain(seed: int) int -> increment(increment(seed))
+        \\func retained(seed: int) int
+        \\    const saved = increment(seed)
+        \\    const other = increment(seed + 1)
+        \\    return saved + other - 1
+        \\func terminate(seed: int) never
+        \\    const saved = increment(seed)
+        \\    const other = increment(seed + 1)
+        \\    exit(saved + other - 1)
+    ;
+    for ([_][]const u8{ "exit(chain(40))", "exit(retained(20))", "terminate(20)" }) |entry| {
+        const program = try std.testing.allocator.print("{s}\n{s}", .{ source, entry });
+        defer std.testing.allocator.free(program);
+        const fixture = try test_sources.SourceFixture.init(program);
+        defer fixture.deinit();
+        try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
+        try fixture.expectExit(0, 42);
+        const scope = (try fixture.db.get(test_sources.queries.BuildModuleScope, 0)).*.?;
+        for ([_][]const u8{ "chain", "retained", "terminate" }) |name| {
+            const artifact = (try fixture.db.get(test_sources.queries.CompileFunction, .{ .item = scope.resolveFunction(name).? })).*.?;
+            const listing = try test_sources.disasm.disassemble(artifact.code, std.testing.allocator);
+            defer std.testing.allocator.free(listing);
+            if (std.mem.eql(u8, name, "chain")) {
+                try std.testing.expect(std.mem.indexOf(u8, listing, "sub rsp, 4") != null);
+                try std.testing.expect(std.mem.indexOf(u8, listing, "rbx") == null);
+                try std.testing.expectEqual(@as(usize, 2), artifact.trace_sites.len);
+                for (artifact.trace_sites) |site| try std.testing.expectEqual(@as(u32, 4), site.stack_size);
+            } else if (std.mem.eql(u8, name, "terminate")) {
+                try std.testing.expect(std.mem.indexOf(u8, listing, "], rbx") == null);
+            }
+        }
+    }
 }
 
 test "straight-line registers preserve branches spills and values across calls" {
@@ -1620,6 +1790,42 @@ test "native predicate branches without edge copies use one conditional jump" {
             try std.testing.expect(std.mem.indexOf(u8, listing, "  jmp ") == null);
             try expectArtifactExitCode(artifact, if (taken) 42 else 7);
         }
+    }
+}
+
+test "native conditional edge copies leave the other edge as fallthrough" {
+    for ([_]bool{ false, true }) |taken| {
+        var arguments = [_]structures.FunctionBlockArgument{ .{ .type_id = .int }, .{ .type_id = .int } };
+        var uses = [_]structures.FunctionValueUse{ .{ .value = @fromBackingInt(4) }, .{ .value = @fromBackingInt(5) } };
+        var instructions = [_]structures.FunctionInstruction{
+            integerConstant(if (taken) -1 else 1),                                                                                                     integerConstant(0),                                                                                                                        integerConstant(42), integerConstant(7),
+            .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } }, .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 1, .end = 2 }, .return_type = .never } },
+        };
+        var calls = [_]structures.FunctionCallArgument{ .{ .prepared = .{ .value = @fromBackingInt(0) } }, .{ .prepared = .{ .value = @fromBackingInt(1) } } };
+        var blocks = [_]structures.FunctionBlock{
+            .{ .instruction_start = 0, .instruction_end = 4, .terminator = .{ .predicate_branch = .{
+                .operation = .lti,
+                .operands = .{ .lhs = @fromBackingInt(2), .rhs = @fromBackingInt(3) },
+                .then_branch = .{ .target = @fromBackingInt(1), .arguments = .{ .start = 0, .end = 1 } },
+                .else_branch = .{ .target = @fromBackingInt(2), .arguments = .{ .start = 1, .end = 2 } },
+            } } },
+            .{ .argument_end = 1, .instruction_start = 4, .instruction_end = 5, .terminator = .diverge },
+            .{ .argument_start = 1, .argument_end = 2, .instruction_start = 5, .instruction_end = 6, .terminator = .diverge },
+        };
+        var body = functionSsa(&instructions, &blocks);
+        body.block_arguments = &arguments;
+        body.branch_arguments = &uses;
+        body.call_arguments = &calls;
+        var artifact = try codegen.compileFunction(&body, TestTypes{}, std.testing.allocator);
+        defer artifact.deinit(std.testing.allocator);
+        const listing = try test_sources.disasm.disassemble(artifact.code, std.testing.allocator);
+        defer std.testing.allocator.free(listing);
+        const jump = std.mem.indexOf(u8, listing, "  jl ").?;
+        const end = std.mem.indexOfScalarPos(u8, listing, jump, '\n').?;
+        const label = try std.fmt.allocPrint(std.testing.allocator, "{s}:\n", .{listing[jump + 5 .. end]});
+        defer std.testing.allocator.free(label);
+        try std.testing.expect(std.mem.indexOf(u8, listing, label).? > std.mem.lastIndexOf(u8, listing, "  ud2").?);
+        try expectArtifactExitCode(artifact, if (taken) 42 else 7);
     }
 }
 

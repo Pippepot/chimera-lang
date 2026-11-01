@@ -1947,6 +1947,949 @@ test "references parameter replacement retains the new referent" {
     , .borrow_outlives_source);
 }
 
+test "references bare returns retain the correct output authority and lifetime" {
+    for ([_][]const u8{ "", "()" }) |returned| {
+        const declarations = try test_sources.renderTemplate(std.testing.allocator,
+            \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+            \\    if not selected -> return none
+            \\    slot = Ref.from(source)
+            \\    return $returned
+        , .{ .returned = returned });
+        defer std.testing.allocator.free(declarations);
+        const valid = try std.mem.concat(std.testing.allocator, u8, &.{
+            declarations, "\n",
+            \\func run() int
+            \\    const original = 1
+            \\    var source = 41
+            \\    var slot = Ref.from(original)
+            \\    const result = replace(slot, source, true)
+            \\    if result is unit -> slot.value += 1
+            \\    return source
+        });
+        defer std.testing.allocator.free(valid);
+        try Fixture.expectParity(valid, 42);
+        const readonly = try std.mem.concat(std.testing.allocator, u8, &.{
+            declarations, "\n",
+            \\func invalid() unit
+            \\    var original = 1
+            \\    const source = 41
+            \\    var slot = Ref.from(original)
+            \\    const result = replace(slot, source, true)
+            \\    if result is unit -> slot.value = 42
+            \\invalid()
+        });
+        defer std.testing.allocator.free(readonly);
+        try Fixture.expectSourceDiagnostic(readonly, .reference_not_writable);
+        const expired = try std.mem.concat(std.testing.allocator, u8, &.{
+            declarations, "\n",
+            \\func invalid() int
+            \\    var original = 1
+            \\    var slot = Ref.from(original)
+            \\    if true
+            \\        var temporary = 42
+            \\        const result = replace(slot, temporary, true)
+            \\        if not (result is unit) -> return 90
+            \\    return slot.value
+            \\exit(invalid())
+        });
+        defer std.testing.allocator.free(expired);
+        try Fixture.expectSourceDiagnostic(expired, .borrow_outlives_source);
+    }
+}
+
+test "references result correlated replacement selects the installed referent" {
+    try Fixture.expectParity(
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const result = replace(slot, source, true)
+        \\    if not (result is unit) -> return 90
+        \\    slot.value += 2
+        \\    return source
+    , 42);
+}
+
+test "references result correlated saved forwarding and loop joins" {
+    try Fixture.expectParity(
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+        \\func forward(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    const result = replace(slot, source, selected)
+        \\    return result
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const result = forward(slot, source, true)
+        \\    const saved = result
+        \\    const success = saved is unit
+        \\    var count = 0
+        \\    loop
+        \\        if count == 2 -> break
+        \\        count += 1
+        \\    if not success -> return 90
+        \\    slot.value += count
+        \\    return source
+    , 42);
+}
+
+test "references result correlated narrowing cannot restore overwritten outputs" {
+    try Fixture.expectSourceDiagnostic(
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+        \\func invalid() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const result = replace(slot, source, true)
+        \\    slot = Ref.from(original)
+        \\    if not (result is unit) -> return 90
+        \\    slot.value += 2
+        \\    return source
+        \\exit(invalid())
+    , .reference_not_writable);
+    try Fixture.expectSourceDiagnostic(
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+        \\func invalid() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    var result = replace(slot, source, false)
+        \\    result = ()
+        \\    if not (result is unit) -> return 90
+        \\    slot.value += 2
+        \\    return source
+        \\exit(invalid())
+    , .reference_not_writable);
+}
+
+test "references result correlated failure retains previous capture" {
+    try Fixture.expectSourceDiagnostic(
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+        \\func invalid() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const result = replace(slot, source, false)
+        \\    if result is unit -> return 90
+        \\    slot.value += 2
+        \\    return source
+        \\exit(invalid())
+    , .reference_not_writable);
+}
+
+test "references result correlated match and indirect output writes" {
+    try Fixture.expectParity(
+        \\func install(var target: Ref(Ref(int)), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    target.value = Ref.from(source)
+        \\    return ()
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    match install(Ref.from(slot), source, true)
+        \\        unit -> slot.value += 2
+        \\        none -> return 90
+        \\    return source
+    , 42);
+    const invalid =
+        \\func install(var target: Ref(Ref(int)), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    target.value = Ref.from(source)
+        \\    return ()
+        \\func invalid() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const result = install(Ref.from(slot), source, false)
+        \\    if result is unit -> return 90
+        \\    slot.value += 2
+        \\    return source
+        \\exit(invalid())
+    ;
+    for ([_]u32{ 0, 1, 2 }) |worker_count| {
+        const db = try test_sources.query.Database.init(std.testing.allocator, .{ .worker_count = worker_count });
+        defer db.deinit();
+        try test_sources.modules.registerSources(db, std.testing.allocator, invalid, &.{}, &.{});
+        const fixture: Fixture = .{ .db = db };
+        fixture.expectDiagnostic(0, .reference_not_writable) catch |err| {
+            std.debug.print("Indirect output authority failed with {d} workers\n", .{worker_count});
+            return err;
+        };
+    }
+}
+
+test "references result correlated selected captures still expire" {
+    try Fixture.expectSourceDiagnostic(
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+        \\func invalid() int
+        \\    var original = 1
+        \\    var slot = Ref.from(original)
+        \\    if 1 == 1
+        \\        var temporary = 42
+        \\        const result = replace(slot, temporary, true)
+        \\        if not (result is unit) -> return 90
+        \\    return slot.value
+        \\exit(invalid())
+    , .borrow_outlives_source);
+}
+
+test "references result correlated branch forwarding and multiple outputs" {
+    try Fixture.expectParity(
+        \\func replace(mut left: Ref(int), mut right: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    left = Ref.from(source)
+        \\    right = Ref.from(source)
+        \\    return ()
+        \\func forward(mut left: Ref(int), mut right: Ref(int), ref source: int, flag: bool) unit | none
+        \\    return if flag -> replace(left, right, source, true) else replace(left, right, source, false)
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 39
+        \\    var left = Ref.from(original)
+        \\    var right = Ref.from(original)
+        \\    const result = forward(left, right, source, true)
+        \\    if not (result is unit) -> return 90
+        \\    left.value += 1
+        \\    right.value += 2
+        \\    return source
+    , 42);
+}
+
+test "references result correlated loop calls preserve earlier iteration captures" {
+    const declarations =
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+        \\func invoke(ref source: int) int
+        \\    var original = 1
+        \\    var slot = Ref.from(original)
+        \\    var count = 0
+        \\    loop
+        \\        const result = replace(slot, source, count == 0)
+        \\        if not (result is unit) -> slot.value += 2
+        \\        count += 1
+        \\        if count == 2 -> break
+        \\    return original
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    var source = 40
+        \\    _ = invoke(source)
+        \\    return source
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\const source = 40
+        \\_ = invoke(source)
+    , .reference_not_writable);
+}
+
+test "references result correlated loop overwrite cannot forge a call result" {
+    try Fixture.expectSourceDiagnostic(
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+        \\func invalid() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    var result = replace(slot, source, false)
+        \\    var count = 0
+        \\    loop
+        \\        if result is unit -> slot.value += 2
+        \\        result = ()
+        \\        count += 1
+        \\        if count == 2 -> break
+        \\    return source
+        \\exit(invalid())
+    , .reference_not_writable);
+}
+
+test "references result correlated mutable saved results survive unchanged loop joins" {
+    try Fixture.expectParity(
+        \\func replace(mut slot: Ref(int), ref source: int, selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot = Ref.from(source)
+        \\    return ()
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    var result = replace(slot, source, true)
+        \\    var count = 0
+        \\    loop
+        \\        count += 1
+        \\        if count == 2 -> break
+        \\    if not (result is unit) -> return 90
+        \\    slot.value += 2
+        \\    return source
+        \\exit(run())
+    , 42);
+}
+
+test "references result correlated equal return alternatives still merge dependencies" {
+    try Fixture.expectSourceDiagnostic(
+        \\func replace(mut slot: Ref(int), ref source: int, flag: bool) unit | none
+        \\    if flag
+        \\        slot = Ref.from(source)
+        \\        return ()
+        \\    return ()
+        \\func invalid() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const result = replace(slot, source, false)
+        \\    if not (result is unit) -> return 90
+        \\    slot.value += 2
+        \\    return source
+        \\exit(invalid())
+    , .reference_not_writable);
+}
+
+test "references result correlated three alternatives retain unselected captures" {
+    const declarations =
+        \\func replace(mut slot: Ref(int), ref source: int, choice: int) unit | none | bool
+        \\    if choice == 0 -> return none
+        \\    if choice == 1 -> return true
+        \\    slot = Ref.from(source)
+        \\    return ()
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func calculate(choice: int) int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const first = replace(slot, source, choice)
+        \\    const second = replace(slot, source, choice)
+        \\    if not (first is unit) -> return 90
+        \\    if not (second is unit) -> return 91
+        \\    slot.value += 2
+        \\    return source
+        \\func run() int -> calculate(2)
+        \\exit(run())
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid(choice: int) int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const first = replace(slot, source, choice)
+        \\    const second = replace(slot, source, choice)
+        \\    if not (first is bool) -> return 90
+        \\    if not (second is bool) -> return 91
+        \\    slot.value += 2
+        \\    return source
+        \\exit(invalid(1))
+    , .reference_not_writable);
+}
+
+test "references result correlated cleared referents release selected captures" {
+    const declarations =
+        \\func clear(slot: Ref(Ref(int) | none), selected: bool) unit | none
+        \\    if not selected -> return none
+        \\    slot.value = none
+        \\    return ()
+        \\func forward(slot: Ref(Ref(int) | none), selected: bool) unit | none -> clear(slot, selected)
+        \\func checked(slot: Ref(int) | none) int
+        \\    if slot is none -> return 42
+        \\    return 90
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    var slot: Ref(int) | none = none
+        \\    if 1 == 1
+        \\        var temporary = 40
+        \\        slot = Ref.from(temporary)
+        \\        const result = forward(Ref(Ref(int) | none).from(slot), true)
+        \\        if not (result is unit) -> return 91
+        \\    return checked(slot)
+        \\exit(run())
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() int
+        \\    var slot: Ref(int) | none = none
+        \\    if 1 == 1
+        \\        var temporary = 40
+        \\        slot = Ref.from(temporary)
+        \\        const result = forward(Ref(Ref(int) | none).from(slot), false)
+        \\        if not (result is none) -> return 91
+        \\    return checked(slot)
+        \\exit(invalid())
+    , .borrow_outlives_source);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() int
+        \\    var slot: Ref(int) | none = none
+        \\    if 1 == 1
+        \\        var temporary = 40
+        \\        slot = Ref.from(temporary)
+        \\        _ = forward(Ref(Ref(int) | none).from(slot), true)
+        \\    return checked(slot)
+        \\exit(invalid())
+    , .borrow_outlives_source);
+}
+
+test "references result correlated borrowed variant results retain dependencies" {
+    const declarations =
+        \\func replace(mut slot: Ref(int), ref source: int, present: bool) ref int | none
+        \\    if not present -> return none
+        \\    slot = Ref.from(source)
+        \\    return source
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const result = replace(slot, source, true)
+        \\    if not (result is int) -> return 90
+        \\    slot.value += 2
+        \\    return source
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    const result = replace(slot, source, false)
+        \\    if result is none -> slot.value += 2
+        \\    return source
+        \\exit(invalid())
+    , .reference_not_writable);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() int
+        \\    var original = 1
+        \\    const source = 40
+        \\    var slot = Ref.from(original)
+        \\    const result = replace(slot, source, true)
+        \\    if result is int -> slot.value += 2
+        \\    return original
+        \\exit(invalid())
+    , .reference_not_writable);
+}
+
+test "references opaque immutable handles require captured write authority" {
+    try Fixture.expectSourceDiagnostic(
+        \\func write(handle: Ref(int)) unit -> handle.value = 42
+        \\func invoke(handler: func(Ref(int)) unit, handle: Ref(int)) unit -> handler(handle)
+        \\const source = 1
+        \\invoke(write, Ref.from(source))
+    , .reference_not_writable);
+    try Fixture.expectParity(
+        \\func write(handle: Ref(int)) unit -> handle.value = 42
+        \\func invoke(handler: func(Ref(int)) unit, handle: Ref(int)) unit -> handler(handle)
+        \\func run() int
+        \\    var source = 1
+        \\    const handle = Ref.from(source)
+        \\    invoke(write, handle)
+        \\    return source
+    , 42);
+}
+
+test "references opaque immutable spans preserve readonly parameter access" {
+    try Fixture.expectSourceDiagnostic(
+        \\func write(view: Span(int)) unit
+        \\    ref item = view[0]
+        \\    item = 42
+        \\func invoke(handler: func(Span(int)) unit, view: Span(int)) unit -> handler(view)
+        \\const values = [1]
+        \\invoke(write, values.span())
+    , .reference_not_writable);
+    try Fixture.expectParity(
+        \\func read(view: Span(int)) int -> view[0]
+        \\func invoke(handler: func(Span(int)) int, view: Span(int)) int -> handler(view)
+        \\func run() int
+        \\    const values = [42]
+        \\    const view = values.span()
+        \\    return invoke(read, view)
+    , 42);
+}
+
+test "references opaque immutable handles invalidate content views" {
+    try Fixture.expectSourceDiagnostic(
+        \\func append(handle: Ref(String)) unit
+        \\    if not (handle.value.append("x") is unit) -> panic "append failed"
+        \\func invoke(handler: func(Ref(String)) unit, handle: Ref(String)) unit -> handler(handle)
+        \\func invalid() int
+        \\    var source: String = "abc"
+        \\    const view = source.view()
+        \\    invoke(append, Ref.from(source))
+        \\    return view.byte_length()
+        \\exit(invalid())
+    , .borrow_outlives_source);
+}
+
+test "references known callable projections and returns preserve contracts" {
+    try Fixture.expectParity(
+        \\func identity(ref source: int) ref int -> source
+        \\struct Callback
+        \\    target: func(ref int) ref int
+        \\func run() int
+        \\    const source = 42
+        \\    const callback = Callback{target = identity}
+        \\    ref selected = callback.target(source)
+        \\    return selected
+    , 42);
+    try Fixture.expectParity(
+        \\func identity(ref source: int) ref int -> source
+        \\func forward(callback: func(ref int) ref int) func(ref int) ref int -> callback
+        \\func run() int
+        \\    const source = 42
+        \\    const callback = forward(identity)
+        \\    ref selected = callback(source)
+        \\    return selected
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func identity(ref source: int) ref int -> source
+        \\func write(ref source: int) ref int
+        \\    source = 42
+        \\    return source
+        \\struct Callback
+        \\    target: func(ref int) ref int
+        \\const source = 1
+        \\var callback = Callback{target = identity}
+        \\callback.target = write
+        \\_ = callback.target(source)
+    , .reference_not_writable);
+}
+
+test "references callable recovery follows long forwarding and immutable copy chains" {
+    for ([_]bool{ false, true }) |aggregate| {
+        var source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer source.deinit();
+        try source.writer.writeAll("func identity(ref source: int) ref int -> source\n");
+        try source.writer.writeAll("func forward(callback: func(ref int) ref int) func(ref int) ref int -> callback\n");
+        try source.writer.writeAll("struct Callback\n    copy = fieldwise\n    target: func(ref int) ref int\nfunc run() int\n    const source = 42\n");
+        if (aggregate) {
+            try source.writer.writeAll("    const callback_0 = Callback{target = identity}\n");
+            for (1..81) |index| try source.writer.print("    const callback_{d} = callback_{d}\n", .{ index, index - 1 });
+            try source.writer.writeAll("    return callback_80.target(source)\n");
+        } else {
+            try source.writer.writeAll("    const callback_0 = identity\n");
+            for (1..81) |index| try source.writer.print("    const callback_{d} = forward(callback_{d})\n", .{ index, index - 1 });
+            try source.writer.writeAll("    return callback_80(source)\n");
+        }
+        try Fixture.expectParity(source.written(), 42);
+    }
+}
+
+test "references returned mutable callbacks remain conservative" {
+    const declarations =
+        \\func identity(ref source: int) ref int -> source
+        \\func write(ref source: int) ref int
+        \\    source = 42
+        \\    return source
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func factory() func(ref int) ref int -> identity
+        \\func run() int
+        \\    const source = 42
+        \\    const callback = factory()
+        \\    return callback(source)
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func redirect(var callback: func(ref int) ref int) func(ref int) ref int
+        \\    callback = write
+        \\    return callback
+        \\const source = 1
+        \\const callback = redirect(identity)
+        \\_ = callback(source)
+    , .reference_not_writable);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func select(which: bool) func(ref int) ref int
+        \\    if which -> return write
+        \\    return identity
+        \\const source = 1
+        \\const callback = select(false)
+        \\_ = callback(source)
+    , .reference_not_writable);
+}
+
+test "references automatic drop publishes installed reference authority" {
+    try Fixture.expectParity(
+        \\struct Install
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.source
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    const install = Install{target = Ref.from(slot), source = Ref.from(source)}
+        \\    _ = install
+        \\    slot.value += 1
+        \\    return source
+    , 42);
+}
+
+test "references automatic drop preserves installed reference lifetime" {
+    try Fixture.expectSourceDiagnostic(
+        \\struct Install
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.source
+        \\func invalid() int
+        \\    var original = 1
+        \\    var slot = Ref.from(original)
+        \\    if true
+        \\        var temporary = 42
+        \\        const install = Install{target = Ref.from(slot), source = Ref.from(temporary)}
+        \\        _ = install
+        \\    return slot.value
+        \\exit(invalid())
+    , .borrow_outlives_source);
+}
+
+test "references automatic drop follows captured slot replacements" {
+    const declarations =
+        \\struct FollowSlot
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(Ref(int))
+        \\    drop = func(deinit self: FollowSlot) -> self.target.value = self.source.value
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 1
+        \\    var later = 41
+        \\    var source = Ref.from(original)
+        \\    var slot = Ref.from(original)
+        \\    const install = FollowSlot{target = Ref.from(slot), source = Ref.from(source)}
+        \\    _ = install
+        \\    source = Ref.from(later)
+        \\    _ = install
+        \\    slot.value += 1
+        \\    return later
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() unit
+        \\    var original = 1
+        \\    const later = 41
+        \\    var source = Ref.from(original)
+        \\    var slot = Ref.from(original)
+        \\    const install = FollowSlot{target = Ref.from(slot), source = Ref.from(source)}
+        \\    _ = install
+        \\    source = Ref.from(later)
+        \\    _ = install
+        \\    slot.value = 42
+        \\invalid()
+    , .reference_not_writable);
+}
+
+test "references unused automatic drop exports parameter writes" {
+    const declarations =
+        \\struct Install
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.source
+        \\func install(mut target: Ref(int), imm source: Ref(int)) unit
+        \\    const hook = Install{target = Ref.from(target), source = source}
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    install(slot, Ref.from(source))
+        \\    slot.value += 1
+        \\    return source
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() unit
+        \\    var original = 1
+        \\    const source = 41
+        \\    var slot = Ref.from(original)
+        \\    install(slot, Ref.from(source))
+        \\    slot.value = 42
+        \\invalid()
+    , .reference_not_writable);
+}
+
+test "references automatic drop follows capture and branch chronology" {
+    const declarations =
+        \\struct Install
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.source
+        \\struct Wrapper
+        \\    install: Install
+        \\struct Pair
+        \\    first: Install
+        \\    second: Install
+        \\struct Slots
+        \\    first: Ref(int)
+        \\    second: Ref(int)
+    ;
+    const sources = [_][]const u8{
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    const install = Install{target = Ref.from(slot), source = Ref.from(source)}
+        \\    ref captured = slot.value
+        \\    const saved = slot
+        \\    _ = install
+        \\    slot.value += 1
+        \\    return source + captured + saved.value - 2
+        ,
+        \\func select(which: bool) int
+        \\    const original = 42
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    const install = Install{target = Ref.from(slot), source = Ref.from(source)}
+        \\    if which
+        \\        ref captured = slot.value
+        \\        _ = install
+        \\        return captured
+        \\    else
+        \\        return slot.value + 1
+        \\func run() int -> select(true) + select(false) - 42
+        ,
+        \\func run() int
+        \\    const original = 1
+        \\    var first_source = 40
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    const first = Install{target = Ref.from(slot), source = Ref.from(first_source)}
+        \\    _ = first
+        \\    const second = Install{target = Ref.from(slot), source = Ref.from(source)}
+        \\    _ = second
+        \\    slot.value += 1
+        \\    return source
+        ,
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    const wrapper = Wrapper{install = Install{target = Ref.from(slot), source = Ref.from(source)}}
+        \\    _ = wrapper
+        \\    slot.value += 1
+        \\    return source
+        ,
+    };
+    inline for (sources) |source| try Fixture.expectParity(declarations ++ "\n" ++ source, 42);
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 1
+        \\    const installed = 2
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    const install = Install{target = Ref.from(slot), source = Ref.from(installed)}
+        \\    _ = install
+        \\    slot = Ref.from(source)
+        \\    slot.value += 1
+        \\    return source
+    , 42);
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    loop
+        \\        const install = Install{target = Ref.from(slot), source = Ref.from(source)}
+        \\        _ = install
+        \\        break
+        \\    slot.value += 1
+        \\    return source
+    , 42);
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 1
+        \\    var first = 20
+        \\    var second = 20
+        \\    var slots = Slots{first = Ref.from(original), second = Ref.from(original)}
+        \\    const pair = Pair{
+        \\        first = Install{target = Ref.from(slots.first), source = Ref.from(first)},
+        \\        second = Install{target = Ref.from(slots.second), source = Ref.from(second)},
+        \\    }
+        \\    _ = pair
+        \\    slots.first.value += 1
+        \\    slots.second.value += 1
+        \\    return first + second
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() unit
+        \\    var original = 1
+        \\    var installed = 2
+        \\    const readonly = 41
+        \\    var slot = Ref.from(original)
+        \\    const install = Install{target = Ref.from(slot), source = Ref.from(installed)}
+        \\    _ = install
+        \\    slot = Ref.from(readonly)
+        \\    slot.value = 42
+        \\invalid()
+    , .reference_not_writable);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid(var repeat: bool) unit
+        \\    var original = 1
+        \\    const readonly = 41
+        \\    var slot = Ref.from(original)
+        \\    loop
+        \\        if not repeat -> break
+        \\        const install = Install{target = Ref.from(slot), source = Ref.from(readonly)}
+        \\        _ = install
+        \\        repeat = false
+        \\    slot.value = 42
+        \\invalid(true)
+    , .reference_not_writable);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid(which: bool) unit
+        \\    const original = 1
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    const install = Install{target = Ref.from(slot), source = Ref.from(source)}
+        \\    if which
+        \\        ref captured = slot.value
+        \\        _ = install
+        \\        captured = 42
+        \\    else
+        \\        _ = slot.value
+        \\invalid(true)
+    , .reference_not_writable);
+}
+
+test "references automatic drop follows aggregate cleanup order" {
+    const declarations =
+        \\struct Install
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.source
+        \\struct Pair
+        \\    left: Install
+        \\    right: Install
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    var pair = Pair{left = Install{target = Ref.from(slot), source = Ref.from(source)}, right = Install{target = Ref.from(slot), source = Ref.from(original)}}
+        \\    _ = pair
+        \\    slot.value = 42
+        \\    return source
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() unit
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    var pair = Pair{left = Install{target = Ref.from(slot), source = Ref.from(original)}, right = Install{target = Ref.from(slot), source = Ref.from(source)}}
+        \\    _ = pair
+        \\    slot.value = 42
+        \\invalid()
+    , .reference_not_writable);
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    var pair = Pair{left = Install{target = Ref.from(slot), source = Ref.from(original)}, right = Install{target = Ref.from(slot), source = Ref.from(source)}}
+        \\    var moved = pair.left^
+        \\    _ = pair.right.source
+        \\    slot.value = 42
+        \\    _ = moved
+        \\    return source
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() unit
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    var pair = Pair{left = Install{target = Ref.from(slot), source = Ref.from(source)}, right = Install{target = Ref.from(slot), source = Ref.from(original)}}
+        \\    var moved = pair.left^
+        \\    _ = pair.right.source
+        \\    slot.value = 42
+        \\    _ = moved
+        \\invalid()
+    , .reference_not_writable);
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    var installs = [Install{target = Ref.from(slot), source = Ref.from(source)}, Install{target = Ref.from(slot), source = Ref.from(original)}]
+        \\    _ = installs
+        \\    slot.value = 42
+        \\    return source
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() unit
+        \\    const original = 1
+        \\    var source = 40
+        \\    var slot = Ref.from(original)
+        \\    var installs = [Install{target = Ref.from(slot), source = Ref.from(original)}, Install{target = Ref.from(slot), source = Ref.from(source)}]
+        \\    _ = installs
+        \\    slot.value = 42
+        \\invalid()
+    , .reference_not_writable);
+}
+
+test "references automatic drop contents cross shared diamonds and preserve branch writes" {
+    var source: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer source.deinit();
+    try source.writer.writeAll(
+        \\struct Install
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.source
+        \\func inspect(chosen: bool) int
+        \\    const original = 1
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    const install = Install{target = Ref.from(slot), source = Ref.from(source)}
+        \\    _ = install
+        \\    var count = 0
+        \\
+    );
+    for (0..18) |_| try source.writer.writeAll("    if chosen\n        count += 1\n    else\n        count += 2\n");
+    try source.writer.writeAll(
+        \\    slot.value += 1
+        \\    if count == 18 or count == 36 -> return source
+        \\    return 90
+        \\func run() int
+        \\    if inspect(true) <> 42 -> return 91
+        \\    return inspect(false)
+    );
+    try Fixture.expectParity(source.written(), 42);
+}
+
+test "references automatic drop guarded carrier preserves untouched origins" {
+    try Fixture.expectSourceDiagnostic(
+        \\struct Install
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.source
+        \\func invalid(which: bool) unit
+        \\    const original = 1
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    var install: Install | none = none
+        \\    if which -> install = Install{target = Ref.from(slot), source = Ref.from(source)}
+        \\    _ = install
+        \\    slot.value = 42
+        \\invalid(false)
+    , .reference_not_writable);
+}
+
 test "references fieldwise copying copies addresses of noncopyable referents" {
     try Fixture.expectParity(
         \\pub struct Payload

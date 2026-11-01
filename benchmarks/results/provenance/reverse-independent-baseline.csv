@@ -1,0 +1,9 @@
+case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable
+independent-128,normal,cold,0,26007902,21429,3,false
+independent-128,normal,cold,1,27512005,21429,3,false
+independent-128,normal,cold,2,26924474,21429,3,false
+independent-128,normal,contract-edit,0,4941868,21429,3,false
+independent-128,normal,contract-edit,1,5103808,21429,3,false
+independent-128,normal,contract-edit,2,5741473,21429,3,false
+independent-128,normal,runtime,0,35982166,21429,2,true
+independent-128,normal,runtime,1,35625072,21429,2,true
