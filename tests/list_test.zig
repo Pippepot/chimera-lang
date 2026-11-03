@@ -284,6 +284,129 @@ test "List borrowed iteration allows replacement in stable initialized slots" {
     , 42);
 }
 
+test "List structural mutation is rejected while a dependent stays in use" {
+    const mutations = [_][]const u8{ "values.append(4)", "values.reserve(100)", "values.remove(0)" };
+    const dependents = [_]struct { setup: []const u8, use: []const u8 }{
+        .{ .setup = "var cursor = values.iter()", .use = "cursor.next()" },
+        .{ .setup = "ref first = values[0]", .use = "first += 1" },
+        .{ .setup = "const view = values.span()", .use = "view.len()" },
+    };
+    for (mutations) |mutation| {
+        const loop_source = try test_sources.renderTemplate(std.testing.allocator,
+            \\func invalid()
+            \\    var values: List(int) = [1, 2, 3]
+            \\    for item in values
+            \\        $mutation
+            \\        print(item)
+            \\invalid()
+        , .{ .mutation = mutation });
+        defer std.testing.allocator.free(loop_source);
+        try Fixture.expectSourceDiagnostic(loop_source, .borrow_outlives_source);
+        for (dependents) |dependent| {
+            const source = try test_sources.renderTemplate(std.testing.allocator,
+                \\func invalid()
+                \\    var values: List(int) = [1, 2, 3]
+                \\    $setup
+                \\    $mutation
+                \\    $use
+                \\invalid()
+            , .{ .setup = dependent.setup, .mutation = mutation, .use = dependent.use });
+            defer std.testing.allocator.free(source);
+            try Fixture.expectSourceDiagnostic(source, .borrow_outlives_source);
+        }
+    }
+}
+
+test "List structural mutation is allowed once every dependent has finished" {
+    try expectCalculation(
+        \\func calculate() int | none
+        \\    var values: List(int) = [1, 2, 3]
+        \\    var total = 0
+        \\    for item in values -> total += item
+        \\    ref first = values[0]
+        \\    first += 4
+        \\    var cursor = values.iter()
+        \\    const polled = cursor.next()
+        \\    if not (polled is int) -> return none
+        \\    values.append(total)
+        \\    values.remove(1)
+        \\    const view = values.span()
+        \\    total += view.len()
+        \\    values.append(5)
+        \\    return total + values[0] + values[2] + values.len() + 18
+    , 42);
+}
+
+test "List index loops stay legal under structural mutation and bounds check stale indices" {
+    try expectCalculation(
+        \\func calculate() int | none
+        \\    var values: List(int) = [1, 2, 3]
+        \\    for index in 0..values.len()
+        \\        if values[index] == 2
+        \\            values.remove(index)
+        \\            break
+        \\    return values.len() * 20 + values[1] - 1
+    , 42);
+    try Fixture.expectSourceExit(
+        \\func run() int
+        \\    var values: List(int) = [1, 2, 3]
+        \\    for index in 0..values.len()
+        \\        if values[index] == 2 -> values.remove(index)
+        \\    return 0
+        \\exit(run())
+    , 134);
+}
+
+test "List worklists mutate between explicit length checks without a cursor" {
+    try expectCalculation(
+        \\func calculate() int | none
+        \\    var pending: List(int) = [3]
+        \\    var total = 0
+        \\    loop
+        \\        if pending.len() == 0 -> break
+        \\        const next = pending.remove(pending.len() - 1)
+        \\        if not (next is int) -> return none
+        \\        total += next
+        \\        if next > 1
+        \\            pending.append(next - 1)
+        \\            pending.append(next - 1)
+        \\    return total * 3 + 9
+    , 42);
+}
+
+test "List content writes keep live cursors and slot references through direct and called replacement" {
+    try expectCalculation(
+        \\func store(mut values: List(int), index: int, item: int) -> values[index] = item
+        \\func calculate() int | none
+        \\    var values: List(int) = [1, 2, 3]
+        \\    var cursor = values.iter()
+        \\    ref first = values[0]
+        \\    values[1] = 20
+        \\    store(values, 2, 9)
+        \\    first += 10
+        \\    const polled = cursor.next()
+        \\    if not (polled is int) -> return none
+        \\    const second = cursor.next()
+        \\    if not (second is int) -> return none
+        \\    return first + polled + second
+    , 42);
+}
+
+test "List content writes still reject dependents after structural calls" {
+    try Fixture.expectSourceDiagnostic(
+        \\func store(mut values: List(int), index: int, item: int) unit | none
+        \\    values.append(item)
+        \\    return ()
+        \\func invalid() unit | none
+        \\    var values: List(int) = [1, 2, 3]
+        \\    ref first = values[0]
+        \\    store(values, 1, 4)
+        \\    first += 1
+        \\    return ()
+        \\if (invalid() is unit) -> ()
+    , .borrow_outlives_source);
+}
+
 test "List transfer through field and conditional sources selects consuming traversal" {
     try Fixture.expectParity(owned_item ++ "\n" ++
         \\struct Holder

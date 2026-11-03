@@ -2467,6 +2467,42 @@ for ref item in items -> modify_original(item)
 # A reference into stable backing may outlive the cursor, but not its owner.
 # A view into a cursor's reused buffer cannot survive an invalidating poll.
 #
+# Structural mutation during iteration
+# A cursor over a collection depends on its owner for as long as it is live: for
+# the whole loop, or until the last use of a named cursor. Adapters hold that
+# dependency through their inputs. Structural mutation changes a collection's
+# extent or relocates, shifts, or destroys element slots: List append, remove,
+# reserve, whole-value replacement, and transfer, including consuming traversal.
+# It requires the owner to have no live dependent, so it is a source error while
+# any of these remain in use afterward: a cursor or loop over the owner, a
+# reference from get, [] or a poll, or a Span or other view of it. There is no
+# runtime revalidation and no iteration-time exception.
+#
+# Dependents fall into two classes. A reference into stable backing names one
+# slot: Array and Box storage, or List storage while no structural mutation is
+# possible. It is invalidated only by relocation or destruction of that slot or
+# its owner. A Span or cursor over the extent depends on it too, so any structural
+# mutation invalidates it. A view that also carries proofs about contents, such as
+# a StringView with validated bytes, is further invalidated by any overlapping write.
+#
+# Content writes through a List or Array (indexed replacement, element writes
+# through a ref binding) keep the extent and slot identities when they replace
+# trivially destroyed elements. They do not invalidate a live cursor, reference,
+# or Span, which observe the written value. Replacing an element that needs
+# automatic drop or has variants ends the old value's allocated descendants, and
+# the analysis may treat such a write, or one through an index it cannot resolve
+# to one slot, as overlapping every slot.
+#
+# Code that must remove while traversing uses an index loop, whose bounds-checked
+# access panics on a stale index instead of reading an ended slot, a
+# worklist driven by explicit length and removal, or an in-place library
+# algorithm that completes the mutation inside one call and holds no cursor.
+for item in values
+    if item == 2 -> values.append(4)    # error: values is in use by the loop
+for ref item in values -> item += 1     # ok: content writes only
+for i in 0..values.len()
+    if values[i] == 2 -> values.remove(i)   # compiles; a stale i panics on []
+#
 # Adapters are ordinary cursor structs. An adapter that inspects an owned item
 # must retain that exact item until returning it; polling upstream again is a
 # different operation that may repeat effects or produce a different item. Borrowed items

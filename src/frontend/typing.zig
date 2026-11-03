@@ -526,6 +526,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             reference_origins: ?u32 = null,
             return_origin: bool = false,
             writes_storage: bool = true,
+            /// Every contract write to the place replaces a trivially destroyed value in an existing slot.
+            preserves_slots: bool = false,
         };
         const PendingReferenceOutput = struct { reference: Value, origins: ?u32 };
 
@@ -7906,8 +7908,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     const field_start: u32 = @intCast(self.mut_argument_fields.items.len);
                     try self.mut_argument_fields.appendSlice(self.gpa, place_fields.items[place.fields.start..place.fields.end]);
                     var writes_storage = reference_contract == null;
+                    var preserves_slots = reference_contract != null;
                     if (reference_contract) |contract| for (contract.requirements) |requirement| {
-                        if (requirement.parameter == argument_index and requirement.kind == .place) writes_storage = true;
+                        if (requirement.parameter != argument_index or requirement.kind != .place) continue;
+                        writes_storage = true;
+                        preserves_slots = preserves_slots and try self.replacesTrivialSlots(requirement);
                     };
                     try mut_arguments_to_publish.append(self.gpa, .{
                         .result_identity = try self.newBindingIdentity(),
@@ -7918,6 +7923,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                         .argument_index = @intCast(argument_index),
                         .return_origin = borrowed_return,
                         .writes_storage = writes_storage,
+                        .preserves_slots = writes_storage and preserves_slots,
                     });
                 }
                 arguments_to_publish[argument_index] = if (expected.mode == .deinit) .{ .deinit = argument.value } else if (expected.mode == .mut) .{ .borrowed = argument.value } else .{ .prepared = argument };
@@ -9637,6 +9643,15 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             } });
         }
 
+        /// A write that neither ends a lifetime nor destroys or retags the previous value leaves every slot's storage in place.
+        fn replacesTrivialSlots(self: *Self, requirement: structures.ReferenceRequirement) !bool {
+            if (requirement.ends_lifetime) return false;
+            const written_type = requirement.written_type orelse return false;
+            const facts = self.analysis_context.facts();
+            const capabilities = (try facts.ownershipCapabilities(written_type)) orelse return error.Unavailable;
+            return !capabilities.needs_automatic_drop and try facts.variantMembers(written_type) == null;
+        }
+
         fn applyCallMutArgument(self: *Self, pending: PendingMutArgument) !void {
             const fields = self.mut_argument_fields.items[pending.place.fields.start..pending.place.fields.end];
             switch (pending.place.root) {
@@ -9683,6 +9698,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 return;
             }
             var updated = try self.updateOwnedValue(root, updated_root);
+            if (pending.preserves_slots) self.binding_versions.items[pending.result_identity.fixed] = .{ .write = .{ .previous = root.binding_identity, .preserved_storage_depth = std.math.maxInt(u32) } };
             updated.binding_identity = pending.result_identity;
             updated.storage_identity = root.storage_identity orelse root.binding_identity;
             updated.variant_identity = if (fields.len == 0) pending.result_identity else root.variant_identity orelse root.binding_identity;

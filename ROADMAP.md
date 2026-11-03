@@ -9,15 +9,6 @@ diagnostics, execution, ownership, and incremental/cache behavior.
 
 ## Ordered milestones
 
-### Collection mutation provenance
-
-- Preserve per-element provenance and failure cleanup through removal, append,
-  and relocation of reference-containing elements. Borrowed get/index results,
-  reference append/relocation, checked replacement, and explicit consuming
-  traversal already have implementations and regression coverage.
-- Settle structural mutation during iteration, distinguishing references into
-  stable backing from views that depend on contents.
-
 ### Basic collection algorithms
 
 - `swap`, `reverse`, and `sort` need not wait for Map/Set. Define support for
