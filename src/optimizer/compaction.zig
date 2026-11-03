@@ -277,22 +277,21 @@ fn remapValue(value_map: []const ?u32, value: *ValueId) void {
 }
 
 const Liveness = struct {
-    function: *Function,
     live: []bool,
-    pending: std.ArrayList(ValueId) = .empty,
-    failed: ?std.mem.Allocator.Error = null,
+    /// Every value is pushed at most once, so one slot per value never overflows.
+    pending: []ValueId,
+    count: usize = 0,
 
     fn mark(self: *Liveness, value: ValueId) void {
         if (self.live[@backingInt(value)]) return;
         self.live[@backingInt(value)] = true;
-        self.pending.append(self.function.scratch, value) catch |err| {
-            self.failed = err;
-        };
+        self.pending[self.count] = value;
+        self.count += 1;
     }
 };
 
 fn liveValues(scratch: std.mem.Allocator, function: *Function, reachable: []const bool) ![]const bool {
-    var liveness: Liveness = .{ .function = function, .live = try scratch.alloc(bool, function.valueCount()) };
+    var liveness: Liveness = .{ .live = try scratch.alloc(bool, function.valueCount()), .pending = try scratch.alloc(ValueId, function.valueCount()) };
     @memset(liveness.live, false);
     const incoming = (try function.controlFlowEdges()).incoming;
     for (function.blocks.items[function.entry].parameters.items) |parameter| liveness.mark(parameter);
@@ -304,24 +303,27 @@ fn liveValues(scratch: std.mem.Allocator, function: *Function, reachable: []cons
         }
         for (block.terminator.operands()) |operand| if (operand) |value| liveness.mark(value.*);
     }
-    while (liveness.pending.pop()) |value| switch (function.definitions.items[@backingInt(value)]) {
-        .instruction => |index| {
-            std.debug.assert(!function.removed.items[index]);
-            function_ir.visitInstructionReferences(function, &function.instructions.items[index], &liveness, Liveness.mark);
-        },
-        .argument => |argument| {
-            const position = std.mem.indexOfScalar(ValueId, function.blocks.items[argument.block].parameters.items, value).?;
-            for (incoming[argument.block].items) |edge| {
-                const branch = edge.branch(function);
-                liveness.mark(function.branch_arguments.items[branch.arguments.start + position].value);
-            }
-        },
-    };
-    if (liveness.failed) |err| return err;
+    while (liveness.count != 0) {
+        liveness.count -= 1;
+        const value = liveness.pending[liveness.count];
+        switch (function.definitions.items[@backingInt(value)]) {
+            .instruction => |index| {
+                std.debug.assert(!function.removed.items[index]);
+                function_ir.visitInstructionReferences(function, &function.instructions.items[index], &liveness, Liveness.mark);
+            },
+            .argument => |argument| {
+                const position = std.mem.indexOfScalar(ValueId, function.blocks.items[argument.block].parameters.items, value).?;
+                for (incoming[argument.block].items) |edge| {
+                    const branch = edge.branch(function);
+                    liveness.mark(function.branch_arguments.items[branch.arguments.start + position].value);
+                }
+            },
+        }
+    }
     return liveness.live;
 }
 
-pub fn removableWhenUnused(function: *const Function, instruction: Instruction) bool {
+pub inline fn removableWhenUnused(function: *const Function, instruction: Instruction) bool {
     return switch (instruction) {
         .numeric_binary, .numeric_unary => !instruction.numericMayTrap(),
         .const_numeric, .numeric_convert, .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .variant_tag, .field_access, .borrow_address, .borrow_read, .storage_projection, .allocation_element, .array_element, .storage_cursor, .cursor_offset, .cursor_element => true,

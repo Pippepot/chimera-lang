@@ -26,18 +26,63 @@ pub const Facts = struct {
     normal_return_ranges: []const ?@import("loops.zig").IntegerRange = &.{},
 };
 
-const Cache = struct {
+/// Constants copied from callees live once in the entry block, which dominates
+/// every use, instead of once per inlined body.
+const Constants = struct {
+    const Context = struct {
+        pub fn hash(_: Context, instruction: Instruction) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            std.hash.autoHash(&hasher, instruction);
+            return hasher.final();
+        }
+
+        pub fn eql(_: Context, left: Instruction, right: Instruction) bool {
+            return std.meta.eql(left, right);
+        }
+    };
+
+    values: std.HashMapUnmanaged(Instruction, ValueId, Context, 80) = .empty,
+    inserted: usize = 0,
+
+    fn shareable(instruction: Instruction) bool {
+        return switch (instruction) {
+            .const_numeric, .const_int, .const_byte, .const_bool, .const_unit, .const_none => true,
+            else => false,
+        };
+    }
+
+    fn get(self: *Constants, function: *Function, instruction: Instruction, span: SourceSpan, frame: InlineFrameId) !ValueId {
+        const entry = try self.values.getOrPut(function.scratch, instruction);
+        if (!entry.found_existing) {
+            entry.value_ptr.* = try function.insertInstruction(function.entry, 0, instruction, span, frame);
+            self.inserted += 1;
+        }
+        return entry.value_ptr.*;
+    }
+};
+
+/// Callee resolutions for one optimization of a function. Callee identity and
+/// eligibility do not change as the caller simplifies; inserted constants do.
+pub const Cache = struct {
     bodies: std.AutoHashMapUnmanaged(structures.InstanceId, ?*const Body) = .empty,
     facts: std.AutoHashMapUnmanaged(*const Body, Facts) = .empty,
+    instance_facts: std.AutoHashMapUnmanaged(structures.InstanceId, ?Facts) = .empty,
+    constants: Constants = .{},
     limit: ?u32 = null,
 
-    fn body(self: *Cache, scratch: std.mem.Allocator, context: anytype, instance: structures.InstanceId) !?*const Body {
+    pub fn body(self: *Cache, scratch: std.mem.Allocator, context: anytype, instance: structures.InstanceId) !?*const Body {
         const entry = try self.bodies.getOrPut(scratch, instance);
         if (!entry.found_existing) entry.value_ptr.* = try context.inlineBody(instance);
         return entry.value_ptr.*;
     }
 
-    fn analyze(self: *Cache, scratch: std.mem.Allocator, callee: *const Body) !Facts {
+    pub fn instanceFacts(self: *Cache, scratch: std.mem.Allocator, context: anytype, instance: structures.InstanceId) !?Facts {
+        const entry = try self.instance_facts.getOrPut(scratch, instance);
+        if (!entry.found_existing) entry.value_ptr.* = try context.inlineFacts(instance);
+        return entry.value_ptr.*;
+    }
+
+    pub fn analyze(self: *Cache, scratch: std.mem.Allocator, callee: *const Body) !Facts {
         const entry = try self.facts.getOrPut(scratch, callee);
         if (!entry.found_existing) entry.value_ptr.* = try analyzeCallee(scratch, callee);
         return entry.value_ptr.*;
@@ -91,8 +136,8 @@ pub fn growthBudget(function: *const Function) usize {
     return @max(size * 4, size + 512);
 }
 
-pub fn inlineCalls(function: *Function, context: anytype, budget: usize) !bool {
-    var cache: Cache = .{};
+pub fn inlineCalls(function: *Function, context: anytype, budget: usize, cache: *Cache) !bool {
+    cache.constants = .{};
     var size = liveInstructions(function);
     const reachable = (try function.controlFlowEdges()).reachable;
     var changed = false;
@@ -101,17 +146,26 @@ pub fn inlineCalls(function: *Function, context: anytype, budget: usize) !bool {
         if (block < reachable.len and !reachable[block]) continue;
         if (size > budget) break;
         var position: usize = 0;
-        while (position < function.blocks.items[block].instructions.items.len) : (position += 1) {
+        while (position < function.blocks.items[block].instructions.items.len) {
             const index = function.blocks.items[block].instructions.items[position];
-            if (function.removed.items[index]) continue;
             const instruction = function.instructions.items[index];
-            if (instruction != .call) continue;
-            const callee = (try candidate(function, context, &cache, instruction.call)) orelse continue;
-            if (callee.body.instructions.len > budget -| size) continue;
-            try inlineInstruction(function, context, block, position, index, callee);
-            size += callee.body.instructions.len;
+            const callee = if (!function.removed.items[index] and instruction == .call)
+                try candidate(function, context, cache, instruction.call)
+            else
+                null;
+            if (callee == null or callee.?.body.instructions.len > budget -| size) {
+                position += 1;
+                continue;
+            }
+            const straight = straightLine(function, instruction.call, callee.?);
+            const shared = cache.constants.inserted;
+            if (straight) try inlineStraight(function, context, cache, block, position, index, callee.?) else try inlineInstruction(function, context, cache, block, position, index, callee.?);
+            // Constants inserted at the start of the entry block shift this scan.
+            if (block == function.entry) position += cache.constants.inserted - shared;
+            size += callee.?.body.instructions.len;
             changed = true;
-            break;
+            // A straight-line splice leaves the remaining calls in this block.
+            if (!straight or size > budget) break;
         }
     }
     return changed;
@@ -165,7 +219,7 @@ fn candidate(function: *Function, context: anytype, cache: *Cache, call: structu
         if (cost(body) > cache.limit.?) return null;
     }
     const facts = if (@hasDecl(@TypeOf(context), "inlineFacts") and !callee.region)
-        (try context.inlineFacts(callee.instance)) orelse return null
+        (try cache.instanceFacts(function.scratch, context, callee.instance)) orelse return null
     else
         try cache.analyze(function.scratch, body);
     if (!facts.eligible) return null;
@@ -179,7 +233,7 @@ const Exit = struct {
     destination: ?ValueId,
 };
 
-fn inlineInstruction(function: *Function, context: anytype, block: u32, position: usize, index: u32, callee: Callee) !void {
+fn inlineInstruction(function: *Function, context: anytype, cache: *Cache, block: u32, position: usize, index: u32, callee: Callee) !void {
     const call = function.instructions.items[index].call;
     const result = function.results.items[index];
     const tail = try function.splitBlock(block, position + 1);
@@ -188,21 +242,83 @@ fn inlineInstruction(function: *Function, context: anytype, block: u32, position
     const span = function.instructionSpan(index);
     const frame = function.instructionFrame(index);
     const returns_value = call.destination == null and call.return_type != .unit and call.return_type != .never;
-    var splice = try Splice.init(function, callee, span, frame, block);
+    var splice = try Splice.init(function, callee, span, frame, block, null);
+    splice.constants = &cache.constants;
     try splice.bindArguments(call, block);
     try splice.copyBody(.{ .block = tail, .parameter = returns_value, .destination = call.destination });
     if (returns_value) {
         const parameter = try function.addParameter(tail, .{ .type_id = call.return_type });
-        function.replace(result, try materializeResult(function, context, tail, parameter, call.return_type, span, frame));
+        function.replace(result, try materializeResult(function, context, tail, 0, parameter, call.return_type, span, frame));
     } else if (call.return_type != .never) {
         function.replace(result, try function.insertInstruction(tail, 0, .const_unit, span, frame));
     }
 }
 
-fn materializeResult(function: *Function, context: anytype, block: u32, parameter: ValueId, type_id: structures.TypeId, span: SourceSpan, frame: InlineFrameId) !ValueId {
+/// A single-block callee that returns directly and routes no arguments splices
+/// into the call's block, avoiding a continuation block and join parameter.
+fn straightLine(function: *const Function, call: structures.FunctionCall, callee: Callee) bool {
+    const body = callee.body;
+    if (callee.region or body.blocks.len != 1) return false;
+    switch (body.blocks[0].terminator) {
+        .return_unit => {},
+        .return_value => |returned| if (returned.coerce_to != null) return false,
+        else => return false,
+    }
+    const arguments = function.call_arguments.items[call.arguments.start..call.arguments.end];
+    for (arguments, callee.entry_taken) |argument, taken| switch (argument) {
+        .prepared => |prepared| if (prepared.coerce_to != null or taken or !function.plainValue(prepared.value)) return false,
+        .borrowed, .deinit, .initializer => {},
+    };
+    return true;
+}
+
+fn inlineStraight(function: *Function, context: anytype, cache: *Cache, block: u32, position: usize, index: u32, callee: Callee) !void {
+    const call = function.instructions.items[index].call;
+    const result = function.results.items[index];
+    const instructions = &function.blocks.items[block].instructions;
+    const rest = try function.scratch.dupe(u32, instructions.items[position + 1 ..]);
+    instructions.shrinkRetainingCapacity(position);
+    function.removed.items[index] = true;
+    const span = function.instructionSpan(index);
+    const frame = function.instructionFrame(index);
+    var splice = try Splice.init(function, callee, span, frame, block, block);
+    splice.constants = &cache.constants;
+    const body = callee.body;
+    const arguments = function.call_arguments.items[call.arguments.start..call.arguments.end];
+    for (arguments, body.blocks[0].argument_start..) |argument, parameter| splice.values[parameter] = switch (argument) {
+        .prepared => |prepared| prepared.value,
+        .borrowed, .deinit, .initializer => |source| source,
+    };
+    try splice.copyInstructions(call.destination);
+    const returned: ?structures.FunctionValueUse = switch (body.blocks[0].terminator) {
+        .return_value => |returned| try splice.use(returned),
+        else => null,
+    };
+    const returns_value = call.destination == null and call.return_type != .unit and call.return_type != .never;
+    if (call.destination) |destination| {
+        if (returned) |value| try splice.storeResult(block, value, destination);
+    }
+    const end = function.blocks.items[block].instructions.items.len;
+    if (returns_value) {
+        // A returned place is read where the call stood, as the join parameter would have.
+        const value = returned.?.value;
+        const direct = !try context.passesIndirectly(call.return_type);
+        const snapshot = if (direct and !function.plainValue(value))
+            try function.insertInstruction(block, end, .{ .value_copy = .{ .source = value, .type_id = call.return_type, .destination = null } }, span, frame)
+        else
+            value;
+        const after = end + @intFromBool(snapshot != value);
+        function.replace(result, try materializeResult(function, context, block, after, snapshot, call.return_type, span, frame));
+    } else if (call.return_type != .never) {
+        function.replace(result, try function.insertInstruction(block, end, .const_unit, span, frame));
+    }
+    try function.blocks.items[block].instructions.appendSlice(function.scratch, rest);
+}
+
+fn materializeResult(function: *Function, context: anytype, block: u32, position: usize, parameter: ValueId, type_id: structures.TypeId, span: SourceSpan, frame: InlineFrameId) !ValueId {
     if (!try context.passesIndirectly(type_id)) return parameter;
-    const storage = try function.insertInstruction(block, 0, .{ .local_storage = type_id }, span, frame);
-    _ = try function.insertInstruction(block, 1, .{ .value_copy = .{ .source = parameter, .type_id = type_id, .destination = storage } }, span, frame);
+    const storage = try function.insertInstruction(block, position, .{ .local_storage = type_id }, span, frame);
+    _ = try function.insertInstruction(block, position + 1, .{ .value_copy = .{ .source = parameter, .type_id = type_id, .destination = storage } }, span, frame);
     return storage;
 }
 
@@ -218,8 +334,9 @@ const Splice = struct {
     region: bool,
     captures: []const ValueId,
     entry_taken: []const bool,
+    constants: ?*Constants = null,
 
-    fn init(function: *Function, callee: Callee, span: SourceSpan, parent: InlineFrameId, after: u32) !Splice {
+    fn init(function: *Function, callee: Callee, span: SourceSpan, parent: InlineFrameId, after: u32, reuse: ?u32) !Splice {
         const scratch = function.scratch;
         const body = callee.body;
         var splice: Splice = .{
@@ -250,6 +367,10 @@ const Splice = struct {
         }
         var previous = after;
         for (body.blocks, splice.blocks, 0..) |_, *mapped, index| {
+            if (reuse) |existing| {
+                mapped.* = existing;
+                continue;
+            }
             const source = splice.origin(body.terminator_spans, body.terminator_frames, index);
             mapped.* = try function.addBlock(.diverge, source.span, source.frame);
             try function.placeAfter(mapped.*, previous);
@@ -308,6 +429,11 @@ const Splice = struct {
     }
 
     fn copyBody(self: *Splice, exit: Exit) !void {
+        try self.copyInstructions(exit.destination);
+        for (self.callee.blocks, 0..) |block, block_index| try self.copyTerminator(block.terminator, self.blocks[block_index], exit);
+    }
+
+    fn copyInstructions(self: *Splice, destination: ?ValueId) !void {
         const function = self.function;
         const body = self.callee;
         const first: u32 = @intCast(function.instructions.items.len);
@@ -315,21 +441,24 @@ const Splice = struct {
             for (block.instruction_start..block.instruction_end) |index| {
                 var instruction = body.instructions[index];
                 if (instruction == .result_storage) {
-                    if (exit.destination) |destination| {
-                        self.values[@backingInt(body.instructionValue(index))] = destination;
+                    if (destination) |target| {
+                        self.values[@backingInt(body.instructionValue(index))] = target;
                         continue;
                     }
                     const storage_type = instruction.result_storage;
                     instruction = .{ .local_storage = storage_type };
                 }
                 const source = self.origin(body.instruction_spans, body.instruction_frames, index);
+                if (self.constants) |constants| if (Constants.shareable(instruction)) {
+                    self.values[@backingInt(body.instructionValue(index))] = try constants.get(function, instruction, source.span, source.frame);
+                    continue;
+                };
                 const copied = try function.newInstruction(instruction, source.span, source.frame);
                 try function.blocks.items[self.blocks[block_index]].instructions.append(function.scratch, copied);
                 self.values[@backingInt(body.instructionValue(index))] = function.results.items[copied];
             }
         }
         for (function.instructions.items[first..]) |*instruction| try self.relocateInstruction(instruction);
-        for (body.blocks, 0..) |block, block_index| try self.copyTerminator(block.terminator, self.blocks[block_index], exit);
     }
 
     fn value(self: *const Splice, original: ValueId) ValueId {

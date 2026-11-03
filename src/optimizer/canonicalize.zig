@@ -16,7 +16,9 @@ pub fn canonicalize(function: *Function) !function_ir.Changes {
     var changes: function_ir.Changes = .{};
     while (changed) {
         changed = false;
-        for (function.blocks.items) |*block| {
+        const order = (try function.controlFlowEdges()).order;
+        for (order) |block_index| {
+            const block = &function.blocks.items[block_index];
             rules.source = block.instructions.items;
             rules.rewritten = .empty;
             for (rules.source, 0..) |index, position| {
@@ -27,20 +29,24 @@ pub fn canonicalize(function: *Function) !function_ir.Changes {
                     const result = function.results.items[index];
                     const original = function.instructions.items[index];
                     var instruction = original;
-                    if (try rules.simplify(&instruction, result)) {
+                    while (try rules.simplify(&instruction, result)) {
                         function.instructions.items[index] = instruction;
                         changes.changed = true;
-                        changed = changed or original != .call;
                         changes.storage = changes.storage or switch (original) {
                             .borrow_read, .borrow_write, .borrow_address => true,
                             .call => false,
                             else => function_ir.usesStorage(function, &original) or function_ir.usesStorage(function, &instruction),
                         };
+                        if (instruction == .call or function.find(result) != result) break;
                     }
                 }
                 if (rules.rewritten.capacity != 0) try rules.rewritten.append(function.scratch, index);
             }
-            if (rules.rewritten.capacity != 0) block.instructions = rules.rewritten;
+            if (rules.rewritten.capacity != 0) {
+                // Emitted scalars were not themselves simplified in this pass.
+                block.instructions = rules.rewritten;
+                changed = true;
+            }
         }
         for (function.blocks.items) |*block| {
             function_ir.terminatorAllOperands(function, &block.terminator, function, Function.resolveOperand);
@@ -57,7 +63,7 @@ pub fn canonicalize(function: *Function) !function_ir.Changes {
 const Rules = struct {
     function: *Function,
     address_taken: []const bool,
-    stable_values: ?[]const bool = null,
+    stability: ?effects.Stability = null,
     graph_changed: bool = false,
     source: []const u32 = &.{},
     position: usize = 0,
@@ -449,9 +455,8 @@ const Rules = struct {
         if (self.function.valueType(value) != operation.type_id) return false;
         if (!self.function.plainValue(value)) return false;
         if (self.isAddressTaken(result) or self.isAddressTaken(value)) {
-            if (self.stable_values == null) self.stable_values = try effects.stableValues(self.function);
-            const stable = self.stable_values.?;
-            if (!stable[@backingInt(result)] or !stable[@backingInt(value)]) return false;
+            if (self.stability == null) self.stability = .{ .function = self.function };
+            if (!try self.stability.?.stable(result) or !try self.stability.?.stable(value)) return false;
             self.function.replace(result, value);
             return true;
         }

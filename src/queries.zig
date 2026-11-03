@@ -4322,9 +4322,9 @@ fn selectEntry(ctx: anytype, file_id: structures.FileId) anyerror!?structures.It
     unreachable;
 }
 
-pub const OptimizeFunctionInstance = CompilerQuery("OptimizeFunctionInstance", .optimization, optimizeFunctionInstance, .{});
+pub const OptimizeFunctionInstance = CompilerQuery("OptimizeFunctionInstance", .optimization, optimizeFunctionInstance, .{ .result_arena = true });
 
-pub const PrepareFunctionInstance = CompilerQuery("PrepareFunctionInstance", .optimization, prepareFunctionInstance, .{});
+pub const PrepareFunctionInstance = CompilerQuery("PrepareFunctionInstance", .optimization, prepareFunctionInstance, .{ .result_arena = true });
 
 pub const InlineFunctionFacts = CompilerQuery("InlineFunctionFacts", .optimization_inline, inlineFunctionFacts, .{ .content_equality = true });
 
@@ -4338,7 +4338,7 @@ fn inlineFunctionFacts(ctx: anytype, instance: structures.InstanceId) anyerror!?
 
 fn prepareFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?structures.FunctionBodyAnalysis {
     const body = (try ctx.get(AnalyzeFunctionInstance, instance)).* orelse return null;
-    return try optimizer.prepare(ctx.allocator(), &body, TypeLayoutContext(@TypeOf(ctx)){ .ctx = ctx });
+    return try optimizer.prepare(ctx.allocator(), ctx.resultAllocator(), &body, TypeLayoutContext(@TypeOf(ctx)){ .ctx = ctx });
 }
 
 fn optimizeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?structures.FunctionBodyAnalysis {
@@ -4346,7 +4346,7 @@ fn optimizeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyer
     const component = (try ctx.get(CallComponent, instance)).* orelse return null;
     const context: OptimizationContext(@TypeOf(ctx)) = .{ .ctx = ctx, .instance = instance, .component = component.members };
     if (ctx.hasParallelWorkers()) try prefetchOptimizationCallees(ctx, &body);
-    return try optimizer.optimize(ctx.allocator(), &body, context);
+    return try optimizer.optimize(ctx.allocator(), ctx.resultAllocator(), &body, context);
 }
 
 fn prefetchOptimizationCallees(ctx: anytype, body: *const structures.FunctionBodyAnalysis) anyerror!void {

@@ -177,8 +177,11 @@ caller SSA and code while requiring relinking.
 | Dependencies and diagnostics | Query entry, replaced atomically on recomputation |
 | Published executable | Filesystem, independent of the database |
 
-Worker-local pools recycle computation scratch. Structurally owned outputs
-compact into result arenas; queries opting into direct result allocation must
+Worker-local pools recycle computation scratch. Scratch and result arenas are
+unsynchronized bump arenas owned by one computation; a result arena's first
+chunk is sized from the query type's previous result. A database with zero
+workers is single-threaded and takes no scheduler or allocator locks. Structurally
+owned outputs compact into result arenas; queries opting into direct result allocation must
 place every owned payload in `Context.resultAllocator`. Pointer-based custom
 outputs retain their computation arena. Equal and failed computations discard
 fresh storage without replacing the old result. Consumers needing a longer

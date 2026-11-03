@@ -29,6 +29,17 @@ pub const Block = struct {
     frame: InlineFrameId,
 };
 
+/// Interned type ids are small and dense, so a multiplicative hash spreads them well.
+const TypeContext = struct {
+    pub fn hash(_: TypeContext, type_id: structures.TypeId) u64 {
+        return @as(u64, @backingInt(type_id)) *% 0x9e3779b97f4a7c15;
+    }
+
+    pub fn eql(_: TypeContext, first: structures.TypeId, second: structures.TypeId) bool {
+        return first == second;
+    }
+};
+
 pub const Function = struct {
     scratch: std.mem.Allocator,
     return_type: structures.TypeId,
@@ -54,7 +65,7 @@ pub const Function = struct {
     borrow_fields: std.ArrayList(structures.BorrowProjection) = .empty,
     inline_frames: std.ArrayList(structures.InlineFrame) = .empty,
     regions: std.ArrayList(Body) = .empty,
-    direct_types: std.AutoHashMapUnmanaged(structures.TypeId, bool) = .empty,
+    direct_types: std.HashMapUnmanaged(structures.TypeId, bool, TypeContext, 80) = .empty,
     classified_values: usize = 0,
     control_flow: ?Graph = null,
     operands_dirty: bool = false,
@@ -128,21 +139,24 @@ pub const Function = struct {
             function.replacement.appendAssumeCapacity(@fromBackingInt(@intCast(function.replacement.items.len)));
         }
         for (body.blocks, function.blocks.items, 0..) |block, *editable, index| {
+            try editable.parameters.ensureTotalCapacityPrecise(scratch, block.argument_end - block.argument_start);
+            try editable.instructions.ensureTotalCapacityPrecise(scratch, block.instruction_end - block.instruction_start);
             for (block.argument_start..block.argument_end) |argument| {
                 function.definitions.items[argument].argument.block = @intCast(index);
-                try editable.parameters.append(scratch, @fromBackingInt(@intCast(argument)));
+                editable.parameters.appendAssumeCapacity(@fromBackingInt(@intCast(argument)));
             }
-            for (block.instruction_start..block.instruction_end) |instruction| try editable.instructions.append(scratch, @intCast(instruction));
+            for (block.instruction_start..block.instruction_end) |instruction| editable.instructions.appendAssumeCapacity(@intCast(instruction));
         }
         try function.instructions.appendSlice(scratch, body.instructions);
         try function.removed.appendNTimes(scratch, false, body.instructions.len);
+        try function.results.ensureTotalCapacityPrecise(scratch, body.instructions.len);
         try function.spans.appendSlice(scratch, body.instruction_spans);
         if (framed) try function.frames.appendSlice(scratch, body.instruction_frames) else if (function.publishes_spans) try function.frames.appendNTimes(scratch, .root, body.instructions.len);
         for (body.instructions, 0..) |instruction, index| {
             if (instruction == .local_storage) function.storage_possible = true;
             function.definitions.appendAssumeCapacity(.{ .instruction = @intCast(index) });
             function.replacement.appendAssumeCapacity(@fromBackingInt(@intCast(function.replacement.items.len)));
-            try function.results.append(scratch, body.instructionValue(index));
+            function.results.appendAssumeCapacity(body.instructionValue(index));
         }
         try function.call_arguments.appendSlice(scratch, body.call_arguments);
         try function.branch_arguments.appendSlice(scratch, body.branch_arguments);

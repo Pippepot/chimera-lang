@@ -3,6 +3,7 @@ const structures = @import("../structures.zig");
 const function_ir = @import("function.zig");
 const canonicalize = @import("canonicalize.zig");
 const loops = @import("loops.zig");
+const inlining = @import("inline.zig");
 const Graph = @import("graph.zig").Graph;
 
 const ValueId = structures.FunctionValueId;
@@ -10,21 +11,20 @@ const Instruction = structures.FunctionInstruction;
 const Function = function_ir.Function;
 const Loop = loops.Loop;
 
-pub fn transform(function: *Function, context: anytype, bulk_fallbacks: *std.AutoHashMapUnmanaged(u32, void)) !bool {
+pub fn transform(function: *Function, context: anytype, callees: *inlining.Cache, bulk_fallbacks: *std.AutoHashMapUnmanaged(u32, void)) !bool {
     var changed = false;
-    while (try once(function, context, bulk_fallbacks)) changed = true;
+    while (try once(function, context, callees, bulk_fallbacks)) changed = true;
     if (changed) function.resolveReferences();
     return changed;
 }
 
-fn once(function: *Function, context: anytype, bulk_fallbacks: *std.AutoHashMapUnmanaged(u32, void)) !bool {
-    while (try loops.canonicalize(function)) {}
+fn once(function: *Function, context: anytype, callees: *inlining.Cache, bulk_fallbacks: *std.AutoHashMapUnmanaged(u32, void)) !bool {
+    const found = try loops.canonicalLoops(function);
     function.resolveReferences();
-    const graph = (try function.controlFlow()).*;
-    const found = try loops.find(function.scratch, function, graph);
     if (found.len == 0) return false;
+    const graph = (try function.controlFlow()).*;
     var analysis = try loops.Analysis.init(function, graph, found);
-    analysis.call_arguments = try successfulCallArguments(function, context);
+    analysis.call_arguments = try successfulCallArguments(function, context, callees);
     for (found) |loop| {
         const preheader = loops.preheader(function, graph, loop) orelse continue;
         if (loop.latches.len != 1) continue;
@@ -36,7 +36,7 @@ fn once(function: *Function, context: anytype, bulk_fallbacks: *std.AutoHashMapU
     return false;
 }
 
-fn successfulCallArguments(function: *Function, context: anytype) ![]const loops.Analysis.CallArgumentRange {
+fn successfulCallArguments(function: *Function, context: anytype, callees: *inlining.Cache) ![]const loops.Analysis.CallArgumentRange {
     var ranges: std.ArrayList(loops.Analysis.CallArgumentRange) = .empty;
     const taken = try canonicalize.addressTaken(function);
     for (function.instructions.items, function.removed.items, 0..) |instruction, removed, index| {
@@ -47,11 +47,11 @@ fn successfulCallArguments(function: *Function, context: anytype) ![]const loops
             const value = function.find(argument.valueId());
             if (function.valueType(value) == .int and function.plainValue(value) and !taken[@backingInt(value)]) break;
         } else continue;
-        const body = (try context.inlineBody(call.target.direct)) orelse continue;
+        const body = (try callees.body(function.scratch, context, call.target.direct)) orelse continue;
         const facts = if (@hasDecl(@TypeOf(context), "inlineFacts"))
-            (try context.inlineFacts(call.target.direct)) orelse continue
+            (try callees.instanceFacts(function.scratch, context, call.target.direct)) orelse continue
         else
-            try @import("inline.zig").analyzeCallee(function.scratch, body);
+            try callees.analyze(function.scratch, body);
         if (!facts.eligible or facts.normal_return_ranges.len == 0) continue;
         std.debug.assert(facts.normal_return_ranges.len == arguments.len);
         for (arguments, facts.normal_return_ranges) |argument, range| {
@@ -250,8 +250,8 @@ fn removeDeadLoop(function: *Function, analysis: *const loops.Analysis, loop: Lo
     var escape: Escape = .{ .analysis = analysis, .loop = loop };
     for (function.blocks.items, 0..) |*block, index| {
         if (!loop.contains(@intCast(index))) function_ir.visitBlockOperands(function, block, &escape, Escape.check);
+        if (escape.escapes) return false;
     }
-    if (escape.escapes) return false;
     if (needs_proof and !analysis.equalityRecurrenceSafe(preheader, controlled)) return false;
     function.blocks.items[preheader].terminator = .{ .branch = .{ .target = @fromBackingInt(test_result.exit), .arguments = .{ .start = 0, .end = 0 } } };
     return true;

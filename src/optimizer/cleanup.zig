@@ -7,6 +7,7 @@ const effects = @import("effects.zig");
 const ValueId = structures.FunctionValueId;
 const Function = function_ir.Function;
 const Incoming = @import("graph.zig").Incoming;
+const Graph = @import("graph.zig").Graph;
 
 pub fn simplifyParameters(function: *Function, variants: bool) !bool {
     if (!function.hasJoinParameters()) return false;
@@ -15,6 +16,7 @@ pub fn simplifyParameters(function: *Function, variants: bool) !bool {
     var parameters: ParameterSimplifier = .{
         .function = function,
         .incoming = graph.incoming,
+        .stability = .{ .function = function },
     };
     var changed = false;
     if (variants) {
@@ -49,22 +51,81 @@ pub fn simplify(function: *Function) !bool {
 
 const scalar_types = [_]structures.TypeId{ .int, .bool, .byte };
 
-const VariantUses = struct {
+// A variant join parameter that every predecessor feeds one injected scalar
+// alternative splits into a tag and payload parameters when its remaining
+// uses only read the tag or a scalar payload.
+const SplitCandidate = struct {
+    block: u32,
+    position: usize,
+    parameter: ValueId,
     references: u32 = 0,
     accepted: u32 = 0,
     payloads: [scalar_types.len]bool = @splat(false),
+    split: ?ScalarVariant = null,
 
-    fn count(uses: []VariantUses, value: ValueId) void {
-        uses[@backingInt(value)].references += 1;
+    fn splittable(self: SplitCandidate) bool {
+        return self.accepted != 0 and self.references == self.accepted;
+    }
+};
+
+const VariantUses = struct {
+    function: *const Function,
+    candidates: []SplitCandidate,
+    taken: []const bool,
+    touched: bool = false,
+
+    fn lookup(self: *VariantUses, value: ValueId) ?*SplitCandidate {
+        if (self.function.definitions.items[@backingInt(value)] != .argument) return null;
+        for (self.candidates) |*candidate| if (candidate.parameter == value) return candidate;
+        return null;
+    }
+
+    fn count(self: *VariantUses, value: ValueId) void {
+        const candidate = self.lookup(value) orelse return;
+        candidate.references += 1;
+        self.touched = true;
+    }
+
+    /// Returns whether every candidate already has a use that prevents splitting.
+    fn block(self: *VariantUses, body: *const function_ir.Block) bool {
+        const function = self.function;
+        for (body.instructions.items) |index| {
+            if (function.removed.items[index]) continue;
+            const instruction = &function.instructions.items[index];
+            function_ir.visitInstructionReferences(function, instruction, self, count);
+            const result = function.results.items[index];
+            if (@backingInt(result) >= self.taken.len or !self.taken[@backingInt(result)]) switch (instruction.*) {
+                .variant_tag => |operand| if (self.lookup(operand)) |candidate| {
+                    candidate.accepted += 1;
+                },
+                .variant_extract => |extraction| if (extraction.destination == null) {
+                    if (std.mem.indexOfScalar(structures.TypeId, &scalar_types, extraction.target_type)) |scalar| {
+                        if (self.lookup(extraction.operand)) |candidate| {
+                            candidate.payloads[scalar] = true;
+                            candidate.accepted += 1;
+                        }
+                    }
+                },
+                else => {},
+            };
+            if (self.touched and !self.anyAlive()) return true;
+        }
+        function_ir.visitTerminatorReferences(function, &body.terminator, self, count);
+        return self.touched and !self.anyAlive();
+    }
+
+    /// References only accumulate, so a candidate with an unaccepted use stays rejected.
+    fn anyAlive(self: *VariantUses) bool {
+        self.touched = false;
+        for (self.candidates) |candidate| if (candidate.references == candidate.accepted) return true;
+        return false;
     }
 };
 
 fn splitScalarVariants(parameters: *ParameterSimplifier) !bool {
     const function = parameters.function;
     const graph = (try function.controlFlowEdges()).*;
-    var uses: ?[]const VariantUses = null;
-    var replacements: ?[]?ScalarVariant = null;
-    var changed = false;
+    var candidates: std.ArrayList(SplitCandidate) = .empty;
     for (graph.order) |block| {
         if (block == function.entry) continue;
         const edges = graph.incoming[block].items;
@@ -80,52 +141,35 @@ fn splitScalarVariants(parameters: *ParameterSimplifier) !bool {
                 const mapping = use.variant_tag_mapping orelse break;
                 if (use.coerce_to == null or mapping.end - mapping.start != 1) break;
             } else {
-                const taken = try parameters.addressTaken();
-                if (taken[@backingInt(parameter)]) continue;
-                if (uses == null) {
-                    uses = try scalarVariantUses(function, taken);
-                    replacements = try function.scratch.alloc(?ScalarVariant, function.valueCount());
-                    @memset(replacements.?, null);
-                }
-                const replacement = try splitScalarVariant(function, block, position, edges, uses.?[@backingInt(parameter)]) orelse continue;
-                replacements.?[@backingInt(parameter)] = replacement;
-                changed = true;
+                if ((try parameters.addressTaken())[@backingInt(parameter)]) continue;
+                try candidates.append(function.scratch, .{ .block = block, .position = position, .parameter = parameter });
             }
         }
     }
+    if (candidates.items.len == 0) return false;
+    countVariantUses(function, graph, try parameters.addressTaken(), candidates.items);
+    var changed = false;
+    for (candidates.items) |*candidate| {
+        if (!candidate.splittable()) continue;
+        candidate.split = try splitScalarVariant(function, candidate.*, graph.incoming[candidate.block].items);
+        changed = true;
+    }
     if (changed) {
-        replaceScalarVariants(function, replacements.?);
+        replaceScalarVariants(function, candidates.items);
         function.resolveReferences();
     }
     return changed;
 }
 
-fn scalarVariantUses(function: *Function, taken: []const bool) ![]const VariantUses {
-    const uses = try function.scratch.alloc(VariantUses, function.valueCount());
-    @memset(uses, .{});
-    for (function.blocks.items) |*body| {
-        for (body.instructions.items) |index| {
-            if (function.removed.items[index]) continue;
-            const instruction = &function.instructions.items[index];
-            function_ir.visitInstructionReferences(function, instruction, uses, VariantUses.count);
-            const result = function.results.items[index];
-            if (@backingInt(result) < taken.len and taken[@backingInt(result)]) continue;
-            switch (instruction.*) {
-                .variant_tag => |operand| {
-                    uses[@backingInt(operand)].accepted += 1;
-                },
-                .variant_extract => |extraction| if (extraction.destination == null) {
-                    const scalar = std.mem.indexOfScalar(structures.TypeId, &scalar_types, extraction.target_type) orelse continue;
-                    const use = &uses[@backingInt(extraction.operand)];
-                    use.payloads[scalar] = true;
-                    use.accepted += 1;
-                },
-                else => {},
-            }
-        }
-        function_ir.visitTerminatorReferences(function, &body.terminator, uses, VariantUses.count);
-    }
-    return uses;
+/// Uses are dominated by their parameter's block, which precedes them in
+/// reverse postorder, so the scan starts at the first candidate and ends once
+/// no candidate can split.
+fn countVariantUses(function: *Function, graph: Graph, taken: []const bool, candidates: []SplitCandidate) void {
+    var uses: VariantUses = .{ .function = function, .candidates = candidates, .taken = taken };
+    var first = graph.order.len;
+    for (candidates) |candidate| first = @min(first, graph.rank[candidate.block]);
+    for (graph.order[first..]) |block| if (uses.block(&function.blocks.items[block])) return;
+    for (function.blocks.items, graph.reachable) |*body, reachable| if (!reachable and uses.block(body)) return;
 }
 
 const ScalarVariant = struct {
@@ -133,11 +177,12 @@ const ScalarVariant = struct {
     payloads: [scalar_types.len]?ValueId,
 };
 
-fn splitScalarVariant(function: *Function, block: u32, position: usize, edges: []const Incoming, uses: VariantUses) !?ScalarVariant {
-    if (uses.accepted == 0 or uses.references != uses.accepted) return null;
+fn splitScalarVariant(function: *Function, candidate: SplitCandidate, edges: []const Incoming) !ScalarVariant {
+    const block = candidate.block;
+    const position = candidate.position;
     const tag = try function.addParameter(block, .{ .type_id = .int });
     var parameters: [scalar_types.len]?ValueId = @splat(null);
-    for (uses.payloads, scalar_types, &parameters) |needed, type_id, *value| {
+    for (candidate.payloads, scalar_types, &parameters) |needed, type_id, *value| {
         if (needed) value.* = try function.addParameter(block, .{ .type_id = type_id });
     }
     for (edges) |edge| {
@@ -157,7 +202,7 @@ fn splitScalarVariant(function: *Function, block: u32, position: usize, edges: [
     return .{ .tag = tag, .payloads = parameters };
 }
 
-fn replaceScalarVariants(function: *Function, replacements: []const ?ScalarVariant) void {
+fn replaceScalarVariants(function: *Function, candidates: []const SplitCandidate) void {
     for (function.blocks.items) |body| for (body.instructions.items) |index| {
         if (function.removed.items[index]) continue;
         const instruction = function.instructions.items[index];
@@ -167,7 +212,9 @@ fn replaceScalarVariants(function: *Function, replacements: []const ?ScalarVaria
             .variant_extract => |extraction| extraction.operand,
             else => continue,
         };
-        const split = replacements[@backingInt(operand)] orelse continue;
+        const split = for (candidates) |candidate| {
+            if (candidate.parameter == operand) break candidate.split orelse continue;
+        } else continue;
         const replacement: ValueId = switch (instruction) {
             .variant_tag => split.tag,
             .variant_extract => |extraction| split.payloads[std.mem.indexOfScalar(structures.TypeId, &scalar_types, extraction.target_type).?].?,
@@ -230,7 +277,7 @@ const ParameterSimplifier = struct {
     function: *Function,
     incoming: []const std.ArrayList(Incoming),
     address_taken: ?[]const bool = null,
-    stable_values: ?[]const bool = null,
+    stability: effects.Stability,
 
     fn addressTaken(self: *ParameterSimplifier) ![]const bool {
         if (self.address_taken == null) self.address_taken = try canonicalize.addressTaken(self.function);
@@ -247,10 +294,8 @@ const ParameterSimplifier = struct {
     fn stable(self: *ParameterSimplifier, value: ValueId) !bool {
         if (!self.function.plainValue(value)) return false;
         const taken = try self.addressTaken();
-        const index = @backingInt(value);
-        if (!taken[index]) return true;
-        if (self.stable_values == null) self.stable_values = try effects.stableValues(self.function);
-        return self.stable_values.?[index];
+        if (!taken[@backingInt(value)]) return true;
+        return !try self.stability.exposed(value) and try self.stability.stable(value);
     }
 
     fn foldParameters(self: *ParameterSimplifier, block: u32) !bool {
@@ -535,10 +580,30 @@ const Sweep = struct {
     fn merge(self: *Sweep, block: u32) !bool {
         const function = self.function;
         if (block == function.entry or self.incoming[block].items.len != 1) return false;
-        const edge = self.incoming[block].items[0];
-        const predecessor = edge.block;
+        const predecessor = self.incoming[block].items[0].block;
         if (predecessor == block or self.dirty[predecessor]) return false;
         if (function.blocks.items[predecessor].terminator != .branch) return false;
+        var current = block;
+        var merged = false;
+        while (true) {
+            const values = function.valueCount();
+            if (!try self.absorb(current, predecessor)) break;
+            merged = true;
+            // Absorbing a block that needed no new values leaves its successor's
+            // facts intact, so a chain of single-predecessor blocks merges in one sweep.
+            const terminator = function.blocks.items[predecessor].terminator;
+            if (terminator != .branch or function.valueCount() != values) break;
+            current = @backingInt(terminator.branch.target);
+            if (current == predecessor or current == function.entry or self.dirty[current] or self.incoming[current].items.len != 1) break;
+        }
+        if (merged) self.touch(predecessor);
+        return merged;
+    }
+
+    fn absorb(self: *Sweep, block: u32, predecessor: u32) !bool {
+        const function = self.function;
+        const edge = self.incoming[block].items[0];
+        std.debug.assert(edge.block == predecessor);
         const arguments = function.branchArguments(edge.branch(function).*);
         if (coerces(arguments)) return false;
         for (function.blocks.items[block].parameters.items, arguments) |parameter, argument| {
@@ -561,7 +626,11 @@ const Sweep = struct {
         target.span = merged.span;
         target.frame = merged.frame;
         merged.terminator = .diverge;
-        self.touch(predecessor);
+        for (function.successors(predecessor)) |successor| if (successor) |next| {
+            for (self.incoming[next].items) |*incoming| if (incoming.block == block) {
+                incoming.block = predecessor;
+            };
+        };
         self.dirty[block] = true;
         return true;
     }

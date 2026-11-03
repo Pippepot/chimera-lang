@@ -23,6 +23,9 @@ pub const Graph = struct {
     next_sibling: []const u32 = &.{},
     frontier: ?[]const std.ArrayList(u32) = null,
     incoming: []const std.ArrayList(Incoming),
+    /// Some edge reaches a block that does not follow its source in reverse
+    /// postorder. Every back edge is such an edge, so without one there is no loop.
+    cyclic: bool,
 
     pub fn init(scratch: std.mem.Allocator, function: *Function) !Graph {
         const count = function.blocks.items.len;
@@ -30,28 +33,46 @@ pub const Graph = struct {
         const reachable = try scratch.alloc(bool, count);
         @memset(reachable, false);
         for (order) |block| reachable[block] = true;
+        const rank = try scratch.alloc(u32, count);
+        @memset(rank, std.math.maxInt(u32));
+        for (order, 0..) |block, position| rank[block] = @intCast(position);
+        // Size every incoming list exactly, in one allocation, before filling it.
         const incoming = try scratch.alloc(std.ArrayList(Incoming), count);
         @memset(incoming, .empty);
+        for (function.blocks.items, reachable) |*block, kept| {
+            if (!kept) continue;
+            for (block.terminator.successors()) |maybe_target| if (maybe_target) |target| {
+                incoming[@backingInt(target.*)].capacity += 1;
+            };
+        }
+        var edges: usize = 0;
+        for (incoming) |list| edges += list.capacity;
+        const storage = try scratch.alloc(Incoming, edges);
+        var start: usize = 0;
+        for (incoming) |*list| {
+            list.items = storage[start..][0..0];
+            start += list.capacity;
+        }
+        var cyclic = false;
         for (function.blocks.items, reachable, 0..) |*block, kept, index| {
             if (!kept) continue;
             for (block.terminator.successors(), 0..) |maybe_target, ordinal| if (maybe_target) |target| {
-                try incoming[@backingInt(target.*)].append(scratch, .{
+                const successor = @backingInt(target.*);
+                cyclic = cyclic or rank[successor] <= rank[index];
+                incoming[successor].appendAssumeCapacity(.{
                     .block = @intCast(index),
                     .ordinal = @intCast(ordinal),
                 });
             };
         }
-        const rank = try scratch.alloc(u32, count);
-        @memset(rank, std.math.maxInt(u32));
-        for (order, 0..) |block, position| rank[block] = @intCast(position);
-        return .{ .reachable = reachable, .order = order, .rank = rank, .incoming = incoming };
+        return .{ .reachable = reachable, .order = order, .rank = rank, .incoming = incoming, .cyclic = cyclic };
     }
 
     pub fn analyzeDominance(self: *Graph, scratch: std.mem.Allocator) !void {
         if (self.dominator.len != 0) return;
         const count = self.reachable.len;
         const order = self.order;
-        const dominator = try dominators(scratch, order, self.rank, self.incoming);
+        const dominator = try dominators(scratch, order, self.rank, self.incoming, self.cyclic);
         const first_child = try scratch.alloc(u32, count);
         const next_sibling = try scratch.alloc(u32, count);
         const subtree_size = try scratch.alloc(u32, count);
@@ -117,34 +138,39 @@ pub const Graph = struct {
     }
 };
 
-pub fn reversePostorder(scratch: std.mem.Allocator, function: *Function) ![]u32 {
-    var order: std.ArrayList(u32) = .empty;
-    const visited = try scratch.alloc(bool, function.blocks.items.len);
+pub fn reversePostorder(scratch: std.mem.Allocator, function: *Function) ![]const u32 {
+    const count = function.blocks.items.len;
+    const Frame = struct { block: u32, successors: [2]?u32, next: u2 = 0 };
+    // Blocks finish in postorder; fill the order from its end instead of reversing.
+    const order = try scratch.alloc(u32, count);
+    const visited = try scratch.alloc(bool, count);
     @memset(visited, false);
-    const Frame = struct { block: u32, next: u2 };
-    var stack: std.ArrayList(Frame) = .empty;
+    const stack = try scratch.alloc(Frame, count);
+    var depth: usize = 1;
+    var position = count;
     visited[function.entry] = true;
-    try stack.append(scratch, .{ .block = function.entry, .next = 0 });
-    while (stack.items.len != 0) {
-        const frame = &stack.items[stack.items.len - 1];
-        const successors = function.successors(frame.block);
+    stack[0] = .{ .block = function.entry, .successors = function.successors(function.entry) };
+    while (depth != 0) {
+        const frame = &stack[depth - 1];
         if (frame.next < 2) {
-            const successor = successors[frame.next];
+            const successor = frame.successors[frame.next];
             frame.next += 1;
             if (successor) |target| if (!visited[target]) {
                 visited[target] = true;
-                try stack.append(scratch, .{ .block = target, .next = 0 });
+                stack[depth] = .{ .block = target, .successors = function.successors(target) };
+                depth += 1;
             };
             continue;
         }
-        try order.append(scratch, frame.block);
-        _ = stack.pop();
+        position -= 1;
+        order[position] = frame.block;
+        depth -= 1;
     }
-    std.mem.reverse(u32, order.items);
-    return order.items;
+    return order[position..];
 }
 
-fn dominators(scratch: std.mem.Allocator, order: []const u32, rank: []const u32, incoming: []const std.ArrayList(Incoming)) ![]u32 {
+/// Without retreating edges every predecessor precedes its block in `order`, so one pass is exact.
+fn dominators(scratch: std.mem.Allocator, order: []const u32, rank: []const u32, incoming: []const std.ArrayList(Incoming), cyclic: bool) ![]u32 {
     const unset = std.math.maxInt(u32);
     const dominator = try scratch.alloc(u32, rank.len);
     @memset(dominator, unset);
@@ -163,6 +189,7 @@ fn dominators(scratch: std.mem.Allocator, order: []const u32, rank: []const u32,
                 changed = true;
             }
         }
+        if (!cyclic) break;
     }
     return dominator;
 }

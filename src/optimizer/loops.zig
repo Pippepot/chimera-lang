@@ -563,14 +563,24 @@ fn deeperFirst(_: void, left: Loop, right: Loop) bool {
     return left.depth > right.depth;
 }
 
-pub fn canonicalize(function: *Function) !bool {
+/// Gives every loop a preheader and a single latch, then returns the loops of
+/// the resulting graph. Dominance is computed only when some edge can be a back
+/// edge. Fixing one loop leaves the edges into every other header and the
+/// membership of every other loop's latches intact, so one analysis serves the
+/// whole round, in the same order as repeating the analysis after each fix.
+pub fn canonicalLoops(function: *Function) ![]const Loop {
     const scratch = function.scratch;
-    const graph = (try function.controlFlow()).*;
-    const loops = try find(scratch, function, graph);
-    for (loops) |loop| {
-        if (try insertPreheader(function, graph, loop) or try mergeLatches(function, loop)) return true;
+    while (true) {
+        if (!(try function.controlFlowEdges()).cyclic) return &.{};
+        const graph = (try function.controlFlow()).*;
+        const loops = try find(scratch, function, graph);
+        var changed = false;
+        for (loops) |loop| {
+            changed = (try insertPreheader(function, graph, loop)) or changed;
+            changed = (try mergeLatches(function, loop)) or changed;
+        }
+        if (!changed) return loops;
     }
-    return false;
 }
 
 pub fn preheader(function: *const Function, graph: Graph, loop: Loop) ?u32 {
@@ -700,24 +710,14 @@ test "loop canonicalization preserves branch payloads when block storage relocat
     const verifier = @import("verifier.zig");
     try verifier.verifyFunction(&function);
     const original_blocks = function.blocks.items.ptr;
-    try std.testing.expect(try canonicalize(&function));
+    _ = try canonicalLoops(&function);
     try std.testing.expect(original_blocks != function.blocks.items.ptr);
-    try std.testing.expectEqual(@as(usize, 7), function.blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 8), function.blocks.items.len);
     const preheader_block = function.blocks.items[6];
     try std.testing.expectEqual(@as(usize, 1), preheader_block.parameters.items.len);
     try expectBranch(&function, preheader_block.terminator.branch, 1, &.{ .{ .value = shared }, .{ .value = preheader_block.parameters.items[0] } });
     try expectBranch(&function, function.blocks.items[0].terminator.predicate_branch.then_branch, 6, &.{.{ .value = varying }});
     try expectBranch(&function, function.blocks.items[2].terminator.branch, 6, &.{.{ .value = shared }});
-    try expectBranch(&function, function.blocks.items[3].terminator.predicate_branch.then_branch, 1, &.{ .{ .value = carried_shared }, .{ .value = carried_varying } });
-    try expectBranch(&function, function.blocks.items[4].terminator.branch, 1, &.{ .{ .value = shared }, .{ .value = carried_shared } });
-    try verifier.verifyFunction(&function);
-    try std.testing.expect(try graph_ir.dominatesUses(&function));
-
-    try function.blocks.shrinkToLen(scratch);
-    const preheader_blocks = function.blocks.items.ptr;
-    try std.testing.expect(try canonicalize(&function));
-    try std.testing.expect(preheader_blocks != function.blocks.items.ptr);
-    try std.testing.expectEqual(@as(usize, 8), function.blocks.items.len);
     const latch = function.blocks.items[7];
     try std.testing.expectEqual(@as(usize, 2), latch.parameters.items.len);
     try expectBranch(&function, latch.terminator.branch, 1, &.{ .{ .value = latch.parameters.items[0] }, .{ .value = latch.parameters.items[1] } });
@@ -725,7 +725,9 @@ test "loop canonicalization preserves branch payloads when block storage relocat
     try expectBranch(&function, function.blocks.items[4].terminator.branch, 7, &.{ .{ .value = shared }, .{ .value = carried_shared } });
     try verifier.verifyFunction(&function);
     try std.testing.expect(try graph_ir.dominatesUses(&function));
-    try std.testing.expect(!try canonicalize(&function));
+    const canonical_blocks = function.blocks.items.ptr;
+    try std.testing.expectEqual(@as(usize, 1), (try canonicalLoops(&function)).len);
+    try std.testing.expectEqual(canonical_blocks, function.blocks.items.ptr);
 }
 
 fn expectBranch(function: *const Function, branch: structures.FunctionBranch, target: u32, arguments: []const structures.FunctionValueUse) !void {

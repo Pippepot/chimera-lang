@@ -58,6 +58,8 @@ const Scan = struct {
     slots: []Slot,
     site: Site,
     failed: bool = false,
+    /// A reference to a slot was seen; accepted operands are a subset of references.
+    hit: bool = false,
 
     fn accept(self: *Scan, operand: *ValueId) void {
         const index = self.mapping[@backingInt(operand.*)] orelse return;
@@ -72,6 +74,7 @@ const Scan = struct {
 
     fn reference(self: *Scan, value: ValueId) void {
         const index = self.mapping[@backingInt(value)] orelse return;
+        self.hit = true;
         self.slots[index].references += 1;
     }
 };
@@ -96,7 +99,9 @@ fn collectSlots(function: *Function, graph: Graph) ![]const Slot {
             if (function.removed.items[index]) continue;
             scan.site = .{ .block = block_index, .instruction = index };
             const instruction = &function.instructions.items[index];
+            scan.hit = false;
             function_ir.visitInstructionReferences(function, instruction, &scan, Scan.reference);
+            if (!scan.hit) continue;
             if (instruction.* == .value_copy) if (instruction.value_copy.destination) |destination| {
                 if (destination != instruction.value_copy.source and instruction.value_copy.type_id == function.valueType(destination)) {
                     var storage = destination;
@@ -106,8 +111,9 @@ fn collectSlots(function: *Function, graph: Graph) ![]const Slot {
             function_ir.readOperands(function, instruction, &scan, Scan.accept);
         }
         scan.site = .{ .block = block_index, .instruction = null };
+        scan.hit = false;
         function_ir.visitTerminatorReferences(function, &block.terminator, &scan, Scan.reference);
-        function_ir.terminatorReadOperands(function, &block.terminator, &scan, Scan.accept);
+        if (scan.hit) function_ir.terminatorReadOperands(function, &block.terminator, &scan, Scan.accept);
     }
     if (scan.failed) return error.OutOfMemory;
     var kept: usize = 0;

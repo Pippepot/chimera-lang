@@ -8,11 +8,28 @@ const Instruction = structures.FunctionInstruction;
 const Function = function_ir.Function;
 const Graph = @import("graph.zig").Graph;
 
+/// Word-at-a-time multiplicative hasher: instruction keys are short and hashed
+/// field by field, where buffered Wyhash updates cost more than the lookup.
+const Fold = struct {
+    state: u64 = 0,
+
+    pub inline fn update(self: *Fold, bytes: []const u8) void {
+        var offset: usize = 0;
+        while (offset < bytes.len) : (offset += 8) {
+            var word: u64 = 0;
+            const length = @min(8, bytes.len - offset);
+            @memcpy(std.mem.asBytes(&word)[0..length], bytes[offset..][0..length]);
+            self.state = (self.state ^ word) *% 0x9e3779b97f4a7c15;
+            self.state ^= self.state >> 32;
+        }
+    }
+};
+
 const Context = struct {
     pub fn hash(_: Context, instruction: Instruction) u64 {
-        var hasher = std.hash.Wyhash.init(0);
-        std.hash.autoHash(&hasher, instruction);
-        return hasher.final();
+        var fold: Fold = .{};
+        std.hash.autoHash(&fold, instruction);
+        return fold.state;
     }
 
     pub fn eql(_: Context, left: Instruction, right: Instruction) bool {
@@ -97,10 +114,13 @@ pub fn number(function: *Function, workspace: *Workspace) !function_ir.Changes {
     alternatives.clearRetainingCapacity();
     var changes: function_ir.Changes = .{};
     for (graph.order) |block| {
-        loads.clearRetainingCapacity();
+        if (loads.count() != 0) loads.clearRetainingCapacity();
         for (function.blocks.items[block].instructions.items) |index| {
             if (function.removed.items[index]) continue;
-            const instruction = canonical(function, function.instructions.items[index]);
+            // Operands were resolved above; only this pass's own eliminations stale them.
+            // Users follow their definitions, so resolving in place leaves nothing for a later sweep.
+            if (changes.changed) function_ir.allOperands(function, &function.instructions.items[index], function, Function.resolveOperand);
+            const instruction = function.instructions.items[index];
             const result = function.results.items[index];
             const shareable = !taken[@backingInt(result)];
             if (instruction == .aggregate) {
@@ -135,10 +155,17 @@ pub fn number(function: *Function, workspace: *Workspace) !function_ir.Changes {
                         eliminate(function, index, entry.value_ptr.*, &changes);
                     } else entry.value_ptr.* = result;
                 },
-                .write => loads.clearRetainingCapacity(),
+                .write => if (loads.count() != 0) loads.clearRetainingCapacity(),
                 .none => {},
             }
         }
+        if (changes.changed) function_ir.terminatorAllOperands(function, &function.blocks.items[block].terminator, function, Function.resolveOperand);
+    }
+    if (changes.changed) {
+        for (function.blocks.items, graph.reachable) |*block, reachable| {
+            if (!reachable) function_ir.visitBlockOperands(function, block, function, Function.resolveOperand);
+        }
+        function.operands_dirty = false;
     }
     return changes;
 }
@@ -151,14 +178,6 @@ fn eliminate(function: *Function, index: u32, target: ValueId, changes: *functio
 }
 
 const Kind = enum { pure, load, write, none };
-
-fn canonical(function: *const Function, instruction: Instruction) Instruction {
-    var copy = instruction;
-    for (copy.operands()) |operand| if (operand) |value| {
-        value.* = function.find(value.*);
-    };
-    return copy;
-}
 
 fn kind(roots: *const effects.Roots, instruction: Instruction) Kind {
     return switch (instruction) {

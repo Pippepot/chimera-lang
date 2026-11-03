@@ -1,9 +1,68 @@
 const std = @import("std");
+const BumpArena = @import("../bump_arena.zig");
 const machine = @import("machine.zig");
 const x86 = @import("x86_encoding.zig");
 
 const Register = x86.Register;
-const BitSet = std.DynamicBitSetUnmanaged;
+
+/// Equal-width bit rows share one allocation, so per-block liveness sets cost
+/// a single zeroed block instead of an allocation per set.
+const Rows = struct {
+    words: usize,
+    storage: []usize,
+
+    fn init(allocator: std.mem.Allocator, count: usize, bits: usize) !Rows {
+        const words = (bits + @bitSizeOf(usize) - 1) / @bitSizeOf(usize);
+        const storage = try allocator.alloc(usize, count * words);
+        @memset(storage, 0);
+        return .{ .words = words, .storage = storage };
+    }
+
+    fn row(rows: Rows, index: usize) []usize {
+        return rows.storage[index * rows.words ..][0..rows.words];
+    }
+};
+
+fn isSet(row: []const usize, bit: usize) bool {
+    return row[bit / @bitSizeOf(usize)] >> @intCast(bit % @bitSizeOf(usize)) & 1 != 0;
+}
+
+fn setBit(row: []usize, bit: usize) void {
+    row[bit / @bitSizeOf(usize)] |= @as(usize, 1) << @intCast(bit % @bitSizeOf(usize));
+}
+
+fn clearBit(row: []usize, bit: usize) void {
+    row[bit / @bitSizeOf(usize)] &= ~(@as(usize, 1) << @intCast(bit % @bitSizeOf(usize)));
+}
+
+fn unionInto(destination: []usize, source: []const usize) void {
+    for (destination, source) |*word, other| word.* |= other;
+}
+
+fn subtractFrom(destination: []usize, source: []const usize) void {
+    for (destination, source) |*word, other| word.* &= ~other;
+}
+
+const SetBits = struct {
+    row: []const usize,
+    index: usize = 0,
+    word: usize,
+
+    fn init(row: []const usize) SetBits {
+        return .{ .row = row, .word = if (row.len != 0) row[0] else 0 };
+    }
+
+    fn next(bits: *SetBits) ?usize {
+        while (bits.word == 0) {
+            bits.index += 1;
+            if (bits.index >= bits.row.len) return null;
+            bits.word = bits.row[bits.index];
+        }
+        const bit = @ctz(bits.word);
+        bits.word &= bits.word - 1;
+        return bits.index * @bitSizeOf(usize) + bit;
+    }
+};
 
 pub const Allocation = struct {
     registers: []?Register,
@@ -44,7 +103,7 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
         }
         return .{ .registers = registers, .used = &.{} };
     }
-    var arena: std.heap.ArenaAllocator = .init(gpa);
+    var arena: BumpArena = .init(gpa);
     defer arena.deinit();
     const scratch = arena.allocator();
     const instructions = function.instructions.items;
@@ -97,31 +156,27 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
     for (block_depths, 0..) |block_depth, block| @memset(depth[starts.items[block]..starts.items[block + 1]], block_depth);
     const weights = try scratch.alloc(u64, candidate_count);
     @memset(weights, 0);
-    const uses = try scratch.alloc(BitSet, block_count);
-    const defines = try scratch.alloc(BitSet, block_count);
-    for (uses, defines, 0..) |*used, *defined, block| {
-        used.* = try BitSet.initEmpty(scratch, candidate_count);
-        defined.* = try BitSet.initEmpty(scratch, candidate_count);
+    const uses = try Rows.init(scratch, block_count, candidate_count);
+    const defines = try Rows.init(scratch, block_count, candidate_count);
+    for (0..block_count) |block| {
+        const used = uses.row(block);
+        const defined = defines.row(block);
         for (starts.items[block]..starts.items[block + 1]) |index| {
             const instruction = instructions[index];
             const access = instruction.registerAccess() orelse continue;
             const value = mapping[@backingInt(access.value)].?;
             if (access.write) {
-                defined.set(value);
+                setBit(defined, value);
             } else {
-                if (!defined.isSet(value)) used.set(value);
+                if (!isSet(defined, value)) setBit(used, value);
             }
             weights[value] +|= loopWeight(depth[index]);
         }
     }
 
-    const live_in = try scratch.alloc(BitSet, block_count);
-    const live_out = try scratch.alloc(BitSet, block_count);
-    for (live_in, live_out) |*input, *output| {
-        input.* = try BitSet.initEmpty(scratch, candidate_count);
-        output.* = try BitSet.initEmpty(scratch, candidate_count);
-    }
-    var next = try BitSet.initEmpty(scratch, candidate_count);
+    const live_in = try Rows.init(scratch, block_count, candidate_count);
+    const live_out = try Rows.init(scratch, block_count, candidate_count);
+    const next = try scratch.alloc(usize, live_in.words);
     var changed = true;
     while (changed) {
         changed = false;
@@ -129,15 +184,12 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
         while (order > 0) {
             order -= 1;
             const block = order;
-            for (successors[block]) |target| if (target) |successor| live_out[block].setUnion(live_in[successor]);
-            next.unsetAll();
-            next.setUnion(live_out[block]);
-            var definitions = defines[block].iterator(.{});
-            while (definitions.next()) |defined| next.unset(defined);
-            next.setUnion(uses[block]);
-            if (!next.eql(live_in[block])) {
-                live_in[block].unsetAll();
-                live_in[block].setUnion(next);
+            for (successors[block]) |target| if (target) |successor| unionInto(live_out.row(block), live_in.row(successor));
+            @memcpy(next, live_out.row(block));
+            subtractFrom(next, defines.row(block));
+            unionInto(next, uses.row(block));
+            if (!std.mem.eql(usize, next, live_in.row(block))) {
+                @memcpy(live_in.row(block), next);
                 changed = true;
             }
         }
@@ -146,9 +198,8 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
     @memset(ranges, .empty);
     const range_ends = try scratch.alloc(u32, candidate_count);
     for (0..block_count) |block| {
-        next.unsetAll();
-        next.setUnion(live_out[block]);
-        var outputs = next.iterator(.{});
+        @memcpy(next, live_out.row(block));
+        var outputs: SetBits = .init(next);
         while (outputs.next()) |value| range_ends[value] = starts.items[block + 1] * 2;
         var index: usize = starts.items[block + 1];
         while (index > starts.items[block]) {
@@ -158,15 +209,15 @@ pub fn allocate(gpa: std.mem.Allocator, function: *const machine.Function, value
             const value = mapping[@backingInt(access.value)].?;
             const position: u32 = @intCast(index * 2);
             if (access.write) {
-                const end = if (next.isSet(value)) range_ends[value] else position + 1;
+                const end = if (isSet(next, value)) range_ends[value] else position + 1;
                 try ranges[value].append(scratch, .{ .start = position + 1, .end = end });
-                next.unset(value);
-            } else if (!next.isSet(value)) {
-                next.set(value);
+                clearBit(next, value);
+            } else if (!isSet(next, value)) {
+                setBit(next, value);
                 range_ends[value] = position;
             }
         }
-        var inputs = next.iterator(.{});
+        var inputs: SetBits = .init(next);
         while (inputs.next()) |value| try ranges[value].append(scratch, .{ .start = starts.items[block] * 2, .end = range_ends[value] });
     }
 

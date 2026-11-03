@@ -982,6 +982,21 @@ test "optimized native code agrees with unoptimized compile-time execution" {
     , 42);
 }
 
+test "inlined element reads snapshot the value before later writes to the same slot" {
+    try Fixture.expectParity(
+        \\func calculate() int | none
+        \\    var values: List(int) = [10, 11, 21]
+        \\    const removed = values.remove(1)
+        \\    if not (removed is int) -> return none
+        \\    return values[0] + removed + values[1]
+        \\func run() int
+        \\    match calculate()
+        \\        result and result is int -> return result
+        \\        _ -> ()
+        \\    return 99
+    , 42);
+}
+
 test "integer algebra shares width-correct identities across overflow modes" {
     for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize" }) |kind| {
         for ([_][]const u8{ "", "wrapping", "saturating" }) |mode| {
@@ -1368,6 +1383,70 @@ test "scalar replacement preserves nested storage and cross-local snapshots" {
         \\    right.extra = 100
         \\    saved.pair.second = 28
         \\    return saved.pair.first + saved.pair.second + saved.extra + copied.extra - 1
+    , 42);
+}
+
+test "scalar replacement splits deeply nested structs through whole copies and field updates" {
+    const program =
+        \\pub struct Leaf
+        \\    copy = trivial
+        \\    pub a: int
+        \\    pub b: int
+        \\pub struct Mid
+        \\    copy = trivial
+        \\    pub leaf: Leaf
+        \\    pub weight: int
+        \\struct Top
+        \\    copy = trivial
+        \\    pub mid: Mid
+        \\    pub tail: Leaf
+        \\    pub id: int
+        \\func calculate(seed: int) int
+        \\    var top = Top{mid = Mid{leaf = Leaf{a = seed, b = 2}, weight = 3}, tail = Leaf{a = 4, b = 5}, id = 6}
+        \\    var saved = top
+        \\    top.mid.leaf.a = 10
+        \\    top.tail = top.mid.leaf
+        \\    var moved = top.mid
+        \\    moved.leaf.b = 7
+        \\    top.mid = moved
+        \\    saved.tail.a += top.mid.leaf.b
+        \\    return saved.mid.leaf.a + saved.tail.a + top.tail.b + top.mid.leaf.a + top.mid.weight + saved.id + top.id + moved.weight
+        \\func run() int -> calculate(1)
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "calculate")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{ .aggregate, .field_access, .local_storage, .storage_projection }));
+}
+
+test "scalar replacement keeps a nested slot whose address escapes while splitting its siblings" {
+    try Fixture.expectParity(
+        \\pub struct Leaf
+        \\    copy = trivial
+        \\    pub first: int
+        \\    pub second: int
+        \\struct Wrap
+        \\    copy = trivial
+        \\    pub leaf: Leaf
+        \\    pub other: Leaf
+        \\    pub count: int
+        \\func bump(mut leaf: Leaf) -> leaf.first += 1
+        \\func calculate(limit: int) int
+        \\    var wrap = Wrap{leaf = Leaf{first = 1, second = 2}, other = Leaf{first = 5, second = 6}, count = 0}
+        \\    var snapshot = wrap
+        \\    var index = 0
+        \\    loop
+        \\        if index == limit -> break
+        \\        bump(wrap.leaf)
+        \\        wrap.leaf.second += wrap.leaf.first
+        \\        wrap.other.first += wrap.leaf.second
+        \\        wrap.count += 1
+        \\        index += 1
+        \\    snapshot.count = wrap.count
+        \\    snapshot.other = wrap.other
+        \\    return wrap.leaf.first * 10 + wrap.leaf.second + snapshot.leaf.first + snapshot.leaf.second + snapshot.count + snapshot.other.first - wrap.other.first
+        \\func run() int -> calculate(3) + calculate(0) - 30
     , 42);
 }
 

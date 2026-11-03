@@ -626,6 +626,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }, void) = .empty,
         has_cleanup_outputs: bool = false,
         provisional_reference_contents: bool = false,
+        /// Once analysis has finished building, loop and contents summaries only
+        /// change when the provisional contents are replaced, so resolved heads
+        /// are remembered until then.
+        reference_origins_frozen: bool = false,
+        resolved_reference_origins: std.AutoHashMapUnmanaged(u32, ?u32) = .empty,
         loop_backedges: std.ArrayList(LoopBackedge) = .empty,
         pending_reference_uses: std.ArrayList(PendingReferenceUse) = .empty,
         reference_uses: std.ArrayList(ReferenceUse) = .empty,
@@ -700,6 +705,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             try self.block_arguments.ensureUnusedCapacity(self.gpa, parameters.len);
             try self.parameter_modes.ensureUnusedCapacity(self.gpa, parameters.len);
             try self.block_argument_generations.ensureUnusedCapacity(self.gpa, parameters.len);
+            // Bodies open a couple of boundaries and reference origins per expression;
+            // reserving them avoids repeatedly regrowing and copying these large records.
+            try self.boundaries.ensureTotalCapacity(self.gpa, 2 * self.unresolved.expressions.len);
+            try self.reference_storage.origins.ensureTotalCapacity(self.gpa, 2 * self.unresolved.expressions.len);
             const root_span = self.unresolved.blocks[@backingInt(self.unresolved.root_block)].span;
             var parameter_local: usize = 0;
             for (parameters, 0..) |parameter, index| {
@@ -841,6 +850,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             std.debug.assert(!self.type_check_only);
             self.provisional_reference_contents = self.has_cleanup_outputs;
             for (self.reference_contents_reads.items) |*read| read.complete = true;
+            self.reference_origins_frozen = true;
             try self.resolvePendingReferenceUses(null);
             if (self.generations.items.len != 0) {
                 try self.finishOwnershipMetadata();
@@ -878,6 +888,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     for (read.path) |step| origins = try self.transformReferenceOrigins(origins, .{ .select = step });
                     self.reference_contents_reads.items[index].origins = origins;
                 }
+                self.resolved_reference_origins.clearRetainingCapacity();
                 self.provisional_reference_contents = false;
                 var lifetimes_changed = false;
                 try self.resolvePendingReferenceUses(&lifetimes_changed);
@@ -8814,11 +8825,25 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             var result = self.referenceOriginSet(origins);
             defer result.deinit(self.gpa);
             var current = self.originList(origins);
+            // Leading origins the operation leaves as they are join the result only
+            // once a later origin differs; an unchanged set is its own result.
+            var unchanged: usize = 0;
+            var diverged = false;
             while (current.next()) |listed| {
                 var origin = listed;
-                if (try self.transformReferenceOrigin(&origin, operation)) try self.addResultOrigin(&result, origin);
+                const kept = try self.transformReferenceOrigin(&origin, operation);
+                if (!diverged and kept and std.mem.eql(u8, std.mem.asBytes(&origin), std.mem.asBytes(&listed))) {
+                    unchanged += 1;
+                    continue;
+                }
+                if (!diverged) {
+                    diverged = true;
+                    var replay = self.originList(origins);
+                    for (0..unchanged) |_| try self.addResultOrigin(&result, replay.next().?);
+                }
+                if (kept) try self.addResultOrigin(&result, origin);
             }
-            return result.head;
+            return if (diverged) result.head else origins;
         }
 
         fn referenceOriginSet(self: *Self, origins: ?u32) ReferenceOriginSet {
@@ -8984,8 +9009,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             while (existing.next()) |origin| {
                 if (origin.loop != null or origin.contents != null) break;
             } else return origins;
+            if (self.reference_origins_frozen) if (self.resolved_reference_origins.get(origins.?)) |resolved| return resolved;
             var visiting: std.ArrayList(u32) = .empty;
-            return self.expandReferenceOrigins(origins, &visiting, incomplete);
+            var expanded_incomplete = false;
+            const resolved = try self.expandReferenceOrigins(origins, &visiting, &expanded_incomplete);
+            if (expanded_incomplete) incomplete.* = true else if (self.reference_origins_frozen)
+                try self.resolved_reference_origins.put(self.gpa, origins.?, resolved);
+            return resolved;
         }
 
         fn expandReferenceOrigins(

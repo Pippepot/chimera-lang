@@ -94,6 +94,17 @@ expanded block instruction lists, once in execution order. Existing address and
 memory facts stay conservative because emitted scalar values are private and
 introduce no writes or address exposure.
 
+Typed bodies and freshly inlined bodies dirty every analysis and iterate to a fixed
+point. After a loop rewrite, one round of joins, canonicalization, numbering, and
+cleanup suffices because storage and numbering facts stay valid until those passes
+report changes; cleanup runs last and its own changes do not start another round.
+Inlined bodies are rebuilt densely before loop transformations so later passes no
+longer size their tables by removed instructions; bodies without a retreating
+edge have no loops and go straight to final compaction. Prepare and optimize
+queries clone their result once, directly into the result arena. Scratch memory
+comes from an unsynchronized bump arena, since each function's optimizer state
+has one owner.
+
 Joins and canonicalization converge together. Repeat an earlier phase only when
 a later mutation changes facts it consumed. Removed storage uses or address
 exposure can require another round; deleting unread scalar computations cannot.
@@ -112,6 +123,9 @@ Reachability, reverse postorder, incoming edges, dominators, and tree intervals
 are computed lazily. Only promotion needs dominance frontiers. Value rewrites,
 parameter edits, and motion preserve CFG analyses; edge and block changes do not.
 Incoming edges retain source block and ordinal, never mutable-array pointers.
+Any back edge reaches a block that does not follow its source in reverse
+postorder, so graphs without such an edge need no loop analysis and one
+dominator pass.
 
 ## Inlining
 
@@ -137,7 +151,8 @@ failure; existing optimized bodies retain lazy validation after edits.
 Directly passed aggregate arguments make primitive constants free in callee cost
 because they expose scalar-replacement opportunities. Caller growth still counts
 every inserted instruction. No std identity or speculative specialization is
-needed. Within one pass, repeated calls reuse resolution and eligibility facts.
+needed. One optimization reuses callee resolution and eligibility facts across
+inlining rounds and loop analysis.
 Inlining revisits remaining calls after local simplification frees growth
 capacity. Every round retains the original caller's budget; pruning cannot
 repeatedly multiply its permitted size.
@@ -169,8 +184,10 @@ writes; potentially faulting reads move only from the header. Snapshotting an
 allocation descriptor makes its address independent of a changing element index,
 not immune to ordinary alias/write checks or descriptor replacement.
 
-Scalar replacement splits eligible structs and rebuilds whole reads with
-aggregates; field reads then fold. Promotion handles scalar/directly passed slots.
+Scalar replacement splits eligible structs, including structs nested in split
+structs, in one analysis and one rewrite of the touched blocks, and rebuilds
+whole reads with aggregates; field reads then fold. Promotion handles
+scalar/directly passed slots.
 Single-block slots use a local fast path; other slots share backward liveness and
 one dominator-tree renaming walk with sparse restoration. Typing guarantees no
 reachable read before initialization; scalar promotion may use typed zero on
@@ -197,7 +214,8 @@ the condition, preserving the other arm's observable exit state.
 ## Loops
 
 Backedges in the dominator tree identify loops, canonicalized with a preheader
-and single latch. `loops.zig` owns read-only instruction, counter, exit, and range
+and single latch, all fixed from one analysis because a fix leaves other
+loops' header edges and latches intact. `loops.zig` owns read-only instruction, counter, exit, and range
 facts; `idioms.zig` owns transformations. Successful rewrites invalidate relevant
 facts and restart analysis. Loop-free functions skip this work.
 Local simplification after a rewrite can expose containing loops, so loop

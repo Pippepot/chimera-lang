@@ -2,6 +2,7 @@ const std = @import("std");
 const disk_codec = @import("codec.zig");
 const value_operations = @import("../value.zig");
 const profiling = @import("../profiling.zig");
+const BumpArena = @import("../bump_arena.zig");
 
 const Revision = u64;
 const Sha256 = std.crypto.hash.sha2.Sha256;
@@ -73,7 +74,7 @@ const EntryResult = union(enum) {
 const QueryOutput = struct {
     pointer: *anyopaque,
     storage: union(enum) {
-        arena: std.heap.ArenaAllocator,
+        arena: BumpArena,
         inline_value,
     },
 
@@ -100,15 +101,21 @@ const Computation = struct {
 };
 
 const QueryStorage = struct {
-    const sizes = .{ 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576 };
-    const general_class_count = 6;
+    /// Pooled sizes step by a quarter of their octave, wasting at most a
+    /// quarter of a retained block: 64, 80, 96, 112, 128, 160, ... 1 MiB.
+    const class_count = 57;
+    const general_limit = 65536;
+    const general_class_count = classIndex(general_limit) + 1;
+    const largest_pooled = 1048576;
     const large_sizes = .{ 4194304, 16777216, 67108864, 268435456 };
 
     backing: std.mem.Allocator,
     pool_arena: std.heap.ArenaAllocator.State = .{},
     io: std.Io = undefined,
+    /// Without workers one thread owns the database, so the mutex is skipped.
+    synchronized: bool = true,
     mutex: std.Io.Mutex = .init,
-    free_lists: [sizes.len]std.SinglyLinkedList = @splat(.{}),
+    free_lists: [class_count]std.SinglyLinkedList = @splat(.{}),
     large_free_lists: [large_sizes.len]std.SinglyLinkedList = @splat(.{}),
 
     fn allocator(storage: *QueryStorage) std.mem.Allocator {
@@ -116,19 +123,19 @@ const QueryStorage = struct {
     }
 
     fn arenaAllocator(storage: *QueryStorage) std.mem.Allocator {
-        return storage.classAllocator(sizes.len);
+        return storage.classAllocator(class_count);
     }
 
-    fn classAllocator(storage: *QueryStorage, comptime class_count: usize) std.mem.Allocator {
+    fn classAllocator(storage: *QueryStorage, comptime pooled_classes: usize) std.mem.Allocator {
         const Classes = struct {
             fn alloc(pointer: *anyopaque, length: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
                 const owner: *QueryStorage = @ptrCast(@alignCast(pointer));
-                return owner.allocClass(class_count, length, alignment, return_address);
+                return owner.allocClass(pooled_classes, length, alignment, return_address);
             }
 
             fn free(pointer: *anyopaque, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
                 const owner: *QueryStorage = @ptrCast(@alignCast(pointer));
-                owner.freeClass(class_count, memory, alignment, return_address);
+                owner.freeClass(pooled_classes, memory, alignment, return_address);
             }
         };
         return .{ .ptr = storage, .vtable = &.{
@@ -145,9 +152,17 @@ const QueryStorage = struct {
         arena.deinit();
     }
 
+    fn lock(storage: *QueryStorage) void {
+        if (storage.synchronized) storage.mutex.lockUncancelable(storage.io);
+    }
+
+    fn unlock(storage: *QueryStorage) void {
+        if (storage.synchronized) storage.mutex.unlock(storage.io);
+    }
+
     fn releaseLarge(storage: *QueryStorage) void {
-        storage.mutex.lockUncancelable(storage.io);
-        defer storage.mutex.unlock(storage.io);
+        storage.lock();
+        defer storage.unlock();
         inline for (large_sizes, 0..) |size, index| {
             while (storage.large_free_lists[index].popFirst()) |node| {
                 const memory: [*]u8 = @ptrCast(node);
@@ -160,24 +175,37 @@ const QueryStorage = struct {
     /// backing allocator; large classes are released when queries go idle.
     const SizeClass = struct { free_list: *std.SinglyLinkedList, size: usize, pooled: bool };
 
+    fn classIndex(length: usize) usize {
+        if (length <= 64) return 0;
+        const msb = std.math.log2_int(usize, length - 1);
+        return (@as(usize, msb) - 6) * 4 + ((length - 1) >> (msb - 2) & 3) + 1;
+    }
+
+    fn classSize(index: usize) usize {
+        if (index == 0) return 64;
+        const octave: u6 = @intCast((index - 1) / 4);
+        return (@as(usize, 64) << octave) + ((index - 1) % 4 + 1) * (@as(usize, 16) << octave);
+    }
+
     /// Null means the backing allocator serves the request directly.
-    fn sizeClass(storage: *QueryStorage, comptime class_count: usize, length: usize, alignment: std.mem.Alignment) ?SizeClass {
+    fn sizeClass(storage: *QueryStorage, comptime pooled_classes: usize, length: usize, alignment: std.mem.Alignment) ?SizeClass {
         if (alignment.toByteUnits() > 16) return null;
-        inline for (sizes, 0..) |size, index| {
-            if (index < class_count and length <= size) return .{ .free_list = &storage.free_lists[index], .size = size, .pooled = true };
+        if (length <= largest_pooled) {
+            const index = classIndex(length);
+            if (index >= pooled_classes) return null;
+            return .{ .free_list = &storage.free_lists[index], .size = classSize(index), .pooled = true };
         }
-        if (length <= sizes[sizes.len - 1]) return null;
         inline for (large_sizes, 0..) |size, index| {
             if (length <= size) return .{ .free_list = &storage.large_free_lists[index], .size = size, .pooled = false };
         }
         return null;
     }
 
-    fn allocClass(storage: *QueryStorage, comptime class_count: usize, length: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
-        const class = storage.sizeClass(class_count, length, alignment) orelse
+    fn allocClass(storage: *QueryStorage, comptime pooled_classes: usize, length: usize, alignment: std.mem.Alignment, return_address: usize) ?[*]u8 {
+        const class = storage.sizeClass(pooled_classes, length, alignment) orelse
             return storage.backing.rawAlloc(length, alignment, return_address);
-        storage.mutex.lockUncancelable(storage.io);
-        defer storage.mutex.unlock(storage.io);
+        storage.lock();
+        defer storage.unlock();
         if (class.free_list.popFirst()) |node| return @ptrCast(node);
         if (!class.pooled) return storage.backing.rawAlloc(class.size, .@"16", return_address);
         var arena = storage.pool_arena.promote(storage.backing);
@@ -186,11 +214,11 @@ const QueryStorage = struct {
         return memory.ptr;
     }
 
-    fn freeClass(storage: *QueryStorage, comptime class_count: usize, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
-        const class = storage.sizeClass(class_count, memory.len, alignment) orelse
+    fn freeClass(storage: *QueryStorage, comptime pooled_classes: usize, memory: []u8, alignment: std.mem.Alignment, return_address: usize) void {
+        const class = storage.sizeClass(pooled_classes, memory.len, alignment) orelse
             return storage.backing.rawFree(memory, alignment, return_address);
-        storage.mutex.lockUncancelable(storage.io);
-        defer storage.mutex.unlock(storage.io);
+        storage.lock();
+        defer storage.unlock();
         class.free_list.prepend(@ptrCast(@alignCast(memory.ptr)));
     }
 };
@@ -265,11 +293,26 @@ test "recycling allocator reuses released blocks that fit later requests" {
     for (live) |byte| try std.testing.expectEqual(@as(u8, 0x5a), byte);
 }
 
+test "query storage classes are contiguous, ordered, and quarter-octave steps" {
+    try std.testing.expectEqual(QueryStorage.general_limit, QueryStorage.classSize(QueryStorage.general_class_count - 1));
+    try std.testing.expectEqual(QueryStorage.largest_pooled, QueryStorage.classSize(QueryStorage.class_count - 1));
+    for (0..QueryStorage.class_count) |index| {
+        const size = QueryStorage.classSize(index);
+        try std.testing.expectEqual(index, QueryStorage.classIndex(size));
+        try std.testing.expect(size % 16 == 0);
+        if (index == 0) continue;
+        const previous = QueryStorage.classSize(index - 1);
+        try std.testing.expect(previous < size);
+        try std.testing.expectEqual(index, QueryStorage.classIndex(previous + 1));
+        try std.testing.expect(size - previous <= @max(16, size / 4));
+    }
+}
+
 test "query storage reuses allocation classes without overlapping live storage" {
     var storage: QueryStorage = .{ .backing = std.testing.allocator, .io = std.testing.io };
     defer storage.deinit();
     const allocator = storage.arenaAllocator();
-    inline for (QueryStorage.sizes) |size| {
+    inline for (.{ 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576 }) |size| {
         const memory = try allocator.alloc(u8, size / 2);
         defer allocator.free(memory);
         @memset(memory, 0xa5);
@@ -285,10 +328,10 @@ test "query storage reuses allocation classes without overlapping live storage" 
     }
     const general = storage.allocator();
     const retained = storage.free_lists[QueryStorage.general_class_count].first;
-    general.free(try general.alloc(u8, QueryStorage.sizes[QueryStorage.general_class_count - 1] + 1));
+    general.free(try general.alloc(u8, QueryStorage.general_limit + 1));
     try std.testing.expectEqual(retained, storage.free_lists[QueryStorage.general_class_count].first);
 
-    const large = try allocator.alloc(u8, QueryStorage.sizes[QueryStorage.sizes.len - 1] + 1);
+    const large = try allocator.alloc(u8, QueryStorage.largest_pooled + 1);
     allocator.free(large);
     const reused_large = try general.alloc(u8, QueryStorage.large_sizes[0]);
     try std.testing.expectEqual(large.ptr, reused_large.ptr);
@@ -428,7 +471,7 @@ pub const Database = struct {
     entries: EntryMap,
     entry_pool: std.heap.MemoryPool(Entry) = .empty,
     query_storage: QueryStorage,
-    scratch_arenas: std.ArrayList(std.heap.ArenaAllocator.State) = .empty,
+    scratch_arenas: std.ArrayList(BumpArena) = .empty,
     inputs: InputMap,
     intern_mutex: std.Io.Mutex = .init,
     intern_slots: std.atomic.Value(*InternSlots),
@@ -488,7 +531,7 @@ pub const Database = struct {
             .allocator = allocator,
             .profile = options.profile,
             .io_runtime = std.Io.Threaded.init(allocator, .{}),
-            .query_storage = .{ .backing = allocator },
+            .query_storage = .{ .backing = allocator, .synchronized = worker_count != 0 },
             .workers = undefined,
             .entries = undefined,
             .inputs = undefined,
@@ -761,14 +804,20 @@ pub const Database = struct {
     }
 
     /// A fresh arena for a decoded output that importQuery will retain.
-    pub fn outputArena(db: *Database) std.heap.ArenaAllocator {
-        return .init(db.query_storage.arenaAllocator());
+    pub fn outputArena(db: *Database) BumpArena {
+        return db.resultArena(256);
+    }
+
+    /// Retained results of one query type are alike in size, so each arena
+    /// starts with a chunk sized for the previous result.
+    fn resultArena(db: *Database, first_chunk: usize) BumpArena {
+        return .initSized(db.query_storage.arenaAllocator(), first_chunk);
     }
 
     /// Retain a decoded output with the same compact ownership as computed
     /// results. `arena` owns `output` and everything it references; the
     /// database takes the arena when the import succeeds.
-    pub fn importQuery(db: *Database, comptime Q: type, input_value: Q.Input, arena: std.heap.ArenaAllocator, output: *Q.Output, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
+    pub fn importQuery(db: *Database, comptime Q: type, input_value: Q.Input, arena: BumpArena, output: *Q.Output, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
         validateQuery(Q);
         const input_copy = input_value;
         const lookup_key = queryKey(Q, &input_copy);
@@ -1327,29 +1376,25 @@ pub const Database = struct {
         for (db.workers[0..spawned]) |*worker| worker.thread.join();
     }
 
-    fn acquireScratchArena(db: *Database, worker_index: ?usize) std.heap.ArenaAllocator {
-        const allocator = db.query_storage.arenaAllocator();
+    fn acquireScratchArena(db: *Database, worker_index: ?usize) BumpArena {
         const index = worker_index orelse {
             db.lock();
             defer db.unlock();
-            return if (db.scratch_arenas.pop()) |state| state.promote(allocator) else .init(allocator);
+            return db.scratch_arenas.pop() orelse .init(db.query_storage.arenaAllocator());
         };
         std.debug.assert(db.workers[index].thread_id == std.Thread.getCurrentId());
-        return if (db.workers[index].scratch_arenas.pop()) |state| state.promote(allocator) else .init(allocator);
+        return db.workers[index].scratch_arenas.pop() orelse .init(db.query_storage.arenaAllocator());
     }
 
-    fn releaseScratchArena(db: *Database, worker_index: ?usize, arena: *std.heap.ArenaAllocator) void {
-        if (!arena.reset(.{ .retain_with_limit = 128 * 1024 })) {
-            arena.deinit();
-            return;
-        }
-        if (arena.queryCapacity() == 0) return;
+    fn releaseScratchArena(db: *Database, worker_index: ?usize, arena: *BumpArena) void {
+        arena.reset(512 * 1024);
+        if (arena.newest == null) return;
         const retained = if (worker_index) |index|
-            db.workers[index].scratch_arenas.append(db.query_storage.allocator(), arena.state)
+            db.workers[index].scratch_arenas.append(db.query_storage.allocator(), arena.*)
         else retained: {
             db.lock();
             defer db.unlock();
-            break :retained db.scratch_arenas.append(db.query_storage.allocator(), arena.state);
+            break :retained db.scratch_arenas.append(db.query_storage.allocator(), arena.*);
         };
         retained catch {
             arena.deinit();
@@ -1358,8 +1403,8 @@ pub const Database = struct {
         arena.* = .init(db.query_storage.arenaAllocator());
     }
 
-    fn destroyScratchArenas(db: *Database, arenas: *std.ArrayList(std.heap.ArenaAllocator.State)) void {
-        for (arenas.items) |state| state.promote(db.query_storage.arenaAllocator()).deinit();
+    fn destroyScratchArenas(db: *Database, arenas: *std.ArrayList(BumpArena)) void {
+        for (arenas.items) |arena| arena.deinit();
         arenas.deinit(db.query_storage.allocator());
     }
 
@@ -1368,6 +1413,7 @@ pub const Database = struct {
     }
 
     fn lock(db: *Database) void {
+        if (db.workers.len == 0) return;
         for (0..lock_spin_attempts) |_| {
             if (db.mutex.state.load(.monotonic) == .unlocked and db.mutex.tryLock()) return;
             std.atomic.spinLoopHint();
@@ -1376,6 +1422,7 @@ pub const Database = struct {
     }
 
     fn unlock(db: *Database) void {
+        if (db.workers.len == 0) return;
         db.mutex.unlock(db.io());
     }
 };
@@ -1410,7 +1457,7 @@ const EqlOpaqueFn = *const fn (*const anyopaque, *const anyopaque) bool;
 const WriteOpaqueFn = *const fn (*disk_codec.Writer, *const anyopaque) anyerror!void;
 
 /// Each query dependency maps to its output once `Context.get` observed it.
-const DependencyMap = std.ArrayHashMapUnmanaged(*Entry, ?*const anyopaque, DependencyContext, false);
+const DependencyMap = std.ArrayHashMapUnmanaged(*Entry, ?*const anyopaque, DependencyContext, true);
 
 const DependencyContext = struct {
     pub fn hash(_: DependencyContext, entry: *Entry) u32 {
@@ -1559,7 +1606,7 @@ const Worker = struct {
     thread: std.Thread = undefined,
     thread_id: std.Thread.Id = undefined,
     queue: std.DoublyLinkedList = .{},
-    scratch_arenas: std.ArrayList(std.heap.ArenaAllocator.State) = .empty,
+    scratch_arenas: std.ArrayList(BumpArena) = .empty,
 };
 
 fn workerMain(db: *Database, worker_index: usize) void {
@@ -1806,7 +1853,10 @@ fn computeFn(comptime Q: type) ComputeFn {
             var scratch = db.acquireScratchArena(worker_index);
             defer db.releaseScratchArena(worker_index, &scratch);
             var recycler: RecyclingAllocator = .{ .backing = scratch.allocator() };
-            var result_arena: std.heap.ArenaAllocator = .init(db.query_storage.arenaAllocator());
+            const Hint = struct {
+                var first_chunk: std.atomic.Value(usize) = .init(256);
+            };
+            var result_arena = db.resultArena(Hint.first_chunk.load(.monotonic));
             defer result_arena.deinit();
             const direct_result = @hasDecl(Q, "result_arena") and Q.result_arena;
             var ctx: Context = .{
@@ -1856,8 +1906,9 @@ fn computeFn(comptime Q: type) ComputeFn {
             } else {
                 const output_box = try result_arena.allocator().create(Q.Output);
                 output_box.* = if (direct_result and !restored) output_value else try value_operations.Owned(Q.Output).clone(result_arena.allocator(), output_value);
+                Hint.first_chunk.store(@min(result_arena.bytesUsed() + 256, 1 << 20), .monotonic);
                 const arena = result_arena;
-                result_arena = .init(db.query_storage.arenaAllocator());
+                result_arena = db.resultArena(Hint.first_chunk.load(.monotonic));
                 return .{ .pointer = @ptrCast(output_box), .storage = .{ .arena = arena } };
             }
         }

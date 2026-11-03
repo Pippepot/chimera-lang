@@ -17,23 +17,47 @@ pub const Resource = union(enum) {
 
 /// Addressable snapshots may still be immutable when their addresses remain
 /// private and no instruction writes their storage. Heap contents are separate.
-pub fn stableValues(function: *Function) ![]const bool {
-    function.resolveReferences();
-    const memory = try Memory.init(function);
-    var writes: Writes = .{};
-    for (function.blocks.items) |block| for (block.instructions.items) |index| {
-        if (!function.removed.items[index]) try writes.instruction(function.scratch, &memory, function.instructions.items[index]);
-    };
-    const stable = try function.scratch.alloc(bool, function.valueCount());
-    for (stable, 0..) |*value, index| {
-        const id: ValueId = @fromBackingInt(@intCast(index));
-        value.* = function.plainValue(id) and !memory.roots.address_taken[index];
-        if (value.* or !function.plainValue(id)) continue;
-        const root = memory.roots.root(id);
-        value.* = root == .slot and !memory.slotExposed(root.slot) and !writes.slots.contains(root.slot);
+/// The memory and write scans run on the first query of an addressable value.
+pub const Stability = struct {
+    function: *Function,
+    memory: ?Memory = null,
+    writes: ?Writes = null,
+
+    fn scanMemory(self: *Stability) !*const Memory {
+        if (self.memory == null) {
+            self.function.resolveReferences();
+            self.memory = try Memory.init(self.function);
+        }
+        return &self.memory.?;
     }
-    return stable;
-}
+
+    /// Whether an addressable value's storage escapes, which makes it unstable
+    /// without scanning for writes.
+    pub fn exposed(self: *Stability, value: ValueId) !bool {
+        const memory = try self.scanMemory();
+        const index = @backingInt(value);
+        if (index >= memory.roots.address_taken.len or !memory.roots.address_taken[index]) return false;
+        const root = memory.roots.root(value);
+        return root != .slot or memory.slotExposed(root.slot);
+    }
+
+    pub fn stable(self: *Stability, value: ValueId) !bool {
+        const function = self.function;
+        if (!function.plainValue(value)) return false;
+        const memory = try self.scanMemory();
+        if (self.writes == null) {
+            var writes: Writes = .{};
+            for (function.blocks.items) |block| for (block.instructions.items) |index| {
+                if (!function.removed.items[index]) try writes.instruction(function.scratch, memory, function.instructions.items[index]);
+            };
+            self.writes = writes;
+        }
+        const index = @backingInt(value);
+        if (index >= memory.roots.address_taken.len or !memory.roots.address_taken[index]) return true;
+        const root = memory.roots.root(value);
+        return root == .slot and !memory.slotExposed(root.slot) and !self.writes.?.slots.contains(root.slot);
+    }
+};
 
 pub const Roots = struct {
     function: *Function,

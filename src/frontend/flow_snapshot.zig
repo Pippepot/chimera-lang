@@ -7,7 +7,8 @@ const std = @import("std");
 pub fn Buffer(comptime Element: type, comptime initial: Element) type {
     return struct {
         const Self = @This();
-        const page_size = 16;
+        // Large elements get smaller pages so that a write after a snapshot copies less.
+        const page_size = @min(16, std.math.floorPowerOfTwo(usize, @max(1, 2048 / @sizeOf(Element))));
         const Page = struct { writable: bool = true, values: [page_size]Element = @splat(initial) };
         const Root = struct { writable: bool = true, pages: []?*Page };
 

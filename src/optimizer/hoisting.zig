@@ -9,10 +9,10 @@ const Instruction = structures.FunctionInstruction;
 const Function = function_ir.Function;
 
 pub fn hoist(function: *Function) !bool {
-    while (try loops.canonicalize(function)) {}
     const scratch = function.scratch;
+    const found = try loops.canonicalLoops(function);
+    if (found.len == 0) return false;
     const graph = (try function.controlFlow()).*;
-    const found = try loops.find(scratch, function, graph);
     var changed = try snapshotAllocationReads(function, found);
     const memory = try effects.Memory.init(function);
     const owner = try scratch.alloc(u32, function.instructions.items.len);
