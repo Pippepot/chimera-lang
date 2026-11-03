@@ -1,2 +1,5 @@
+pub func copyable(static T: type) bool -> T.copy is func(imm T) T
+pub func movable(static T: type) bool -> T.move is func(deinit T) T
+
 extern func copy_value(static T: type, imm value: T) T
 extern func move_value(static T: type, deinit value: T) T

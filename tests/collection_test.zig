@@ -929,3 +929,323 @@ test "generic sequence consumers infer fixed runtime and forwarded element types
         \\    return 90
     , 42);
 }
+
+test "collection permutation shares Array List and sliced Span storage" {
+    try Fixture.expectFilesParity(
+        \\import std.memory.{exchange_slots}
+        \\func run() int
+        \\    var values = [1, 2, 3, 4, 5]
+        \\    var whole = values.span()
+        \\    exchange_slots(whole, 0, 4)
+        \\    values.reverse()
+        \\    if values[0] <> 1 or values[1] <> 4 or values[4] <> 5 -> return 90
+        \\    var middle = values[1..4]
+        \\    middle.reverse()
+        \\    exchange_slots(middle, 0, 2)
+        \\    var list: List(int) = [10, 20, 30, 40]
+        \\    const capacity = list.capacity()
+        \\    list.reverse()
+        \\    var list_view = list.span()
+        \\    exchange_slots(list_view, 0, 3)
+        \\    if list.len() <> 4 or list.capacity() <> capacity -> return 91
+        \\    var empty: Array(int, 0) = []
+        \\    empty.reverse()
+        \\    var single = [42]
+        \\    single.reverse()
+        \\    var single_view = single.span()
+        \\    exchange_slots(single_view, 0, 0)
+        \\    if values[0] <> 1 or values[1] <> 4 or values[2] <> 3 or values[3] <> 2 or values[4] <> 5 -> return 92
+        \\    if list[0] <> 10 or list[1] <> 30 or list[2] <> 20 or list[3] <> 40 -> return 93
+        \\    return single[0]
+    , &.{.{ .path = "cursor_test.chi", .module_path = "std.memory", .source = cursor_test_library }}, 42);
+}
+
+test "collection permutation moves noncopyable elements and preserves nested referents" {
+    try Fixture.expectFilesParity(
+        \\import std.memory.{exchange_slots}
+        \\struct Item
+        \\    copy = none
+        \\    pub target: Ref(int)
+        \\func run() int
+        \\    var left = 11
+        \\    var right = 20
+        \\    var array = [Item{target = Ref.from(left)}, Item{target = Ref.from(right)}]
+        \\    array.reverse()
+        \\    array[0].target.value += 10
+        \\    array[1].target.value += 1
+        \\    if left <> 12 or right <> 30 -> return 90
+        \\    var list: List(Item) = [Item{target = Ref.from(left)}, Item{target = Ref.from(right)}]
+        \\    var view = list[..]
+        \\    exchange_slots(view, 0, 1)
+        \\    view.reverse()
+        \\    list[0].target.value += 1
+        \\    list[1].target.value -= 1
+        \\    if left <> 13 or right <> 29 -> return 91
+        \\    return left + right
+    , &.{.{ .path = "cursor_test.chi", .module_path = "std.memory", .source = cursor_test_library }}, 42);
+}
+
+test "collection permutation invokes move hooks without copying or premature drops" {
+    try Fixture.expectFilesParity(
+        \\import std.memory.{exchange_slots}
+        \\struct Item
+        \\    copy = none
+        \\    pub value: int
+        \\    moves: Ref(int)
+        \\    drops: Ref(int)
+        \\    move = func(deinit self: Item) Item
+        \\        self.moves.value += 1
+        \\        return Item{value = self.value, moves = self.moves, drops = self.drops}
+        \\    drop = func(deinit self: Item) -> self.drops.value += self.value
+        \\func calculate(ref moves: int, ref drops: int) int
+        \\    var values = [Item{value = 19, moves = Ref.from(moves), drops = Ref.from(drops)}, Item{value = 23, moves = Ref.from(moves), drops = Ref.from(drops)}]
+        \\    var view = values.span()
+        \\    exchange_slots(view, 0, 0)
+        \\    if moves <> 0 or drops <> 0 -> return 90
+        \\    values.reverse()
+        \\    if drops <> 0 -> return 91
+        \\    if moves <> 4 -> return 92
+        \\    return values[0].value + values[1].value
+        \\func run() int
+        \\    var moves = 0
+        \\    var drops = 0
+        \\    const answer = calculate(moves, drops)
+        \\    if drops <> 42 -> return 93
+        \\    return answer
+    , &.{.{ .path = "cursor_test.chi", .module_path = "std.memory", .source = cursor_test_library }}, 42);
+}
+
+test "collection permutation retains readonly element captures" {
+    try Fixture.expectSourceDiagnostic(
+        \\func invalid()
+        \\    const readonly = 19
+        \\    var writable = 23
+        \\    var values = [Ref.from(readonly), Ref.from(writable)]
+        \\    values[0].value += 1
+        \\invalid()
+    , .reference_not_writable);
+    try Fixture.expectSourceDiagnostic(
+        \\func invalid()
+        \\    const readonly = 19
+        \\    var writable = 23
+        \\    var values = [Ref.from(readonly), Ref.from(writable)]
+        \\    values.reverse()
+        \\    values[1].value += 1
+        \\invalid()
+    , .reference_not_writable);
+    try Fixture.expectSourceDiagnostic(
+        \\func invalid()
+        \\    var values = [19, 23]
+        \\    const source = values.span()
+        \\    var copy = source
+        \\    copy.reverse()
+        \\invalid()
+    , .reference_not_writable);
+}
+
+test "collection permutation rejects loans into relocated element storage" {
+    try Fixture.expectSourceDiagnostic(
+        \\func invalid()
+        \\    var values: Array(List(int), 2) = [[19], [23]]
+        \\    ref first = values[0][0]
+        \\    values.reverse()
+        \\    print(first)
+        \\invalid()
+    , .borrow_outlives_source);
+}
+
+test "collection permutation recomputes changed callee effects" {
+    const readonly =
+        \\pub func permute(mut values: Array(List(int), 2)) -> ()
+    ;
+    const reversing =
+        \\pub func permute(mut values: Array(List(int), 2)) -> values.reverse()
+    ;
+    const fixture = try Fixture.initFiles(
+        \\import library.{permute}
+        \\var values: Array(List(int), 2) = [[19], [23]]
+        \\ref first = values[0][0]
+        \\permute(values)
+        \\exit(first + 23)
+    , &.{.{ .path = "library/algorithm.chi", .module_path = "library", .source = readonly }});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(test_sources.queries.SourceText, 1, reversing);
+    try fixture.expectDiagnostic(0, .borrow_outlives_source);
+    try fixture.db.setInput(test_sources.queries.SourceText, 1, readonly);
+    try fixture.expectExit(0, 42);
+}
+
+test "collection permutation preserves stable scalar slot references" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var values = [19, 23]
+        \\    ref first = values[0]
+        \\    values.reverse()
+        \\    return first + values[1]
+    , 42);
+}
+
+test "collection permutation transfers explicit drop obligations" {
+    try Fixture.expectParity(
+        \\struct Token
+        \\    drop = explicit
+        \\    pub value: int
+        \\func dispose(deinit token: Token) int -> token.value
+        \\func run() int
+        \\    var values = [Token{value = 19}, Token{value = 23}]
+        \\    var view = values[..]
+        \\    view.reverse()
+        \\    const [first, second] = values^
+        \\    const selected = first.value
+        \\    const total = dispose(first^) + dispose(second^)
+        \\    if selected <> 23 -> return 90
+        \\    return total
+    , 42);
+}
+
+test "collection permutation handles zero sized elements and drop counts" {
+    const fixture = try Fixture.initFiles(
+        \\import std.memory.{exchange_slots}
+        \\struct Token
+        \\    copy = none
+        \\    drop = func(deinit self: Token) -> print("drop")
+        \\func run()
+        \\    var values = [Token{}, Token{}, Token{}]
+        \\    values.reverse()
+        \\    var view = values.span()
+        \\    exchange_slots(view, 1, 1)
+        \\run()
+    , &.{.{ .path = "cursor_test.chi", .module_path = "std.memory", .source = cursor_test_library }});
+    defer fixture.deinit();
+    const result = try fixture.runIo("");
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
+    try std.testing.expectEqualStrings("drop\ndrop\ndrop\n", result.stdout);
+    try std.testing.expectEqualStrings("", result.stderr);
+}
+
+test "collection exchange remains a private library helper" {
+    try Fixture.expectSourceDiagnostic(
+        \\var values = [19, 23]
+        \\values.swap(0, 1)
+    , .unknown_namespace_member);
+}
+
+const cursor_test_library =
+    \\pub func exchange_slots(static T: type, mut source: Span(T), first: int, second: int)
+    \\    swap_elements(T, source.data, first, second)
+    \\pub func take_slot(static T: type, mut storage: Allocation(T), index: int) T
+    \\    var cursor = allocation_cursor(T, storage)
+    \\    return cursor_take(T, cursor, index)
+    \\pub func destroy_slot(static T: type, mut storage: Allocation(T), index: int)
+    \\    var cursor = allocation_cursor(T, storage)
+    \\    cursor_destroy(T, cursor, index)
+;
+
+test "collection cursor extraction detaches contained references from allocation storage" {
+    try Fixture.expectFilesParity(
+        \\import std.memory.{Allocation, take_slot}
+        \\func run() int
+        \\    var target = 19
+        \\    var storage = Allocation(Ref(int)).allocate(1)
+        \\    if not (storage is Allocation(Ref(int))) -> return 90
+        \\    storage.unsafe_initialize(0, Ref.from(target))
+        \\    var saved = take_slot(storage, 0)
+        \\    storage.deallocate()
+        \\    saved.value += 23
+        \\    return target
+    , &.{.{ .path = "cursor_test.chi", .module_path = "std.memory", .source = cursor_test_library }}, 42);
+}
+
+test "collection cursor destruction handles immovable values in their original slots" {
+    try Fixture.expectFilesParity(
+        \\import std.memory.{Allocation, destroy_slot}
+        \\struct Token
+        \\    move = none
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Token) -> self.trace.value += 23
+        \\func run() int
+        \\    var trace = 19
+        \\    var storage = Allocation(Token).allocate(1)
+        \\    if not (storage is Allocation(Token)) -> return 90
+        \\    storage.unsafe_initialize(0, Token{trace = Ref.from(trace)})
+        \\    destroy_slot(storage, 0)
+        \\    storage.deallocate()
+        \\    return trace
+    , &.{.{ .path = "cursor_test.chi", .module_path = "std.memory", .source = cursor_test_library }}, 42);
+}
+
+test "collection permutation rejects immovable elements at the public capability boundary" {
+    try Fixture.expectAnySourceDiagnostic(
+        \\struct Token
+        \\    move = none
+        \\var values = [Token{}, Token{}]
+        \\values.reverse()
+    , .where_condition_failed);
+}
+
+test "collection permutation exports custom hook alias exclusions to callers" {
+    const source =
+        \\struct Item
+        \\    pub value: int
+        \\    pub target: Ref(int)
+        \\    move = func(deinit self: Item) Item
+        \\        self.target.value += 1
+        \\        return Item{value = self.value, target = self.target}
+        \\func invalid()
+        \\    var external = 0
+        \\    var values = [Item{value = 19, target = Ref.from(external)}, Item{value = 23, target = Ref.from(external)}]
+        \\    values[0].target = Ref.from(values[1].value)
+        \\    values.reverse()
+        \\invalid()
+    ;
+    const unchanged = try std.mem.replaceOwned(u8, std.testing.allocator, source, "values.reverse()", "unit");
+    defer std.testing.allocator.free(unchanged);
+    const fixture = try Fixture.init(unchanged);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 0);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, source);
+    try fixture.expectDiagnostic(0, .borrow_outlives_source);
+}
+
+test "collection permutation preserves active variants containing owners and reference handles" {
+    try Fixture.expectFilesParity(
+        \\import std.memory.{exchange_slots}
+        \\struct Token
+        \\    pub value: int
+        \\func run() int
+        \\    var target = 23
+        \\    var values: Array(Token | Ref(int) | none, 3) = [Token{value = 19}, Ref.from(target), none]
+        \\    values.reverse()
+        \\    if not (values[0] is none) -> return 90
+        \\    var view = values.span()
+        \\    exchange_slots(view, 0, 1)
+        \\    ref first = values[0]
+        \\    if not (first is Ref(int)) -> return 91
+        \\    var selected = first
+        \\    selected.value += 19
+        \\    ref last = values[2]
+        \\    if not (last is Token) -> return 92
+        \\    if last.value <> 19 -> return 93
+        \\    return target
+    , &.{.{ .path = "cursor_test.chi", .module_path = "std.memory", .source = cursor_test_library }}, 42);
+}
+
+test "collection permutation without custom moves preserves references into stable backing slots" {
+    try Fixture.expectParity(
+        \\struct Item
+        \\    pub value: int
+        \\    pub target: Ref(int)
+        \\func run() int
+        \\    var external = 0
+        \\    var values = [Item{value = 19, target = Ref.from(external)}, Item{value = 23, target = Ref.from(external)}]
+        \\    values[0].target = Ref.from(values[1].value)
+        \\    values.reverse()
+        \\    var selected = values[1].target
+        \\    selected.value += 23
+        \\    if values[1].value <> 42 -> return 90
+        \\    return values[1].value
+    , 42);
+}

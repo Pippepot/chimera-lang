@@ -127,28 +127,24 @@ pub converter(imm value: Range) String
     return result^
 func format_range(imm value: Range) String | none
     var result = String.empty()
-    const selected_result_11 = append_bound(result, value.first)
-    if not (selected_result_11 is unit) -> return none
-    const selected_result_12 = result.append("..")
-    if not (selected_result_12 is unit) -> return none
+    if not (append_bound(result, value.first) is unit) -> return none
+    if not (result.append("..") is unit) -> return none
     if value.inclusive
-        const selected_result_13 = result.append("=")
-        if not (selected_result_13 is unit) -> return none
-    const selected_result_14 = append_bound(result, value.limit)
-    if not (selected_result_14 is unit) -> return none
+        if not (result.append("=") is unit) -> return none
+    if not (append_bound(result, value.limit) is unit) -> return none
     return result^
 func resolve_bound(bound: int | FromEnd | none, length: int, omitted: int) int | none
-    if bound is int -> return bound
-    if bound is FromEnd -> return bound.resolve(length)
-    return omitted
+    return match bound
+        int -> bound
+        FromEnd -> bound.resolve(length)
+        none -> omitted
 func append_bound(mut result: String, bound: int | FromEnd | none) unit | none
-    if bound is int -> return result.append(String(bound))
-    if bound is FromEnd
-        const value = bound
-        const selected_result_15 = result.append("^")
-        if not (selected_result_15 is unit) -> return none
-        return result.append(String(value.distance))
-    return unit
+    match bound
+        int -> return result.append(String(bound))
+        FromEnd ->
+            if not (result.append("^") is unit) -> return none
+            return result.append(String(bound.distance))
+        none -> return unit
 
 func has_steps(first: int, last: int, stride: int, count: int) bool
     const low = if first < last -> first else last

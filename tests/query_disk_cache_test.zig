@@ -2344,3 +2344,83 @@ test "numeric snapshots retain concrete values conversions overflow modes and li
     try fixture.db.setInput(queries.SourceText, 0, source);
     try fixture.expectExit(42);
 }
+
+test "collection permutation snapshots retain moved reference permissions and recompute library edits" {
+    const source =
+        \\func run() int
+        \\    var left = 19
+        \\    var right = 23
+        \\    var values = [Ref.from(left), Ref.from(right)]
+        \\    values.reverse()
+        \\    values[0].value += 1
+        \\    return right + 18
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var right = 23", "const right = 23");
+    defer std.testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectDiagnostic(.reference_not_writable);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+    const memory_module = try fixture.db.intern(queries.ModulePaths, .{ .path = "std.memory" });
+    const declarations = (try fixture.db.get(queries.ModuleDeclarations, memory_module)).*.?;
+    const resolved = (try fixture.db.get(queries.ResolveItem, declarations.resolveFunction("swap_elements").?)).*.?;
+    const library_source = standard_library.source("memory/allocation.chi");
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, library_source, "if first == second -> return", "if first == first -> return");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, resolved.file_id, changed);
+    try fixture.expectExit(41);
+    try fixture.db.setInput(queries.SourceText, resolved.file_id, library_source);
+    try fixture.expectExit(42);
+}
+
+test "collection sorting snapshots track comparator library and captured permissions" {
+    const declarations =
+        \\struct Item
+        \\    pub key: int
+        \\    copies: Ref(int)
+        \\    copy = func(imm self: Item) Item
+        \\        self.copies.value += 1
+        \\        return Item{key = self.key, copies = self.copies}
+        \\func before(imm left: Item, imm right: Item) bool -> left.key < right.key
+        \\func run() int
+        \\    var copies = 0
+        \\    const values = [Item{key = 23, copies = Ref.from(copies)}, Item{key = 19, copies = Ref.from(copies)}, Item{key = 0, copies = Ref.from(copies)}]
+        \\    var ordered = values.sorted(before)
+        \\    if not (ordered is List(Item)) -> return 90
+        \\    if copies <> 3 or values[0].key <> 23 -> return 91
+        \\    return ordered[0].key + 42
+    ;
+    for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
+        const source = try std.fmt.allocPrint(std.testing.allocator, "{s}\n{s}", .{ declarations, entry });
+        defer std.testing.allocator.free(source);
+        const fixture = try Fixture.restore(source);
+        defer fixture.db.deinit();
+        try fixture.expectExit(42);
+
+        const changed_comparator = try std.mem.replaceOwned(u8, std.testing.allocator, source, "left.key < right.key", "left.key > right.key");
+        defer std.testing.allocator.free(changed_comparator);
+        try fixture.db.setInput(queries.SourceText, 0, changed_comparator);
+        try fixture.expectExit(65);
+        const readonly = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var copies = 0", "const copies = 0");
+        defer std.testing.allocator.free(readonly);
+        try fixture.db.setInput(queries.SourceText, 0, readonly);
+        try fixture.expectDiagnostic(.reference_not_writable);
+        try fixture.db.setInput(queries.SourceText, 0, source);
+        try fixture.expectExit(42);
+
+        const library_source = standard_library.source("memory/sort.chi");
+        const original = "if not before(source[current], source[current - 1]) -> break";
+        try std.testing.expect(std.mem.indexOf(u8, library_source, original) != null);
+        const changed_library = try std.mem.replaceOwned(u8, std.testing.allocator, library_source, original, "if before(source[current], source[current - 1]) -> break");
+        defer std.testing.allocator.free(changed_library);
+        const sort_file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_sort))).*;
+        try fixture.db.setInput(queries.SourceText, sort_file, changed_library);
+        try fixture.expectExit(65);
+        try fixture.db.setInput(queries.SourceText, sort_file, library_source);
+        try fixture.expectExit(42);
+    }
+}

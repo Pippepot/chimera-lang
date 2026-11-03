@@ -6383,6 +6383,100 @@ test "ownership members participate in where type tests" {
     , 42);
 }
 
+test "standard ownership helpers inspect independent capabilities without running hooks" {
+    try Fixture.expectParity(
+        \\import std.ownership.{copyable, movable}
+        \\struct CopyOnly
+        \\    move = none
+        \\    copy = trivial
+        \\    value: int
+        \\struct MoveOnly
+        \\    value: int
+        \\struct Neither
+        \\    move = none
+        \\    copy = none
+        \\struct Hooks
+        \\    value: int
+        \\    copy = func(imm self: Hooks) Hooks -> panic "copy hook ran"
+        \\    move = func(deinit self: Hooks) Hooks -> panic "move hook ran"
+        \\func accept(static T: type) int where copyable(T) and movable(T) -> 42
+        \\func run() int
+        \\    if not copyable(int) or not movable(int) -> return 90
+        \\    if not copyable(CopyOnly) or movable(CopyOnly) -> return 91
+        \\    if copyable(MoveOnly) or not movable(MoveOnly) -> return 92
+        \\    if copyable(Neither) or movable(Neither) -> return 93
+        \\    if not copyable(Hooks) or not movable(Hooks) -> return 94
+        \\    if movable(CopyOnly | int) or copyable(MoveOnly | none) -> return 95
+        \\    if not copyable(Array(int, 2)) or not movable(Array(int, 2)) -> return 96
+        \\    if copyable(List(int)) or not movable(List(int)) -> return 97
+        \\    return accept(Hooks)
+    , 42);
+}
+
+test "standard ownership helpers reject missing capabilities in constraints" {
+    for ([_][]const u8{ "copyable", "movable" }) |name| {
+        const source = try testing.allocator.print(
+            \\import std.ownership.{{copyable, movable}}
+            \\struct Item
+            \\    copy = none
+            \\    move = none
+            \\func accept(static T: type) int where {s}(T) -> 42
+            \\exit(accept(Item))
+        , .{name});
+        defer testing.allocator.free(source);
+        try Fixture.expectSourceDiagnostic(source, .where_condition_failed);
+    }
+}
+
+test "standard ownership helpers recompute after capability edits" {
+    const entry =
+        \\import std.ownership.{copyable, movable}
+        \\import items.{Item}
+        \\exit((if copyable(Item) -> 20 else 0) + (if movable(Item) -> 22 else 0))
+    ;
+    const original =
+        \\pub struct Item
+        \\    copy = trivial
+        \\    value: int
+    ;
+    const fixture = try Fixture.initFiles(entry, &.{.{ .path = "items/item.chi", .module_path = "items", .source = original }});
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(queries.SourceText, 1,
+        \\pub struct Item
+        \\    copy = none
+        \\    move = none
+        \\    value: int
+    );
+    try fixture.expectExit(0, 0);
+    try fixture.db.setInput(queries.SourceText, 1, original);
+    try fixture.expectExit(0, 42);
+}
+
+test "standard ownership helpers retain invalid definition diagnostics" {
+    try Fixture.expectSourceDiagnostic(
+        \\import std.ownership.{copyable}
+        \\struct Item
+        \\    copy = func(imm self: int) int -> self
+        \\    value: int
+        \\exit(if copyable(Item) -> 42 else 0)
+    , .struct_ownership_hook_signature_mismatch);
+}
+
+test "standard ownership helper support leaves runtime member tests at runtime" {
+    try Fixture.expectSourceExit(
+        \\struct Item
+        \\    value: int | none
+        \\func make() Item
+        \\    print("runtime")
+        \\    return Item{value = 42}
+        \\func run() int
+        \\    if not (make().value is int) -> return 90
+        \\    return 42
+        \\exit(run())
+    , 42);
+}
+
 test "ownership members with missing capabilities fail where conditions" {
     for ([_][]const u8{ "copy", "move" }) |name| {
         const source = try testing.allocator.print(

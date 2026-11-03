@@ -1306,6 +1306,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             const names = std.StaticStringMap(structures.CallBehavior).initComptime(.{
                 .{ "take", .box_value },
                 .{ "append_collection_bounded", .collection_append_bounded },
+                .{ "append_collection_moved", .collection_append_bounded },
                 .{ "append_collection_growing", .collection_append_growing },
                 .{ "append_collection_optional", .collection_append_growing },
             });
@@ -3576,7 +3577,7 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             if (external) |symbol| {
                 switch (symbol) {
                     .static_iteration_item => return self.captureStaticItem(signature.parameters[0].type_id, arguments[0], call_span),
-                    .primitive_operation, .numeric_converter, .copy_value, .move_value, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => {},
+                    .primitive_operation, .numeric_converter, .copy_value, .move_value, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => {},
                     .allocate, .allocate_host_storage => return self.allocateStorage(symbol, signature.return_type, arguments, storage),
                     .deallocate, .deallocate_host_storage => {
                         comptime_interpreter.releaseAllocation(arguments[0]);
@@ -3591,7 +3592,8 @@ fn ComptimeCallExecutor(comptime Context: type) type {
                     else => return .{ .execution_error = .{ .reason = .unsupported_operation, .span = call_span } },
                 }
             }
-            var snapshot_arena: std.heap.ArenaAllocator = .init(self.ctx.allocator());
+            // Query scratch retains freed arena chunks; these snapshots live only for this call.
+            var snapshot_arena: std.heap.ArenaAllocator = .init(self.ctx.db.allocator);
             defer snapshot_arena.deinit();
             const snapshot_storage = snapshot_arena.allocator();
             const saved_arguments = try comptime_interpreter.ValueSnapshot.init(arguments, snapshot_storage);
@@ -4509,7 +4511,7 @@ fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?s
     if (intrinsics.hasTypedBody(symbol)) return compileTypedFunction(ctx, instance_id);
     return switch (symbol) {
         .static_iteration_item => null,
-        .primitive_operation, .numeric_converter, .copy_value, .move_value, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => unreachable,
+        .primitive_operation, .numeric_converter, .copy_value, .move_value, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => unreachable,
         .io_read, .io_write => try codegen.compileExternalByteIo(symbol == .io_read, signature, types, ctx.allocator()),
         .exit => try codegen.compileExternalExit(ctx.allocator()),
         .panic_message => try codegen.compileExternalPanic(signature, types, ctx.allocator()),

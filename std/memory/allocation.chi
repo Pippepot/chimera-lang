@@ -4,6 +4,7 @@ import std.iteration.{End}
 import std.range.{Range, FromEnd}
 import std.memory
 import std.search
+import std.ownership.{copyable, movable}
 
 pub struct Allocation(T: type)
     storage: HostStorage
@@ -35,10 +36,7 @@ pub struct List(T: type)
     storage: Allocation(T)
     initialized: int
     drop = func(deinit self: List(T))
-        var index = self.initialized
-        loop
-            if index == 0 -> break
-            index -= 1
+        for index in (0..self.initialized).reversed()
             unsafe_destroy(T, self.storage, index)
         deallocate(T, self.storage^)
 
@@ -54,17 +52,31 @@ pub struct List(T: type)
         const storage = allocate(T, reserved)
         if not (storage is Allocation(T)) -> return none
         return List(T){storage = storage^, initialized = 0}
-    pub func filled(imm value: T, count: int) List(T) | none where T.copy is func(imm T) T
+    pub func filled(imm value: T, count: int) List(T) | none where copyable(T)
         const storage = allocate(T, count)
         if not (storage is Allocation(T)) -> return none
         var result = List(T){storage = storage^, initialized = 0}
-        loop
-            if result.initialized == count -> break
-            initialize_collection_element(T, result.storage, result.initialized, value)
+        for index in 0..count
+            initialize_collection_element(T, result.storage, index, value)
             result.initialized += 1
         return result^
 
     pub func len(imm self: List(T)) int -> self.initialized
+    pub func reverse(mut self: List(T)) unit where movable(T)
+        var view = self.span()
+        view.reverse()
+    func sort_default(mut self: List(T)) unit where movable(T)
+        var view = self.span()
+        return view.sort()
+    func sort_by(mut self: List(T), before: func(imm T, imm T) bool) unit where movable(T)
+        var view = self.span()
+        return view.sort(before)
+    pub overload sort(sort_default, sort_by)
+    func sorted_default(imm self: List(T)) List(T) | none where copyable(T) and movable(T)
+        return self.span().sorted()
+    func sorted_by(imm self: List(T), before: func(imm T, imm T) bool) List(T) | none where copyable(T) and movable(T)
+        return self.span().sorted(before)
+    pub overload sorted(sorted_default, sorted_by)
     pub func capacity(imm self: List(T)) int -> self.storage.capacity()
     pub func span(ref self: List(T)) Span(T) -> Span(T){data = allocation_cursor(T, self.storage), size = self.initialized}
     func index_of_equal(static Needle: type, imm self: List(T), imm needle: Needle) int | none -> std.search.index_of(self.span(), needle)
@@ -88,8 +100,7 @@ pub struct List(T: type)
     pub func read_bytes(mut self: List(byte), descriptor: int, count: int) int | none
         if count < 0 or count > 2147483647 - self.initialized -> return none
         if count == 0 -> return 0
-        const selected_result_5 = self.reserve(self.initialized + count)
-        if not (selected_result_5 is unit) -> return none
+        if not (self.reserve(self.initialized + count) is unit) -> return none
         const actual = io_read(descriptor, self.storage, self.initialized, count)
         if not (actual is int) -> return none
         self.initialized += actual
@@ -100,10 +111,7 @@ pub struct List(T: type)
         if minimum_capacity <= self.capacity() -> return unit
         var replacement = allocate(T, minimum_capacity)
         if not (replacement is Allocation(T)) -> return none
-        var index = self.initialized
-        loop
-            if index == 0 -> break
-            index -= 1
+        for index in (0..self.initialized).reversed()
             const item = unsafe_take(T, self.storage, index)
             initialize_collection_element(T, replacement, index, item^)
         const previous = self.storage^
@@ -112,15 +120,7 @@ pub struct List(T: type)
         return unit
 
     pub func append(mut self: List(T), var item: T) unit | none
-        const capacity = self.capacity()
-        if self.initialized == capacity
-            if capacity == 2147483647 -> return none
-            var next_capacity = 1
-            if capacity > 0
-                if capacity <= 1073741823 -> next_capacity = capacity * 2
-                else next_capacity = 2147483647
-            const selected_result_8 = self.reserve(next_capacity)
-            if not (selected_result_8 is unit) -> return none
+        if not (reserve_collection_element(T, self) is unit) -> return none
         unsafe_initialize(T, self.storage, self.initialized, item^)
         self.initialized += 1
         return unit
@@ -149,13 +149,10 @@ pub struct List(T: type)
     pub func remove(mut self: List(T), index: int) T | none
         if index < 0 or index >= self.initialized -> return none
         const result = unsafe_take(T, self.storage, index)
-        var position = index
-        loop
+        for position in index..(self.initialized - 1)
             const next = position + 1
-            if next >= self.initialized -> break
             const item = unsafe_take(T, self.storage, next)
             initialize_collection_element(T, self.storage, position, item^)
-            position = next
         self.initialized -= 1
         return result^
     pub func []=(static Index: type, mut self: List(T), index: Index, var item: T) unit where Index is int or Index is FromEnd
@@ -168,10 +165,7 @@ pub struct ListIterator(T: type)
     first: int
     limit: int
     drop = func(deinit self: ListIterator(T))
-        var position = self.limit
-        loop
-            if position == self.first -> break
-            position -= 1
+        for position in (self.first..self.limit).reversed()
             unsafe_destroy(T, self.storage, position)
         deallocate(T, self.storage^)
     pub func next(mut self: ListIterator(T)) T | End
@@ -207,10 +201,14 @@ func append_collection_bounded(static T: type, mut result: List(T), init item: T
     if result.initialized >= result.capacity() -> panic "Collection construction bound exceeded"
     initialize_collection_element(T, result.storage, result.initialized, item)
     result.initialized += 1
+func append_collection_moved(static T: type, mut result: List(T), deinit item: T)
+    if result.initialized >= result.capacity() -> panic "Collection construction bound exceeded"
+    var cursor = allocation_cursor(T, result.storage)
+    cursor_initialize(T, cursor, result.initialized, item^)
+    result.initialized += 1
 func append_collection_growing(static T: type, mut result: List(T), init item: T)
-    const selected_result_13 = append_collection_optional(T, result, item)
-    if not (selected_result_13 is unit) -> panic "List literal allocation failed"
-func append_collection_optional(static T: type, mut result: List(T), init item: T) unit | none
+    if not (append_collection_optional(T, result, item) is unit) -> panic "List literal allocation failed"
+func reserve_collection_element(static T: type, mut result: List(T)) unit | none
     const capacity = result.capacity()
     if result.initialized == capacity
         if capacity == 2147483647 -> return none
@@ -218,8 +216,10 @@ func append_collection_optional(static T: type, mut result: List(T), init item: 
         if capacity > 0
             if capacity <= 1073741823 -> next = capacity * 2
             else next = 2147483647
-        const selected_result_14 = result.reserve(next)
-        if not (selected_result_14 is unit) -> return none
+        return result.reserve(next)
+    return unit
+func append_collection_optional(static T: type, mut result: List(T), init item: T) unit | none
+    if not (reserve_collection_element(T, result) is unit) -> return none
     initialize_collection_element(T, result.storage, result.initialized, item)
     result.initialized += 1
     return unit
@@ -252,6 +252,19 @@ pub struct Span(T: type)
         if initialized < 0 or initialized > allocation.capacity() -> return none
         return Span(T){data = allocation_cursor(T, allocation), size = initialized}
     pub func len(imm self: Span(T)) int -> self.size
+    pub func reverse(mut self: Span(T)) unit where movable(T)
+        for first in 0..(self.size / 2)
+            swap_elements(T, self.data, first, self.size - 1 - first)
+    func sort_default(mut self: Span(T)) unit where movable(T)
+        return sort_span(T, self, natural_order)
+    func sort_by(mut self: Span(T), before: func(imm T, imm T) bool) unit where movable(T)
+        return sort_span(T, self, before)
+    pub overload sort(sort_default, sort_by)
+    func sorted_default(var self: Span(T)) List(T) | none where copyable(T) and movable(T)
+        return sorted_span(T, self, natural_order)
+    func sorted_by(var self: Span(T), before: func(imm T, imm T) bool) List(T) | none where copyable(T) and movable(T)
+        return sorted_span(T, self, before)
+    pub overload sorted(sorted_default, sorted_by)
     func index_of_equal(static Needle: type, imm self: Span(T), imm needle: Needle) int | none -> std.search.index_of(self, needle)
     func index_of_by(static Needle: type, imm self: Span(T), imm needle: Needle, matches: func(imm T, imm Needle) bool) int | none -> std.search.index_of(self, needle, matches)
     pub overload index_of(index_of_equal, index_of_by)
@@ -304,6 +317,16 @@ extern func allocation_cursor(static T: type, ref allocation: Allocation(T)) Sto
 extern func cursor_offset(static T: type, ref source: StorageCursor(T), offset: int) StorageCursor(T)
 extern func cursor_element(static T: type, ref source: StorageCursor(T), index: int) ref T
 extern func cursor_attenuate(static T: type, imm source: StorageCursor(T)) StorageCursor(T)
+extern func cursor_take(static T: type, mut source: StorageCursor(T), index: int) T
+extern func cursor_initialize(static T: type, mut source: StorageCursor(T), index: int, deinit item: T) unit
+extern func cursor_destroy(static T: type, mut source: StorageCursor(T), index: int) unit
+
+func swap_elements(static T: type, mut source: StorageCursor(T), first: int, second: int)
+    if first == second -> return
+    const left = cursor_take(T, source, first)
+    const right = cursor_take(T, source, second)
+    cursor_initialize(T, source, first, right^)
+    cursor_initialize(T, source, second, left^)
 
 pub struct Ref(T: type)
     copy = trivial

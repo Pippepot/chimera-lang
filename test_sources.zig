@@ -12,6 +12,7 @@ pub const comptime_interpreter = @import("src/frontend/comptime_interpreter.zig"
 pub const modules = @import("src/modules.zig");
 pub const profiling = @import("src/profiling.zig");
 pub const query = @import("src/query/engine.zig");
+pub const query_codec = @import("src/query/codec.zig");
 pub const queries = @import("src/queries.zig");
 pub const query_disk_cache = @import("src/query_disk_cache.zig");
 pub const query_artifact = @import("src/query_artifact.zig");

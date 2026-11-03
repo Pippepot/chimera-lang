@@ -1,0 +1,277 @@
+import std.array.{Array}
+
+struct DriftRun
+    copy = trivial
+    first: int
+    limit: int
+    sorted: bool
+    power: int
+
+func natural_order(static T: type, imm left: T, imm right: T) bool -> left < right
+
+func sort_span(static T: type, mut source: Span(T), before: func(imm T, imm T) bool) unit
+    const length = source.len()
+    if length < 2 -> return unit
+    if length <= 20
+        insertion_sort_slots(T, source, before)
+        return unit
+
+    const descending = before(source[1], source[0])
+    var run = 2
+    loop
+        if run == length -> break
+        if before(source[run], source[run - 1]) <> descending -> break
+        run += 1
+    if run == length
+        if descending -> source.reverse()
+        return unit
+
+    var order = List(int).filled(0, length)
+    if not (order is List(int)) -> panic "sort scratch allocation failed"
+    var scratch = List(int).filled(0, length)
+    if not (scratch is List(int)) -> panic "sort scratch allocation failed"
+    for index in 0..length
+        order[index] = index
+    drift_indices(T, source, order, scratch, before)
+    apply_sort_order(T, source.data, order)
+    return unit
+
+func insertion_sort_slots(static T: type, mut source: Span(T), before: func(imm T, imm T) bool)
+    for position in 1..source.len()
+        var current = position
+        loop
+            if current == 0 -> break
+            if not before(source[current], source[current - 1]) -> break
+            swap_elements(T, source.data, current, current - 1)
+            current -= 1
+
+func sorted_span(static T: type, ref source: Span(T), before: func(imm T, imm T) bool) List(T) | none
+    var result = List(T).new(source.len())
+    if not (result is List(T)) -> return none
+    for const item in source
+        append_collection_moved(T, result, item^)
+    result.sort(before)
+    return result^
+
+func drift_indices(static T: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), before: func(imm T, imm T) bool)
+    const length = source.len()
+    const threshold = drift_run_threshold(length)
+    var runs = Array(DriftRun, 64).filled(DriftRun{first = 0, limit = 0, sorted = false, power = 0})
+    var count = 0
+    var scan = 0
+    loop
+        if scan == length -> break
+        const next = drift_next_run(T, source, order, scan, threshold, before)
+        if count > 0
+            const power = drift_node_power(length, runs[count - 1].first, scan, next.limit)
+            loop
+                if count < 2 -> break
+                if runs[count - 2].power < power -> break
+                drift_merge_runs(T, source, order, scratch, runs, count - 2, before)
+                count -= 1
+            runs[count - 1].power = power
+        runs[count] = next
+        count += 1
+        scan = next.limit
+
+    loop
+        if count <= 1 -> break
+        drift_merge_runs(T, source, order, scratch, runs, count - 2, before)
+        count -= 1
+    if not runs[0].sorted
+        drift_quicksort(T, source, order, scratch, 0, length, drift_depth(length), before)
+
+func drift_run_threshold(length: int) int
+    if length <= 4096
+        const half = length - length / 2
+        if half < 64 -> return half
+        return 64
+    var scaled = length
+    var estimate = 1
+    loop
+        if scaled < 4 -> break
+        scaled /= 4
+        estimate *= 2
+    return (estimate + length / estimate) / 2
+
+func drift_next_run(static T: type, ref source: Span(T), mut order: List(int), first: int, threshold: int, before: func(imm T, imm T) bool) DriftRun
+    const remaining = source.len() - first
+    if remaining >= threshold
+        const descending = before(source[order[first + 1]], source[order[first]])
+        var limit = first + 2
+        loop
+            if limit == source.len() -> break
+            if before(source[order[limit]], source[order[limit - 1]]) <> descending -> break
+            limit += 1
+        if limit - first >= threshold
+            if descending -> reverse_order(order, first, limit)
+            return DriftRun{first = first, limit = limit, sorted = true, power = 0}
+    var limit = source.len()
+    if remaining > threshold -> limit = first + threshold
+    return DriftRun{first = first, limit = limit, sorted = false, power = 0}
+
+func reverse_order(mut order: List(int), first: int, limit: int)
+    for offset in 0..((limit - first) / 2)
+        const left = first + offset
+        const right = limit - 1 - offset
+        const saved = order[left]
+        order[left] = order[right]
+        order[right] = saved
+
+func drift_node_power(length: int, first: int, middle: int, limit: int) int
+    const denominator = i64(length) * 2
+    var left = i64(first) + i64(middle)
+    var right = i64(middle) + i64(limit)
+    var power = 0
+    loop
+        left *= 2
+        right *= 2
+        power += 1
+        const left_high = left >= denominator
+        const right_high = right >= denominator
+        if left_high <> right_high -> return power
+        if left_high
+            left -= denominator
+            right -= denominator
+
+func drift_merge_runs(static T: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), mut runs: Array(DriftRun, 64), index: int, before: func(imm T, imm T) bool)
+    const left = runs[index]
+    const right = runs[index + 1]
+    var sorted = false
+    if left.sorted or right.sorted
+        if not left.sorted
+            drift_quicksort(T, source, order, scratch, left.first, left.limit, drift_depth(left.limit - left.first), before)
+        if not right.sorted
+            drift_quicksort(T, source, order, scratch, right.first, right.limit, drift_depth(right.limit - right.first), before)
+        drift_merge(T, source, order, scratch, left.first, left.limit, right.limit, before)
+        sorted = true
+    runs[index] = DriftRun{first = left.first, limit = right.limit, sorted = sorted, power = right.power}
+
+func drift_depth(length: int) int
+    var remaining = length
+    var depth = 0
+    loop
+        if remaining <= 1 -> break
+        remaining /= 2
+        depth += 2
+    return depth
+
+func drift_quicksort(static T: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), first: int, limit: int, depth: int, before: func(imm T, imm T) bool)
+    const length = limit - first
+    if length <= 20
+        insertion_sort_order(T, source, order, first, limit, before)
+        return
+    if depth == 0
+        drift_merge_sort(T, source, order, scratch, first, limit, before)
+        return
+    const pivot = drift_pivot(T, source, order, first, limit, before)
+    const middle = drift_partition(T, source, order, scratch, first, limit, pivot, false, before)
+    const greater = drift_partition(T, source, order, scratch, middle, limit, pivot, true, before)
+    drift_quicksort(T, source, order, scratch, first, middle, depth - 1, before)
+    drift_quicksort(T, source, order, scratch, greater, limit, depth - 1, before)
+
+func drift_pivot(static T: type, ref source: Span(T), imm order: List(int), first: int, limit: int, before: func(imm T, imm T) bool) int
+    const a = order[first]
+    const b = order[first + (limit - first) / 2]
+    const c = order[limit - 1]
+    if before(source[a], source[b])
+        if before(source[b], source[c]) -> return b
+        if before(source[a], source[c]) -> return c
+        return a
+    if before(source[a], source[c]) -> return a
+    if before(source[b], source[c]) -> return c
+    return b
+
+func drift_partition(static T: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), first: int, limit: int, pivot: int, equal: bool, before: func(imm T, imm T) bool) int
+    var left = first
+    var right = limit
+    for position in first..limit
+        const item = order[position]
+        var selected = false
+        if equal
+            if item == pivot -> selected = true
+            else selected = not before(source[pivot], source[item])
+        else
+            if item <> pivot -> selected = before(source[item], source[pivot])
+        if selected
+            scratch[left] = item
+            left += 1
+        else
+            right -= 1
+            scratch[right] = item
+    for position in first..left
+        order[position] = scratch[position]
+    for position in left..limit
+        const reversed = limit - 1 - (position - left)
+        order[position] = scratch[reversed]
+    return left
+
+func insertion_sort_order(static T: type, ref source: Span(T), mut order: List(int), first: int, limit: int, before: func(imm T, imm T) bool)
+    if first >= limit -> return
+    for position in (first + 1)..limit
+        const item = order[position]
+        var destination = position
+        loop
+            if destination == first -> break
+            if not before(source[item], source[order[destination - 1]]) -> break
+            order[destination] = order[destination - 1]
+            destination -= 1
+        order[destination] = item
+
+func drift_merge_sort(static T: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), first: int, limit: int, before: func(imm T, imm T) bool)
+    const length = limit - first
+    var width = 1
+    loop
+        if width >= length -> break
+        var start = first
+        loop
+            if start == limit -> break
+            var middle = limit
+            if limit - start > width -> middle = start + width
+            var end = limit
+            if limit - middle > width -> end = middle + width
+            if middle < end -> drift_merge(T, source, order, scratch, start, middle, end, before)
+            start = end
+        if width > length / 2 -> break
+        width *= 2
+
+func drift_merge(static T: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), first: int, middle: int, limit: int, before: func(imm T, imm T) bool)
+    var left = first
+    var right = middle
+    var position = first
+    loop
+        if left == middle or right == limit -> break
+        if before(source[order[right]], source[order[left]])
+            scratch[position] = order[right]
+            right += 1
+        else
+            scratch[position] = order[left]
+            left += 1
+        position += 1
+    loop
+        if left == middle -> break
+        scratch[position] = order[left]
+        left += 1
+        position += 1
+    loop
+        if right == limit -> break
+        scratch[position] = order[right]
+        right += 1
+        position += 1
+    for index in first..limit
+        order[index] = scratch[index]
+
+func apply_sort_order(static T: type, mut cursor: StorageCursor(T), mut order: List(int))
+    for start in 0..order.len()
+        if order[start] <> start
+            const saved = cursor_take(T, cursor, start)
+            var destination = start
+            loop
+                const next = order[destination]
+                order[destination] = destination
+                if next == start
+                    cursor_initialize(T, cursor, destination, saved^)
+                    break
+                const item = cursor_take(T, cursor, next)
+                cursor_initialize(T, cursor, destination, item^)
+                destination = next

@@ -805,6 +805,42 @@ test "interpreter call cycles reject unchanged references and allow changed refe
     try std.testing.expectEqual(@as(i32, 42), value.runtime.value.int);
 }
 
+test "interpreter releases transient snapshots between calls" {
+    const MemoryTracker = test_sources.diagnostic_rendering.MemoryTracker;
+    var tracker: MemoryTracker = .{ .backing = std.testing.allocator };
+    {
+        const allocator = tracker.allocator();
+        const db = try query.Database.init(allocator, .{ .worker_count = 0 });
+        defer db.deinit();
+        try modules.registerSources(db, allocator,
+            \\func read(imm values: Array(int, 128), index: int) int -> values[index]
+            \\func run() int
+            \\    var values = Array(int, 128).filled(1)
+            \\    var total = 0
+            \\    var index = 0
+            \\    loop
+            \\        if index == 1024 -> break
+            \\        total += read(values, index % 128)
+            \\        index += 1
+            \\    return total / 1024 + 41
+        , &.{}, &.{});
+        const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+        const arguments = try db.intern(queries.CompileTimeValueTuples, .{ .values = &.{} });
+        const result = (try db.get(queries.ExecuteComptimeCall, .{
+            .instance = .{ .item = scope.resolveFunction("run").? },
+            .arguments = arguments,
+        })).*.?;
+        try std.testing.expect(result == .completed);
+        const value = (try db.lookupInterned(queries.CompileTimeValues, result.completed.outcome.returned)).*;
+        try std.testing.expectEqual(@as(i32, 42), value.runtime.value.int);
+        const peak = tracker.peak.load(.monotonic);
+        const limit = 64 * 1024 * 1024;
+        if (peak >= limit) std.debug.print("transient snapshot peak: {d} bytes\n", .{peak});
+        try std.testing.expect(peak < limit);
+    }
+    try std.testing.expectEqual(@as(usize, 0), tracker.live.load(.monotonic));
+}
+
 test "interpreter direct branch values snapshot descriptors while storage aliases them" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

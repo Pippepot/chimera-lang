@@ -1,0 +1,34 @@
+import std.io.{stdin, read_bytes}
+
+static SIZE = 65536
+
+func benchmark(pattern: int, rounds: int, seed: int)
+    var values = Array(int, SIZE).filled(0)
+    var checksum = 0
+    for round in 0..rounds
+        var state = (seed + round) % 65536
+        for index in 0..SIZE
+            state = (state * 25173 + 13849) % 65536
+            var value = state
+            if pattern == 1 -> value = index
+            else if pattern == 2 -> value = SIZE - 1 - index
+            else if pattern == 3 -> value = state % 16
+            else if pattern == 4 -> value = ((SIZE - 1) / 256 - index / 256) * 256 + index % 256
+            values[index] = value
+        values.sort()
+        for index in 0..SIZE
+            if index > 0 and values[index - 1] > values[index] -> exit(3)
+            checksum = (checksum * 31 + values[index]) % 1000003
+    print(checksum)
+
+var input: List(byte) = []
+loop
+    if input.len() == 5 -> break
+    const received = read_bytes(stdin, input, 5 - input.len())
+    if not (received is int) -> exit(1)
+    if received == 0 -> exit(1)
+const pattern = int(input[0])
+const rounds = int(input[1]) + int(input[2]) * 256
+const seed = int(input[3]) + int(input[4]) * 256
+if pattern > 4 or rounds == 0 -> exit(1)
+benchmark(pattern, rounds, seed)

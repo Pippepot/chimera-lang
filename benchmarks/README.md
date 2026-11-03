@@ -19,6 +19,19 @@ matching Chimera and C workloads:
 python3 benchmarks/key-gen-face-five/run.py --cpu 4
 ```
 
+## Array Sorting
+
+The standalone [array-sort comparison](array-sort/README.md) benchmarks Chimera's
+`Array.sort()` against Clang C++ `std::sort` and `std::stable_sort` at `-O3`:
+
+```sh
+python3 benchmarks/array-sort/run.py --cpu 4
+```
+
+It checks matching signed 32-bit inputs across five distributions and reports
+whole-process timings for repeated fill/sort/verification batches, including
+medians, ranges, and raw samples. See the benchmark guide for timing boundaries.
+
 ## Recording Results
 
 The focused [provenance benchmark](results/provenance/README.md) measures cold

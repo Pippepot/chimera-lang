@@ -1385,6 +1385,66 @@ func forward_initializer(static T: type, init item: T) T
 # Span(byte) and BytesView are arbitrary bytes, not validated UTF-8 text.
 # StringView maintains that additional guarantee through validation and invalidation.
 #
+# Array, List, and writable Span provide reverse(). It changes only the
+# initialized extent of its receiver; empty and singleton extents do nothing.
+# It does not allocate, change length/capacity, or require copying.
+# Elements must be movable. Custom move hooks run for each requested transfer;
+# the private exchange helper takes both elements into owned temporaries and constructs them in the
+# opposite slots. Each nontrivial exchange therefore requests four moves and
+# performs no element destruction. Contained references retain their referents
+# and captured permissions. Explicit-drop obligations transfer with their values;
+# this does not extend List's existing element capabilities.
+#
+# Standard-library algorithms panic if an internal auxiliary allocation fails;
+# auxiliary storage does not add none to their result types. APIs that explicitly
+# allocate or grow owned storage retain their declared recoverable allocation
+# results. This distinction depends on the allocation's role, not its size or
+# estimated likelihood of failure.
+#
+# Array, List, and Span provide stable sort() and sort(before), returning
+# unit. sort mutates the initialized extent, so its receiver and backing
+# must be writable and its elements movable. Length and capacity do not change.
+# sorted() and sorted(before) instead copy the elements into a new owned
+# List(T), sort that List, and leave the source sequence in its original order.
+# They return List(T) | none; none means the result allocation was refused.
+# Their elements must be copyable and movable, and List requires them to be
+# automatically droppable. Each element is copied once before sorting; custom
+# copy hooks may therefore change the values being ordered. Readonly collection
+# backing can be copied without discarding the permissions of references stored
+# inside its elements. Temporary Array and List values can be sorted into a copy.
+#
+# The default order uses `<`. A supplied comparator is an infallible
+# func(imm T, imm T) bool; it must define a strict weak ordering throughout the
+# call for sorted output. Equivalent values retain their original relative order.
+# Even an inconsistent comparator terminates and preserves the elements, but does
+# not guarantee an ordering. Custom moves used by sorting must preserve each
+# element's comparison-relevant order and equivalence across transfers.
+# Comparator and ownership-hook effects on captured references follow their usual
+# permissions and are not rolled back.
+#
+# The stable Driftsort hybrid adapts to ordered runs and repeated keys and has
+# O(n log n) worst-case work. Small, already ordered, and strictly descending
+# inputs need no algorithm-owned scratch allocation. Other inputs use two
+# O(n) index buffers before moving any source element; if either allocation
+# fails, sort panics. sorted returns none if its result allocation fails, and
+# panics if later scratch allocation fails. Panic does not unwind owners.
+#
+# These are library algorithms over private storage cursors. Private cursor
+# take/initialize/destroy operations share allocation storage's caller-proven
+# bounds, initialization, and nonoverlap obligations. Taking or destroying an
+# element ends its old lifetime. Cursor initialization consumes an owned value
+# through deinit and moves it into an empty slot; it does not defer evaluation.
+# Allocation unsafe_initialize retains its init API for in-place construction,
+# including immovable values.
+# Custom move hooks must not access temporarily empty slots. Cursor relocation
+# with custom moves therefore requires contained references to be disjoint from
+# its backing storage; the compiler conservatively rejects overlap it cannot
+# disprove after caller substitution. Movement without custom hooks does not
+# impose that restriction on contained references into stable slots.
+# Algorithms restore every slot before returning. The compiler tracks backing
+# permissions, contained reference origins, and invalidation of outstanding loans;
+# a cursor handle itself owns neither its backing nor the elements it addresses.
+#
 # Returned borrows retain every source they can actually reference. The compiler
 # infers private return-origin and write contracts from function bodies, including
 # recursive calls. Callers substitute their places and contained references;
@@ -1735,9 +1795,13 @@ pub struct Interval
 # The member names copy and move are reserved for these operations. Ownership
 # properties remain in their separate declaration scope. Arbitrary namespace
 # functions cannot manufacture a capability or replace its member.
-# Capability validation precedes member availability. A where-condition may
-# test these members and their callable types; a missing capability fails the
-# condition, while an invalid ownership definition remains a diagnostic.
+# Capability validation precedes member availability. Type-namespace member tests,
+# including where conditions, may inspect these members and their callable types;
+# a missing capability yields false, while an invalid ownership definition remains
+# a diagnostic.
+# std.ownership.copyable(T) and movable(T) expose these signature tests as
+# compile-time Boolean helpers, usable in where clauses or ordinary expressions.
+# Copy and move are independent; testing a capability does not invoke its hook.
 
 
 # Variants

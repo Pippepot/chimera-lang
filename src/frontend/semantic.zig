@@ -1956,11 +1956,19 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         fn matchNameIsType(self: *Self, index: structures.Node.Index) !bool {
             const name = tokenText(self.ast, self.source, self.ast.nodes[index.index()].token_index);
             if (std.mem.eql(u8, name, "_")) return false;
-            if (self.locals.get(name)) |local| return switch (local) {
-                .type_value => true,
-                .static_value => |value| (try self.analysis_context.lookupCompileTimeValue(value)) == .type,
-                .value, .place, .runtime_capture => false,
-            };
+            return self.expressionIsType(index);
+        }
+
+        fn expressionIsType(self: *Self, index: structures.Node.Index) !bool {
+            const node = self.ast.nodes[index.index()];
+            if (node.tag == .identifier or node.tag == .type) {
+                const name = tokenText(self.ast, self.source, node.token_index);
+                if (self.locals.get(name)) |local| return switch (local) {
+                    .type_value => true,
+                    .static_value => |value| (try self.analysis_context.lookupCompileTimeValue(value)) == .type,
+                    .value, .place, .runtime_capture => false,
+                };
+            }
             const reference = (try self.namedExpression(index)) orelse return false;
             const value = switch (reference) {
                 .constant => |value| value,
@@ -2018,7 +2026,10 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         fn buildVariantMembership(self: *Self, index: structures.Node.Index) !UnresolvedBody.ValueId {
             const node = self.ast.nodes[index.index()];
             const target_type = try self.analyzeTypeOrReject(node.data.node_node.b, .inspection_type_not_supported);
-            if (self.where_condition)
+            const operand_node = self.ast.nodes[node.data.node_node.a.index()];
+            const static_member = operand_node.tag == .field_access and
+                try self.expressionIsType(operand_node.data.node);
+            if (self.where_condition or static_member)
                 return self.appendExpression(index, .{ .static_membership = .{ .operand = node.data.node_node.a, .target_type = target_type } });
             const operand = try self.appendUse(node.data.node_node.a, false);
             return self.appendExpression(index, .{ .variant_membership = .{ .operand = operand, .target_type = target_type } });

@@ -28,8 +28,6 @@ pub func write_all(stream: Stream, imm bytes: BytesView) unit | none
 pub func write_text(stream: Stream, imm text: StringView) unit | none -> write_all(stream, text.as_bytes())
 pub overload print(print_value)
 func print_value(static T: type, imm value: T)
-    const selected_result_3 = write_text(stdout, String(value))
-    if not (selected_result_3 is unit) -> panic "standard output write failed"
-    const selected_result_4 = write_text(stdout, "\n")
-    if not (selected_result_4 is unit) -> panic "standard output newline write failed"
+    if not (write_text(stdout, String(value)) is unit) -> panic "standard output write failed"
+    if not (write_text(stdout, "\n") is unit) -> panic "standard output newline write failed"
 pub func read_bytes(stream: Stream, mut bytes: List(byte), count: int) int | none -> bytes.read_bytes(stream.descriptor, count)

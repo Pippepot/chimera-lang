@@ -100,6 +100,8 @@ const Computation = struct {
     accums: ?*AccumBucket = null,
 };
 
+const PersistedCleanState = enum { visiting, clean, dirty };
+
 const QueryStorage = struct {
     /// Pooled sizes step by a quarter of their octave, wasting at most a
     /// quarter of a retained block: 64, 80, 96, 112, 128, 160, ... 1 MiB.
@@ -796,7 +798,7 @@ pub const Database = struct {
             else => return null,
         };
         const entry = handle.entry;
-        var clean: std.AutoHashMap(*Entry, bool) = .init(db.allocator);
+        var clean: std.AutoHashMap(*Entry, PersistedCleanState) = .init(db.allocator);
         defer clean.deinit();
         if (!(try db.persistedSubtreeClean(entry, &clean))) return null;
         const actual = try fingerprintWith(db.allocator, writeOutputValue, entry);
@@ -861,7 +863,7 @@ pub const Database = struct {
 
         var records: std.ArrayList(*Entry) = .empty;
         defer records.deinit(db.allocator);
-        var clean: std.AutoHashMap(*Entry, bool) = .init(db.allocator);
+        var clean: std.AutoHashMap(*Entry, PersistedCleanState) = .init(db.allocator);
         defer clean.deinit();
         var entries = db.entries.iterator();
         while (entries.next()) |slot| {
@@ -921,14 +923,20 @@ pub const Database = struct {
         if (output.* != null) try ordered.append(db.allocator, entry);
     }
 
-    fn persistedSubtreeClean(db: *Database, entry: *Entry, clean: *std.AutoHashMap(*Entry, bool)) !bool {
-        if (clean.get(entry)) |result| return result;
+    fn persistedSubtreeClean(db: *Database, entry: *Entry, clean: *std.AutoHashMap(*Entry, PersistedCleanState)) !bool {
+        if (clean.get(entry)) |state| {
+            return state == .clean;
+        }
+        // A memo cycle can retain a fallback from a failed dependency. Exclude
+        // the cycle and its ancestors rather than treating an active visit as
+        // clean before every dependency has been checked.
+        try clean.put(entry, .visiting);
         var result = settledLocked(db, entry) and !entry.accums_in_subtree;
         for (entry.memo.deps.keys()) |dependency| {
             if (!result) break;
             result = try db.persistedSubtreeClean(dependency, clean);
         }
-        try clean.put(entry, result);
+        try clean.put(entry, if (result) .clean else .dirty);
         return result;
     }
 

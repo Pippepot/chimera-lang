@@ -1,6 +1,7 @@
 const std = @import("std");
 const test_sources = @import("test_sources");
 const query = test_sources.query;
+const query_codec = test_sources.query_codec;
 const Context = query.Context;
 const Database = query.Database;
 const Handle = query.Handle;
@@ -996,6 +997,79 @@ test "cycles introduced during dependency verification reject retry and recover"
         try db.setInput(NumberInput, 10, 1);
         try db.setInput(NumberInput, 11, 1);
         try testing.expectEqual(@as(u32, 1), (try db.get(DynamicCycleB, 1)).*);
+    }
+}
+
+test "persistence excludes memo cycles and recovers after dependency changes" {
+    const Graph = struct {
+        const Failure = struct {
+            pub const Input = u32;
+            pub const Output = ?u32;
+
+            pub fn run(_: *Context, _: Input) !Output {
+                return error.ExpectedFailure;
+            }
+        };
+        const Node = struct {
+            pub const Input = u32;
+            pub const Output = ?u32;
+            pub const disk_boundary = true;
+
+            pub fn run(ctx: *Context, key: Input) !Output {
+                if (key == 0) {
+                    const value = (try ctx.get(Node, 1)).*;
+                    if ((try ctx.input(NumberInput, 2)).* != 0) {
+                        if (ctx.get(Failure, 0)) |_| {
+                            return error.TestUnexpectedResult;
+                        } else |err| {
+                            if (err != error.ExpectedFailure) return err;
+                        }
+                    }
+                    return value;
+                }
+                if ((try ctx.input(NumberInput, 1)).* == 0) return 0;
+                const value = ctx.get(Node, 0) catch |err| switch (err) {
+                    error.QueryCycle => return 0,
+                    else => return err,
+                };
+                return value.*;
+            }
+        };
+
+        fn countSaved(db: *Database) !u64 {
+            var writer: query_codec.Writer = .{ .allocator = testing.allocator };
+            defer writer.deinit();
+            try db.writeQueries(Node, &writer, .fingerprinted, .{NumberInput}, .{Node});
+            var reader: query_codec.Reader = .{ .allocator = testing.allocator, .bytes = writer.bytes.items };
+            return reader.read(u64);
+        }
+    };
+
+    for ([_]usize{ 1, 4 }) |worker_count| {
+        for ([_]bool{ false, true }) |failed_dependency| {
+            const db = try testDatabase(worker_count);
+            defer db.deinit();
+            try db.addInput(NumberInput, 1, 0);
+            try db.addInput(NumberInput, 2, 0);
+            try testing.expectEqual(@as(?u32, 0), (try db.get(Graph.Node, 0)).*);
+            try testing.expectEqual(2, try Graph.countSaved(db));
+
+            try db.setInput(NumberInput, 1, 1);
+            if (failed_dependency) try db.setInput(NumberInput, 2, 1);
+            try testing.expectEqual(@as(?u32, 0), (try db.get(Graph.Node, 1)).*);
+            try testing.expectEqual(@as(?u32, 0), (try db.get(Graph.Node, 0)).*);
+            try testing.expectEqual(0, try Graph.countSaved(db));
+            const digest = try query.fingerprint(?u32, testing.allocator, 0);
+            try testing.expect((try db.matchPersistedQuery(Graph.Node, 0, digest)) == null);
+            try testing.expect((try db.matchPersistedQuery(Graph.Node, 1, digest)) == null);
+
+            try db.setInput(NumberInput, 1, 0);
+            try db.setInput(NumberInput, 2, 0);
+            try testing.expectEqual(@as(?u32, 0), (try db.get(Graph.Node, 0)).*);
+            try testing.expectEqual(2, try Graph.countSaved(db));
+            try testing.expect((try db.matchPersistedQuery(Graph.Node, 0, digest)) != null);
+            try testing.expect((try db.matchPersistedQuery(Graph.Node, 1, digest)) != null);
+        }
     }
 }
 

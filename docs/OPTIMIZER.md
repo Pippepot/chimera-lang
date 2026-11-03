@@ -205,8 +205,9 @@ reference, owning, or addressable uses retain their normal representation. Use
 facts are indexed once, parameters removed together, and incoming arguments
 rebuilt once per block. A known incoming predicate may bypass an empty join when
 the selected continuation does not use its parameters before re-entering the
-join. Outgoing arguments substitute the incoming values; cleanup is never skipped
-and no payload is fabricated. A boolean join in a diamond may select operands
+join. Predicates and outgoing arguments resolve aliases introduced by earlier
+block merges before substituting incoming values; cleanup is never skipped and
+no payload is fabricated. A boolean join in a diamond may select operands
 already available at the fork without speculating either arm's effects or traps.
 Branch arguments select the matching arm when their branch already determines
 the condition, preserving the other arm's observable exit state.

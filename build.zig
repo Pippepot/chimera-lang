@@ -101,6 +101,7 @@ pub fn build(b: *std.Build) void {
         "tests/query_artifact_test.zig",
         "tests/array_test.zig",
         "tests/collection_test.zig",
+        "tests/sort_test.zig",
         "tests/iteration_test.zig",
         "tests/list_test.zig",
         "tests/tuple_test.zig",

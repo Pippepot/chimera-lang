@@ -517,7 +517,8 @@ const Sweep = struct {
     }
 
     fn incomingValue(self: *Sweep, join: function_ir.Block, edge: structures.FunctionBranch, operand: ValueId) ?ValueId {
-        const position = std.mem.indexOfScalar(ValueId, join.parameters.items, operand) orelse return operand;
+        const value = self.function.find(operand);
+        const position = std.mem.indexOfScalar(ValueId, join.parameters.items, value) orelse return value;
         const argument = self.function.branchArguments(edge)[position];
         if (argument.coerce_to != null) return null;
         return self.function.find(argument.value);

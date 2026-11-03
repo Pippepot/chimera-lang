@@ -408,7 +408,8 @@ fn validReferencePath(db: *query.Database, types: anytype, initial: structures.T
                 if (field >= definition.fields.len) return false;
             },
             .without_variant => |member| if (!try hasVariantMember(types, type_id, member)) return false,
-            .target, .referent => type_id = (try types.borrowElement(type_id)) orelse return false,
+            .target => type_id = (try types.borrowElement(type_id)) orelse return false,
+            .referent => type_id = (try types.borrowElement(type_id)) orelse (try types.storageAccess(type_id)) orelse return false,
             .descendants => return position + 1 == path.len,
         }
     }

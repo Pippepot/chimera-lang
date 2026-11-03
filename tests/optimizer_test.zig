@@ -545,6 +545,23 @@ test "carried exit rotation preserves empty and final range iterations" {
     try testing.expectEqual(@as(usize, 0), count(body, &.{.select}));
 }
 
+test "threaded range exits resolve aliases introduced by block merging" {
+    try Fixture.expectParity(
+        \\func drain(first: int, limit: int) int
+        \\    for _ in (first..limit).reversed() -> ()
+        \\    return 7
+        \\func run() int
+        \\    const first = drain(0, 2)
+        \\    const second = drain(3, 3)
+        \\    const third = drain(5, 2)
+        \\    var values = List(int).new(2)
+        \\    if not (values is List(int)) -> return 90
+        \\    if not (values.append(10) is unit) -> return 91
+        \\    if not (values.append(11) is unit) -> return 92
+        \\    return first + second + third + values[0] + values[1]
+    , 42);
+}
+
 test "terminal range counters prove guarded array bounds and withdraw edited guards" {
     for ([_][]const u8{ "first..=limit", "(first..=limit).reversed()" }) |range| {
         const program = try test_sources.renderTemplate(testing.allocator,
@@ -1228,7 +1245,9 @@ fn countPredicates(body: structures.FunctionBodyAnalysis) usize {
     return total;
 }
 
+// Keep the bulk-loop shape explicit rather than depending on List.filled's implementation.
 const pipeline_source =
+    \\import std.memory.{Allocation}
     \\struct Pair
     \\    copy = trivial
     \\    pub first: int
@@ -1245,16 +1264,20 @@ const pipeline_source =
     \\    if a > b -> return a
     \\    return b
     \\func scan(n: int) int | none
-    \\    var values = List(int).filled(3, n)
-    \\    if not (values is List(int)) -> return none
+    \\    var values = Allocation(int).allocate(n)
+    \\    if not (values is Allocation(int)) -> return none
     \\    var index = 0
+    \\    loop
+    \\        if index == n -> break
+    \\        values.unsafe_initialize(index, 3)
+    \\        index += 1
+    \\    index = 0
     \\    var sum = 0
     \\    loop
-    \\        if index >= values.len() -> break
-    \\        const value = values.get(index)
-    \\        if not (value is int) -> return none
-    \\        sum += value
+    \\        if index >= n -> break
+    \\        sum += values.unsafe_take(index)
     \\        index += 1
+    \\    values.deallocate()
     \\    return sum
     \\func spin(n: int) int
     \\    var index = n

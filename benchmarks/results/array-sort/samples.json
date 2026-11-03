@@ -1,0 +1,276 @@
+{
+  "recorded_at": "2026-11-03T21:05:04.893329+00:00",
+  "revision": "e72300e7dc8e8879b0109d50fc787e45730d6569",
+  "worktree_dirty": true,
+  "size": 65536,
+  "rounds": 8,
+  "samples": 9,
+  "seed": 0,
+  "machine": "Linux-7.2.5-3-omarchy-x86_64-with-glibc2.44",
+  "cpu": "AMD Ryzen 9 3900X 12-Core Processor",
+  "zig": "0.17.0",
+  "cpp": "clang version 22.1.8",
+  "cpp_flags": [
+    "-std=c++17",
+    "-O3",
+    "-DNDEBUG"
+  ],
+  "sources": {
+    "benchmarks/array-sort/main.chi": "d3a3bf3bde242069d5591b9dd294bd72377b1dc3e1d8d6bfb966fa7edde85240",
+    "benchmarks/array-sort/main.cpp": "7ee473b6322bd1f7feb5b4b68c833a8cf853c2a403a732f6c880303e01fa70cb",
+    "benchmarks/array-sort/run.py": "cd1a21a5b46f770866b05864e82e34a61043afe5613354d862032cb5b084de26",
+    "std/array.chi": "6c90cd22bb2b98ecee4f66e2a1a807f3e93c5866baacf9404b686b919b4ccdc2",
+    "std/memory/sort.chi": "6d7d476bf1416bc20410c8cfc896deafbc43c4a86c8b7ca3a398b428f21060ac"
+  },
+  "measurement": "process wall time: startup, fill, sort, verification, cleanup",
+  "results": [
+    {
+      "pattern": "random",
+      "algorithm": "Chimera Array.sort",
+      "seconds": [
+        0.156652687,
+        0.155999056,
+        0.156536783,
+        0.156609768,
+        0.155910471,
+        0.155951658,
+        0.156174893,
+        0.156591245,
+        0.156637541
+      ],
+      "median_seconds": 0.156536783
+    },
+    {
+      "pattern": "random",
+      "algorithm": "C++ std::sort",
+      "seconds": [
+        0.029182956,
+        0.029056783,
+        0.029827982,
+        0.029552953,
+        0.028761765,
+        0.028943281,
+        0.028990309,
+        0.02868863,
+        0.029508651
+      ],
+      "median_seconds": 0.029056783
+    },
+    {
+      "pattern": "random",
+      "algorithm": "C++ std::stable_sort",
+      "seconds": [
+        0.023141601,
+        0.022999347,
+        0.023603798,
+        0.023838063,
+        0.022910393,
+        0.022921323,
+        0.02305988,
+        0.022692949,
+        0.023762514
+      ],
+      "median_seconds": 0.02305988
+    },
+    {
+      "pattern": "sorted",
+      "algorithm": "Chimera Array.sort",
+      "seconds": [
+        0.007333823,
+        0.007288478,
+        0.007280594,
+        0.007407028,
+        0.007325697,
+        0.007330005,
+        0.007348049,
+        0.007804375,
+        0.007733344
+      ],
+      "median_seconds": 0.007333823
+    },
+    {
+      "pattern": "sorted",
+      "algorithm": "C++ std::sort",
+      "seconds": [
+        0.00745134,
+        0.007470085,
+        0.007504539,
+        0.007458754,
+        0.007527131,
+        0.00750506,
+        0.007557247,
+        0.007538993,
+        0.008020996
+      ],
+      "median_seconds": 0.00750506
+    },
+    {
+      "pattern": "sorted",
+      "algorithm": "C++ std::stable_sort",
+      "seconds": [
+        0.012674939,
+        0.012647538,
+        0.012601853,
+        0.012705966,
+        0.012565947,
+        0.012733197,
+        0.012715484,
+        0.012736122,
+        0.014049548
+      ],
+      "median_seconds": 0.012705966
+    },
+    {
+      "pattern": "reversed",
+      "algorithm": "Chimera Array.sort",
+      "seconds": [
+        0.008652848,
+        0.008805863,
+        0.008551641,
+        0.009053161,
+        0.00834089,
+        0.00848686,
+        0.008631669,
+        0.008748095,
+        0.008200119
+      ],
+      "median_seconds": 0.008631669
+    },
+    {
+      "pattern": "reversed",
+      "algorithm": "C++ std::sort",
+      "seconds": [
+        0.007715249,
+        0.007172844,
+        0.007543361,
+        0.007827138,
+        0.007609544,
+        0.007836404,
+        0.007337319,
+        0.007031361,
+        0.006707802
+      ],
+      "median_seconds": 0.007543361
+    },
+    {
+      "pattern": "reversed",
+      "algorithm": "C++ std::stable_sort",
+      "seconds": [
+        0.014585241,
+        0.014866263,
+        0.014620788,
+        0.014750519,
+        0.014131861,
+        0.01444973,
+        0.01398605,
+        0.013920068,
+        0.014215807
+      ],
+      "median_seconds": 0.01444973
+    },
+    {
+      "pattern": "duplicates",
+      "algorithm": "Chimera Array.sort",
+      "seconds": [
+        0.051697716,
+        0.049535856,
+        0.052966309,
+        0.050495616,
+        0.049507774,
+        0.050522166,
+        0.051107932,
+        0.050140768,
+        0.051782714
+      ],
+      "median_seconds": 0.050522166
+    },
+    {
+      "pattern": "duplicates",
+      "algorithm": "C++ std::sort",
+      "seconds": [
+        0.013349981,
+        0.012870883,
+        0.013330405,
+        0.01337642,
+        0.013057048,
+        0.013262709,
+        0.012864761,
+        0.012551149,
+        0.0135434
+      ],
+      "median_seconds": 0.013262709
+    },
+    {
+      "pattern": "duplicates",
+      "algorithm": "C++ std::stable_sort",
+      "seconds": [
+        0.019891103,
+        0.019716659,
+        0.02093505,
+        0.020593416,
+        0.019930146,
+        0.020273182,
+        0.019952226,
+        0.020043636,
+        0.020529207
+      ],
+      "median_seconds": 0.020043636
+    },
+    {
+      "pattern": "runs",
+      "algorithm": "Chimera Array.sort",
+      "seconds": [
+        0.052036935,
+        0.049630272,
+        0.054079133,
+        0.049965354,
+        0.048165135,
+        0.048171627,
+        0.04913855,
+        0.048015187,
+        0.048277342
+      ],
+      "median_seconds": 0.04913855
+    },
+    {
+      "pattern": "runs",
+      "algorithm": "C++ std::sort",
+      "seconds": [
+        0.008961341,
+        0.008469269,
+        0.009217306,
+        0.00921426,
+        0.008355237,
+        0.008540531,
+        0.008791667,
+        0.00826518,
+        0.00867014
+      ],
+      "median_seconds": 0.00867014
+    },
+    {
+      "pattern": "runs",
+      "algorithm": "C++ std::stable_sort",
+      "seconds": [
+        0.012907491,
+        0.01298286,
+        0.013778546,
+        0.012861385,
+        0.012742354,
+        0.012703331,
+        0.012742595,
+        0.012703261,
+        0.012411721
+      ],
+      "median_seconds": 0.012742595
+    }
+  ],
+  "compiler_sha256": "5be9f4e095e231cfbf8a7a0416ee4474dc04f2f4428f2205f3d16a4c1dfc10ce",
+  "cpp_library": [
+    "#define _GLIBCXX_RELEASE 16",
+    "#define __GLIBCXX__ 20260810"
+  ],
+  "affinity": [
+    4
+  ]
+}

@@ -1,14 +1,30 @@
-import std.memory.{Span, SpanIterator}
+import std.memory.{List, Span, SpanIterator}
 import std.range.{Range, FromEnd}
 import std.search
+import std.ownership.{copyable, movable}
 
 pub struct collection_literal(T: type, N: int)
     move = none
     copy = none
 
 pub struct Array(T: type, N: int)
-    pub func filled(imm value: T) Array(T, N) where T.copy is func(imm T) T -> array_filled(T, N, value)
+    pub func filled(imm value: T) Array(T, N) where copyable(T) -> array_filled(T, N, value)
     pub func len(imm self: Array(T, N)) int -> N
+    pub func reverse(mut self: Array(T, N)) unit where movable(T)
+        var view = self.span()
+        view.reverse()
+    func sort_default(mut self: Array(T, N)) unit where movable(T)
+        var view = self.span()
+        return view.sort()
+    func sort_by(mut self: Array(T, N), before: func(imm T, imm T) bool) unit where movable(T)
+        var view = self.span()
+        return view.sort(before)
+    pub overload sort(sort_default, sort_by)
+    func sorted_default(imm self: Array(T, N)) List(T) | none where copyable(T) and movable(T)
+        return self.span().sorted()
+    func sorted_by(imm self: Array(T, N), before: func(imm T, imm T) bool) List(T) | none where copyable(T) and movable(T)
+        return self.span().sorted(before)
+    pub overload sorted(sorted_default, sorted_by)
     pub func span(ref self: Array(T, N)) Span(T) -> Span(T).from_array(N, self)
     func index_of_equal(static Needle: type, imm self: Array(T, N), imm needle: Needle) int | none -> std.search.index_of(self.span(), needle)
     func index_of_by(static Needle: type, imm self: Array(T, N), imm needle: Needle, matches: func(imm T, imm Needle) bool) int | none -> std.search.index_of(self.span(), needle, matches)

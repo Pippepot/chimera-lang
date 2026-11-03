@@ -51,27 +51,25 @@ pub struct BytesView
                 var continuation = 0
                 var minimum = 128
                 var maximum = 191
-                if first >= 194 and first <= 223 -> continuation = 1
-                else if first >= 224 and first <= 239
-                    continuation = 2
-                    if first == 224 -> minimum = 160
-                    if first == 237 -> maximum = 159
-                else if first >= 240 and first <= 244
-                    continuation = 3
-                    if first == 240 -> minimum = 144
-                    if first == 244 -> maximum = 143
-                else return none
+                match first
+                    194..=223 -> continuation = 1
+                    224..=239 ->
+                        continuation = 2
+                        if first == 224 -> minimum = 160
+                        if first == 237 -> maximum = 159
+                    240..=244 ->
+                        continuation = 3
+                        if first == 240 -> minimum = 144
+                        if first == 244 -> maximum = 143
+                    _ -> return none
                 if continuation > self.byte_length() - index -> return none
                 const second = byte_int(self[index])
                 if second < minimum or second > maximum -> return none
                 index += 1
-                continuation -= 1
-                loop
-                    if continuation == 0 -> break
+                for _ in 1..continuation
                     const next = byte_int(self[index])
                     if next < 128 or next > 191 -> return none
                     index += 1
-                    continuation -= 1
         return StringView{bytes = self}
 
 pub struct StringView
@@ -131,26 +129,25 @@ pub struct String
         const text = bytes.validate_utf8()
         if not (text is StringView) -> return none
         var result = String.empty()
-        const selected_result_10 = result.append(text)
-        if not (selected_result_10 is unit) -> return none
+        if not (result.append(text) is unit) -> return none
         return result^
     pub func empty() String -> String{storage = ""}
     pub func byte_length(imm self: String) int
-        if self.storage is StaticString -> return self.storage.byte_length()
-        if self.storage is OwnedBytes -> return self.storage.size
-        panic "invalid String storage"
+        return match self.storage
+            StaticString -> self.storage.byte_length()
+            OwnedBytes -> self.storage.size
     pub func capacity(imm self: String) int
-        if self.storage is StaticString -> return self.storage.byte_length()
-        if self.storage is OwnedBytes -> return self.storage.allocation.capacity()
-        panic "invalid String storage"
+        return match self.storage
+            StaticString -> self.storage.byte_length()
+            OwnedBytes -> self.storage.allocation.capacity()
     pub func as_bytes(imm self: String) BytesView
-        if self.storage is StaticString -> return self.storage.as_bytes()
-        if self.storage is OwnedBytes
-            ref owned = self.storage
-            const bytes = BytesView.unsafe_from_allocation(owned.allocation, owned.size)
-            if not (bytes is BytesView) -> panic "invalid String byte view"
-            return bytes
-        panic "invalid String storage"
+        match self.storage
+            StaticString -> return self.storage.as_bytes()
+            OwnedBytes ->
+                ref owned = self.storage
+                const bytes = BytesView.unsafe_from_allocation(owned.allocation, owned.size)
+                if not (bytes is BytesView) -> panic "invalid String byte view"
+                return bytes
     pub func view(imm self: String) StringView -> StringView{bytes = self.as_bytes()}
     pub func find(imm self: String, imm needle: StringView) int | none -> self.view().find(needle)
     pub func contains(imm self: String, imm needle: StringView) bool -> self.view().contains(needle)
@@ -166,11 +163,8 @@ pub struct String
         if not (storage is Allocation(byte)) -> return none
         var replacement = OwnedBytes{allocation = storage^, size = 0}
         const bytes = self.as_bytes()
-        var index = 0
-        loop
-            if index == size -> break
+        for index in 0..size
             unsafe_initialize(byte, replacement.allocation, index, bytes[index])
-            index += 1
         replacement.size = size
         self.storage = replacement^
         return unit
@@ -185,33 +179,26 @@ pub struct String
             if capacity <= 1073741823 -> capacity *= 2
             else capacity = 2147483647
             if capacity < required -> capacity = required
-        const selected_result_13 = self.reserve(capacity)
-        if not (selected_result_13 is unit) -> return none
+        if not (self.reserve(capacity) is unit) -> return none
         const bytes = text.as_bytes()
         if self.storage is OwnedBytes
             ref owned = self.storage
-            var index = 0
-            loop
-                if index == count -> break
+            for index in 0..count
                 unsafe_initialize(byte, owned.allocation, size + index, bytes[index])
-                index += 1
             owned.size = required
             return unit
         panic "invalid String storage during append"
     pub func clone(imm self: String) String | none
         var result = String.empty()
-        const selected_result_14 = result.append(self.view())
-        if not (selected_result_14 is unit) -> return none
+        if not (result.append(self.view()) is unit) -> return none
         return result^
 
 func equal_bytes(imm left: BytesView, imm right: BytesView) bool
     const count = left.byte_length()
     if count <> right.byte_length() -> return false
-    var index = 0
-    loop
-        if index == count -> return true
+    for index in 0..count
         if byte_int(left[index]) <> byte_int(right[index]) -> return false
-        index += 1
+    return true
 func match_literal(static T: type, imm value: T, imm literal: StaticString) bool -> equal_bytes(value.as_bytes(), literal.as_bytes())
 
 pub converter(imm value: StaticString) String -> String{storage = value}
@@ -221,13 +208,9 @@ pub converter(imm value: String) StringView -> value.view()
 pub converter(imm value: String) BytesView -> value.as_bytes()
 pub converter(imm value: StringView) String
     var result = String.empty()
-    const selected_result_15 = result.append(value)
-    if not (selected_result_15 is unit) -> panic "string conversion allocation failed"
+    if not (result.append(value) is unit) -> panic "string conversion allocation failed"
     return result^
-pub converter(value: int) String
-    const result = format_integer(value)
-    if not (result is String) -> panic "string conversion allocation failed"
-    return result^
+pub converter(value: int) String -> require_string(format_integer(value))
 pub converter(value: byte) String -> String(byte_int(value))
 pub converter(value: bool) String -> if value -> "true" else "false"
 pub converter(value: unit) String -> "()"
@@ -235,27 +218,17 @@ pub converter(value: none) String -> "none"
 pub converter(static T: type, static N: int, init value: collection_literal(T, N)) String
     const values: Array(T, N) = value
     return String(values)
-pub converter(static T: type, static N: int, imm value: Array(T, N)) String
-    const result = format_span(value.span())
-    if not (result is String) -> panic "string conversion allocation failed"
-    return result^
-pub converter(static T: type, imm value: List(T)) String
-    const result = format_span(value.span())
-    if not (result is String) -> panic "string conversion allocation failed"
-    return result^
-pub converter(static T: type, imm value: Span(T)) String
-    const result = format_span(value)
-    if not (result is String) -> panic "string conversion allocation failed"
-    return result^
+pub converter(static T: type, static N: int, imm value: Array(T, N)) String -> require_string(format_span(value.span()))
+pub converter(static T: type, imm value: List(T)) String -> require_string(format_span(value.span()))
+pub converter(static T: type, imm value: Span(T)) String -> require_string(format_span(value))
 pub converter(imm value: BytesView) String -> String(value.as_span())
-pub converter(static T: type, imm value: Box(T)) String
-    const result = format_wrapped("Box(", value.borrow())
-    if not (result is String) -> panic "string conversion allocation failed"
-    return result^
-pub converter(static T: type, imm value: Ref(T)) String
-    const result = format_wrapped("Ref(", value.value)
-    if not (result is String) -> panic "string conversion allocation failed"
-    return result^
+pub converter(static T: type, imm value: Box(T)) String -> require_string(format_wrapped("Box(", value.borrow()))
+pub converter(static T: type, imm value: Ref(T)) String -> require_string(format_wrapped("Ref(", value.value))
+
+func require_string(deinit result: String | none) String
+    match result
+        String -> return result^
+        none -> panic "string conversion allocation failed"
 
 func format_integer(value: int) String | none
     const storage = allocate(byte, 11)
@@ -283,20 +256,14 @@ func format_span(static T: type, imm values: Span(T)) String | none
     var result = "["
     var separator: StringView = ""
     for value in values
-        const selected_result_23 = result.append(separator)
-        if not (selected_result_23 is unit) -> return none
-        const selected_result_24 = result.append(String(value))
-        if not (selected_result_24 is unit) -> return none
+        if not (result.append(separator) is unit) -> return none
+        if not (result.append(String(value)) is unit) -> return none
         separator = ", "
-    const selected_result_25 = result.append("]")
-    if not (selected_result_25 is unit) -> return none
+    if not (result.append("]") is unit) -> return none
     return result^
 func format_wrapped(static T: type, imm prefix: StringView, imm value: T) String | none
     var result = String.empty()
-    const selected_result_26 = result.append(prefix)
-    if not (selected_result_26 is unit) -> return none
-    const selected_result_27 = result.append(String(value))
-    if not (selected_result_27 is unit) -> return none
-    const selected_result_28 = result.append(")")
-    if not (selected_result_28 is unit) -> return none
+    if not (result.append(prefix) is unit) -> return none
+    if not (result.append(String(value)) is unit) -> return none
+    if not (result.append(")") is unit) -> return none
     return result^

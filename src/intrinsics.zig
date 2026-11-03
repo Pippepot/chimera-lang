@@ -159,6 +159,7 @@ pub fn validExternalSignature(facts: anytype, symbol: standard_library.External,
         .allocation_count => return hasShape(signature, &.{.imm}) and signature.return_type == .int and
             (try facts.allocationElement(signature.parameters[0].type_id)) != null,
         .unsafe_initialize, .initialize_collection_element, .unsafe_take, .unsafe_destroy, .unsafe_borrow => return validAllocationAccessSignature(facts, symbol, signature),
+        .cursor_take, .cursor_initialize, .cursor_destroy => return validCursorAccessSignature(facts, symbol, signature),
     }
 }
 
@@ -210,6 +211,25 @@ fn validArrayFilledSignature(facts: anytype, signature: structures.FunctionSigna
     if (!hasShape(signature, &.{.imm})) return false;
     const array = (try facts.arrayType(signature.return_type)) orelse return false;
     return signature.parameters[0].type_id == array.element_type;
+}
+
+fn validCursorAccessSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
+    if (signature.parameters.len != (if (symbol == .cursor_initialize) @as(usize, 3) else 2)) return false;
+    if (!hasShape(signature, if (symbol == .cursor_initialize) &.{ .mut, .imm, .deinit } else &.{ .mut, .imm })) return false;
+    const element_type = (try facts.storageCursorAccess(signature.parameters[0].type_id)) orelse return false;
+    if (signature.parameters[1].type_id != .int) return false;
+    switch (symbol) {
+        .cursor_take => {
+            const capabilities = (try facts.ownershipCapabilities(element_type)) orelse return false;
+            return capabilities.move != .none and signature.return_type == element_type;
+        },
+        .cursor_initialize => {
+            const capabilities = (try facts.ownershipCapabilities(element_type)) orelse return false;
+            return capabilities.move != .none and signature.return_type == .unit and signature.parameters[2].type_id == element_type;
+        },
+        .cursor_destroy => return signature.return_type == .unit,
+        else => unreachable,
+    }
 }
 
 fn validCursorSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {

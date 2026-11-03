@@ -14,6 +14,7 @@ pub const File = enum(u32) {
     math,
     primitives,
     search,
+    memory_sort,
 
     pub fn path(file: File) []const u8 {
         return switch (file) {
@@ -30,6 +31,7 @@ pub const File = enum(u32) {
             .math => "math.chi",
             .primitives => "primitives.chi",
             .search => "search.chi",
+            .memory_sort => "memory/sort.chi",
         };
     }
 
@@ -74,6 +76,9 @@ pub const External = enum {
     cursor_offset,
     cursor_element,
     cursor_attenuate,
+    cursor_take,
+    cursor_initialize,
+    cursor_destroy,
     byte_int,
     io_read,
     io_write,
@@ -90,7 +95,7 @@ pub const External = enum {
             .copy_value, .move_value => .ownership,
             .array_filled, .array_borrow => .array,
             .allocate_host_storage, .deallocate_host_storage => .memory_host,
-            .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => .memory_allocation,
+            .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => .memory_allocation,
             .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow, .initialize_collection, .initialize_collection_element, .static_iteration_item => .memory_allocation,
         };
     }

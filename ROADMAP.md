@@ -11,13 +11,9 @@ diagnostics, execution, ownership, and incremental/cache behavior.
 
 ### Basic collection algorithms
 
-- `swap`, `reverse`, and `sort` need not wait for Map/Set. Define support for
-  noncopyable and reference-containing elements, comparator access and
-  fallibility, stability, failure guarantees, and mutating versus value-returning
-  APIs.
-- Build pull-iterator utilities in the standard library: `zip`, `enumerate`,
-  `pairwise`, `windows`, and `chunks`; algorithms `map`, `filter`, `find`, `any`,
-  `all`, and `sorted`; numerical helpers `min`, `max`, and `clamp`.
+- Build pull-iterator utilities in the standard library: `zip` and `enumerate`;
+  algorithms `map`, `filter`, `find`, `any`, `all`, and `sorted`; make numerical
+  helpers `min`, `max`, and `clamp` generic. Use `T | none` for `find`.
 
 ### Collections
 
@@ -53,6 +49,8 @@ diagnostics, execution, ownership, and incremental/cache behavior.
 - Contextual enum shorthand (`.Red`); define name resolution and inference.
 - Generator suspension/yield syntax only if ordinary cursor composition proves
   insufficient; preserve item ownership, lending lifetimes, and failure effects.
+- Buffered iterator adapters `pairwise`, `windows`, and `chunks`: settle retained
+  item ownership, overlapping views, lending lifetimes, and partial chunks.
 - Publication of compile-time allocations into static/runtime storage: define
   serialization, relocation, mutability, and ownership before allowing escape.
 - Local `static` declarations. Remove `comptime` only after verified equivalence

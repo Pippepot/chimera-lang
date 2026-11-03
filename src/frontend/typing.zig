@@ -209,6 +209,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 readonly_owned: structures.TypeId,
                 widen,
                 read: struct { state: StateId, instruction: u31 },
+                referent: struct { state: StateId, attenuate_readonly: bool },
                 relocate_read: struct { from: u31, to: u31 },
                 refresh_written: StateId,
                 refresh: struct { root: semantic.UnresolvedBody.LocalId, previous: BindingIdentity, replacement: BindingIdentity, storage_replacement: ?BindingIdentity = null, preserved_storage_depth: u32 = std.math.maxInt(u32) },
@@ -246,6 +247,33 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             flow_handle: ?FlowHandle = null,
             transform: ?u32 = null,
             next: ?u32 = null,
+        };
+        const ReferenceExpansion = struct {
+            const Path = struct { key: u32, parent: ?u32 };
+            const Key = struct { origins: u32, path: ?u32 };
+            const Result = struct { origins: ?u32, incomplete: bool };
+
+            visiting: std.ArrayList(u32) = .empty,
+            path: ?u32 = null,
+            paths: std.AutoArrayHashMapUnmanaged(Path, void) = .empty,
+            memo: std.AutoHashMapUnmanaged(Key, Result) = .empty,
+
+            fn enter(self: *@This(), allocator: std.mem.Allocator, key: u32) !void {
+                const path = try self.paths.getOrPut(allocator, .{ .key = key, .parent = self.path });
+                try self.visiting.append(allocator, key);
+                self.path = @intCast(path.index);
+            }
+
+            fn leave(self: *@This()) void {
+                self.path = self.paths.keys()[self.path.?].parent;
+                _ = self.visiting.pop();
+            }
+
+            fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+                self.visiting.deinit(allocator);
+                self.paths.deinit(allocator);
+                self.memo.deinit(allocator);
+            }
         };
         const BindingIdentity = union(enum) { unknown, fixed: u32, join: u32 };
         const ReferenceRefresh = union(enum) { value: *?u32, slots: *?u32 };
@@ -1073,7 +1101,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .variant => |member| return member,
                 .element, .element_at => return self.referencePathElementType(type_id),
                 .without_element, .without_field, .without_variant => return type_id,
-                .target, .referent => return self.analysis_context.facts().borrowElement(type_id),
+                .target => return self.analysis_context.facts().borrowElement(type_id),
+                .referent => return (try self.analysis_context.facts().borrowElement(type_id)) orelse try self.analysis_context.facts().storageAccess(type_id),
                 .descendants => return null,
             }
         }
@@ -1139,6 +1168,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .array_filled => self.buildArrayFilled(),
                 .array_borrow => self.buildArrayBorrow(),
                 .unsafe_borrow, .unsafe_take, .unsafe_destroy => self.buildMemoryOperation(builtin.symbol),
+                .cursor_take, .cursor_initialize, .cursor_destroy => self.buildCursorMemoryOperation(builtin.symbol),
                 .literal_byte => self.buildLiteralByte(),
                 .byte_int => self.returnValue(try self.appendInstruction(.{ .byte_to_int = self.values.get(0).?.id }), .{ .start = 0, .end = 0 }),
                 .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => self.buildCursorOperation(builtin.symbol),
@@ -1422,6 +1452,53 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             try self.updateLocal(0, .{ .reference_origins = try self.transformReferenceOrigins(source.reference_origins, .{ .exclude = step }) });
             if (destroying) return self.finishFunctionExit(span, .return_unit);
             return self.returnValue(element, span);
+        }
+
+        fn buildCursorMemoryOperation(self: *Self, operation: standard_library.External) !void {
+            if (self.return_type == .never) return self.terminate(.diverge);
+            const span = self.unresolved.parameter_spans[0];
+            const source = self.borrowLocalValue(@fromBackingInt(@as(u32, 0)));
+            const element_type = (try self.analysis_context.facts().storageCursorAccess(source.type_id)) orelse unreachable;
+            const capabilities = (try self.analysis_context.facts().ownershipCapabilities(element_type)) orelse return error.Unavailable;
+            var reference = try self.appendInstruction(.{ .cursor_element = .{
+                .cursor = source.id,
+                .index = self.values.get(1).?.id,
+                .type_id = try self.analysis_context.facts().referenceType(element_type),
+            } });
+            reference.reference_origins = source.reference_origins;
+            reference.writable = source.writable;
+            try self.requireWritableOrigins(reference.reference_origins, span);
+            try self.reference_writes.append(self.gpa, .{
+                .origins = reference.reference_origins,
+                .written_type = element_type,
+                .ends_lifetime = operation != .cursor_initialize,
+            });
+            // borrow_read projects the slot without loading its contents. Initialization
+            // may therefore use it as the destination of an uninitialized element.
+            var element = try self.appendInstruction(.{ .borrow_read = .{ .source = reference.id, .type_id = element_type } });
+            switch (operation) {
+                .cursor_initialize => {
+                    // The immutable index has no local; the consuming item is local 1.
+                    const item = self.state.values.get(1).?;
+                    if (capabilities.needs_custom_move) try self.reference_exclusions.append(self.gpa, .{ .reference = item.reference_origins, .invalidation = reference.reference_origins, .span = span });
+                    const result = try self.moveValue(item, span, element);
+                    try self.recordConsume(result);
+                    try self.storeReferenceContents(reference, result.reference_origins);
+                    return self.finishFunctionExit(span, .return_unit);
+                },
+                .cursor_take, .cursor_destroy => {
+                    if (try self.analysis_context.facts().canStoreBorrow(element_type)) element.reference_origins = try self.referenceContents(reference, null);
+                    element.place_origins = reference.reference_origins;
+                    try self.storeReferenceContents(reference, null);
+                    if (operation == .cursor_destroy) {
+                        try self.dropValue(element, true, span);
+                        return self.finishFunctionExit(span, .return_unit);
+                    }
+                    if (capabilities.needs_custom_move) try self.reference_exclusions.append(self.gpa, .{ .reference = element.reference_origins, .invalidation = reference.reference_origins, .span = span });
+                    return self.returnValue(try self.moveValue(element, span, null), span);
+                },
+                else => unreachable,
+            }
         }
 
         fn buildArrayBorrow(self: *Self) !void {
@@ -4721,7 +4798,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             switch (operation) {
                 .prefix, .select, .exclude, .source_path => |*step| step.* = self.importInitializerStep(step.*, captures),
                 .readonly, .readonly_owned, .widen, .without_result, .guard_result => {},
-                .read, .relocate_read, .refresh, .refresh_written, .place => unreachable,
+                .read, .referent, .relocate_read, .refresh, .refresh_written, .place => unreachable,
             }
             return self.transformReferenceOrigins(previous, operation);
         }
@@ -4750,7 +4827,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
                 try region.referenceSourcePath(origin, &path);
                 var source = capture_origins;
-                for (path.items) |step| source = try self.followReferenceStep(source, origin.source_kind, self.importInitializerStep(step, captures));
+                var source_type: ?structures.TypeId = capture.type_id;
+                for (path.items) |step| source = try self.followReferenceStep(source, origin.source_kind, self.importInitializerStep(step, captures), &source_type);
                 source = try self.importInitializerTransforms(region, captures, source, origin.transform);
                 if (origin.readonly) source = try self.readonlyOrigins(source);
                 if (origin.readonly_owned) |type_id| source = try self.readonlyOwnedOrigins(type_id, source);
@@ -4771,15 +4849,28 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             return result;
         }
 
-        /// Place origins extend their source path; contents origins select within their referents.
-        fn followReferenceStep(self: *Self, origins: ?u32, kind: structures.ReferenceSourceKind, step: structures.ReferencePathStep) !?u32 {
-            return if (kind == .place) self.appendSourcePath(origins, step) else self.transformReferenceOrigins(origins, .{ .select = step });
+        /// A readonly reference attenuates nested effects; readonly collection storage does not attenuate its captured references.
+        fn followReferenceStep(self: *Self, origins: ?u32, kind: structures.ReferenceSourceKind, step: structures.ReferencePathStep, source_type: *?structures.TypeId) !?u32 {
+            const previous_type = source_type.*;
+            const attenuate = if (previous_type) |type_id|
+                step == .referent and (try self.analysis_context.facts().borrowElement(type_id)) != null
+            else
+                false;
+            if (previous_type) |type_id| {
+                const next_type = try self.referencePathStepType(type_id, step);
+                std.debug.assert(next_type != null or step == .descendants);
+                source_type.* = next_type;
+            }
+            if (kind == .place) return self.appendSourcePath(origins, step);
+            if (step == .referent) return self.referenceOriginContentsAt(origins, null, null, attenuate);
+            return self.transformReferenceOrigins(origins, .{ .select = step });
         }
 
         fn requirementOrigins(self: *Self, contract: structures.ReferenceContract, requirement: structures.ReferenceRequirement, arguments: []const CallOriginSource) !?u32 {
             const argument = arguments[requirement.parameter];
             var origins = if (requirement.kind == .place) argument.storage else argument.contained;
-            for (contract.paths[requirement.path.start..requirement.path.end]) |step| origins = try self.followReferenceStep(origins, requirement.kind, self.substituteReferenceStep(step, arguments));
+            var source_type: ?structures.TypeId = argument.type_id;
+            for (contract.paths[requirement.path.start..requirement.path.end]) |step| origins = try self.followReferenceStep(origins, requirement.kind, self.substituteReferenceStep(step, arguments), &source_type);
             return origins;
         }
 
@@ -8509,11 +8600,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn substituteReferenceExclusions(self: *Self, contract: structures.ReferenceContract, arguments: []const CallOriginSource, span: structures.SourceSpan) !void {
-            for (contract.exclusions) |exclusion| try self.reference_exclusions.append(self.gpa, .{
-                .reference = try self.substituteReferenceOrigin(contract, exclusion.reference, arguments),
-                .invalidation = try self.substituteReferenceOrigin(contract, exclusion.invalidation, arguments),
-                .span = span,
-            });
+            for (contract.exclusions) |exclusion| {
+                const reference = try self.substituteReferenceOrigin(contract, exclusion.reference, arguments);
+                const invalidation = try self.substituteReferenceOrigin(contract, exclusion.invalidation, arguments);
+                try self.reference_exclusions.append(self.gpa, .{ .reference = reference, .invalidation = invalidation, .span = span });
+            }
         }
 
         fn referenceReferentStep(path: []const structures.ReferencePathStep) ?usize {
@@ -8525,6 +8616,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             for (contract.requirements) |requirement| {
                 if (requirement.kind != .contents) continue;
                 const written_type = requirement.written_type orelse continue;
+                if (!try self.analysis_context.facts().canStoreBorrow(written_type)) continue;
                 const parameter = requirement.parameter;
                 const target_path = contract.paths[requirement.path.start..requirement.path.end];
                 var output_origins: ?u32 = null;
@@ -8538,8 +8630,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     output_origins = try self.mergeReferenceOrigins(output_origins, origins);
                     found = true;
                 }
-                if (!found) continue;
                 const target_origins = try self.selectReferencePath(sources[parameter].contained, target_path, sources);
+                if (!found) output_origins = try self.referenceOriginContents(target_origins, null);
                 const reference: Value = .{ .id = arguments[parameter].valueId(), .type_id = try self.analysis_context.facts().referenceType(written_type), .reference_origins = target_origins };
                 try self.pending_reference_outputs.append(self.gpa, .{ .reference = reference, .origins = output_origins });
             }
@@ -8614,7 +8706,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .without_result => |place| origin.result_guard = try self.filterResultGuards(origin.result_guard, place, std.math.maxInt(u32)),
                 .guard_result => |guard| origin.result_guard = try self.combineResultGuards(origin.result_guard, try self.resultGuard(.{ .alternative = .{ .place = guard.place, .type_id = guard.type_id } }), true),
                 .widen => {},
-                .read => unreachable,
+                .read, .referent => unreachable,
             }
             if (operation == .widen) origin.projection = null;
             return true;
@@ -8625,14 +8717,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (entry.kind == .place) arguments[parameter].storage else arguments[parameter].contained
             else
                 try self.addReferenceOrigin(null, .{ .permanent = true });
+            var source_type: ?structures.TypeId = if (entry.parameter) |parameter| arguments[parameter].type_id else null;
             for (contract.paths[entry.source_path.start..entry.source_path.end]) |step| {
-                const substituted = self.substituteReferenceStep(step, arguments);
-                origins = if (entry.kind == .place)
-                    try self.appendSourcePath(origins, substituted)
-                else if (step == .referent)
-                    try self.referenceOriginContents(origins, origins)
-                else
-                    try self.transformReferenceOrigins(origins, .{ .select = substituted });
+                origins = try self.followReferenceStep(origins, entry.kind, self.substituteReferenceStep(step, arguments), &source_type);
             }
             if (entry.kind == .place)
                 origins = try self.transformReferenceOrigins(origins, .{ .place = .{ .storage_depth = entry.storage_depth, .variant_guard = entry.variant_guard, .stable = entry.stable, .after_write = entry.after_write } });
@@ -8801,14 +8888,15 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             origin.transform = try self.reference_storage.transform(self.gpa, .{ .operation = operation, .previous = origin.transform });
         }
 
-        fn applyReferenceTransforms(self: *Self, origins: ?u32, transform: ?u32) anyerror!?u32 {
+        fn applyReferenceTransforms(self: *Self, origins: ?u32, transform: ?u32, expansion: *ReferenceExpansion, incomplete: *bool) anyerror!?u32 {
             const index = transform orelse return origins;
             const transformation = self.reference_storage.transforms.keys()[index];
             if (transformation.operation == .without_result)
-                return self.applyReferenceTransforms(try self.transformReferenceOrigins(origins, transformation.operation), transformation.previous);
-            const previous = try self.applyReferenceTransforms(origins, transformation.previous);
+                return self.applyReferenceTransforms(try self.transformReferenceOrigins(origins, transformation.operation), transformation.previous, expansion, incomplete);
+            const previous = try self.applyReferenceTransforms(origins, transformation.previous, expansion, incomplete);
             return switch (transformation.operation) {
                 .read => |read| self.readReferenceOrigins(previous, read.state, read.instruction, false),
+                .referent => |referent| self.expandReferenceOrigins(try self.referenceOriginContentsAt(previous, null, referent.state, referent.attenuate_readonly), expansion, incomplete),
                 else => self.transformReferenceOrigins(previous, transformation.operation),
             };
         }
@@ -9016,9 +9104,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (origin.loop != null or origin.contents != null) break;
             } else return origins;
             if (self.reference_origins_frozen) if (self.resolved_reference_origins.get(origins.?)) |resolved| return resolved;
-            var visiting: std.ArrayList(u32) = .empty;
+            var expansion: ReferenceExpansion = .{};
+            defer expansion.deinit(self.gpa);
             var expanded_incomplete = false;
-            const resolved = try self.expandReferenceOrigins(origins, &visiting, &expanded_incomplete);
+            const resolved = try self.expandReferenceOrigins(origins, &expansion, &expanded_incomplete);
             if (expanded_incomplete) incomplete.* = true else if (self.reference_origins_frozen)
                 try self.resolved_reference_origins.put(self.gpa, origins.?, resolved);
             return resolved;
@@ -9027,10 +9116,20 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn expandReferenceOrigins(
             self: *Self,
             origins: ?u32,
-            visiting: *std.ArrayList(u32),
+            expansion: *ReferenceExpansion,
             incomplete: *bool,
         ) !?u32 {
+            var existing = self.originList(origins);
+            while (existing.next()) |origin| {
+                if (origin.loop != null or origin.contents != null) break;
+            } else return origins;
+            const memo_key: ReferenceExpansion.Key = .{ .origins = origins.?, .path = expansion.path };
+            if (expansion.memo.get(memo_key)) |cached| {
+                if (cached.incomplete) incomplete.* = true;
+                return cached.origins;
+            }
             var resolved: ?u32 = null;
+            var expanded_incomplete = false;
             var expanded_loop = false;
             var current = self.originList(origins);
             while (current.current) |index| {
@@ -9039,24 +9138,24 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     expanded_loop = true;
                     // Contents keys are tagged so they cannot collide with loop indices.
                     const key = if (origin.contents) |contents_index| contents_index | (@as(u32, 1) << 31) else origin.loop.?;
-                    const repeated = std.mem.indexOfScalar(u32, visiting.items, key) != null;
-                    if (!repeated) try visiting.append(self.gpa, key);
+                    const repeated = std.mem.indexOfScalar(u32, expansion.visiting.items, key) != null;
+                    if (!repeated) try expansion.enter(self.gpa, key);
                     var expanded = if (origin.contents) |contents_index| contents: {
                         const contents = self.reference_contents_reads.items[contents_index];
-                        if (!contents.complete) incomplete.* = true;
-                        if (!repeated) break :contents try self.expandReferenceOrigins(contents.origins, visiting, incomplete);
+                        if (!contents.complete) expanded_incomplete = true;
+                        if (!repeated) break :contents try self.expandReferenceOrigins(contents.origins, expansion, &expanded_incomplete);
                         var initial = contents.at.initial;
                         for (contents.path) |step| initial = try self.transformReferenceOrigins(initial, .{ .select = step });
-                        break :contents try self.expandReferenceOrigins(initial, visiting, incomplete);
+                        break :contents try self.expandReferenceOrigins(initial, expansion, &expanded_incomplete);
                     } else loop: {
                         const loop_origins = self.loop_reference_origins.items[origin.loop.?];
-                        if (!loop_origins.complete) incomplete.* = true;
-                        const expanded = try self.expandReferenceOrigins(if (repeated) loop_origins.entry_origins else loop_origins.origins, visiting, incomplete);
+                        if (!loop_origins.complete) expanded_incomplete = true;
+                        const expanded = try self.expandReferenceOrigins(if (repeated) loop_origins.entry_origins else loop_origins.origins, expansion, &expanded_incomplete);
                         break :loop try self.rebaseLoopReadOrigins(expanded, loop_origins.read_checkpoint.?, loop_origins.result_place_limit);
                     };
                     expanded = try self.applyResultGuards(null, expanded, origin.result_guard);
-                    resolved = try self.mergeReferenceOrigins(resolved, try self.applyReferenceTransforms(expanded, origin.transform));
-                    if (!repeated) _ = visiting.pop();
+                    resolved = try self.mergeReferenceOrigins(resolved, try self.applyReferenceTransforms(expanded, origin.transform, expansion, &expanded_incomplete));
+                    if (!repeated) expansion.leave();
                 } else if (resolved == null and current.current == null) {
                     resolved = index;
                 } else if (expanded_loop) {
@@ -9066,6 +9165,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     resolved = try self.reference_storage.prependAssumeUnique(self.gpa, resolved, origin);
                 }
             }
+            try expansion.memo.put(self.gpa, memo_key, .{ .origins = resolved, .incomplete = expanded_incomplete });
+            if (expanded_incomplete) incomplete.* = true;
             return resolved;
         }
 
@@ -9141,14 +9242,25 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn referenceOriginContents(self: *Self, origins: ?u32, fallback: ?u32) !?u32 {
+            return self.referenceOriginContentsAt(origins, fallback, null, false);
+        }
+
+        fn referenceOriginContentsAt(self: *Self, origins: ?u32, fallback: ?u32, state: ?StateId, attenuate_readonly: bool) anyerror!?u32 {
             var result: ?u32 = null;
             var found = false;
             var current = self.originList(origins);
-            while (current.next()) |origin| {
+            while (current.next()) |listed| {
+                var origin = listed;
+                if (origin.loop != null or origin.contents != null) {
+                    try self.deferReferenceTransform(&origin, .{ .referent = .{ .state = state orelse try self.captureState(), .attenuate_readonly = attenuate_readonly } });
+                    result = try self.addReferenceOrigin(result, origin);
+                    found = true;
+                    continue;
+                }
                 if (origin.source_kind == .contents and origin.parameter != null and origin.root == null and origin.projection == null) {
                     const symbolic = try self.addReferenceOrigin(null, origin);
                     const source_type = try self.referenceOriginType(origin);
-                    const contents = if (source_type != null and try self.analysis_context.facts().borrowElement(source_type.?) != null)
+                    const contents = if (source_type != null and ((try self.analysis_context.facts().borrowElement(source_type.?)) orelse try self.analysis_context.facts().storageAccess(source_type.?)) != null)
                         try self.appendSourcePath(symbolic, .referent)
                     else
                         symbolic;
@@ -9157,16 +9269,19 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     continue;
                 }
                 if (origin.source_kind != .place or origin.projection != null) continue;
-                if (self.cleanup_contents_site != null) if (origin.root) |root| {
+                if (state == null and self.cleanup_contents_site != null) if (origin.root) |root| {
                     const initial = self.reference_contents_initials.getEntry(root) orelse return error.Unavailable;
                     var path: std.ArrayList(structures.ReferencePathStep) = .empty;
                     try self.referenceSourcePath(origin, &path);
-                    result = try self.mergeReferenceOrigins(result, try self.deferReferenceContents(root, initial.value_ptr.*, path.items));
+                    var contents = try self.deferReferenceContents(root, initial.value_ptr.*, path.items);
+                    if (attenuate_readonly and origin.readonly) contents = try self.readonlyOrigins(contents);
+                    result = try self.mergeReferenceOrigins(result, contents);
                     found = true;
                     continue;
                 };
+                const values = if (state) |snapshot| self.states.items[@backingInt(snapshot)].values else self.state.values.snapshot();
                 const owner = if (origin.root) |root|
-                    self.state.values.get(@backingInt(root)) orelse continue
+                    values.get(@backingInt(root)) orelse continue
                 else if (origin.parameter != null and origin.parameter.? < self.unresolved.parameter_count)
                     self.values.get(origin.parameter.?) orelse continue
                 else if (origin.frame_type != null and origin.cleanup_value != null and @backingInt(origin.cleanup_value.?) < self.unresolved.parameter_count)
@@ -9177,9 +9292,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
                 try self.referenceSourcePath(origin, &path);
                 var contents = owner.reference_origins;
-                if (self.has_cleanup_outputs and self.current_block != null and origin.root != null) {
+                if (state == null and self.has_cleanup_outputs and self.current_block != null and origin.root != null) {
                     contents = try self.deferReferenceContents(origin.root.?, contents, path.items);
                 } else for (path.items) |step| contents = try self.transformReferenceOrigins(contents, .{ .select = step });
+                if (attenuate_readonly and origin.readonly) contents = try self.readonlyOrigins(contents);
                 result = try self.mergeReferenceOrigins(result, contents);
                 found = true;
             }
@@ -12511,11 +12627,20 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 while (references.next()) |origin| {
                     var mutations = self.originList(invalidations);
                     while (mutations.next()) |mutation| {
-                        if (sharesOriginOwner(origin, mutation) and try self.referenceSourcePathsOverlap(origin, mutation))
+                        if (symbolicContentsOrigin(origin) or symbolicContentsOrigin(mutation)) continue;
+                        if (sharesOriginOwner(origin, mutation) and try self.referenceSourcePathsOverlap(origin, mutation)) {
                             return self.reject(exclusion.span, if (exclusion.match_testing) .match_guard_invalidates_subject else .borrow_outlives_source);
+                        }
                     }
                 }
             }
+        }
+
+        // Reading a reference stored behind a parameter does not establish that
+        // it aliases that parameter's own backing. Export the exclusion until
+        // call-site substitution supplies the referenced owner.
+        fn symbolicContentsOrigin(origin: ReferenceOrigin) bool {
+            return origin.parameter != null and origin.root == null and origin.generation == null and origin.source_kind == .contents;
         }
 
         fn effectAffectsOrigin(self: *Self, site: ReferenceEffectSite, source: ReferenceOrigin) !bool {
@@ -12524,6 +12649,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             var origins = self.originList(try self.completeReferenceOrigins(affected));
             while (origins.next()) |origin| {
                 if (source.stable and !source.deferred_capture and source.storage_depth <= origin.storage_depth) continue;
+                if (!source.deferred_capture and (symbolicContentsOrigin(source) or symbolicContentsOrigin(origin))) continue;
                 if (sharesOriginOwner(source, origin) and try self.referenceSourcePathsOverlap(source, origin)) return true;
                 if (source.deferred_capture and origin.parameter != null and source.root == null and source.generation == null) {
                     if (source.parameter) |parameter| {
@@ -13436,6 +13562,66 @@ test "reference resolution shares concrete singletons and follows changing loop 
         parameters |= @as(u8, 1) << @intCast(origin.parameter.?);
     }
     try std.testing.expectEqual(@as(u8, 0b110), parameters);
+}
+
+test "reference resolution reuses shared nested loop expansions" {
+    var context: TestMaterializerContext = .{ .gpa = std.testing.allocator };
+    defer context.deinit();
+    var builder = testInitMaterializerBuilder(&context);
+    const initial = try builder.addReferenceOrigin(null, .{ .parameter = 0 });
+    const readonly = try builder.reference_storage.transform(builder.gpa, .{ .operation = .readonly, .previous = null });
+    for (0..18) |index| try builder.loop_reference_origins.append(builder.gpa, .{
+        .slot = @intCast(index),
+        .origins = initial,
+        .entry_origins = initial,
+        .read_checkpoint = 0,
+        .complete = true,
+    });
+    for (0..17) |index| {
+        const next: u32 = @intCast(index + 1);
+        const plain = try builder.addReferenceOrigin(null, .{ .loop = next });
+        builder.loop_reference_origins.items[index].origins = try builder.addReferenceOrigin(plain, .{ .loop = next, .transform = readonly });
+    }
+    const root = try builder.addReferenceOrigin(null, .{ .loop = 0 });
+    var origins = builder.originList(try builder.completeReferenceOrigins(root));
+    var permissions: u8 = 0;
+    while (origins.next()) |origin| {
+        try std.testing.expectEqual(@as(?u32, 0), origin.parameter);
+        permissions |= if (origin.readonly) 1 else 2;
+    }
+    try std.testing.expectEqual(@as(u8, 3), permissions);
+    try std.testing.expect(builder.reference_storage.origins.items.len < 4096);
+}
+
+test "reference resolution keeps cycle cuts specific to each expansion path" {
+    var context: TestMaterializerContext = .{ .gpa = std.testing.allocator };
+    defer context.deinit();
+    var builder = testInitMaterializerBuilder(&context);
+    const first = try builder.addReferenceOrigin(null, .{ .parameter = 0 });
+    const second = try builder.addReferenceOrigin(null, .{ .parameter = 1 });
+    try builder.loop_reference_origins.append(builder.gpa, .{
+        .slot = 0,
+        .origins = null,
+        .entry_origins = first,
+        .read_checkpoint = 0,
+        .complete = true,
+    });
+    try builder.loop_reference_origins.append(builder.gpa, .{
+        .slot = 1,
+        .origins = null,
+        .entry_origins = second,
+        .read_checkpoint = 0,
+        .complete = true,
+    });
+    const next = try builder.addReferenceOrigin(null, .{ .loop = 1 });
+    builder.loop_reference_origins.items[0].origins = try builder.addReferenceOrigin(next, .{ .parameter = 2 });
+    const previous = try builder.addReferenceOrigin(null, .{ .loop = 0 });
+    builder.loop_reference_origins.items[1].origins = try builder.addReferenceOrigin(previous, .{ .parameter = 3 });
+    const root = try builder.addReferenceOrigin(previous, .{ .loop = 1 });
+    var origins = builder.originList(try builder.completeReferenceOrigins(root));
+    var parameters: u8 = 0;
+    while (origins.next()) |origin| parameters |= @as(u8, 1) << @intCast(origin.parameter.?);
+    try std.testing.expectEqual(@as(u8, 0b1111), parameters);
 }
 
 test "cleanup materializer preserves effect identities across moves and repeated splits" {

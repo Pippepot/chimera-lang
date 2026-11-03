@@ -32,6 +32,16 @@ belong to the operation using that position. Cursor offsets are
 a separate operation and can be negative. Native addressing trusts these
 contracts rather than repeating source checks.
 
+Private cursor storage operations reuse cursor-element and borrow-read IR to
+project a slot without reading its contents. Taking and consuming initialization
+use ordinary ownership moves, including custom hooks; destruction runs in place.
+Library algorithms own bounds and slot-initialization proofs. Reference contracts
+distinguish a cursor's backing dependency from references stored in its elements
+through referent paths. Alias exclusions involving a symbolic stored reference
+remain obligations until call-site substitution supplies its actual owner.
+Substituting a referent path follows stored references rather than treating a
+write through them as a write to the cursor's backing slot.
+
 Published results are deeply immutable. Construction graphs, mutable analyses,
 and finalization views remain local to their computation; neither source pointers
 nor interpreter frame pointers may escape into cached results.
@@ -254,6 +264,8 @@ reporter.
 Places retain typed projections and storage identity rather than byte offsets.
 Reference fields store addresses while exposing their logical referents.
 Permission follows the captured referent, not the mutability of its carrier.
+Substituting effects through a readonly reference attenuates nested writes;
+readonly collection backing does not attenuate independent captured references.
 Slot identity, owned-object generations, content versions, and active-tag proofs
 are separate; replacing contents need not invalidate a stable slot address.
 
@@ -354,6 +366,8 @@ The interpreter owns logical cells, allocation records, snapshots, and an
 evaluation heap shared by calls and initializer regions. Released backing becomes
 invalid while cell identities remain tombstones until teardown. Frame recursion
 compares logical snapshots while preserving aliases and allocation identity.
+Transient-call snapshots use reclaimable per-frame arenas, not query-long scratch,
+so repeated calls release their snapshot storage before the enclosing query ends.
 Execution errors retain source spans and call notes; compile-time `exit` is
 compiler control, not an ordinary result.
 
@@ -369,9 +383,11 @@ Arrays store elements inline; Lists own an allocation and initialized prefix;
 Allocation owns deallocation facts rather than element initialization state.
 Box, Ref, Span, and text wrappers use ordinary declarations over validated storage
 primitives. Construction and relocation use typed destinations, hooks, and cleanup.
-Recoverable APIs return ordinary optional values; implicit allocation failure
-panics. Zero-byte host allocations reserve a distinct stable address without
-changing logical count or layout.
+Recoverable APIs return ordinary optional values. Explicit allocation and owned
+storage growth can return allocation refusal; internal auxiliary allocations in
+library algorithms panic on failure without adding optional results. Implicit
+allocation failure also panics. Zero-byte host allocations reserve a distinct
+stable address without changing logical count or layout.
 
 Span holds a typed cursor and length. Checked views retain permissions and
 content dependencies; mutable handles cannot upgrade readonly captures. Static
@@ -399,7 +415,9 @@ successful calls need no tracing instructions.
 module directories, and compiler identity. A miss may restore intern identities
 and query outputs for a compatible file mapping. Representation and dependency
 validation precede publication; damaged or stale state falls back to computation.
-Successful writes replace caches atomically.
+Only settled, accumulator-free, acyclic dependency subgraphs are persisted or
+matched: memo cycles can retain a fallback from a failed dependency, so their
+dependents must be recomputed. Successful writes replace caches atomically.
 
 Ordinary runs independently install the embedded std bundle. Byte-identical std
 text can reuse embedded parsed syntax; edited text uses normal parsing. Bundled

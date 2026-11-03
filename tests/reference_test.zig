@@ -803,6 +803,45 @@ test "references readonly recursive owners preserve captured authority when forw
     , 42);
 }
 
+test "references retain nested readonly authority through looped forwarding and edits" {
+    const declarations =
+        \\struct Holder
+        \\    target: Ref(int)
+        \\func update(imm handle: Ref(Holder))
+        \\    var current = handle
+        \\    var remaining = 2
+        \\    loop
+        \\        if remaining == 0 -> break
+        \\        current.value.target.value += 1
+        \\        current = handle
+        \\        remaining -= 1
+        \\func run() int
+        \\    var target = 40
+        \\    var owner = Holder{target = Ref.from(target)}
+        \\    const handle = Ref.from(owner)
+        \\    update(handle)
+        \\    return target
+    ;
+    try Fixture.expectParity(declarations, 42);
+    const source = try std.fmt.allocPrint(std.testing.allocator, "{s}\nexit(run())", .{declarations});
+    defer std.testing.allocator.free(source);
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+
+    const readonly_owner = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var owner =", "const owner =");
+    defer std.testing.allocator.free(readonly_owner);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, readonly_owner);
+    try fixture.expectDiagnostic(0, .reference_not_writable);
+
+    const readonly_target = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var target = 40", "const target = 40");
+    defer std.testing.allocator.free(readonly_target);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, readonly_target);
+    try fixture.expectDiagnostic(0, .reference_not_writable);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+}
+
 test "references readonly recursive owners cannot upgrade owned views" {
     try Fixture.expectAnySourceDiagnostic(
         \\struct Node
