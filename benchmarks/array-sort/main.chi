@@ -1,6 +1,9 @@
 import std.io.{stdin, read_bytes}
 
 static SIZE = 65536
+static RUNTIME_COMPARATOR = false
+
+func before(imm left: int, imm right: int) bool -> left < right
 
 func benchmark(pattern: int, rounds: int, seed: int)
     var values = Array(int, SIZE).filled(0)
@@ -15,7 +18,10 @@ func benchmark(pattern: int, rounds: int, seed: int)
             else if pattern == 3 -> value = state % 16
             else if pattern == 4 -> value = ((SIZE - 1) / 256 - index / 256) * 256 + index % 256
             values[index] = value
-        values.sort()
+        if RUNTIME_COMPARATOR
+            values.sort(before)
+        else
+            values.sort(int, before)
         for index in 0..SIZE
             if index > 0 and values[index - 1] > values[index] -> exit(3)
             checksum = (checksum * 31 + values[index]) % 1000003

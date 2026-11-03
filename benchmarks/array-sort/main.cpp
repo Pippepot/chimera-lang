@@ -8,11 +8,23 @@
 #define ARRAY_SIZE 65536
 #endif
 
+void runtime_sort(std::int32_t *first, std::int32_t *last,
+                  bool (*before)(std::int32_t, std::int32_t), bool stable);
+
+static bool before(std::int32_t left, std::int32_t right) {
+    return left < right;
+}
+
 int main(int argc, char **argv) {
     if (argc != 2 || (std::strcmp(argv[1], "sort") != 0 &&
-                      std::strcmp(argv[1], "stable_sort") != 0))
+                      std::strcmp(argv[1], "stable_sort") != 0 &&
+                      std::strcmp(argv[1], "sort-runtime") != 0 &&
+                      std::strcmp(argv[1], "stable_sort-runtime") != 0))
         return 1;
-    const bool stable = std::strcmp(argv[1], "stable_sort") == 0;
+    const bool stable = std::strcmp(argv[1], "stable_sort") == 0 ||
+                        std::strcmp(argv[1], "stable_sort-runtime") == 0;
+    const bool runtime = std::strcmp(argv[1], "sort-runtime") == 0 ||
+                         std::strcmp(argv[1], "stable_sort-runtime") == 0;
     unsigned char input[5];
     if (std::fread(input, 1, sizeof(input), stdin) != sizeof(input))
         return 1;
@@ -38,7 +50,9 @@ int main(int argc, char **argv) {
                 value = ((ARRAY_SIZE - 1) / 256 - index / 256) * 256 + index % 256;
             values[index] = value;
         }
-        if (stable)
+        if (runtime)
+            runtime_sort(values.data(), values.data() + values.size(), before, stable);
+        else if (stable)
             std::stable_sort(values.begin(), values.end());
         else
             std::sort(values.begin(), values.end());

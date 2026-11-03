@@ -2224,7 +2224,6 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 } orelse return error.Unavailable;
                 break :value try self.analysis_context.lookupCompileTimeValue(value_id);
             };
-            if (value == .runtime and value.runtime.value == .function_ref) return self.reject(argument, .static_argument_not_supported);
             return self.analysis_context.internCompileTimeValue(value);
         }
 

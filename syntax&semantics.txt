@@ -780,8 +780,12 @@ func invalid_state() never -> panic "invalid state"
 # is an error. Inference cannot depend on an expected parameter type that itself
 # requires the missing static arguments. Type-valued call annotations are
 # checked after inference and do not provide an expected type while inferring.
-# Explicit type values and exact-typed primitive compile-time values are
-# supported. Each canonical tuple of static arguments identifies one function
+# Explicit type values, exact-typed primitive compile-time values, and
+# noncapturing function references are supported. A static callable argument is
+# checked against its declared function type; that context may specialize a
+# generic function reference. Its target, existing specialization, and lexical
+# static environment participate in the static value's identity.
+# Each canonical tuple of static arguments identifies one function
 # instance; aliases of the same type therefore reuse an instance. Runtime
 # parameter and return types may refer to static type parameters. Static
 # arguments are available as constants in the instantiated body but are not
@@ -1404,6 +1408,13 @@ func forward_initializer(static T: type, init item: T) T
 # Array, List, and Span provide stable sort() and sort(before), returning
 # unit. sort mutates the initialized extent, so its receiver and backing
 # must be writable and its elements movable. Length and capacity do not change.
+# sort(T, before) explicitly supplies the element type and a static comparator;
+# T must equal the collection's element type. The same explicit static form is
+# available as sorted(T, before). The one-argument comparator forms retain
+# runtime callable support. Distinct argument counts keep these overloads
+# unambiguous without preferring static evaluation during overload selection.
+# The default order and explicit static comparator forms specialize their sort
+# helpers on the comparator identity; the comparator's calls execute at runtime.
 # sorted() and sorted(before) instead copy the elements into a new owned
 # List(T), sort that List, and leave the source sequence in its original order.
 # They return List(T) | none; none means the result allocation was refused.

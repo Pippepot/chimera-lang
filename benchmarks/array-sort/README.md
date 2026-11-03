@@ -1,7 +1,7 @@
 # Array sorting
 
-Compare Chimera's `Array(int, N).sort()` with C++17 `std::sort` and
-`std::stable_sort`, compiled by Clang at `-O3` using its default C++ standard
+Compare Chimera's static and runtime comparator overloads with C++17 `std::sort`
+and `std::stable_sort`, compiled by Clang at `-O3` using its default C++ standard
 library. Chimera's sort is stable, so `std::stable_sort` provides the comparison
 with the same ordering guarantee. Integer elements do not expose stability;
 the compiler's sort test suite separately covers that contract.
@@ -20,6 +20,15 @@ outputs alone. ReleaseFast optimizes the compiler; Chimera's generated machine
 code uses its ordinary native backend. `--compiler PATH` reuses an existing
 compiler instead of building one; its binary hash is retained with the results.
 
+The runner builds six lanes. Chimera static calls `values.sort(int, before)`;
+Chimera runtime calls `values.sort(before)`. The C++ template lanes use their
+default comparator. The two C++ runtime lanes pass the ascending comparison as
+a function pointer to [runtime.cpp](runtime.cpp), compiled as a separate
+translation unit without LTO. Its sorting helpers cannot see the concrete
+callback from [main.cpp](main.cpp). The runtime lanes therefore compare function
+pointer interfaces, and the static lanes compare specialized interfaces. The
+algorithms and runtime bounds checks still differ between languages.
+
 Each program fills the same stack-backed array of signed 32-bit integers and
 sorts it eight times by default. Size, round count, distribution, and seed match
 between languages. The round count, distribution, and seed arrive on stdin.
@@ -35,7 +44,8 @@ probes with seeds 0, 42, and 65,535. Timed batches use seed 0, one discarded ful
 warm-up per algorithm, and nine samples with rotating algorithm order. Failures
 abort the run. Output includes medians, minima, maxima, and wall-time ratios;
 optional JSON preserves every sample, toolchain and machine details, affinity,
-and workload/sort source hashes.
+executable sizes, and workload/sort source hashes. The C++ size covers its combined
+binary containing all four C++ lanes; the Chimera binaries are separate per mode.
 
 The timer measures **whole-process wall time**, including startup, input, array
 initialization, sorting and its scratch allocations, verification, output, and

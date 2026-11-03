@@ -2,6 +2,73 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const Fixture = test_sources.SourceFixture;
 
+test "collection sort static comparators specialize Array List Span and sorted copies" {
+    try Fixture.expectParity(
+        \\func descending(imm left: int, imm right: int) bool -> left > right
+        \\func ascending(static T: type, imm left: T, imm right: T) bool -> left < right
+        \\func selected(reverse: bool) func(imm int, imm int) bool
+        \\    if reverse -> return descending
+        \\    return ascending
+        \\func check(callback: func(imm int, imm int) bool) int
+        \\    var values = [4, 1, 3, 2]
+        \\    values.sort(int, descending)
+        \\    if values[0] <> 4 or values[3] <> 1 -> return 90
+        \\    var view = values[1..4]
+        \\    view.sort(int, ascending)
+        \\    if values[0] <> 4 or values[1] <> 1 or values[3] <> 3 -> return 91
+        \\    var copied = values.sorted(int, ascending)
+        \\    if not (copied is List(int)) -> return 92
+        \\    if values[0] <> 4 or copied[0] <> 1 or copied[3] <> 4 -> return 93
+        \\    var from_view = view.sorted(int, descending)
+        \\    if not (from_view is List(int)) -> return 94
+        \\    if from_view[0] <> 3 or from_view[2] <> 1 -> return 95
+        \\    var list = List(int).filled(0, 64)
+        \\    if not (list is List(int)) -> return 96
+        \\    for index in 0..64 -> list[index] = (index * 37) % 64
+        \\    list.sort(int, descending)
+        \\    if list[0] <> 63 or list[63] <> 0 -> return 97
+        \\    var from_list = list.sorted(int, ascending)
+        \\    if not (from_list is List(int)) -> return 98
+        \\    if list[0] <> 63 or from_list[0] <> 0 or from_list[63] <> 63 -> return 99
+        \\    list.sort(callback)
+        \\    if list[0] <> 0 or list[63] <> 63 -> return 100
+        \\    return 42
+        \\func run() int -> check(selected(false))
+    , 42);
+}
+
+test "collection sort static comparator preserves stability captured authority and drops" {
+    try Fixture.expectParity(
+        \\struct Item
+        \\    copy = none
+        \\    pub key: int
+        \\    pub sequence: int
+        \\    comparisons: Ref(int)
+        \\    drops: Ref(int)
+        \\    drop = func(deinit self: Item) -> self.drops.value += 1
+        \\func before(imm left: Item, imm right: Item) bool
+        \\    left.comparisons.value += 1
+        \\    return left.key < right.key
+        \\func check(mut comparisons: int, mut drops: int) int
+        \\    var values = List(Item).new(64)
+        \\    if not (values is List(Item)) -> return 90
+        \\    for index in 0..64
+        \\        if not (values.append(Item{key = (index * 37) % 7, sequence = index, comparisons = Ref.from(comparisons), drops = Ref.from(drops)}) is unit) -> return 91
+        \\    values.sort(Item, before)
+        \\    if comparisons == 0 or drops <> 0 -> return 92
+        \\    for index in 1..64
+        \\        if values[index - 1].key > values[index].key -> return 93
+        \\        if values[index - 1].key == values[index].key and values[index - 1].sequence > values[index].sequence -> return 94
+        \\    return 42
+        \\func run() int
+        \\    var comparisons = 0
+        \\    var drops = 0
+        \\    if check(comparisons, drops) <> 42 -> return 95
+        \\    if drops <> 64 -> return 96
+        \\    return 42
+    , 42);
+}
+
 test "collection sort handles Array List and sliced Span" {
     try Fixture.expectParity(
         \\func descending(imm left: int, imm right: int) bool -> left > right
@@ -497,9 +564,9 @@ test "driftsort stable fallback sorts a forced depth-limited region" {
     ;
     const standard_library = @import("standard_library");
     const original = standard_library.source("memory/sort.chi");
-    const call = "drift_quicksort(T, source, order, scratch, 0, length, drift_depth(length), before)";
+    const call = "drift_quicksort(T, Order, source, order, scratch, 0, length, drift_depth(length), before)";
     try std.testing.expect(std.mem.indexOf(u8, original, call) != null);
-    const forced = try std.mem.replaceOwned(u8, std.testing.allocator, original, call, "drift_quicksort(T, source, order, scratch, 0, length, 0, before)");
+    const forced = try std.mem.replaceOwned(u8, std.testing.allocator, original, call, "drift_quicksort(T, Order, source, order, scratch, 0, length, 0, before)");
     defer std.testing.allocator.free(forced);
     for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
         const program = try std.fmt.allocPrint(std.testing.allocator, "{s}\n{s}", .{ source, entry });

@@ -84,11 +84,12 @@ def main() -> None:
                      if line.startswith("model name")), "unknown"),
         "zig": subprocess.check_output(["zig", "version"], text=True).strip(),
         "cpp": subprocess.check_output(["clang++", "--version"], text=True).splitlines()[0],
-        "cpp_flags": ["-std=c++17", "-O3", "-DNDEBUG"],
+        "cpp_flags": ["-std=c++17", "-O3", "-DNDEBUG", "-fno-lto"],
         "sources": {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-                    for path in (HERE / "main.chi", HERE / "main.cpp", HERE / "run.py",
+                    for path in (HERE / "main.chi", HERE / "main.cpp", HERE / "runtime.cpp", HERE / "run.py",
                                  ROOT / "std/array.chi", ROOT / "std/memory/sort.chi")},
         "measurement": "process wall time: startup, fill, sort, verification, cleanup",
+        "executable_bytes": {},
         "results": [],
     }
     with tempfile.TemporaryDirectory(prefix="chimera-array-sort-") as directory:
@@ -113,28 +114,38 @@ def main() -> None:
                                                      "#define _LIBCPP_VERSION "))]
         source = (HERE / "main.chi").read_text().replace(
             "static SIZE = 65536", f"static SIZE = {arguments.size}")
-        (work / "main.chi").write_text(source)
         probe = struct.pack("<BHH", 0, 1, 0)
         answer = expected(arguments.size, 0, 1, 0)
-        compiled = subprocess.run(
-            [str(compiler), "--workers=0", str(work / "main.chi")],
-            cwd=work, input=probe, capture_output=True, check=True,
-        )
-        if compiled.stdout != answer + b"exit code: 0\n":
-            raise RuntimeError(f"Chimera compilation check failed: {compiled!r}")
-        chimera = work / "sort-chimera"
-        shutil.move(work / "prog", chimera)
+        commands = {}
+        for mode in ("static", "runtime"):
+            variant = work / mode
+            variant.mkdir()
+            variant_source = source.replace("static RUNTIME_COMPARATOR = false",
+                                            f"static RUNTIME_COMPARATOR = {str(mode == 'runtime').lower()}")
+            (variant / "main.chi").write_text(variant_source)
+            compiled = subprocess.run(
+                [str(compiler), "--workers=0", str(variant / "main.chi")],
+                cwd=variant, input=probe, capture_output=True, check=True,
+            )
+            if compiled.stdout != answer + b"exit code: 0\n":
+                raise RuntimeError(f"Chimera {mode} compilation check failed: {compiled!r}")
+            executable = work / f"sort-chimera-{mode}"
+            shutil.move(variant / "prog", executable)
+            commands[f"Chimera {mode}"] = [str(executable)]
+            report["executable_bytes"][f"Chimera {mode}"] = executable.stat().st_size
         cpp = work / "sort-cpp"
         subprocess.run(
             ["clang++", *report["cpp_flags"], "-Wall", "-Wextra", "-Werror",
-             f"-DARRAY_SIZE={arguments.size}", str(HERE / "main.cpp"), "-o", str(cpp)],
+             f"-DARRAY_SIZE={arguments.size}", str(HERE / "main.cpp"), str(HERE / "runtime.cpp"), "-o", str(cpp)],
             check=True,
         )
-        commands = {
-            "Chimera Array.sort": [str(chimera)],
+        report["executable_bytes"]["C++ combined"] = cpp.stat().st_size
+        commands.update({
             "C++ std::sort": [str(cpp), "sort"],
             "C++ std::stable_sort": [str(cpp), "stable_sort"],
-        }
+            "C++ std::sort runtime": [str(cpp), "sort-runtime"],
+            "C++ std::stable_sort runtime": [str(cpp), "stable_sort-runtime"],
+        })
         if arguments.cpu is not None:
             os.sched_setaffinity(0, {arguments.cpu})
         report["affinity"] = sorted(os.sched_getaffinity(0))
@@ -168,9 +179,11 @@ def main() -> None:
                     "pattern": name, "algorithm": algorithm,
                     "seconds": times, "median_seconds": medians[algorithm],
                 })
-            for algorithm in names[1:]:
-                print(f"  Chimera / {algorithm}: "
-                      f"{medians[names[0]] / medians[algorithm]:.2f}x", flush=True)
+            for mode in ("static", "runtime"):
+                for operation in ("std::sort", "std::stable_sort"):
+                    algorithm = f"C++ {operation}" + (" runtime" if mode == "runtime" else "")
+                    print(f"  Chimera {mode} / {algorithm}: "
+                          f"{medians[f'Chimera {mode}'] / medians[algorithm]:.2f}x", flush=True)
     if arguments.output:
         arguments.output.write_text(json.dumps(report, indent=2) + "\n")
 

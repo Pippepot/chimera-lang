@@ -8281,9 +8281,6 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (argument.runtime_reference) |reference_span| return self.reject(reference_span, .comptime_runtime_capture);
                 const expected_type = if (parameter.is_meta_type) null else try self.analysis_context.staticParameterType(instance, parameter_index, static_arguments.items);
                 const value_id = (try self.analysis_context.staticCallArgument(argument.node, parameter.is_meta_type, expected_type)) orelse return error.Unavailable;
-                const compile_time_value = try self.analysis_context.lookupCompileTimeValue(value_id);
-                if (compile_time_value == .runtime and compile_time_value.runtime.value == .function_ref)
-                    return self.reject(argument.value.span, .static_argument_not_supported);
                 try static_arguments.append(self.gpa, value_id);
             }
             return .{ .direct = try self.analysis_context.specializeFunction(instance, static_arguments.items) };

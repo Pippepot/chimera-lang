@@ -1541,6 +1541,44 @@ test "parallel callee optimization keeps fresh leaf edits to one typed body" {
     }
 }
 
+test "static callable arguments specialize direct member and overload calls and recompute" {
+    const program =
+        \\func bump(value: int) int -> value + 2
+        \\func other(value: int) int -> value + 3
+        \\func apply(static callback: func(int) int, value: int) int -> callback(value)
+        \\func dynamic(callback: func(int) int, value: int, marker: unit) int -> callback(value)
+        \\overload invoke(apply, dynamic)
+        \\struct Operation(callback: func(int) int)
+        \\    pub func call(imm self: Operation(callback), value: int) int -> callback(value)
+        \\struct Dispatcher
+        \\    pub func call(imm self: Dispatcher, static callback: func(int) int, value: int) int -> callback(value)
+        \\func direct(value: int) int -> apply(bump, value)
+        \\func member(value: int) int -> Dispatcher{}.call(bump, value)
+        \\func overloaded(value: int) int -> invoke(bump, value)
+        \\func wrapped(value: int) int -> Operation(bump){}.call(value)
+        \\func run() int -> direct(40) + member(40) + overloaded(40) + wrapped(40) - 126
+        \\exit(run())
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    for ([_][]const u8{ "direct", "member", "overloaded", "wrapped" }) |name|
+        try testing.expectEqual(@as(usize, 0), countCalls((try optimizedBody(fixture, name)).*.?));
+    const dynamic = (try optimizedBody(fixture, "dynamic")).*.?;
+    for (dynamic.instructions) |instruction| {
+        if (instruction == .call) try testing.expect(instruction.call.target == .indirect);
+    }
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, program, "apply(bump, value)", "apply(other, value)");
+    defer testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(0, 43);
+    const changed_body = try std.mem.replaceOwned(u8, testing.allocator, edited, "value + 3", "value + 4");
+    defer testing.allocator.free(changed_body);
+    try fixture.db.setInput(queries.SourceText, 0, changed_body);
+    try fixture.expectExit(0, 44);
+}
+
 test "known indirect calls promote after forwarding and preserve incremental callees" {
     const program =
         \\func bump(value: int) int -> value + 2

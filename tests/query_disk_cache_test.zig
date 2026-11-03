@@ -8,6 +8,29 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "static callable sort snapshots restore comparator identities and invalidate edits" {
+    const source =
+        \\func ascending(imm left: int, imm right: int) bool -> left < right
+        \\func descending(imm left: int, imm right: int) bool -> left > right
+        \\func run() int
+        \\    var values = [4, 1, 3, 2]
+        \\    values.sort(int, ascending)
+        \\    return values[0] + 41
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed_target = try std.mem.replaceOwned(u8, std.testing.allocator, source, "sort(int, ascending)", "sort(int, descending)");
+    defer std.testing.allocator.free(changed_target);
+    try fixture.db.setInput(queries.SourceText, 0, changed_target);
+    try fixture.expectExit(45);
+    const changed_body = try std.mem.replaceOwned(u8, std.testing.allocator, changed_target, "left > right", "left < right");
+    defer std.testing.allocator.free(changed_body);
+    try fixture.db.setInput(queries.SourceText, 0, changed_body);
+    try fixture.expectExit(42);
+}
+
 test "membership snapshots recompute bounds contains bodies and signatures" {
     const declarations =
         \\struct Choices
@@ -2413,9 +2436,9 @@ test "collection sorting snapshots track comparator library and captured permiss
         try fixture.expectExit(42);
 
         const library_source = standard_library.source("memory/sort.chi");
-        const original = "if not before(source[current], source[current - 1]) -> break";
+        const original = "if not before.less(source[current], source[current - 1]) -> break";
         try std.testing.expect(std.mem.indexOf(u8, library_source, original) != null);
-        const changed_library = try std.mem.replaceOwned(u8, std.testing.allocator, library_source, original, "if before(source[current], source[current - 1]) -> break");
+        const changed_library = try std.mem.replaceOwned(u8, std.testing.allocator, library_source, original, "if before.less(source[current], source[current - 1]) -> break");
         defer std.testing.allocator.free(changed_library);
         const sort_file = (try fixture.db.input(queries.StandardFile, @backingInt(standard_library.File.memory_sort))).*;
         try fixture.db.setInput(queries.SourceText, sort_file, changed_library);
