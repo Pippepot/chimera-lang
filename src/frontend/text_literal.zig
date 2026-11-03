@@ -82,12 +82,7 @@ fn unicodeEscape(spelling: []const u8, position: *usize, end: usize) ?u21 {
 }
 
 fn hex(character: u8) ?u8 {
-    return switch (character) {
-        '0'...'9' => character - '0',
-        'a'...'f' => character - 'a' + 10,
-        'A'...'F' => character - 'A' + 10,
-        else => null,
-    };
+    return std.fmt.charToDigit(character, 16) catch null;
 }
 
 fn invalidUtf8Offset(bytes: []const u8) usize {

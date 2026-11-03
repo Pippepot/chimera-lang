@@ -63,7 +63,7 @@ pub const Analysis = struct {
     }
 
     pub fn iterationAcyclic(self: Analysis, loop: Loop) bool {
-        for (loop.blocks) |block| for (Function.edges(&self.function.blocks.items[block].terminator)) |maybe_edge| if (maybe_edge) |edge| {
+        for (loop.blocks) |block| for (self.function.blocks.items[block].terminator.branches()) |maybe_edge| if (maybe_edge) |edge| {
             const target = @backingInt(edge.target);
             if (target == loop.header or !loop.contains(target)) continue;
             if (self.graph.rank[target] <= self.graph.rank[block]) return false;
@@ -108,15 +108,11 @@ pub const Analysis = struct {
         }
     }
 
-    pub fn iterationRange(self: Analysis, preheader_block: u32, counter: InductionExit) ?IterationRange {
-        return self.iterationRangeDepth(preheader_block, counter, 16);
-    }
-
-    fn iterationRangeDepth(self: Analysis, at: u32, counter: InductionExit, depth: u32) ?IterationRange {
+    pub fn iterationRange(self: Analysis, at: u32, counter: InductionExit, depth: u32) ?IterationRange {
         if (depth == 0) return null;
         if (!self.immutable(counter.comparison.other)) return null;
-        const start = self.rangeAtDepth(counter.induction.start, at, depth - 1);
-        const bound = self.rangeAtDepth(counter.comparison.other, at, depth - 1);
+        const start = self.rangeAt(counter.induction.start, at, depth - 1);
+        const bound = self.rangeAt(counter.comparison.other, at, depth - 1);
         if (counter.induction.terminal_bound != null) {
             if (!self.immutable(counter.induction.start)) return null;
             const ascending = counter.induction.step == 1;
@@ -202,8 +198,8 @@ pub const Analysis = struct {
     pub fn equalityRecurrenceSafe(self: Analysis, preheader_block: u32, counter: InductionExit) bool {
         if (!self.immutable(counter.comparison.other)) return false;
         if (counter.induction.start == counter.comparison.other) return true;
-        const start = self.rangeAt(counter.induction.start, preheader_block);
-        const bound = self.rangeAt(counter.comparison.other, preheader_block);
+        const start = self.rangeAt(counter.induction.start, preheader_block, 16);
+        const bound = self.rangeAt(counter.comparison.other, preheader_block, 16);
         return if (counter.induction.step == 1)
             start.upper <= bound.lower
         else if (counter.induction.step == -1)
@@ -229,38 +225,24 @@ pub const Analysis = struct {
         const position = std.mem.indexOfScalar(ValueId, function.blocks.items[loop.header].parameters.items, parameter) orelse return null;
         if (function.valueType(parameter) != .int or !self.immutable(parameter)) return null;
         const start = function.branchArguments(function.blocks.items[preheader_block].terminator.branch)[position];
-        const back = function.branchArguments(latchBranch(function, loop) orelse return null)[position];
+        const back = function.branchArguments((function.branchTo(loop.latches[0], loop.header) orelse return null).*)[position];
         if (start.coerce_to != null or back.coerce_to != null) return null;
         const ending = exitTestAt(function, loop, loop.latches[0]);
         const terminal = if (ending) |exit| if (exit.operation == .eqi) IntegerComparison.init(function, exit.operation, exit.operands, parameter) else null else null;
         const next_value = self.forwardedAssuming(back.value, 16, if (terminal != null) ending else null);
         if (!self.immutable(next_value)) return null;
         const next = function.definition(next_value) orelse return null;
-        var step: i32 = undefined;
-        switch (next) {
-            .numeric_binary => |operation| {
-                if (operation.type_id != .int or operation.overflow == .saturating) return null;
-                const operands = operation.operands;
-                if (operation.operation == .add) {
-                    const operand = if (function.find(operands.lhs) == parameter) operands.rhs else if (function.find(operands.rhs) == parameter) operands.lhs else return null;
-                    step = self.integerConstant(operand) orelse return null;
-                } else if (operation.operation == .sub) {
-                    if (function.find(operands.lhs) != parameter) return null;
-                    const decrement = self.integerConstant(operands.rhs) orelse return null;
-                    if (decrement == std.math.minInt(i32)) return null;
-                    step = -decrement;
-                } else return null;
-            },
-            .addi => |operands| {
-                const operand = if (function.find(operands.lhs) == parameter) operands.rhs else if (function.find(operands.rhs) == parameter) operands.lhs else return null;
-                step = self.integerConstant(operand) orelse return null;
-            },
-            .subi => |operands| {
-                if (function.find(operands.lhs) != parameter) return null;
-                step = -%(self.integerConstant(operands.rhs) orelse return null);
-            },
-            else => return null,
-        }
+        const update = Offset.init(next) orelse return null;
+        const operands = update.operands;
+        const step = if (update.subtract) step: {
+            if (function.find(operands.lhs) != parameter) return null;
+            const decrement = self.integerConstant(operands.rhs) orelse return null;
+            if (decrement == std.math.minInt(i32) and next == .numeric_binary) return null;
+            break :step -%decrement;
+        } else step: {
+            const operand = if (function.find(operands.lhs) == parameter) operands.rhs else if (function.find(operands.rhs) == parameter) operands.lhs else return null;
+            break :step self.integerConstant(operand) orelse return null;
+        };
         if (step == 0) return null;
         var terminal_bound: ?ValueId = null;
         if (terminal) |comparison| {
@@ -272,11 +254,7 @@ pub const Analysis = struct {
             if (next == .numeric_binary and next.numeric_binary.overflow == .checked and self.equalityAt(ending.?.operands, producer, null) != false) return null;
             terminal_bound = comparison.other;
         }
-        return .{ .parameter = parameter, .start = self.forwarded(start.value, 16), .next = next_value, .step = step, .terminal_bound = terminal_bound };
-    }
-
-    fn forwarded(self: Analysis, value: ValueId, depth: u32) ValueId {
-        return self.forwardedAssuming(value, depth, null);
+        return .{ .parameter = parameter, .start = self.forwardedAssuming(start.value, 16, null), .next = next_value, .step = step, .terminal_bound = terminal_bound };
     }
 
     fn forwardedAssuming(self: Analysis, value: ValueId, depth: u32, terminal: ?ExitTest) ValueId {
@@ -301,8 +279,7 @@ pub const Analysis = struct {
         var source: ?ValueId = null;
         for (incoming) |edge| {
             if (terminal) |exit| if (self.equalityAt(exit.operands, edge.block, edge.ordinal) == true) continue;
-            const branch = Function.edges(&self.function.blocks.items[edge.block].terminator)[edge.ordinal].?;
-            const argument = self.function.branchArguments(branch.*)[position];
+            const argument = self.function.branchArguments(edge.branch(self.function).*)[position];
             if (argument.coerce_to != null or argument.variant_tag_mapping != null) return resolved;
             const forwarded_value = self.forwardedAssuming(argument.value, depth - 1, terminal);
             if (source) |previous| {
@@ -312,31 +289,16 @@ pub const Analysis = struct {
         return source orelse resolved;
     }
 
-    pub fn rangeAt(self: Analysis, value: ValueId, at: u32) IntegerRange {
-        return self.rangeAtDepth(value, at, 16);
-    }
-
-    fn rangeAtDepth(self: Analysis, value: ValueId, at: u32, depth: u32) IntegerRange {
+    pub fn rangeAt(self: Analysis, value: ValueId, at: u32, depth: u32) IntegerRange {
         if (!self.immutable(value)) return .{};
         if (self.integerConstant(value)) |number| return .{ .lower = number, .upper = number };
-        var range = self.inductionRange(value, at, depth) orelse self.parameterRange(value, depth) orelse self.shiftedRange(value, at, depth);
+        var range = self.inductionRange(value, at, depth) orelse self.parameterRange(value, depth, &.{}) orelse self.shiftedRange(value, at, depth);
         var block = at;
         while (block != self.function.entry) {
             block = self.graph.dominator[block];
-            const terminator = self.function.blocks.items[block].terminator;
-            if (terminator != .predicate_branch) continue;
-            const predicate = terminator.predicate_branch;
+            const predicate = self.pathPredicate(block, at, null) orelse continue;
             const comparison = IntegerComparison.init(self.function, predicate.operation, predicate.operands, value) orelse continue;
-            const bound = self.integerConstant(comparison.other) orelse continue;
-            const then_target = @backingInt(predicate.then_branch.target);
-            const else_target = @backingInt(predicate.else_branch.target);
-            const taken = if (self.graph.incoming[then_target].items.len == 1 and self.graph.dominates(then_target, at))
-                true
-            else if (self.graph.incoming[else_target].items.len == 1 and self.graph.dominates(else_target, at))
-                false
-            else
-                continue;
-            range.refine(if (taken) comparison.operation else comparison.operation.negated(), bound);
+            range.refine(comparison.operation, self.integerConstant(comparison.other) orelse continue);
         }
         return range;
     }
@@ -353,18 +315,14 @@ pub const Analysis = struct {
                 if (!self.graph.dominates(exit.stay, at)) continue;
                 const counter = self.invariantInductionExit(loop, entry, exit, parameter) orelse continue;
                 if (!self.immutable(counter.comparison.other)) continue;
-                const range = self.iterationRangeDepth(at, counter, depth - 1) orelse continue;
+                const range = self.iterationRange(at, counter, depth - 1) orelse continue;
                 return range.absolute;
             }
         }
         return null;
     }
 
-    fn parameterRange(self: Analysis, value: ValueId, depth: u32) ?IntegerRange {
-        return self.parameterRangeLeaves(value, depth, &.{});
-    }
-
-    fn parameterRangeLeaves(self: Analysis, value: ValueId, depth: u32, visited: []const ValueId) ?IntegerRange {
+    fn parameterRange(self: Analysis, value: ValueId, depth: u32, visited: []const ValueId) ?IntegerRange {
         const resolved = self.function.find(value);
         if (std.mem.indexOfScalar(ValueId, visited, resolved) != null) return null;
         if (depth == 0) return .{};
@@ -380,16 +338,15 @@ pub const Analysis = struct {
         const position = std.mem.indexOfScalar(ValueId, self.function.blocks.items[block].parameters.items, resolved).?;
         var range: ?IntegerRange = null;
         for (incoming) |edge| {
-            const branch = Function.edges(&self.function.blocks.items[edge.block].terminator)[edge.ordinal].?;
-            const argument = self.function.branchArguments(branch.*)[position];
+            const argument = self.function.branchArguments(edge.branch(self.function).*)[position];
             if (argument.coerce_to != null or argument.variant_tag_mapping != null) return .{};
             const source = self.function.find(argument.value);
             if (!self.immutable(source)) return .{};
             const source_definition = self.function.definitions.items[@backingInt(source)];
             const found = if (source_definition == .argument and source_definition.argument.block != self.function.entry)
-                self.parameterRangeLeaves(source, depth - 1, path[0 .. visited.len + 1]) orelse continue
+                self.parameterRange(source, depth - 1, path[0 .. visited.len + 1]) orelse continue
             else
-                self.rangeAtDepth(source, edge.block, depth - 1);
+                self.rangeAt(source, edge.block, depth - 1);
             if (range) |previous| {
                 range = .{ .lower = @min(previous.lower, found.lower), .upper = @max(previous.upper, found.upper) };
             } else {
@@ -401,34 +358,11 @@ pub const Analysis = struct {
 
     fn shiftedRange(self: Analysis, value: ValueId, at: u32, depth: u32) IntegerRange {
         if (depth == 0) return .{};
-        const definition = self.function.definition(self.function.find(value)) orelse return .{};
-        var operands: structures.BinaryOperands = undefined;
-        var subtract: bool = undefined;
-        var checked = false;
-        switch (definition) {
-            .numeric_binary => |operation| {
-                if (operation.type_id != .int or operation.overflow == .saturating) return .{};
-                subtract = switch (operation.operation) {
-                    .add => false,
-                    .sub => true,
-                    else => return .{},
-                };
-                operands = operation.operands;
-                checked = operation.overflow == .checked;
-            },
-            .addi => |operation| {
-                operands = operation;
-                subtract = false;
-            },
-            .subi => |operation| {
-                operands = operation;
-                subtract = true;
-            },
-            else => return .{},
-        }
+        const update = Offset.init(self.function.definition(self.function.find(value)) orelse return .{}) orelse return .{};
+        const operands = update.operands;
         const offset = self.integerConstant(operands.rhs) orelse return .{};
-        const shift: i64 = if (subtract) -@as(i64, offset) else offset;
-        var base = self.rangeAtDepth(operands.lhs, at, depth - 1);
+        const shift: i64 = if (update.subtract) -@as(i64, offset) else offset;
+        var base = self.rangeAt(operands.lhs, at, depth - 1);
         const producer = self.function.instructionIndex(self.function.find(value)).?;
         for (self.call_arguments) |argument| {
             if (self.function.find(argument.value) != self.function.find(operands.lhs)) continue;
@@ -441,8 +375,27 @@ pub const Analysis = struct {
         }
         const lower = base.lower + shift;
         const upper = base.upper + shift;
-        if (!checked and (lower < std.math.minInt(i32) or upper > std.math.maxInt(i32))) return .{};
+        if (!update.checked and (lower < std.math.minInt(i32) or upper > std.math.maxInt(i32))) return .{};
         return .{ .lower = @max(lower, std.math.minInt(i32)), .upper = @min(upper, std.math.maxInt(i32)) };
+    }
+};
+
+/// Integer addition or subtraction, either modular or checked.
+const Offset = struct {
+    operands: structures.BinaryOperands,
+    subtract: bool,
+    checked: bool = false,
+
+    fn init(instruction: structures.FunctionInstruction) ?Offset {
+        return switch (instruction) {
+            .numeric_binary => |operation| if (operation.type_id != .int or operation.overflow == .saturating) null else switch (operation.operation) {
+                .add, .sub => .{ .operands = operation.operands, .subtract = operation.operation == .sub, .checked = operation.overflow == .checked },
+                else => null,
+            },
+            .addi => |operands| .{ .operands = operands, .subtract = false },
+            .subi => |operands| .{ .operands = operands, .subtract = true },
+            else => null,
+        };
     }
 };
 
@@ -467,15 +420,9 @@ pub const ExitTest = struct {
 };
 
 pub fn exitTest(function: *const Function, loop: Loop) ?ExitTest {
-    const result = exitTestWithArguments(function, loop) orelse return null;
-    for (Function.edges(&function.blocks.items[loop.header].terminator)) |maybe_edge| if (maybe_edge) |edge| {
-        if (@backingInt(edge.target) == result.exit and edge.arguments.start != edge.arguments.end) return null;
-    };
-    return result;
-}
-
-pub fn exitTestWithArguments(function: *const Function, loop: Loop) ?ExitTest {
-    return exitTestAt(function, loop, loop.header);
+    const result = exitTestAt(function, loop, loop.header) orelse return null;
+    const arguments = function.branchTo(loop.header, result.exit).?.arguments;
+    return if (arguments.start == arguments.end) result else null;
 }
 
 pub fn exitTestAt(function: *const Function, loop: Loop, block: u32) ?ExitTest {
@@ -489,13 +436,6 @@ pub fn exitTestAt(function: *const Function, loop: Loop, block: u32) ?ExitTest {
     const stay = if (loop.contains(then_target)) predicate.then_branch else predicate.else_branch;
     const operation = if (loop.contains(then_target)) predicate.operation.negated() else predicate.operation;
     return .{ .operation = operation, .operands = predicate.operands, .exit = @backingInt(exit.target), .stay = @backingInt(stay.target) };
-}
-
-fn latchBranch(function: *const Function, loop: Loop) ?structures.FunctionBranch {
-    for (Function.edges(&function.blocks.items[loop.latches[0]].terminator)) |maybe_edge| if (maybe_edge) |edge| {
-        if (@backingInt(edge.target) == loop.header) return edge.*;
-    };
-    return null;
 }
 
 pub const IntegerComparison = struct {
@@ -627,13 +567,10 @@ pub fn canonicalize(function: *Function) !bool {
     const scratch = function.scratch;
     const graph = (try function.controlFlow()).*;
     const loops = try find(scratch, function, graph);
-    var changed = false;
     for (loops) |loop| {
-        if (try insertPreheader(function, graph, loop)) changed = true;
-        if (changed) return true;
-        if (try mergeLatches(function, loop)) return true;
+        if (try insertPreheader(function, graph, loop) or try mergeLatches(function, loop)) return true;
     }
-    return changed;
+    return false;
 }
 
 pub fn preheader(function: *const Function, graph: Graph, loop: Loop) ?u32 {
@@ -664,7 +601,7 @@ fn insertPreheader(function: *Function, graph: Graph, loop: Loop) !bool {
         const data = function.definitions.items[@backingInt(parameter)].argument.data;
         const first = function.branchArguments(outside.items[0].branch(function).*)[position];
         const value = function.find(first.value);
-        if (data.representation == .value and function.direct(data.type_id) and function.plainValue(value) and !taken[@backingInt(value)] and first.coerce_to == null) {
+        if (function.directParameter(parameter) and function.plainValue(value) and !taken[@backingInt(value)] and first.coerce_to == null) {
             for (outside.items[1..]) |edge| {
                 const argument = function.branchArguments(edge.branch(function).*)[position];
                 if (argument.coerce_to != null or function.find(argument.value) != value) break;
@@ -693,13 +630,6 @@ fn insertPreheader(function: *Function, graph: Graph, loop: Loop) !bool {
 
 fn mergeLatches(function: *Function, loop: Loop) !bool {
     if (loop.latches.len < 2) return false;
-    var back: std.ArrayList(graph_ir.Incoming) = .empty;
-    for (loop.latches) |latch| {
-        for (Function.edges(&function.blocks.items[latch].terminator), 0..) |maybe_edge, ordinal| if (maybe_edge) |edge| {
-            if (@backingInt(Function.edgeTarget(edge)) != loop.header) continue;
-            try back.append(function.scratch, .{ .block = latch, .ordinal = @intCast(ordinal) });
-        };
-    }
     const header = &function.blocks.items[loop.header];
     const block = try function.addBlock(.diverge, header.span, header.frame);
     var arguments: std.ArrayList(structures.FunctionValueUse) = .empty;
@@ -708,7 +638,9 @@ fn mergeLatches(function: *Function, loop: Loop) !bool {
         try arguments.append(function.scratch, .{ .value = try function.addParameter(block, data) });
     }
     function.blocks.items[block].terminator = .{ .branch = .{ .target = @fromBackingInt(loop.header), .arguments = try function.appendBranchArguments(arguments.items) } };
-    for (back.items) |edge| edge.branch(function).target = @fromBackingInt(block);
+    for (loop.latches) |latch| for (function.blocks.items[latch].terminator.branches()) |maybe_edge| if (maybe_edge) |edge| {
+        if (@backingInt(edge.target) == loop.header) edge.target = @fromBackingInt(block);
+    };
     try function.placeAfter(block, loop.latches[loop.latches.len - 1]);
     return true;
 }

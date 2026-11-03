@@ -6,9 +6,8 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIMERAQRY49";
-const max_records = 1_000_000;
-// Snapshot records name their interner, input, or query boundary by type name.
+const format = "CHIMERAQRY50";
+// Snapshot records name their interner, input, or query boundary by its index here.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
 pub const persisted_inputs = .{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile, queries.InlineLimit };
 pub const persisted_query_dependencies = .{ queries.ResolveTypeNamespace, queries.BuildModuleScope, queries.ModuleDeclarations, queries.IndexModuleItems, queries.ResolveItem, queries.FunctionSignature, queries.FunctionInstanceSignature, queries.ConversionCandidates, queries.InferReferenceContract, queries.AnalyzeFunctionInstance, queries.StandardLibraryUnchanged };
@@ -17,20 +16,18 @@ pub fn save(io: std.Io, allocator: std.mem.Allocator, directory: []const u8, key
     var writer: codec.Writer = .{ .allocator = allocator };
     defer writer.deinit();
     try writer.bytes.appendSlice(allocator, format);
-    try db.writeInternedValues(&writer);
-    try db.writeCompletedQueries(queries.AnalyzeFunctionInstance, &writer);
-    try db.writeCompletedQueries(queries.CompileFunction, &writer);
+    try db.writeInterns(&writer, interners);
+    inline for (.{ queries.AnalyzeFunctionInstance, queries.CompileFunction }) |Q| {
+        try db.writeQueries(Q, &writer, .fingerprinted, persisted_inputs, persisted_query_dependencies);
+    }
     try cache.save(io, allocator, directory, key, writer.bytes.items);
 }
 
 pub fn restoreInterns(db: *query.Database, allocator: std.mem.Allocator, payload: []const u8) !usize {
     var reader: codec.Reader = .{ .allocator = allocator, .bytes = payload };
     if (!std.mem.eql(u8, try reader.take(format.len), format)) return error.InvalidCache;
-    const count = try readCount(&reader);
-    for (0..count) |index| {
-        const name = try reader.read([]const u8);
-        defer allocator.free(name);
-        restoreNamedIntern(name, db, &reader, index) catch |err| switch (err) {
+    for (0..try reader.readCount()) |index| {
+        restoreIntern(db, &reader, try reader.read(u8), index) catch |err| switch (err) {
             error.InvalidInternId => return error.InvalidCache,
             else => return err,
         };
@@ -38,18 +35,17 @@ pub fn restoreInterns(db: *query.Database, allocator: std.mem.Allocator, payload
     return reader.offset;
 }
 
-fn restoreNamedIntern(name: []const u8, db: *query.Database, reader: *codec.Reader, index: usize) !void {
-    inline for (interners) |I| {
-        if (std.mem.eql(u8, name, @typeName(I))) return restoreIntern(I, db, reader, index);
+fn restoreIntern(db: *query.Database, reader: *codec.Reader, kind: u8, index: usize) !void {
+    inline for (interners, 0..) |I, interner| {
+        if (kind == interner) {
+            var value = try reader.read(I.Value);
+            defer codec.freeValue(I.Value, reader.allocator, &value);
+            const id = try importIntern(I, db, value);
+            if (@backingInt(id) != index) return error.InvalidCache;
+            return;
+        }
     }
     return error.InvalidCache;
-}
-
-fn restoreIntern(comptime I: type, db: *query.Database, reader: *codec.Reader, index: usize) !void {
-    var value = try reader.read(I.Value);
-    defer codec.freeValue(I.Value, reader.allocator, &value);
-    const id = try importIntern(I, db, value);
-    if (@backingInt(id) != index) return error.InvalidCache;
 }
 
 pub fn importIntern(comptime I: type, db: *query.Database, value: I.Value) !I.Id {
@@ -95,25 +91,27 @@ pub fn restoreQueries(db: *query.Database, payload: []const u8, offset: usize) !
 }
 
 fn restoreQuery(comptime Q: type, db: *query.Database, reader: *codec.Reader) !usize {
-    const count = try readCount(reader);
     var imported_count: usize = 0;
-    for (0..count) |_| {
+    for (0..try reader.readCount()) |_| {
         const input = try reader.read(Q.Input);
-        var output = try reader.read(Q.Output);
+        var arena = db.outputArena();
         var transferred = false;
-        defer if (!transferred) codec.freeValue(Q.Output, reader.allocator, &output);
-        if (output == null) return error.InvalidCache;
+        defer if (!transferred) arena.deinit();
+        const output = try arena.allocator().create(Q.Output);
+        output.* = try reader.readUsing(Q.Output, arena.allocator());
+        if (output.* == null) return error.InvalidCache;
         var valid = try validateIds(Q.Input, db, input) and
-            try validateIds(Q.Output, db, output) and
-            try validOutput(Q, db, output);
+            try validateIds(Q.Output, db, output.*) and
+            try validOutput(Q, db, output.*);
         var input_deps: std.ArrayList(query.PersistedInputRef) = .empty;
         defer input_deps.deinit(reader.allocator);
         var query_deps: std.ArrayList(query.PersistedQueryRef) = .empty;
         defer query_deps.deinit(reader.allocator);
-        try restoreDependencies(query.PersistedInputRef, persisted_inputs, db, reader, &valid, &input_deps);
-        try restoreDependencies(query.PersistedQueryRef, persisted_query_dependencies, db, reader, &valid, &query_deps);
+        const values: SnapshotValues = .{ .db = db };
+        try restoreDependencies(query.PersistedInputRef, persisted_inputs, db, reader, values, &valid, &input_deps);
+        try restoreDependencies(query.PersistedQueryRef, persisted_query_dependencies, db, reader, values, &valid, &query_deps);
         if (valid) {
-            try db.importCompletedQuery(Q, input, output, input_deps.items, query_deps.items);
+            try db.importQuery(Q, input, arena, output, input_deps.items, query_deps.items);
             transferred = true;
             imported_count += 1;
         }
@@ -121,39 +119,33 @@ fn restoreQuery(comptime Q: type, db: *query.Database, reader: *codec.Reader) !u
     return imported_count;
 }
 
-/// Reads every recorded dependency. Each still matches against the current
-/// database only while the record remains valid.
-fn restoreDependencies(comptime Ref: type, comptime candidates: anytype, db: *query.Database, reader: *codec.Reader, valid: *bool, matched: *std.ArrayList(Ref)) !void {
-    const count = try readCount(reader);
-    for (0..count) |_| {
-        const dependency = try restoreDependency(Ref, candidates, db, reader, valid.*);
-        if (dependency) |match| {
-            try matched.append(reader.allocator, match);
-        } else valid.* = false;
+/// Reads every recorded dependency. `values.digest` consumes one recorded
+/// value, may translate its key, and returns the value's digest, or null when
+/// the record cannot match.
+pub fn restoreDependencies(comptime Ref: type, comptime candidates: anytype, db: *query.Database, reader: *codec.Reader, values: anytype, valid: *bool, matched: *std.ArrayList(Ref)) !void {
+    const is_input = Ref == query.PersistedInputRef;
+    for (0..try reader.readCount()) |_| {
+        const kind = try reader.read(u8);
+        const dependency: ?Ref = inline for (candidates, 0..) |Owner, index| {
+            if (kind == index) {
+                var key = try reader.read(if (is_input) Owner.Key else Owner.Input);
+                const digest = (try values.digest(Owner, is_input, reader, &key, valid.*)) orelse break null;
+                break if (is_input) try db.matchPersistedInput(Owner, key, digest) else try db.matchPersistedQuery(Owner, key, digest);
+            }
+        } else return error.InvalidCache;
+        if (dependency) |match| try matched.append(reader.allocator, match) else valid.* = false;
     }
 }
 
-fn restoreDependency(comptime Ref: type, comptime candidates: anytype, db: *query.Database, reader: *codec.Reader, check: bool) !?Ref {
-    const name = try reader.read([]const u8);
-    defer reader.allocator.free(name);
-    inline for (candidates) |T| {
-        if (std.mem.eql(u8, name, query.identityName(T))) {
-            const is_input = Ref == query.PersistedInputRef;
-            const key = try reader.read(if (is_input) T.Key else T.Input);
-            var digest: [32]u8 = undefined;
-            @memcpy(&digest, try reader.take(digest.len));
-            if (!check or !(try validateIds(@TypeOf(key), db, key))) return null;
-            return if (is_input) db.matchPersistedInput(T, key, digest) else db.matchPersistedQuery(T, key, digest);
-        }
-    }
-    return error.InvalidCache;
-}
+const SnapshotValues = struct {
+    db: *query.Database,
 
-fn readCount(reader: *codec.Reader) !usize {
-    const count = try reader.read(u64);
-    if (count > max_records or count > reader.bytes.len - reader.offset) return error.InvalidCache;
-    return @intCast(count);
-}
+    pub fn digest(self: SnapshotValues, comptime _: type, comptime _: bool, reader: *codec.Reader, key: anytype, check: bool) !?[32]u8 {
+        const recorded = (try reader.take(32))[0..32].*;
+        if (!check or !(try validateIds(@TypeOf(key.*), self.db, key.*))) return null;
+        return recorded;
+    }
+};
 
 fn validArrayType(db: *query.Database, array: structures.ArrayType) !bool {
     return array.length <= std.math.maxInt(i32) and try validArrayElementType(db, array.element_type);
@@ -299,7 +291,7 @@ pub fn validOutput(comptime Q: type, db: *query.Database, output: Q.Output) !boo
 fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnalysis) anyerror!bool {
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
     if (!try validArrayStorageType(db, types, body.return_type)) return false;
-    if (!try validReferenceContractTypes(db, types, body)) return false;
+    if (!try validReferenceContract(db, types, body)) return false;
     for (body.block_arguments) |argument| if (!try validArrayStorageType(db, types, argument.type_id)) return false;
     for (body.instructions) |instruction| {
         if (!try validArrayStorageType(db, types, instruction.resultType())) return false;
@@ -423,38 +415,56 @@ fn validReferencePath(db: *query.Database, types: anytype, initial: structures.T
     return true;
 }
 
-fn validReferenceContractTypes(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis) anyerror!bool {
+/// Contract indexes are checked before the paths and types they select.
+fn validReferenceContract(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis) anyerror!bool {
     const contract = body.reference_contract;
+    const parameter_count = body.parameter_modes.len;
     for (contract.paths) |step| {
         const index = switch (step) {
             .element_at => |index| index,
             .without_element => |index| index orelse continue,
             else => continue,
         };
-        if (index.parameter) |parameter| {
-            if (body.block_arguments[parameter].type_id != .int or body.parameter_modes[parameter] != .imm) return false;
-        }
+        const parameter = index.parameter orelse continue;
+        if (parameter >= parameter_count) return false;
+        if (body.block_arguments[parameter].type_id != .int or body.parameter_modes[parameter] != .imm) return false;
     }
     for (contract.origins) |origin| {
+        if (origin.output_parameter) |parameter| if (parameter >= parameter_count) return false;
+        if (!validOriginBounds(contract, origin, parameter_count)) return false;
         if (!try validReferenceOriginTypes(db, types, body, origin, false)) return false;
     }
-    for (contract.outputs) |output| {
-        const members = (try types.variantMembers(body.return_type)) orelse return false;
-        if (std.mem.indexOfScalar(structures.TypeId, members, output.result_type) == null) return false;
+    for (contract.outputs, 0..) |output, index| {
+        if (output.parameter >= parameter_count) return false;
+        for (contract.outputs[0..index]) |previous| {
+            if (previous.parameter == output.parameter and previous.result_type == output.result_type) return false;
+        }
+        if (!try hasVariantMember(types, body.return_type, output.result_type)) return false;
         for (output.origins) |origin| {
+            if (origin.output_parameter != output.parameter or !validOriginBounds(contract, origin, parameter_count)) return false;
             if (!try validReferenceOriginTypes(db, types, body, origin, true)) return false;
         }
     }
     for (contract.requirements) |requirement| {
+        if (requirement.parameter >= parameter_count or !validRange(requirement.path, contract.paths.len)) return false;
         if (!try validReferencePath(db, types, body.block_arguments[requirement.parameter].type_id, contract.paths[requirement.path.start..requirement.path.end])) return false;
         if (requirement.ends_lifetime and requirement.written_type == null) return false;
     }
     for (contract.exclusions) |exclusion| {
         for ([_]structures.ReferenceOriginContract{ exclusion.reference, exclusion.invalidation }) |origin| {
-            if (!try validReferencePath(db, types, body.block_arguments[origin.parameter.?].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
+            const parameter = origin.parameter orelse return false;
+            if (origin.output_parameter != null or origin.result_path.start != origin.result_path.end) return false;
+            if (!validOriginBounds(contract, origin, parameter_count)) return false;
+            if (origin.reads_contents or origin.after_write or origin.variant_guard or origin.readonly_owned != null) return false;
+            if (!try validReferencePath(db, types, body.block_arguments[parameter].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
         }
     }
     return true;
+}
+
+fn validOriginBounds(contract: structures.ReferenceContract, origin: structures.ReferenceOriginContract, parameter_count: usize) bool {
+    if (origin.parameter) |parameter| if (parameter >= parameter_count) return false;
+    return validRange(origin.source_path, contract.paths.len) and validRange(origin.result_path, contract.paths.len);
 }
 
 fn validReferenceOriginTypes(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis, origin: structures.ReferenceOriginContract, conditional: bool) anyerror!bool {
@@ -617,45 +627,6 @@ fn validBranch(branch: structures.FunctionBranch, body: structures.FunctionBodyA
     return true;
 }
 
-fn validReferenceContract(contract: structures.ReferenceContract, parameter_count: usize) bool {
-    for (contract.paths) |step| {
-        const index = switch (step) {
-            .element_at => |index| index,
-            .without_element => |index| index orelse continue,
-            else => continue,
-        };
-        if (index.parameter) |parameter| if (parameter >= parameter_count) return false;
-    }
-    for (contract.origins) |origin| {
-        if (origin.output_parameter) |parameter| if (parameter >= parameter_count) return false;
-        if (origin.parameter) |parameter| if (parameter >= parameter_count) return false;
-        if (!validRange(origin.source_path, contract.paths.len) or !validRange(origin.result_path, contract.paths.len)) return false;
-    }
-    for (contract.outputs, 0..) |output, index| {
-        if (output.parameter >= parameter_count) return false;
-        for (contract.outputs[0..index]) |previous| {
-            if (previous.parameter == output.parameter and previous.result_type == output.result_type) return false;
-        }
-        for (output.origins) |origin| {
-            if (origin.output_parameter != output.parameter) return false;
-            if (origin.parameter) |parameter| if (parameter >= parameter_count) return false;
-            if (!validRange(origin.source_path, contract.paths.len) or !validRange(origin.result_path, contract.paths.len)) return false;
-        }
-    }
-    for (contract.requirements) |requirement| {
-        if (requirement.parameter >= parameter_count or !validRange(requirement.path, contract.paths.len)) return false;
-    }
-    for (contract.exclusions) |exclusion| {
-        for ([_]structures.ReferenceOriginContract{ exclusion.reference, exclusion.invalidation }) |origin| {
-            const parameter = origin.parameter orelse return false;
-            if (parameter >= parameter_count or origin.output_parameter != null or origin.result_path.start != origin.result_path.end) return false;
-            if (!validRange(origin.source_path, contract.paths.len) or !validRange(origin.result_path, contract.paths.len)) return false;
-            if (origin.reads_contents or origin.after_write or origin.variant_guard or origin.readonly_owned != null) return false;
-        }
-    }
-    return true;
-}
-
 fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     if (body.blocks.len == 0 or @backingInt(body.entry) >= body.blocks.len) return false;
     if (body.valueCount() > std.math.maxInt(u32)) return false;
@@ -675,7 +646,6 @@ fn validFunctionBody(body: structures.FunctionBodyAnalysis) bool {
     const entry = body.blocks[@backingInt(body.entry)];
     if (entry.argument_start != 0) return false;
     if (body.parameter_modes.len != entry.argument_end - entry.argument_start) return false;
-    if (!validReferenceContract(body.reference_contract, body.parameter_modes.len)) return false;
     for (body.parameter_modes, body.block_arguments[entry.argument_start..entry.argument_end]) |mode, argument| {
         if ((mode == .init) != (argument.representation == .initializer)) return false;
         if (!body.is_initializer_region) {
@@ -766,6 +736,11 @@ fn validCompiledFunction(artifact: structures.CompiledFunction) bool {
     return true;
 }
 
+fn internerIndex(comptime I: type) u8 {
+    inline for (interners, 0..) |Interner, index| if (I == Interner) return index;
+    unreachable;
+}
+
 test "query restore rejects obsolete IR formats" {
     const allocator = std.testing.allocator;
     const db = try query.Database.init(allocator, .{ .worker_count = 1 });
@@ -787,7 +762,7 @@ test "restoring a malformed canonical type rejects the snapshot" {
         defer writer.deinit();
         try writer.bytes.appendSlice(allocator, format);
         try writer.write(u64, 1);
-        try writer.write([]const u8, @typeName(queries.Types));
+        try writer.write(u8, internerIndex(queries.Types));
         try writer.write(queries.Types.Value, .{ .variant = .{ .members = members } });
         try std.testing.expectError(error.InvalidCache, restoreInterns(db, allocator, writer.bytes.items));
     }
@@ -812,7 +787,7 @@ test "restoring scalar values rejects mismatched payload types" {
             defer writer.deinit();
             try writer.bytes.appendSlice(allocator, format);
             try writer.write(u64, 1);
-            try writer.write([]const u8, @typeName(queries.CompileTimeValues));
+            try writer.write(u8, internerIndex(queries.CompileTimeValues));
             try writer.write(structures.CompileTimeValue, .{ .runtime = .{
                 .type_id = if (matching) type_id else if (type_id == .int) .bool else .int,
                 .value = value,
@@ -951,12 +926,12 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
             origin.output_parameter = 0;
             origin.result_path = .{ .start = 0, .end = 0 };
             invalid.reference_contract.origins = &origins;
-            try std.testing.expect(!try validReferenceContractTypes(db, queries.TypeFacts(*query.Database){ .ctx = db }, invalid));
+            try std.testing.expect(!try validReferenceContract(db, queries.TypeFacts(*query.Database){ .ctx = db }, invalid));
             origin.output_parameter = null;
             origin.source_path = .{ .start = 0, .end = 1 };
             var paths = [_]structures.ReferencePathStep{.{ .field = std.math.maxInt(u32) }};
             invalid.reference_contract.paths = &paths;
-            try std.testing.expect(!try validReferenceContractTypes(db, queries.TypeFacts(*query.Database){ .ctx = db }, invalid));
+            try std.testing.expect(!try validReferenceContract(db, queries.TypeFacts(*query.Database){ .ctx = db }, invalid));
         }
         if (std.mem.eql(u8, name, "retained")) {
             try std.testing.expect(body.reference_contract.exclusions.len > 0);
@@ -1827,7 +1802,7 @@ test "array snapshot interns reject unavailable elements unsupported storage and
         defer writer.deinit();
         try writer.bytes.appendSlice(allocator, format);
         try writer.write(u64, 1);
-        try writer.write([]const u8, @typeName(queries.Types));
+        try writer.write(u8, internerIndex(queries.Types));
         try writer.write(queries.Types.Value, .{ .array = array });
         try std.testing.expectError(error.InvalidCache, restoreInterns(db, allocator, writer.bytes.items));
     }
@@ -1873,7 +1848,7 @@ test "aggregate runtime snapshots require the declared shape and runtime member 
         var writer: codec.Writer = .{ .allocator = allocator };
         defer writer.deinit();
         try writer.bytes.appendSlice(allocator, format);
-        try first.writeInternedValues(&writer);
+        try first.writeInterns(&writer, interners);
         const second = try query.Database.init(allocator, .{ .worker_count = 1 });
         defer second.deinit();
         if (case_index % 5 == 0) {
@@ -1901,7 +1876,7 @@ test "text intern restoration rejects malformed bytes IDs and payload types" {
         var writer: codec.Writer = .{ .allocator = allocator };
         defer writer.deinit();
         try writer.bytes.appendSlice(allocator, format);
-        try first.writeInternedValues(&writer);
+        try first.writeInterns(&writer, interners);
         const second = try query.Database.init(allocator, .{ .worker_count = 1 });
         defer second.deinit();
         if (case_index == 0) {
@@ -1940,7 +1915,7 @@ test "cursor intern restoration validates nominal identity offsets and current t
         var writer: codec.Writer = .{ .allocator = allocator };
         defer writer.deinit();
         try writer.bytes.appendSlice(allocator, format);
-        try first.writeInternedValues(&writer);
+        try first.writeInterns(&writer, interners);
         const second = try query.Database.init(allocator, .{ .worker_count = 1 });
         defer second.deinit();
         if (case_index == 0 or case_index == 8) {

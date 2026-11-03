@@ -50,7 +50,7 @@ pub const Roots = struct {
                 .argument => |argument| {
                     if (argument.block == self.function.entry) return .parameter;
                     if (self.address_taken[@backingInt(current)]) return .{ .slot = current };
-                    return if (argument.data.representation == .value and self.function.direct(argument.data.type_id)) .immutable else .unknown;
+                    return if (self.function.directParameter(current)) .immutable else .unknown;
                 },
                 .instruction => |index| switch (self.function.instructions.items[index]) {
                     .local_storage => return .{ .slot = current },
@@ -88,27 +88,22 @@ pub const Memory = struct {
         const exposed = try function.scratch.alloc(bool, function.valueCount());
         @memset(exposed, false);
         var memory: Memory = .{ .roots = roots, .exposed = exposed };
-        const tables = function_ir.tableView(function);
         for (function.blocks.items) |*block| {
             for (block.instructions.items) |index| {
                 if (function.removed.items[index]) continue;
                 switch (function.instructions.items[index]) {
                     .borrow_address => |address| if (!address.base_is_reference) memory.expose(address.source),
                     .storage_cursor => |cursor| memory.expose(cursor.source),
-                    .initializer_ref => |reference| for (tables.initializer_captures[reference.captures.start..reference.captures.end]) |capture| memory.expose(capture),
-                    .call => |call| memory.exposeCall(call),
+                    .initializer_ref => |reference| for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |capture| memory.expose(capture),
+                    .call => |call| for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
+                        if (argument != .prepared) memory.expose(argument.valueId());
+                    },
                     else => {},
                 }
             }
             var terminator = block.terminator;
             for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
-                const parameters = function.blocks.items[@backingInt(branch.target)].parameters.items;
-                const arguments = function.branchArguments(branch.*);
-                const count = @min(arguments.len, parameters.len);
-                for (arguments[0..count], parameters[0..count]) |argument, parameter| {
-                    const data = function.definitions.items[@backingInt(parameter)].argument.data;
-                    if (data.representation != .value or !function.direct(data.type_id)) memory.expose(argument.value);
-                }
+                canonicalize.visitBranchAddresses(function, branch.*, &memory, Memory.expose);
             };
         }
         return memory;
@@ -117,12 +112,6 @@ pub const Memory = struct {
     fn expose(self: *Memory, value: ValueId) void {
         const resource = self.roots.root(value);
         if (resource == .slot) self.exposed[@backingInt(resource.slot)] = true;
-    }
-
-    fn exposeCall(self: *Memory, call: structures.FunctionCall) void {
-        for (self.roots.function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
-            if (argument != .prepared) self.expose(argument.valueId());
-        }
     }
 
     pub fn slotExposed(self: *const Memory, slot: ValueId) bool {

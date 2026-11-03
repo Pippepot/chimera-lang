@@ -123,16 +123,32 @@ Earlier probe prefixes describe intermediate versions, not this final state;
 The separate reference-contract investigation fixes opaque handle authority,
 immutable callable recovery, and scheduled automatic-drop writeback. Captured-slot
 reads use cleanup-time contents; mutable parameter outputs include cleanup writes.
-The final affected checks pass 112 reference tests and 366 query tests, with six
-query skips. The close-out reused those successful cached checks; the CLI build,
-formatting, whitespace, and editor diagnostics also pass. The earlier shared full
-run's captured-slot failure passes in the subsequent reference suite. A new full
-routine run was not performed for this final source.
+The 112 reference tests pass, and the full Safe run passed 2,236 executed tests
+with 24 skips; the reference suite was cached in that run. This resolves the
+earlier captured-slot automatic-drop failure.
 
-**Performance is not qualified.** The matched cleanup-128 cold median grows from
-21.426 to 27.039 ms (+26.2%), and its edit median from 14.814 to 20.011 ms (+35.1%);
-both pairs are stable. This agrees with earlier cleanup regressions. Further
-optimization is deferred at the user's request to finish the close-out quickly.
+### Follow-up verification
+
+The cleanup path now iterates pending reference outputs in place rather than
+allocating a duplicate slice. `TypeFunctionInstance` also checks unresolved
+expressions for statically identifiable cleanup types before running its
+reference-independent typing probe; precise analysis remains the fallback.
+Profiling showed this halves cleanup-candidate probe calls, from 1,792 to 896.
+The hot reference-path transformation now applies ordinary selectors per origin
+and merges once at the end; exclusion selectors retain the existing fallback.
+In an instrumented cleanup-128 profile, origin-path transformation fell from
+0.620 ms to 0.054 ms across 640 calls.
+
+Repeated pinned CPU-4 cleanup-128 comparisons against the user-selected parent
+`e11253e` used the same fast LLVM driver, sampler, and zero query workers. Both
+lanes exit successfully, but generated images differ as expected (parent
+32e210…, candidate f85439…; 958 versus 777 bytes). Candidate contract-edit
+medians ranged from 11.427 to 12.373 ms across stable runs; parent medians
+ranged from 10.676 to 11.607 ms, with all those parent runs unstable. In the
+latest reversed-order pair, the candidate was 12.109 ms (stable) and the parent
+11.034 ms (unstable). **End-to-end performance remains unqualified**: the
+profile shows a substantial local improvement, but timing variance prevents
+claiming a reliable whole-workload speedup or parity.
 
 The [qualification artifact](reference-contract-scheduled-state.json) retains
 source hashes, every sample and stability flag, raw CSVs, and image fingerprints.

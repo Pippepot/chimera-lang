@@ -5,10 +5,7 @@ const query = @import("query/engine.zig");
 const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 
-pub const DiscoveredFile = struct {
-    path: []const u8,
-    module_path: []u8,
-};
+pub const DiscoveredFile = struct { path: []const u8, module_path: []u8 };
 
 pub const SourceFile = struct {
     path: []const u8,
@@ -111,12 +108,12 @@ pub fn collectModuleFiles(
     // Walker order is undefined; both lists determine stable cache identities.
     std.mem.sort(DiscoveredFile, files.items, {}, struct {
         fn lessThan(_: void, left: DiscoveredFile, right: DiscoveredFile) bool {
-            return std.mem.order(u8, left.path, right.path) == .lt;
+            return std.mem.lessThan(u8, left.path, right.path);
         }
     }.lessThan);
     std.mem.sort([]u8, modules.items, {}, struct {
         fn lessThan(_: void, left: []u8, right: []u8) bool {
-            return std.mem.order(u8, left, right) == .lt;
+            return std.mem.lessThan(u8, left, right);
         }
     }.lessThan);
     var owned_files = try files.toOwnedSlice(gpa);

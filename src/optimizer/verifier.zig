@@ -23,11 +23,15 @@ pub fn verify(body: *const Body) void {
         std.debug.assert(block.instruction_start <= block.instruction_end);
         std.debug.assert(block.instruction_end <= body.instructions.len);
         instruction_count += block.instruction_end - block.instruction_start;
-        function_ir.visitTerminatorReferences(body, &block.terminator, body, checkValue);
-        verifyTargets(body, block.terminator);
+        var terminator = block.terminator;
+        for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
+            std.debug.assert(@backingInt(branch.target) < body.blocks.len);
+            const target = body.blocks[@backingInt(branch.target)];
+            std.debug.assert(branch.arguments.end - branch.arguments.start == target.argument_end - target.argument_start);
+        };
     }
     std.debug.assert(instruction_count == body.instructions.len);
-    for (body.instructions) |*instruction| function_ir.visitInstructionReferences(body, instruction, body, checkValue);
+    body.visitValueReferences(body, checkValue);
     for (body.initializer_regions) |*region| verify(region);
 }
 
@@ -35,25 +39,8 @@ fn checkFrame(body: *const Body, frame: structures.InlineFrameId) void {
     if (frame != .root) std.debug.assert(@backingInt(frame) < body.inline_frames.len);
 }
 
-fn checkValue(body: *const Body, value: ValueId) void {
-    std.debug.assert(@backingInt(value) < body.valueCount());
-}
-
-fn verifyTargets(body: *const Body, terminator: structures.FunctionTerminator) void {
-    switch (terminator) {
-        .branch => |branch| verifyBranch(body, branch),
-        .predicate_branch => |predicate| {
-            verifyBranch(body, predicate.then_branch);
-            verifyBranch(body, predicate.else_branch);
-        },
-        .return_unit, .return_value, .diverge => {},
-    }
-}
-
-fn verifyBranch(body: *const Body, branch: structures.FunctionBranch) void {
-    std.debug.assert(@backingInt(branch.target) < body.blocks.len);
-    const target = body.blocks[@backingInt(branch.target)];
-    std.debug.assert(branch.arguments.end - branch.arguments.start == target.argument_end - target.argument_start);
+fn checkValue(body: *const Body, value: *const ValueId) void {
+    std.debug.assert(@backingInt(value.*) < body.valueCount());
 }
 
 const Function = function_ir.Function;
@@ -80,14 +67,10 @@ pub fn verifyFunction(function: *Function) !void {
             defined[@backingInt(function.results.items[index])] = true;
         };
     }
-    const tables = function_ir.tableView(function);
     const context: FunctionCheck = .{ .function = function, .defined = defined };
     for (function.blocks.items, reachable) |*block, kept| {
         if (!kept) continue;
-        for (block.instructions.items) |instruction| if (!function.removed.items[instruction]) {
-            function_ir.visitInstructionReferences(tables, &function.instructions.items[instruction], &context, FunctionCheck.check);
-        };
-        function_ir.visitTerminatorReferences(tables, &block.terminator, &context, FunctionCheck.check);
+        function_ir.visitBlockReferences(function, block, &context, FunctionCheck.check);
         for (block.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
             std.debug.assert(branch.arguments.end - branch.arguments.start == function.blocks.items[@backingInt(branch.target)].parameters.items.len);
         };

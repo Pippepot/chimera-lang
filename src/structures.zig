@@ -69,54 +69,29 @@ pub const Token = struct {
         .number_literal = null,
         .ellipsis2 = "..",
         .ellipsis3 = "...",
-
-        .keyword_and = null,
-        .keyword_as = null,
-        .keyword_break = null,
-        .keyword_catch = null,
-        .keyword_comptime = null,
-        .keyword_const = null,
-        .keyword_converter = null,
-        .keyword_continue = null,
-        .keyword_deinit = null,
-        .keyword_init = null,
-        .keyword_else = null,
-        .keyword_extern = null,
-        .keyword_false = null,
-        .keyword_func = null,
-        .keyword_for = null,
-        .keyword_if = null,
-        .keyword_in = null,
-        .keyword_is = null,
-        .keyword_loop = null,
-        .keyword_match = null,
-        .keyword_mut = null,
-        .keyword_ref = null,
-        .keyword_not = null,
-        .keyword_none = null,
-        .keyword_or = null,
-        .keyword_overload = null,
-        .keyword_panic = null,
-        .keyword_imm = null,
-        .keyword_return = null,
-        .keyword_sizeof = null,
-        .keyword_static = null,
-        .keyword_struct = null,
-        .keyword_test = null,
-        .keyword_true = null,
-        .keyword_var = null,
-        .keyword_where = null,
-        .keyword_import = null,
-        .keyword_pub = null,
     };
 
-    pub const Tag = std.meta.FieldEnum(@TypeOf(definitions));
+    /// Each keyword `word` has the tag `keyword_word`.
+    const keyword_spellings = [_][]const u8{
+        "and",    "as",       "break", "catch",  "comptime", "const",  "converter", "continue",
+        "deinit", "init",     "else",  "extern", "false",    "func",   "for",       "if",
+        "in",     "is",       "loop",  "match",  "mut",      "ref",    "not",       "none",
+        "or",     "overload", "panic", "imm",    "return",   "sizeof", "static",    "struct",
+        "test",   "true",     "var",   "where",  "import",   "pub",
+    };
+
+    pub const Tag = blk: {
+        const fixed_names = @typeInfo(@TypeOf(definitions)).@"struct".field_names;
+        var names: [fixed_names.len + keyword_spellings.len][]const u8 = undefined;
+        for (fixed_names, 0..) |name, index| names[index] = name;
+        for (keyword_spellings, fixed_names.len..) |keyword, index| names[index] = "keyword_" ++ keyword;
+        const Int = std.math.IntFittingRange(0, names.len - 1);
+        break :blk @Enum(Int, .exhaustive, &names, &std.simd.iota(Int, names.len));
+    };
 
     pub const keywords = std.StaticStringMap(Tag).initComptime(blk: {
-        var entries: []const struct { []const u8, Tag } = &.{};
-        for (std.enums.values(Tag)) |tag| {
-            if (std.mem.startsWith(u8, @tagName(tag), "keyword_")) entries = entries ++ .{.{ @tagName(tag)["keyword_".len..], tag }};
-        }
+        var entries: [keyword_spellings.len]struct { []const u8, Tag } = undefined;
+        for (keyword_spellings, &entries) |keyword, *entry| entry.* = .{ keyword, @field(Tag, "keyword_" ++ keyword) };
         break :blk entries;
     });
 
@@ -271,27 +246,15 @@ pub const Node = struct {
     pub const Data = union {
         none: void,
         node: Index,
-        node_node: struct {
-            a: Index,
-            b: Index,
-        },
-        parameter: struct {
-            access: ?Token.Tag = null,
-            annotation: Index = .null,
-        },
-        field: struct {
-            type_annotation: Index,
-            kind: MemberKind,
-        },
+        node_node: struct { a: Index, b: Index },
+        parameter: struct { access: ?Token.Tag = null, annotation: Index = .null },
+        field: struct { type_annotation: Index, kind: MemberKind },
         signature: struct {
             parameters: Index,
             return_type: Index,
             where_clauses: Index,
         },
-        ref: struct {
-            start: u32,
-            end: u32,
-        },
+        ref: struct { start: u32, end: u32 },
     };
 
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
@@ -383,9 +346,7 @@ pub const FileId = u64;
 
 pub const ModuleId = enum(u32) { _ };
 
-pub const ModulePath = struct {
-    path: []const u8,
-};
+pub const ModulePath = struct { path: []const u8 };
 
 pub const ItemId = enum(u32) { _ };
 
@@ -569,14 +530,7 @@ pub const Name = union(enum) {
     pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
-pub const ItemKind = enum {
-    function,
-    overload,
-    structure,
-    static,
-    top_level_entry,
-    primitive,
-};
+pub const ItemKind = enum { function, overload, structure, static, top_level_entry, primitive };
 
 pub const ConversionCandidate = struct {
     instance: InstanceId,
@@ -752,10 +706,7 @@ pub const FunctionOverloadSet = struct {
     pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
-pub const ImportTarget = union(enum) {
-    namespace: NamespaceBinding,
-    declaration: ItemId,
-};
+pub const ImportTarget = union(enum) { namespace: NamespaceBinding, declaration: ItemId };
 
 pub const FileImport = struct {
     name: []const u8,
@@ -773,19 +724,13 @@ pub const FileImports = struct {
     pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
-pub const ResolvedItem = struct {
-    file_id: FileId,
-    declaration: u32,
-};
+pub const ResolvedItem = struct { file_id: FileId, declaration: u32 };
 
 pub const CompileTimeValue = union(enum) {
     type: TypeId,
     runtime: Runtime,
 
-    pub const Runtime = struct {
-        type_id: TypeId,
-        value: RuntimeValue,
-    };
+    pub const Runtime = struct { type_id: TypeId, value: RuntimeValue };
 
     pub const RuntimeValue = union(enum) {
         int: i32,
@@ -799,10 +744,7 @@ pub const CompileTimeValue = union(enum) {
         none,
         function_ref: FunctionReference,
         structure: CompileTimeValueTupleId,
-        variant: struct {
-            member_type: TypeId,
-            payload: CompileTimeValueId,
-        },
+        variant: struct { member_type: TypeId, payload: CompileTimeValueId },
 
         pub fn scalarTypeId(self: @This()) ?TypeId {
             return switch (self) {
@@ -821,40 +763,34 @@ pub const CompileTimeValueId = enum(u32) { _ };
 /// Canonical immutable bytes, owned by the database rather than source or frames.
 pub const ByteStringId = enum(u32) { _ };
 pub const ByteString = struct { bytes: []const u8 };
-pub const StaticStorageCursor = struct { type_id: TypeId, data: ?ByteStringId = null, offset: u32 = 0 };
+pub const StaticStorageCursor = struct {
+    type_id: TypeId,
+    data: ?ByteStringId = null,
+    offset: u32 = 0,
+};
 pub const StaticStringConstant = struct { type_id: TypeId, data: ByteStringId };
 
 /// Session-stable identity of one ordered tuple of canonical compile-time
 /// values. Specializations and interpreted calls share this representation.
 pub const CompileTimeValueTupleId = enum(u32) { _ };
 
-pub const CompileTimeValueTuple = struct {
-    values: []const CompileTimeValueId,
-};
+pub const CompileTimeValueTuple = struct { values: []const CompileTimeValueId };
 
 /// Result of evaluating one typed compile-time thunk. A returned value is
 /// canonical before it crosses the query boundary; failure and compiler
 /// control remain execution outcomes rather than value kinds.
-pub const CompileTimeOutcome = union(enum) {
-    returned: CompileTimeValueId,
-    exit: i32,
-};
+pub const CompileTimeOutcome = union(enum) { returned: CompileTimeValueId, exit: i32 };
 
 /// Result of one memoized interpreted call. Updated ordinary arguments are
 /// canonicalized separately so mutable copy-back uses the same query result.
 pub const CompileTimeCallOutcome = union(enum) {
-    completed: struct {
-        outcome: CompileTimeOutcome,
-        arguments: CompileTimeValueTupleId,
-    },
+    completed: struct { outcome: CompileTimeOutcome, arguments: CompileTimeValueTupleId },
     execution_error,
 };
 
 /// Uncatchable process exit requested by compile-time execution and handled by
 /// the embedding compiler driver rather than rendered as a source diagnostic.
-pub const CompilerControl = struct {
-    exit: i32,
-};
+pub const CompilerControl = struct { exit: i32 };
 
 /// Database interner index carried inside a non-primitive TypeId. The remaining
 /// TypeId bit distinguishes interned identities from reserved primitive IDs.
@@ -915,33 +851,17 @@ pub const TypeId = enum(u32) {
     }
 };
 
-pub const VariantType = struct {
-    members: []const TypeId,
-};
+pub const VariantType = struct { members: []const TypeId };
 
-pub const ParameterMode = enum {
-    imm,
-    ref,
-    static,
-    mut,
-    @"var",
-    deinit,
-    init,
-};
+pub const ParameterMode = enum { imm, ref, static, mut, @"var", deinit, init };
 
-pub const CallableParameter = struct {
-    mode: ParameterMode,
-    type_id: TypeId,
-};
+pub const CallableParameter = struct { mode: ParameterMode, type_id: TypeId };
 
 pub const ResultMode = enum { owned, reference };
 
 pub const MemberKind = enum { owned, reference };
 
-pub const MemberSpec = struct {
-    type_id: TypeId,
-    kind: MemberKind = .owned,
-};
+pub const MemberSpec = struct { type_id: TypeId, kind: MemberKind = .owned };
 
 pub const CallableType = struct {
     parameters: []const CallableParameter,
@@ -957,15 +877,9 @@ pub const CallableType = struct {
     pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
-pub const GeneratedStructIdentity = struct {
-    owner: InstanceId,
-    node_offset: i64,
-};
+pub const GeneratedStructIdentity = struct { owner: InstanceId, node_offset: i64 };
 
-pub const StructIdentity = union(enum) {
-    declared: ItemId,
-    generated: GeneratedStructIdentity,
-};
+pub const StructIdentity = union(enum) { declared: ItemId, generated: GeneratedStructIdentity };
 
 pub const TypeData = union(enum) {
     /// Nonowning address used by typed IR. Source references have logical type T.
@@ -977,9 +891,7 @@ pub const TypeData = union(enum) {
     tuple: TupleType,
 };
 
-pub const TupleType = struct {
-    members: []const MemberSpec,
-};
+pub const TupleType = struct { members: []const MemberSpec };
 
 /// Logical result of consuming an init carrier. A projection describes a
 /// construction-only wrapper's reference shape, not runtime wrapper storage.
@@ -989,24 +901,15 @@ pub const InitializerConstruction = struct {
     optional_allocation: bool = false,
 };
 
-pub const ArrayType = struct {
-    element_type: TypeId,
-    length: u32,
-};
+pub const ArrayType = struct { element_type: TypeId, length: u32 };
 
 /// Byte size and alignment in one layout domain. Byte size includes the padding
 /// needed for an element stride; the current layout queries resolve the host ABI.
-pub const TypeLayout = struct {
-    byte_size: u32,
-    byte_alignment: u32,
-};
+pub const TypeLayout = struct { byte_size: u32, byte_alignment: u32 };
 
 pub const ArgumentPassing = enum { direct, indirect };
 
-pub const VariantLayout = struct {
-    layout: TypeLayout,
-    payload_offset: u32,
-};
+pub const VariantLayout = struct { layout: TypeLayout, payload_offset: u32 };
 
 pub const StructField = struct {
     name: []const u8,
@@ -1022,10 +925,7 @@ pub const StructDefinition = struct {
     is_static: bool = false,
     is_error: bool = false,
 
-    pub const ResolvedField = struct {
-        index: u32,
-        type_id: TypeId,
-    };
+    pub const ResolvedField = struct { index: u32, type_id: TypeId };
 
     pub fn resolveField(self: StructDefinition, name: []const u8) ?ResolvedField {
         for (self.fields, 0..) |field, index| {
@@ -1065,26 +965,11 @@ pub const StructLayout = struct {
     pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
-pub const MoveCapability = enum {
-    trivial,
-    fieldwise,
-    custom,
-    none,
-};
+pub const MoveCapability = enum { trivial, fieldwise, custom, none };
 
-pub const CopyCapability = enum {
-    trivial,
-    fieldwise,
-    custom,
-    none,
-};
+pub const CopyCapability = MoveCapability;
 
-pub const DropCapability = enum {
-    trivial,
-    fieldwise,
-    custom,
-    explicit,
-};
+pub const DropCapability = enum { trivial, fieldwise, custom, explicit };
 
 pub const OwnershipCapabilities = struct {
     move: MoveCapability,
@@ -1103,10 +988,7 @@ pub const OwnershipCapabilities = struct {
 pub const FunctionValueId = enum(u32) { _ };
 pub const FunctionBlockId = enum(u32) { _ };
 
-pub const FunctionValueRange = struct {
-    start: u32,
-    end: u32,
-};
+pub const FunctionValueRange = struct { start: u32, end: u32 };
 
 pub const invalid_variant_tag = std.math.maxInt(u32);
 
@@ -1114,10 +996,7 @@ pub fn functionInstructionValue(argument_count: usize, instruction_index: usize)
     return @fromBackingInt(@intCast(argument_count + instruction_index));
 }
 
-pub const BinaryOperands = struct {
-    lhs: FunctionValueId,
-    rhs: FunctionValueId,
-};
+pub const BinaryOperands = struct { lhs: FunctionValueId, rhs: FunctionValueId };
 
 pub const FunctionValueUse = struct {
     value: FunctionValueId,
@@ -1189,10 +1068,7 @@ pub const PredicateOperation = enum {
     }
 };
 
-pub const FunctionBranch = struct {
-    target: FunctionBlockId,
-    arguments: FunctionValueRange,
-};
+pub const FunctionBranch = struct { target: FunctionBlockId, arguments: FunctionValueRange };
 
 pub const FunctionTerminator = union(enum) {
     branch: FunctionBranch,
@@ -1223,11 +1099,9 @@ pub const FunctionTerminator = union(enum) {
     }
 
     pub fn successors(self: *FunctionTerminator) [2]?*FunctionBlockId {
-        return switch (self.*) {
-            .branch => |*branch| .{ &branch.target, null },
-            .predicate_branch => |*branch| .{ &branch.then_branch.target, &branch.else_branch.target },
-            .return_unit, .return_value, .diverge => .{ null, null },
-        };
+        var targets: [2]?*FunctionBlockId = undefined;
+        for (self.branches(), &targets) |branch, *target| target.* = if (branch) |present| &present.target else null;
+        return targets;
     }
 
     pub fn successorCount(self: FunctionTerminator) u2 {
@@ -1270,10 +1144,7 @@ pub const CallBehavior = enum {
     collection_append_growing,
 };
 
-pub const FunctionParameterShape = struct {
-    mode: ParameterMode,
-    is_meta_type: bool,
-};
+pub const FunctionParameterShape = struct { mode: ParameterMode, is_meta_type: bool };
 
 /// Declaration-level callable facts. Unlike `FunctionSignature`, this keeps
 /// static parameters and does not require dependent runtime types to have been
@@ -1297,7 +1168,11 @@ pub const FunctionShape = struct {
 };
 
 pub const FunctionCall = struct {
-    target: union(enum) { direct: InstanceId, indirect: FunctionValueId, initializer: FunctionValueId },
+    target: union(enum) {
+        direct: InstanceId,
+        indirect: FunctionValueId,
+        initializer: FunctionValueId,
+    },
     arguments: FunctionValueRange,
     return_type: TypeId,
     destination: ?FunctionValueId = null,
@@ -1335,7 +1210,11 @@ pub const VariantOperation = struct {
 pub const StorageProjection = struct {
     owner: FunctionValueId,
     type_id: TypeId,
-    projection: union(enum) { field: u32, variant, allocation_array },
+    projection: union(enum) {
+        field: u32,
+        variant,
+        allocation_array,
+    },
 };
 
 pub const AllocationElement = struct {
@@ -1356,10 +1235,7 @@ pub const CursorElement = struct {
     type_id: TypeId,
 };
 
-pub const BorrowOperation = struct {
-    source: FunctionValueId,
-    type_id: TypeId,
-};
+pub const BorrowOperation = struct { source: FunctionValueId, type_id: TypeId };
 
 pub const BorrowProjection = union(enum) { field: u32, variant: TypeId };
 
@@ -1388,10 +1264,7 @@ pub const FieldAccessOperation = struct {
     field_type: TypeId,
 };
 
-pub const CompareOperation = struct {
-    operation: PredicateOperation,
-    operands: BinaryOperands,
-};
+pub const CompareOperation = struct { operation: PredicateOperation, operands: BinaryOperands };
 
 pub const SelectOperation = struct {
     condition: FunctionValueId,
@@ -1415,10 +1288,7 @@ pub const MoveOperation = struct {
     backward: bool,
 };
 
-pub const AggregateOperation = struct {
-    fields: FunctionValueRange,
-    type_id: TypeId,
-};
+pub const AggregateOperation = struct { fields: FunctionValueRange, type_id: TypeId };
 
 pub const NumericConstant = struct { type_id: TypeId, bits: u64 };
 pub const NumericBinary = struct {
@@ -1461,7 +1331,11 @@ pub const FunctionInstruction = union(enum) {
     const_unit,
     const_none,
     function_ref: FunctionReference,
-    initializer_ref: struct { region: u32, captures: FunctionValueRange, type_id: TypeId },
+    initializer_ref: struct {
+        region: u32,
+        captures: FunctionValueRange,
+        type_id: TypeId,
+    },
     variant_tag: FunctionValueId,
     variant_coerce: VariantOperation,
     variant_extract: VariantOperation,
@@ -1476,7 +1350,11 @@ pub const FunctionInstruction = union(enum) {
     value_copy: ValueCopy,
     field_access: FieldAccessOperation,
     call: FunctionCall,
-    static_conversion: struct { operand: FunctionValueId, type_id: TypeId, destination: ?FunctionValueId = null },
+    static_conversion: struct {
+        operand: FunctionValueId,
+        type_id: TypeId,
+        destination: ?FunctionValueId = null,
+    },
     negi: FunctionValueId,
     addi: BinaryOperands,
     subi: BinaryOperands,
@@ -1595,10 +1473,7 @@ pub const FunctionInstruction = union(enum) {
 /// address projections consumed by code generation.
 /// A slot selector can be constant or affine in one immutable integer argument.
 /// Unresolved runtime selectors widen to `element`, never to a guessed slot.
-pub const ReferenceIndex = struct {
-    parameter: ?u32 = null,
-    offset: i32 = 0,
-};
+pub const ReferenceIndex = struct { parameter: ?u32 = null, offset: i32 = 0 };
 
 pub const ReferencePathStep = union(enum) {
     field: u32,
@@ -1704,12 +1579,12 @@ pub const ReferenceContract = struct {
                 if (output.origins.len != candidate.origins.len) continue;
                 for (output.origins) |origin| {
                     for (candidate.origins) |other| {
-                        if (sameOrigin(left, origin, right, other)) break;
+                        if (same(left, origin, right, other)) break;
                     } else break;
                 } else break;
             } else return false;
         }
-        inline for (.{ "origins", "requirements", "exclusions" }, .{ sameOrigin, sameRequirement, sameExclusion }) |name, same| {
+        inline for (.{ "origins", "requirements", "exclusions" }) |name| {
             const first = @field(left, name);
             const second = @field(right, name);
             if (first.len != second.len) return false;
@@ -1722,19 +1597,16 @@ pub const ReferenceContract = struct {
         return true;
     }
 
-    pub fn sameExclusion(left: @This(), a: ReferenceExclusion, right: @This(), b: ReferenceExclusion) bool {
-        return sameOrigin(left, a.reference, right, b.reference) and sameOrigin(left, a.invalidation, right, b.invalidation);
-    }
-
-    pub fn sameOrigin(left: @This(), a: ReferenceOriginContract, right: @This(), b: ReferenceOriginContract) bool {
-        return a.output_parameter == b.output_parameter and a.parameter == b.parameter and a.kind == b.kind and a.readonly == b.readonly and a.readonly_owned == b.readonly_owned and
-            a.storage_depth == b.storage_depth and a.recursive_storage == b.recursive_storage and a.variant_guard == b.variant_guard and a.stable == b.stable and a.after_write == b.after_write and a.reads_contents == b.reads_contents and
-            samePath(left, a.source_path, right, b.source_path) and samePath(left, a.result_path, right, b.result_path);
-    }
-
-    pub fn sameRequirement(left: @This(), a: ReferenceRequirement, right: @This(), b: ReferenceRequirement) bool {
-        return a.parameter == b.parameter and a.kind == b.kind and a.written_type == b.written_type and
-            a.storage_depth == b.storage_depth and a.recursive_storage == b.recursive_storage and a.ends_lifetime == b.ends_lifetime and samePath(left, a.path, right, b.path);
+    /// Compares contract entries field by field, resolving each path range in
+    /// the contract that owns it.
+    pub fn same(left: @This(), a: anytype, right: @This(), b: @TypeOf(a)) bool {
+        const Entry = @TypeOf(a);
+        if (Entry == FunctionValueRange) return samePath(left, a, right, b);
+        if (@typeInfo(Entry) != .@"struct") return a == b;
+        inline for (@typeInfo(Entry).@"struct".field_names) |name| {
+            if (!same(left, @field(a, name), right, @field(b, name))) return false;
+        }
+        return true;
     }
 
     pub fn samePath(left: @This(), a: FunctionValueRange, right: @This(), b: FunctionValueRange) bool {
@@ -1877,10 +1749,7 @@ pub const CompileTimeSite = struct {
 /// Identity of one concrete compile-time function invocation. Ordinary
 /// parameters are supplied in `arguments`; static parameters are already part
 /// of `instance.specialization`.
-pub const CompileTimeCallKey = struct {
-    instance: InstanceId,
-    arguments: CompileTimeValueTupleId,
-};
+pub const CompileTimeCallKey = struct { instance: InstanceId, arguments: CompileTimeValueTupleId };
 
 /// Owned deterministic breadth-first order of instances reachable from an entry.
 /// The slice is nonempty and stores the entry first.
@@ -1914,10 +1783,7 @@ pub const CompiledFunction = struct {
 
     pub const ReferenceId = enum(u32) { _ };
 
-    pub const RelocationKind = enum {
-        call_relative_32,
-        address_absolute_64,
-    };
+    pub const RelocationKind = enum { call_relative_32, address_absolute_64 };
 
     pub const Relocation = struct {
         /// Byte offset of the field to patch. Relative displacements are based
@@ -1933,10 +1799,7 @@ pub const CompiledFunction = struct {
     pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
-pub const SourceSpan = struct {
-    start: usize,
-    end: usize,
-};
+pub const SourceSpan = struct { start: usize, end: usize };
 
 pub const Diagnostic = struct {
     pub fn eql(a: Diagnostic, b: Diagnostic) bool {
@@ -1953,21 +1816,11 @@ pub const Diagnostic = struct {
     instance: ?InstanceId = null,
     notes: []const Note = &.{},
 
-    pub const TypeMismatch = struct {
-        expected: TypeId,
-        found: TypeId,
-    };
+    pub const TypeMismatch = struct { expected: TypeId, found: TypeId };
 
-    pub const TypeNotCopyable = struct {
-        type_id: TypeId,
-        is_movable: bool,
-    };
+    pub const TypeNotCopyable = struct { type_id: TypeId, is_movable: bool };
 
-    pub const InvalidStructPropertyValue = enum {
-        move,
-        copy,
-        drop,
-    };
+    pub const InvalidStructPropertyValue = enum { move, copy, drop };
 
     pub const IncompatibleStructOwnershipProperty = enum {
         trivial_move,
@@ -1978,32 +1831,30 @@ pub const Diagnostic = struct {
         trivial_drop,
     };
 
-    pub const Message = struct {
-        text: []const u8,
-        source_label: bool = false,
+    pub const Message = struct { text: []const u8, source_label: bool = false };
+
+    /// Renders a `TypeId` payload between fixed text.
+    pub const TypeMessage = struct { prefix: []const u8, suffix: []const u8 = "" };
+
+    /// Renders a `TypeMismatch` payload as "<prefix>expected `T`, found `U`".
+    pub const MismatchMessage = struct { prefix: []const u8 };
+
+    /// Type definitions are payloads with custom renderers; other definitions
+    /// carry the rendered text for their payload.
+    pub const Kind = kind: {
+        @setEvalBranchQuota(10_000);
+        const names = @typeInfo(@TypeOf(definitions)).@"struct".field_names;
+        var payloads: [names.len]type = undefined;
+        for (names, &payloads) |name, *payload| payload.* = switch (@TypeOf(@field(definitions, name))) {
+            type => @field(definitions, name),
+            TypeMessage => TypeId,
+            MismatchMessage => TypeMismatch,
+            else => void,
+        };
+        break :kind @Union(.auto, std.meta.FieldEnum(@TypeOf(definitions)), names, &payloads, &@splat(.{}));
     };
 
-    fn kindFromDefinitions(comptime schema: anytype) type {
-        @setEvalBranchQuota(10_000);
-        const names = @typeInfo(@TypeOf(schema)).@"struct".field_names;
-        var payloads: [names.len]type = undefined;
-        for (names, 0..) |name, index| {
-            const definition = @field(schema, name);
-            payloads[index] = if (@TypeOf(definition) == type) definition else void;
-        }
-        return @Union(.auto, std.meta.FieldEnum(@TypeOf(schema)), names, &payloads, &@splat(.{}));
-    }
-
-    pub const Kind = kindFromDefinitions(definitions);
-
-    pub fn message(comptime tag: std.meta.Tag(Kind)) Message {
-        const definition = @field(definitions, @tagName(tag));
-        if (@TypeOf(definition) == type) @compileError("missing custom renderer for diagnostic " ++ @tagName(tag));
-        if (@TypeOf(definition) == Message) return definition;
-        return .{ .text = definition };
-    }
-
-    const definitions = .{
+    pub const definitions = .{
         .expected_token = struct {
             expected: Token.Tag,
             found: Token.Tag,
@@ -2016,10 +1867,10 @@ pub const Diagnostic = struct {
         .match_capture_must_be_immutable = "a match capture is immutable; use a bare name or `ref`, not `var`",
         .match_requires_arm = "a match requires at least one arm",
         .match_redundant_arm = "this match arm is fully covered by preceding arms",
-        .match_not_exhaustive = TypeId,
-        .match_pattern_incompatible = TypeMismatch,
-        .match_literal_ambiguous = TypeId,
-        .match_range_ambiguous = TypeId,
+        .match_not_exhaustive = TypeMessage{ .prefix = "match is not exhaustive; uncovered values remain in " },
+        .match_pattern_incompatible = MismatchMessage{ .prefix = "match pattern is incompatible with the subject: " },
+        .match_literal_ambiguous = TypeMessage{ .prefix = "literal pattern has more than one matching type in " },
+        .match_range_ambiguous = TypeMessage{ .prefix = "range pattern has more than one matching type in " },
         .match_range_empty = "range pattern contains no values",
         .match_range_bound_not_integer = "range pattern bounds must be compile-time integers",
         .match_tuple_capture_type_ambiguous = "a tuple capture must have the same element type in every matching tuple alternative; use separate type arms",
@@ -2056,13 +1907,13 @@ pub const Diagnostic = struct {
         .invalid_entry_return = "entry may return only unit or marked error alternatives",
         .unknown_struct_property = void,
         .invalid_struct_property_value = InvalidStructPropertyValue,
-        .struct_ownership_hook_signature_mismatch = TypeMismatch,
+        .struct_ownership_hook_signature_mismatch = MismatchMessage{ .prefix = "struct ownership hook signature mismatch: " },
         .struct_ownership_property_incompatible_with_fields = IncompatibleStructOwnershipProperty,
         .struct_field_type_not_supported = "this struct field type is not supported yet",
         .recursive_struct_containment = Message{ .text = "struct recursively contains itself by value through field", .source_label = true },
-        .static_initializer_type_mismatch = TypeMismatch,
+        .static_initializer_type_mismatch = MismatchMessage{ .prefix = "static initializer type mismatch: " },
         .type_value_used_as_runtime_value = Message{ .text = "expected a value, found a type", .source_label = true },
-        .compile_time_only_type = TypeId,
+        .compile_time_only_type = TypeMessage{ .prefix = "compile-time-only type ", .suffix = " cannot be materialized during runtime execution" },
         .ambiguous_conversion = TypeMismatch,
         .ambiguous_variant_member = TypeMismatch,
         .tuple_context_not_tuple = "tuple expression requires a tuple type in this context",
@@ -2126,29 +1977,29 @@ pub const Diagnostic = struct {
         .mutable_borrow_requires_writable_place = "a writable reference requires a mutable place or writable Ref",
         .reference_not_writable = "cannot modify a readonly reference",
         .transferred_value_not_restored_before_loop_backedge = "transferred value must be reassigned before the next loop iteration",
-        .type_not_movable = TypeId,
-        .relocation_requires_direct_move = TypeId,
+        .type_not_movable = TypeMessage{ .prefix = "cannot transfer value of immovable type " },
+        .relocation_requires_direct_move = TypeMessage{ .prefix = "a completed value of type ", .suffix = " cannot move directly into another destination; construct it there, giving the result a known type if needed" },
         .type_not_copyable = TypeNotCopyable,
-        .list_requires_automatic_drop = TypeId,
-        .list_requires_direct_move = TypeId,
-        .list_iteration_item_conflicts_with_end = TypeId,
-        .borrow_write_requires_automatic_drop = TypeId,
-        .borrow_write_requires_direct_move = TypeId,
-        .box_requires_automatic_drop = TypeId,
-        .box_extraction_requires_direct_move = TypeId,
-        .value_requires_explicit_drop = TypeId,
+        .list_requires_automatic_drop = TypeMessage{ .prefix = "List requires an automatically droppable element type; found " },
+        .list_requires_direct_move = TypeMessage{ .prefix = "List requires a directly movable element type for relocation; found " },
+        .list_iteration_item_conflicts_with_end = TypeMessage{ .prefix = "List consuming iteration cannot distinguish an owned End element from exhaustion; element type is " },
+        .borrow_write_requires_automatic_drop = TypeMessage{ .prefix = "write requires an automatically droppable pointee type; found " },
+        .borrow_write_requires_direct_move = TypeMessage{ .prefix = "write requires a directly movable pointee type; found " },
+        .box_requires_automatic_drop = TypeMessage{ .prefix = "Box requires an automatically droppable element type; found " },
+        .box_extraction_requires_direct_move = TypeMessage{ .prefix = "cannot extract a non-directly-movable value from Box; found " },
+        .value_requires_explicit_drop = TypeMessage{ .prefix = "", .suffix = " must be transferred with `^` or passed to a `deinit` parameter before this scope ends" },
         .expression_not_supported = "this expression is not supported yet",
         .invalid_collection_sequence = "collection_sequence must contain one owned List value matching its element type",
         .collection_requires_static_count = "Array construction requires a statically known element count; use List for runtime-sized results",
         .collection_size_out_of_range = "collection element count exceeds the supported range",
         .static_iteration_binding_mode = "static for bindings must be bare or const value bindings",
-        .struct_initializer_not_struct = TypeId,
+        .struct_initializer_not_struct = TypeMessage{ .prefix = "only a struct type can be initialized with `{...}`; found " },
         .unknown_struct_field = Message{ .text = "unknown struct field", .source_label = true },
         .duplicate_struct_initializer_field = Message{ .text = "struct field is initialized more than once", .source_label = true },
         .missing_struct_initializer_field = struct { type_id: TypeId, field_index: u32 },
-        .struct_initializer_field_type_mismatch = TypeMismatch,
-        .field_access_not_struct = TypeId,
-        .private_struct_field = TypeId,
+        .struct_initializer_field_type_mismatch = MismatchMessage{ .prefix = "struct field initializer type mismatch: " },
+        .field_access_not_struct = TypeMessage{ .prefix = "field access requires a struct value, found " },
+        .private_struct_field = TypeMessage{ .prefix = "cannot name a private field of ", .suffix = " outside its defining module" },
         .public_field_private_type = "a public field's type cannot name a private declaration",
         .unknown_field = Message{ .text = "unknown struct field", .source_label = true },
         .duplicate_local_binding = Message{ .text = "binding is already declared in this scope", .source_label = true },
@@ -2156,7 +2007,7 @@ pub const Diagnostic = struct {
         .unknown_type = Message{ .text = "unknown type", .source_label = true },
         .unknown_value = Message{ .text = "unknown value", .source_label = true },
         .assignment_to_immutable = Message{ .text = "cannot assign to immutable binding", .source_label = true },
-        .assignment_type_mismatch = TypeMismatch,
+        .assignment_type_mismatch = MismatchMessage{ .prefix = "assignment type mismatch: " },
         .integer_literal_out_of_range = "integer literal is outside the destination numeric range or is not exactly representable",
         .invalid_numeric_literal = "invalid numeric literal",
         .float_literal_out_of_range = "floating-point literal overflows or rounds a nonzero value to zero",
@@ -2164,20 +2015,20 @@ pub const Diagnostic = struct {
         .compile_time_integer_overflow = "integer overflow during compile-time execution",
         .invalid_string_escape = "invalid string escape",
         .invalid_string_utf8 = "string literal is not valid UTF-8",
-        .condition_not_bool = TypeId,
+        .condition_not_bool = TypeMessage{ .prefix = "condition requires bool, found " },
         .inspection_type_not_supported = "this inspection type is not supported yet",
         .iterator_result_requires_end = TypeMismatch,
         .loop_invalidates_type_proof = "this loop can repeat after invalidating a type proof used in its body; test the type inside the loop",
         .condition_binding_must_be_immutable = "an `if` binding must use `const`, not `var`",
         .value_not_callable = Message{ .text = "value is not callable", .source_label = true },
-        .local_type_mismatch = TypeMismatch,
-        .comparison_operand_not_int = TypeId,
-        .equality_operand_not_supported = TypeId,
-        .equality_operand_type_mismatch = TypeMismatch,
-        .missing_return_value = TypeId,
-        .return_type_mismatch = TypeMismatch,
+        .local_type_mismatch = MismatchMessage{ .prefix = "initializer type mismatch: " },
+        .comparison_operand_not_int = TypeMessage{ .prefix = "comparison requires `int`, found " },
+        .equality_operand_not_supported = TypeMessage{ .prefix = "equality is not supported for " },
+        .equality_operand_type_mismatch = MismatchMessage{ .prefix = "equality operand type mismatch: " },
+        .missing_return_value = TypeMessage{ .prefix = "function must return ", .suffix = " on every reachable path" },
+        .return_type_mismatch = MismatchMessage{ .prefix = "return type mismatch: " },
         .unknown_function = Message{ .text = "unknown function", .source_label = true },
         .call_argument_count_mismatch = struct { expected: u32, found: u32 },
-        .call_argument_type_mismatch = TypeMismatch,
+        .call_argument_type_mismatch = MismatchMessage{ .prefix = "argument type mismatch: " },
     };
 };

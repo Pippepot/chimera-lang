@@ -8,6 +8,8 @@ pub const Category = enum {
     body_overhead,
     body_build,
     body_typing,
+    cleanup_output_candidates,
+    cleanup_output_scheduling,
     body_lifetimes,
     body_freeze,
     type_facts,
@@ -36,10 +38,7 @@ pub fn queryCategory(comptime Query: type) Category {
     return if (@hasDecl(Query, "profile_category")) Query.profile_category else .query_other;
 }
 
-pub const Counter = struct {
-    nanoseconds: i96 = 0,
-    runs: usize = 0,
-};
+pub const Counter = struct { nanoseconds: i96 = 0, runs: usize = 0 };
 
 pub const Snapshot = struct {
     counters: [@typeInfo(Category).@"enum".field_names.len]Counter = std.mem.zeroes([@typeInfo(Category).@"enum".field_names.len]Counter),

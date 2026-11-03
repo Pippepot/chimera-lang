@@ -19,6 +19,10 @@ const DebugFlags = struct {
     @"asm": bool = false,
     timing: bool = false,
     memory: bool = false,
+
+    fn rendersIr(self: DebugFlags) bool {
+        return self.ast or self.ssa or self.optimized or self.@"asm";
+    }
 };
 
 const RunInput = struct {
@@ -26,9 +30,10 @@ const RunInput = struct {
     source: []const u8,
     source_files: []const modules.SourceFile = &.{},
     module_paths: []const []const u8 = &.{},
-    program_args: []const []const u8,
-    debug_flags: DebugFlags,
-    started: std.Io.Timestamp,
+    program_args: []const []const u8 = &.{},
+    debug_flags: DebugFlags = .{},
+    /// Null starts timing when compilation starts.
+    started: ?std.Io.Timestamp = null,
     cache_directory: ?[]const u8 = null,
     worker_count: ?usize = null,
 };
@@ -66,10 +71,7 @@ const CommandLine = struct {
     positional: []const []const u8 = &.{},
 };
 
-const ParsedCommandLine = union(enum) {
-    help,
-    run: CommandLine,
-};
+const ParsedCommandLine = union(enum) { help, run: CommandLine };
 
 fn parseCommandLine(args: []const []const u8, errors: *std.Io.Writer) !?ParsedCommandLine {
     var command_line: CommandLine = .{};
@@ -131,17 +133,13 @@ fn compileAndRun(
     output: *std.Io.Writer,
     errors: *std.Io.Writer,
 ) !RunOutcome {
-    var timings: diagnostics.TimingLog = .init(input.started);
+    var timings: diagnostics.TimingLog = .init(input.started orelse std.Io.Clock.awake.now(io));
     var profile: @import("profiling.zig").Collector = .{ .io = io };
     if (input.debug_flags.timing) timings.enableQueryProfiling(&profile);
     timings.mark(io, "load source");
-    const use_cache = input.cache_directory != null and !input.debug_flags.ast and
-        !input.debug_flags.ssa and !input.debug_flags.optimized and !input.debug_flags.@"asm";
+    const use_cache = input.cache_directory != null and !input.debug_flags.rendersIr();
     const compiler_digest = if (use_cache) cache.compilerDigest(io) catch null else null;
-    const cache_key = if (compiler_digest) |digest|
-        cache.key(digest, input.source_path, input.source, input.source_files, input.module_paths)
-    else
-        null;
+    const cache_key = if (compiler_digest) |digest| cache.key(digest, input.source_path, input.source, input.source_files, input.module_paths) else null;
     if (cache_key) |digest| {
         if (try cache.load(io, gpa, input.cache_directory.?, digest)) |bytes| {
             defer gpa.free(bytes);
@@ -150,14 +148,8 @@ fn compileAndRun(
         }
     }
     const worker_count = input.worker_count orelse @min(2, std.Thread.getCpuCount() catch 1);
-    const snapshot_key = if (compiler_digest) |digest|
-        cache.querySnapshotKey(digest, input.source_path, input.source_files)
-    else
-        null;
-    const snapshot = if (snapshot_key) |digest|
-        try cache.load(io, gpa, input.cache_directory.?, digest)
-    else
-        null;
+    const snapshot_key = if (compiler_digest) |digest| cache.querySnapshotKey(digest, input.source_path, input.source_files) else null;
+    const snapshot = if (snapshot_key) |digest| try cache.load(io, gpa, input.cache_directory.?, digest) else null;
     defer if (snapshot) |bytes| gpa.free(bytes);
 
     const database_options: query.Options = .{
@@ -200,10 +192,7 @@ fn compileAndRun(
         timings.mark(io, "restore queries");
     }
 
-    const bundled = if (!input.debug_flags.ast and !input.debug_flags.ssa and !input.debug_flags.optimized and !input.debug_flags.@"asm")
-        try standard_bundle.install(db, @embedFile("standard_bundle"))
-    else
-        null;
+    const bundled = if (!input.debug_flags.rendersIr()) try standard_bundle.install(db, @embedFile("standard_bundle")) else null;
     if (bundled != null) timings.mark(io, "index precompiled std");
     if (input.debug_flags.timing) try buildWithStageTimings(db, io, &timings);
     const executable_result = try db.get(queries.BuildExecutable, file_id);
@@ -214,19 +203,9 @@ fn compileAndRun(
             try errors.print("precompiled std: {d} typed, {d} prepared, {d} optimized bodies, {d} call components, {d} native functions loaded on demand\n", .{ loaded.bodies, loaded.prepared, loaded.optimized, loaded.components, loaded.functions });
         }
     }
-    const emitted = try db.transitiveAccumulatorValues(
-        queries.BuildExecutable,
-        file_id,
-        structures.Diagnostic,
-        gpa,
-    );
+    const emitted = try db.transitiveAccumulatorValues(queries.BuildExecutable, file_id, structures.Diagnostic, gpa);
     defer gpa.free(emitted);
-    const compiler_controls = try db.transitiveAccumulatorValues(
-        queries.BuildExecutable,
-        file_id,
-        structures.CompilerControl,
-        gpa,
-    );
+    const compiler_controls = try db.transitiveAccumulatorValues(queries.BuildExecutable, file_id, structures.CompilerControl, gpa);
     defer gpa.free(compiler_controls);
     timings.mark(io, "collect diagnostics");
 
@@ -394,6 +373,26 @@ fn reportProgramTermination(output: *std.Io.Writer, errors: *std.Io.Writer, term
     return false;
 }
 
+/// Captures compiler output and removes the executable the run may produce.
+const TestRun = struct {
+    output: std.Io.Writer.Allocating,
+    errors: std.Io.Writer.Allocating,
+
+    fn init() TestRun {
+        return .{ .output = .init(std.testing.allocator), .errors = .init(std.testing.allocator) };
+    }
+
+    fn deinit(self: *TestRun) void {
+        self.output.deinit();
+        self.errors.deinit();
+        std.Io.Dir.cwd().deleteFile(std.testing.io, "prog") catch {};
+    }
+
+    fn compile(self: *TestRun, input: RunInput) !RunOutcome {
+        return compileAndRun(std.testing.io, std.testing.allocator, input, &self.output.writer, &self.errors.writer);
+    }
+};
+
 test "CLI reports a generated program signal separately from compiler failure" {
     var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer output.deinit();
@@ -412,11 +411,11 @@ test "CLI options stop at the source path and preserve program arguments" {
     try std.testing.expect(parsed.debug_flags.ast);
     try std.testing.expect(parsed.debug_flags.memory);
     try std.testing.expectEqualSlices([]const u8, args[1..], parsed.positional);
-    try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), errors.written().len);
     try std.testing.expect(!parsed.disk_cache_enabled);
     try std.testing.expect(try parseCommandLine(&.{"--debug=ssa"}, &errors.writer) == null);
     try std.testing.expect(try parseCommandLine(&.{ "--debug=unknown", "main.chi" }, &errors.writer) == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "unknown debug flag 'unknown'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, errors.written(), "unknown debug flag 'unknown'") != null);
     const workers = (try parseCommandLine(&.{ "--workers=4", "main.chi" }, &errors.writer)).?.run;
     try std.testing.expectEqual(@as(?usize, 4), workers.worker_count);
     const serial = (try parseCommandLine(&.{ "--workers=0", "main.chi" }, &errors.writer)).?.run;
@@ -433,13 +432,12 @@ test "CLI help accepts both spellings without a source path" {
     try std.testing.expect((try parseCommandLine(&.{"-h"}, &errors.writer)).? == .help);
     try std.testing.expect((try parseCommandLine(&.{"--help"}, &errors.writer)).? == .help);
     try std.testing.expect((try parseCommandLine(&.{ "--workers=2", "--help" }, &errors.writer)).? == .help);
-    try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), errors.written().len);
     try std.testing.expect(try parseCommandLine(&.{ "--debug=unknown", "--help" }, &errors.writer) == null);
 }
 
 test "CLI reuses a complete disk cache entry and invalidates changed source" {
     const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const cache_directory = try tmp.dir.realPathFileAlloc(io, ".", std.testing.allocator);
@@ -456,79 +454,60 @@ test "CLI reuses a complete disk cache entry and invalidates changed source" {
             const name = std.fmt.bytesToHex(digest, .lower);
             try tmp.dir.writeFile(io, .{ .sub_path = &name, .data = "damaged" });
         }
-        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer output.deinit();
-        var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer errors.deinit();
-        const result = try compileAndRun(io, std.testing.allocator, .{
+        var run: TestRun = .init();
+        defer run.deinit();
+        const result = try run.compile(.{
             .source_path = "test.chi",
             .source = case.source,
-            .program_args = &.{},
             .debug_flags = .{ .timing = true },
-            .started = std.Io.Clock.awake.now(io),
             .cache_directory = cache_directory,
             .worker_count = 2,
-        }, &output.writer, &errors.writer);
+        });
         try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = case.expected } }, result);
-        try std.testing.expectEqual(case.hit, std.mem.indexOf(u8, errors.writer.buffered(), "cache hit") != null);
+        try std.testing.expectEqual(case.hit, std.mem.indexOf(u8, run.errors.written(), "cache hit") != null);
     }
 
-    var uncached_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer uncached_output.deinit();
-    var uncached_errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer uncached_errors.deinit();
-    const uncached_result = try compileAndRun(io, std.testing.allocator, .{
+    var uncached: TestRun = .init();
+    defer uncached.deinit();
+    const uncached_result = try uncached.compile(.{
         .source_path = "test.chi",
         .source = "exit(18)",
-        .program_args = &.{},
         .debug_flags = .{ .timing = true },
-        .started = std.Io.Clock.awake.now(io),
         .worker_count = 2,
-    }, &uncached_output.writer, &uncached_errors.writer);
+    });
     try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 18 } }, uncached_result);
-    try std.testing.expect(std.mem.indexOf(u8, uncached_errors.writer.buffered(), "cache hit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, uncached.errors.written(), "cache hit") == null);
 
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-    const rejected = try compileAndRun(io, std.testing.allocator, .{
+    var run: TestRun = .init();
+    defer run.deinit();
+    const rejected = try run.compile(.{
         .source_path = "test.chi",
         .source = "exit(",
-        .program_args = &.{},
-        .debug_flags = .{},
-        .started = std.Io.Clock.awake.now(io),
         .cache_directory = cache_directory,
         .worker_count = 2,
-    }, &output.writer, &errors.writer);
+    });
     try std.testing.expectEqual(RunOutcome.rejected, rejected);
-    try std.testing.expect(errors.writer.buffered().len != 0);
+    try std.testing.expect(run.errors.written().len != 0);
 
     const snapshot_key = cache.querySnapshotKey(try cache.compilerDigest(io), "test.chi", &[_]modules.SourceFile{});
     const snapshot = (try cache.load(io, std.testing.allocator, cache_directory, snapshot_key)).?;
     defer std.testing.allocator.free(snapshot);
     snapshot[0] ^= 1;
     try cache.save(io, std.testing.allocator, cache_directory, snapshot_key, snapshot);
-    var recovered_output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer recovered_output.deinit();
-    var recovered_errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer recovered_errors.deinit();
-    const recovered = try compileAndRun(io, std.testing.allocator, .{
+    var recovery: TestRun = .init();
+    defer recovery.deinit();
+    const recovered = try recovery.compile(.{
         .source_path = "test.chi",
         .source = "exit(19)",
-        .program_args = &.{},
-        .debug_flags = .{},
-        .started = std.Io.Clock.awake.now(io),
         .cache_directory = cache_directory,
         .worker_count = 2,
-    }, &recovered_output.writer, &recovered_errors.writer);
+    });
     try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 19 } }, recovered);
-    try std.testing.expectEqual(@as(usize, 0), recovered_errors.writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), recovery.errors.written().len);
 }
 
 test "zero one and four workers produce identical multi-file artifacts" {
     const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
     const source_files = [_]modules.SourceFile{
         .{ .path = "a.chi", .module_path = "", .source = "static a = func() int -> shared() + 5" },
         .{ .path = "b.chi", .module_path = "", .source = "static b = func() int -> shared() + 6" },
@@ -537,21 +516,16 @@ test "zero one and four workers produce identical multi-file artifacts" {
     var first_artifact: ?[]u8 = null;
     defer if (first_artifact) |bytes| std.testing.allocator.free(bytes);
     for ([_]usize{ 0, 1, 4 }) |workers| {
-        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer output.deinit();
-        var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer errors.deinit();
-        const result = try compileAndRun(io, std.testing.allocator, .{
+        var run: TestRun = .init();
+        defer run.deinit();
+        const result = try run.compile(.{
             .source_path = "main.chi",
             .source = "exit(a() + b())",
             .source_files = &source_files,
-            .program_args = &.{},
-            .debug_flags = .{},
-            .started = std.Io.Clock.awake.now(io),
             .worker_count = workers,
-        }, &output.writer, &errors.writer);
+        });
         try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 21 } }, result);
-        try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+        try std.testing.expectEqual(@as(usize, 0), run.errors.written().len);
         const artifact = try std.Io.Dir.cwd().readFileAlloc(io, "prog", std.testing.allocator, .limited(1024 * 1024));
         if (first_artifact) |first| {
             defer std.testing.allocator.free(artifact);
@@ -563,100 +537,80 @@ test "zero one and four workers produce identical multi-file artifacts" {
 }
 
 test "CLI core renders debug output and runs the compiled program" {
-    const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var run: TestRun = .init();
+    defer run.deinit();
 
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-
-    const exit_code = try compileAndRun(io, std.testing.allocator, .{
+    const exit_code = try run.compile(.{
         .source_path = "test.chi",
         .source =
         \\static status = func(value: int) int -> return value * 2
         \\const a = status(21)
         \\exit(a)
         ,
-        .program_args = &.{},
         .debug_flags = .{ .ast = true, .ssa = true, .@"asm" = true, .timing = true },
-        .started = std.Io.Clock.awake.now(io),
-    }, &output.writer, &errors.writer);
+    });
 
     try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 42 } }, exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "AST\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "SSA\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "ASM\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "db 0x") == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "wall ms  thread ms") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "database init") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "parse") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "validate modules") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "analyze entry") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "compile reachable functions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "typing / SSA") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "codegen") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "exclusive worker time") == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "parallel-worker sums") == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "queries/functions count") == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "restore identities") == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "restore queries") == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "save queries") == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "analyze bodies") == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "compile functions") == null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "link executable") != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "collect diagnostics") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.output.written(), "AST\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.output.written(), "SSA\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.output.written(), "ASM\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.output.written(), "db 0x") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "wall ms  thread ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "database init") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "parse") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "validate modules") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "analyze entry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "compile reachable functions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "typing / SSA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "codegen") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "exclusive worker time") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "parallel-worker sums") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "queries/functions count") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "restore identities") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "restore queries") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "save queries") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "analyze bodies") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "compile functions") == null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "link executable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "collect diagnostics") != null);
 }
 
 test "CLI core renders source diagnostics without running" {
-    const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var run: TestRun = .init();
+    defer run.deinit();
 
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-
-    const exit_code = try compileAndRun(io, std.testing.allocator, .{
+    const exit_code = try run.compile(.{
         .source_path = "broken.chi",
         .source = "exit()",
-        .program_args = &.{},
         .debug_flags = .{ .ast = true, .timing = true },
-        .started = std.Io.Clock.awake.now(io),
-    }, &output.writer, &errors.writer);
+    });
 
     try std.testing.expectEqual(RunOutcome.rejected, exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, output.writer.buffered(), "AST\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.output.written(), "AST\n") != null);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        errors.writer.buffered(),
+        run.errors.written(),
         "broken.chi:1:1: expected 1 call argument, found 0",
     ) != null);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "wall ms  thread ms") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "wall ms  thread ms") != null);
 }
 
 test "CLI renders bare and message compile-time panic without compiler-control exit" {
-    const io = std.testing.io;
     for ([_]struct { expression: []const u8, expected: []const u8 }{
         .{ .expression = "panic", .expected = "panic during compile-time execution\n" },
         .{ .expression = "panic \"failed\"", .expected = "panic during compile-time execution: failed\n" },
     }) |case| {
-        var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer output.deinit();
-        var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-        defer errors.deinit();
+        var run: TestRun = .init();
+        defer run.deinit();
         const source = try std.testing.allocator.print("func stop() int -> {s}\nstatic result = stop()\nexit(result)", .{case.expression});
         defer std.testing.allocator.free(source);
-        const result = try compileAndRun(io, std.testing.allocator, .{
+        const result = try run.compile(.{
             .source_path = "panic.chi",
             .source = source,
-            .program_args = &.{},
-            .debug_flags = .{},
-            .started = std.Io.Clock.awake.now(io),
-        }, &output.writer, &errors.writer);
+        });
         try std.testing.expectEqual(RunOutcome.rejected, result);
-        try std.testing.expectEqualStrings("", output.writer.buffered());
-        const rendered = errors.writer.buffered();
+        try std.testing.expectEqualStrings("", run.output.written());
+        const rendered = run.errors.written();
         try std.testing.expect(std.mem.indexOf(u8, rendered, case.expected) != null);
         try std.testing.expect(std.mem.indexOf(u8, rendered, "panic.chi:1:20:") != null);
         try std.testing.expect(std.mem.indexOf(u8, rendered, "panic.chi:2:") != null);
@@ -664,15 +618,10 @@ test "CLI renders bare and message compile-time panic without compiler-control e
 }
 
 test "CLI core renders compile-time call traces from the failure outward" {
-    const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var run: TestRun = .init();
+    defer run.deinit();
 
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-
-    const exit_code = try compileAndRun(io, std.testing.allocator, .{
+    const exit_code = try run.compile(.{
         .source_path = "trace.chi",
         .source =
         \\static fail_value = func() int -> 42 / 0
@@ -680,14 +629,11 @@ test "CLI core renders compile-time call traces from the failure outward" {
         \\static bad = middle()
         \\exit(bad)
         ,
-        .program_args = &.{},
-        .debug_flags = .{},
-        .started = std.Io.Clock.awake.now(io),
-    }, &output.writer, &errors.writer);
+    });
 
     try std.testing.expectEqual(RunOutcome.rejected, exit_code);
-    try std.testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
-    const rendered = errors.writer.buffered();
+    try std.testing.expectEqual(@as(usize, 0), run.output.written().len);
+    const rendered = run.errors.written();
     const failure = std.mem.indexOf(u8, rendered, "division by zero during compile-time execution").?;
     const inner_call = std.mem.indexOf(u8, rendered, "trace.chi:2:").?;
     const outer_call = std.mem.indexOf(u8, rendered, "trace.chi:3:").?;
@@ -697,13 +643,9 @@ test "CLI core renders compile-time call traces from the failure outward" {
 }
 
 test "CLI supports compile-time local borrowing" {
-    const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-    const result = try compileAndRun(io, std.testing.allocator, .{
+    var run: TestRun = .init();
+    defer run.deinit();
+    const result = try run.compile(.{
         .source_path = "borrowing.chi",
         .source =
         \\import std.memory
@@ -714,22 +656,15 @@ test "CLI supports compile-time local borrowing" {
         \\static answer = compute()
         \\exit(answer)
         ,
-        .program_args = &.{},
-        .debug_flags = .{},
-        .started = std.Io.Clock.awake.now(io),
-    }, &output.writer, &errors.writer);
+    });
     try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 42 } }, result);
-    try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), run.errors.written().len);
 }
 
 test "CLI supports compile-time allocation with scalar publication" {
-    const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-    const result = try compileAndRun(io, std.testing.allocator, .{
+    var run: TestRun = .init();
+    defer run.deinit();
+    const result = try run.compile(.{
         .source_path = "allocation.chi",
         .source =
         \\func compute() int | none
@@ -741,79 +676,55 @@ test "CLI supports compile-time allocation with scalar publication" {
         \\    _ -> panic "unexpected none"))
         \\exit(answer)
         ,
-        .program_args = &.{},
-        .debug_flags = .{},
-        .started = std.Io.Clock.awake.now(io),
-    }, &output.writer, &errors.writer);
+    });
     try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 42 } }, result);
-    try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), run.errors.written().len);
 }
 
 test "CLI core handles compile-time exit without producing an artifact" {
-    const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var run: TestRun = .init();
+    defer run.deinit();
 
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-
-    const exit_code = try compileAndRun(io, std.testing.allocator, .{
+    const exit_code = try run.compile(.{
         .source_path = "comptime-exit.chi",
         .source =
         \\static stopped = exit(42)
         \\exit(stopped)
         ,
-        .program_args = &.{},
-        .debug_flags = .{},
-        .started = std.Io.Clock.awake.now(io),
-    }, &output.writer, &errors.writer);
+    });
 
     try std.testing.expectEqual(RunOutcome{ .compiler_exit = 42 }, exit_code);
-    try std.testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
-    try std.testing.expectEqual(@as(usize, 0), errors.writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), run.output.written().len);
+    try std.testing.expectEqual(@as(usize, 0), run.errors.written().len);
 }
 
 test "CLI core rejects duplicate top-level names without running" {
-    const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var run: TestRun = .init();
+    defer run.deinit();
 
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-
-    const exit_code = try compileAndRun(io, std.testing.allocator, .{
+    const exit_code = try run.compile(.{
         .source_path = "duplicates.chi",
         .source =
         \\static duplicate = func() int -> return 1
         \\static duplicate = func() int -> return 2
         \\exit(0)
         ,
-        .program_args = &.{},
-        .debug_flags = .{},
-        .started = std.Io.Clock.awake.now(io),
-    }, &output.writer, &errors.writer);
+    });
 
     try std.testing.expectEqual(RunOutcome.rejected, exit_code);
-    try std.testing.expectEqual(@as(usize, 0), output.writer.buffered().len);
+    try std.testing.expectEqual(@as(usize, 0), run.output.written().len);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        errors.writer.buffered(),
+        run.errors.written(),
         "duplicates.chi:2:8: top-level name is already declared: `duplicate`",
     ) != null);
 }
 
 test "source files load without changing the entry program" {
-    const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    var run: TestRun = .init();
+    defer run.deinit();
 
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-
-    const exit_code = try compileAndRun(io, std.testing.allocator, .{
+    const exit_code = try run.compile(.{
         .source_path = "test.chi",
         .source =
         \\static status = func(value: int) int -> return value * 2
@@ -823,10 +734,7 @@ test "source files load without changing the entry program" {
         .source_files = &.{
             .{ .path = "physics/body.chi", .source = "exit(0)", .module_path = "physics" },
         },
-        .program_args = &.{},
-        .debug_flags = .{},
-        .started = std.Io.Clock.awake.now(io),
-    }, &output.writer, &errors.writer);
+    });
 
     try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 42 } }, exit_code);
 }
@@ -854,7 +762,7 @@ test "diagnostics render with their own file paths" {
     }, held);
     try std.testing.expect(std.mem.indexOf(
         u8,
-        output.writer.buffered(),
+        output.written(),
         "physics/body.chi:1:1: expected 1 call argument, found 0",
     ) != null);
 }
@@ -875,7 +783,7 @@ test "ownership diagnostics describe field transfers" {
         .{ .file_id = 0, .span = null, .kind = .{ .box_extraction_requires_direct_move = .int } },
     });
 
-    const rendered = output.writer.buffered();
+    const rendered = output.written();
     try std.testing.expect(std.mem.indexOf(u8, rendered, "`^` can only transfer a local binding or one of its fields") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "cannot transfer or join these fields independently under the current ownership rules") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "transfer or dispose of it on every path") != null);
@@ -883,22 +791,16 @@ test "ownership diagnostics describe field transfers" {
 }
 
 test "CLI debug labels sources across modules and timing preserves unused code" {
-    const io = std.testing.io;
-    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-    const outcome = try compileAndRun(io, std.testing.allocator, .{
+    var run: TestRun = .init();
+    defer run.deinit();
+    const outcome = try run.compile(.{
         .source_path = "/project/main.chi",
         .source = "import lib\nfunc unused() -> exit(comptime -> exit(99))\nexit(lib.answer())",
         .source_files = &.{.{ .path = "lib/a.chi", .module_path = "lib", .source = "pub func answer() int -> return 42\nexit(comptime -> exit(98))" }},
-        .program_args = &.{},
         .debug_flags = .{ .ast = true, .ssa = true, .@"asm" = true, .timing = true },
-        .started = std.Io.Clock.awake.now(io),
-    }, &output.writer, &errors.writer);
+    });
     try std.testing.expectEqual(RunOutcome{ .program = .{ .exited = 42 } }, outcome);
-    const rendered = output.writer.buffered();
+    const rendered = run.output.written();
     for ([_][]const u8{ "source /project/main.chi", "source /project/lib/a.chi", "SSA\n", "ASM\n", ":: lib.answer" }) |expected|
         try std.testing.expect(std.mem.indexOf(u8, rendered, expected) != null);
     const ssa = rendered[std.mem.indexOf(u8, rendered, "SSA\n").?..];
@@ -906,39 +808,28 @@ test "CLI debug labels sources across modules and timing preserves unused code" 
 }
 
 test "CLI qualified access diagnostics identify the defining dependency file" {
-    const io = std.testing.io;
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-    const outcome = try compileAndRun(io, std.testing.allocator, .{
+    var run: TestRun = .init();
+    defer run.deinit();
+    const outcome = try run.compile(.{
         .source_path = "/project/main.chi",
         .source = "import api\nexit(api.answer())",
         .source_files = &.{
             .{ .path = "lib/a.chi", .module_path = "lib", .source = "static secret = 42" },
             .{ .path = "api/a.chi", .module_path = "api", .source = "import lib\npub func answer() int -> return lib.secret" },
         },
-        .program_args = &.{},
-        .debug_flags = .{},
-        .started = std.Io.Clock.awake.now(io),
-    }, &output.writer, &errors.writer);
+    });
     try std.testing.expectEqual(RunOutcome.rejected, outcome);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "/project/api/a.chi:2:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "/project/api/a.chi:2:") != null);
 }
 
 test "missing field diagnostics use the struct definition's source file" {
-    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer output.deinit();
-    var errors: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer errors.deinit();
-    const outcome = try compileAndRun(std.testing.io, std.testing.allocator, .{
+    var run: TestRun = .init();
+    defer run.deinit();
+    const outcome = try run.compile(.{
         .source_path = "/project/main.chi",
         .source = "import lib\nconst s = lib.S{}",
         .source_files = &.{.{ .path = "lib/s.chi", .module_path = "lib", .source = "pub struct S\n  pub required: int" }},
-        .program_args = &.{},
-        .debug_flags = .{},
-        .started = std.Io.Clock.awake.now(std.testing.io),
-    }, &output.writer, &errors.writer);
+    });
     try std.testing.expectEqual(RunOutcome.rejected, outcome);
-    try std.testing.expect(std.mem.indexOf(u8, errors.writer.buffered(), "missing required field `required`") != null);
+    try std.testing.expect(std.mem.indexOf(u8, run.errors.written(), "missing required field `required`") != null);
 }

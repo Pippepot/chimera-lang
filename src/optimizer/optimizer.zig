@@ -2,7 +2,8 @@ const std = @import("std");
 const structures = @import("../structures.zig");
 const value_operations = @import("../value.zig");
 const profiling = @import("../profiling.zig");
-const Function = @import("function.zig").Function;
+const function_ir = @import("function.zig");
+const Function = function_ir.Function;
 const canonicalize = @import("canonicalize.zig");
 const cleanup = @import("cleanup.zig");
 const compaction = @import("compaction.zig");
@@ -17,15 +18,9 @@ const verifier = @import("verifier.zig");
 
 const Body = structures.FunctionBodyAnalysis;
 
-pub fn prepare(gpa: std.mem.Allocator, body: *const Body, context: anytype) !Body {
-    return run(gpa, body, context);
-}
+pub const prepare = optimize;
 
 pub fn optimize(gpa: std.mem.Allocator, body: *const Body, context: anytype) !Body {
-    return run(gpa, body, context);
-}
-
-fn run(gpa: std.mem.Allocator, body: *const Body, context: anytype) !Body {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const optimized = try optimizeInto(arena.allocator(), body, context);
@@ -53,10 +48,6 @@ fn optimizeInto(scratch: std.mem.Allocator, body: *const Body, context: anytype)
             try check(&function);
             try simplify(&function, context, &numbering_workspace, &field_layouts);
         }
-    } else {
-        try simplify(&function, context, &numbering_workspace, &field_layouts);
-    }
-    if (final) {
         // Store identities survive cleanup even when fallback latch blocks merge.
         // Keep them across rounds so bulk rewrites cannot version their fallback.
         var bulk_fallbacks: std.AutoHashMapUnmanaged(u32, void) = .empty;
@@ -71,6 +62,8 @@ fn optimizeInto(scratch: std.mem.Allocator, body: *const Body, context: anytype)
             // containing loop's counter and carried exit.
             needs_simplification = false;
         }
+    } else {
+        try simplify(&function, context, &numbering_workspace, &field_layouts);
     }
     return measured(.optimization_compaction, compaction.compact, .{ scratch, &function });
 }
@@ -109,16 +102,14 @@ fn simplify(function: *Function, context: anytype, numbering_workspace: *numberi
             }
         }
         try check(function);
-        const numbered: @import("function.zig").Changes = if (numbering_dirty)
-            try measured(.optimization_numbering, numbering.number, .{ function, numbering_workspace })
-        else
-            .{};
-        try check(function);
-        const dead: @import("function.zig").Changes = if (numbering_dirty)
-            try measured(.optimization_dead_code, compaction.removeDead, .{function})
-        else
-            .{};
-        try check(function);
+        var numbered: function_ir.Changes = .{};
+        var dead: function_ir.Changes = .{};
+        if (numbering_dirty) {
+            numbered = try measured(.optimization_numbering, numbering.number, .{ function, numbering_workspace });
+            try check(function);
+            dead = try measured(.optimization_dead_code, compaction.removeDead, .{function});
+            try check(function);
+        }
         const cleaned = try measured(.optimization_cleanup, cleanup.simplify, .{function});
         // Numbering visits dominating definitions before their users. Its own
         // substitutions need another numbering pass only after another phase

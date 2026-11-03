@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,11 +28,12 @@ from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parent.parent
 PROTOCOL = "core-million-zero-workers-v6"
-SAMPLING_PROTOCOL = "one-warmup-range-2pct-min2-compile3-runtime5-v1"
+SAMPLING_PROTOCOL = "one-warmup-range-2pct-min2-compile3-runtime5-serial-compile-parallel5-v2"
 MINIMUM_SAMPLES = 2
 MAXIMUM_SAMPLES = 5
 COMPILATION_MAXIMUM_SAMPLES = 3
 RELATIVE_RANGE_PERCENT = 2
+PARALLEL_SAMPLES = 5
 COMPILATION_PROTOCOL = "core-million-modules-one-line-leaf-v2"
 RUNTIME_PROTOCOL = "sieve-88000000-i32-wall-v1"
 LEGACY_RUNTIME = {
@@ -43,6 +45,7 @@ C_LANES = ("c-O0", "c-O3")
 COMPILATION_CASE = "core-1000000"
 RUNTIME_CASE = "sieve-88000000"
 COMPILATION_LANES = {"normal": "Compile", "workers-8": "Compile (8 workers)"}
+WORKLOADS = ((COMPILATION_CASE, 0), (COMPILATION_CASE, 8), (RUNTIME_CASE, 0))
 CORE_CASES = {COMPILATION_CASE: ("cold", "leaf-edit"), RUNTIME_CASE: ("runtime",)}
 COMPILER_BRIDGE = '''pub const optimize_mode = @import("builtin").mode;
 pub const query = @import("query/engine.zig");
@@ -75,12 +78,43 @@ def suite_id() -> str:
     return digest.hexdigest()
 
 
-def command(arguments: list[str], cwd: Path = ROOT) -> str:
+def command(arguments: list[str], cwd: Path = ROOT, echo: bool = True) -> str:
     result = subprocess.run(arguments, cwd=cwd, check=True, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True)
-    if result.stderr:
+    if result.stderr and echo:
         print(result.stderr, file=sys.stderr, end="", flush=True)
     return result.stdout.strip()
+
+
+def parallel_commands(arguments: list[str], cwd: Path, cpus: list[int], count: int) -> list[str]:
+    """Run `count` copies, at most one per CPU at a time, each pinned to its own CPU.
+
+    Each simultaneous copy gets its own working directory because the harness writes
+    and executes its compiled program in the current directory."""
+    outputs = []
+    failure = None
+    for start in range(0, count, len(cpus)):
+        batch = []
+        for slot, cpu in enumerate(cpus[:count - start]):
+            directory = cwd / f".parallel-{slot}"
+            directory.mkdir(exist_ok=True)
+            stdout, stderr = tempfile.TemporaryFile("w+"), tempfile.TemporaryFile("w+")
+            process = subprocess.Popen(arguments, cwd=directory, stdout=stdout, stderr=stderr, text=True,
+                                       preexec_fn=lambda cpu=cpu: os.sched_setaffinity(0, {cpu}))
+            batch.append((process, stdout, stderr))
+        for process, stdout, stderr in batch:
+            process.wait()
+            stdout.seek(0)
+            stderr.seek(0)
+            output, errors = stdout.read(), stderr.read()
+            stdout.close()
+            stderr.close()
+            if process.returncode != 0 and failure is None:
+                failure = subprocess.CalledProcessError(process.returncode, arguments, output, errors)
+            outputs.append(output.strip())
+        if failure is not None:
+            raise failure
+    return outputs
 
 
 def commits(revision: str) -> list[tuple[str, str]]:
@@ -134,23 +168,34 @@ def loc_policy() -> str:
     return hashlib.sha256(b"root-or-src-layout-v2\0" + (ROOT / "loc.sh").read_bytes()).hexdigest()
 
 
+def is_stable(nanoseconds: list[int]) -> bool:
+    values = sorted(nanoseconds)
+    middle = len(values) // 2
+    median = (values[middle - 1] + (values[middle] - values[middle - 1]) // 2
+              if len(values) % 2 == 0 else values[middle])
+    return median > 0 and (values[-1] - values[0]) * 100 <= median * RELATIVE_RANGE_PERCENT
+
+
 def validate_measurement(samples: list[dict], *, legacy: bool = False) -> None:
     count = samples[0].get("sample_count")
+    parallel = samples[0].get("parallel", False)
     maximum = COMPILATION_MAXIMUM_SAMPLES if samples[0]["case"] == COMPILATION_CASE else MAXIMUM_SAMPLES
+    if parallel:
+        minimum = maximum = PARALLEL_SAMPLES
+    else:
+        minimum = MINIMUM_SAMPLES
     if count is None and legacy:
         count = 9
         if any("sample_count" in sample or "stable" in sample for sample in samples):
             raise ValueError("mixed sampling protocols")
     else:
-        if not isinstance(count, int) or not MINIMUM_SAMPLES <= count <= maximum:
+        if not isinstance(count, int) or not minimum <= count <= maximum:
             raise ValueError("invalid declared sample count")
         if any(sample.get("sample_count") != count for sample in samples):
             raise ValueError("inconsistent declared sample count")
-        values = sorted(sample["nanoseconds"] for sample in samples)
-        middle = len(values) // 2
-        median = (values[middle - 1] + (values[middle] - values[middle - 1]) // 2
-                  if len(values) % 2 == 0 else values[middle])
-        stable = median > 0 and (values[-1] - values[0]) * 100 <= median * RELATIVE_RANGE_PERCENT
+        if any(sample.get("parallel", False) != parallel for sample in samples):
+            raise ValueError("mixed serial and parallel samples")
+        stable = is_stable([sample["nanoseconds"] for sample in samples])
         if any(sample.get("stable") is not stable for sample in samples):
             raise ValueError("incorrect stability declaration")
         if not stable and count != maximum:
@@ -161,11 +206,10 @@ def validate_measurement(samples: list[dict], *, legacy: bool = False) -> None:
         raise ValueError("invalid benchmark measurement")
 
 
-def parse_samples(text: str, case: str | None = None) -> list[dict]:
+def parse_rows(text: str) -> list[dict]:
     samples = list(csv.DictReader(io.StringIO(text)))
     if not samples:
         raise ValueError("benchmark produced no samples")
-    groups = defaultdict(list)
     for sample in samples:
         try:
             for field in ("sample", "nanoseconds", "executable_bytes", "sample_count"):
@@ -173,9 +217,34 @@ def parse_samples(text: str, case: str | None = None) -> list[dict]:
             if sample["stable"] not in ("true", "false"):
                 raise ValueError("invalid stability declaration")
             sample["stable"] = sample["stable"] == "true"
-            groups[(sample["case"], sample["lane"], sample["phase"])].append(sample)
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError("invalid benchmark sample") from error
+    return samples
+
+
+def merge_parallel(outputs: list[str]) -> list[dict]:
+    """Combine one-sample serial compilation runs into a single fixed-size measurement."""
+    merged = []
+    for index, text in enumerate(outputs):
+        rows = parse_rows(text)
+        if sorted((row["case"], row["lane"], row["phase"], row["sample"], row["sample_count"]) for row in rows) != [
+                (COMPILATION_CASE, "normal", phase, 0, 1) for phase in CORE_CASES[COMPILATION_CASE]]:
+            raise ValueError("parallel compilation run must supply exactly one cold and one leaf-edit sample")
+        merged.extend(dict(row, sample=index, sample_count=len(outputs), parallel=True) for row in rows)
+    for phase in CORE_CASES[COMPILATION_CASE]:
+        group = [row for row in merged if row["phase"] == phase]
+        stable = is_stable([row["nanoseconds"] for row in group])
+        for row in group:
+            row["stable"] = stable
+        validate_measurement(group)
+    return sorted(merged, key=lambda row: (row["phase"] != "cold", row["sample"]))
+
+
+def parse_samples(text: str, case: str | None = None) -> list[dict]:
+    samples = parse_rows(text)
+    groups = defaultdict(list)
+    for sample in samples:
+        groups[(sample["case"], sample["lane"], sample["phase"])].append(sample)
     for measurement in groups.values():
         validate_measurement(measurement)
     compilation = [{(COMPILATION_CASE, lane, phase) for phase in CORE_CASES[COMPILATION_CASE]}
@@ -197,8 +266,41 @@ def parse_samples(text: str, case: str | None = None) -> list[dict]:
 def sampling_note(sample: dict) -> str:
     if "stable" not in sample:
         return "; fixed-count sampling"
+    if sample.get("parallel"):
+        return f"; {sample['sample_count']} simultaneous runs" + ("; stable (<=2% range)" if sample["stable"] else "; range above 2%")
     maximum = COMPILATION_MAXIMUM_SAMPLES if sample.get("case") == COMPILATION_CASE else MAXIMUM_SAMPLES
     return "; stable (<=2% range)" if sample["stable"] else f"; unstable at {maximum}-sample cap"
+
+
+def elapsed(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, seconds = divmod(round(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m{seconds:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def timing(nanoseconds: float) -> str:
+    for scale, unit in ((1e9, "s"), (1e6, "ms"), (1e3, "µs")):
+        if nanoseconds >= scale:
+            return f"{nanoseconds / scale:.3g} {unit}"
+    return f"{nanoseconds:.0f} ns"
+
+
+def summarize(rows: list[dict]) -> str:
+    groups = defaultdict(list)
+    for row in rows:
+        groups[(row["lane"], row["phase"])].append(row)
+    parts = []
+    for (lane, phase), samples in groups.items():
+        name = lane if lane in C_LANES else phase
+        part = f"{name} {timing(statistics.median(sample['nanoseconds'] for sample in samples))}"
+        if not samples[0]["stable"]:
+            part += " (unstable)"
+        parts.append(part)
+    return ", ".join(parts)
 
 
 def runner() -> dict:
@@ -272,6 +374,17 @@ def c_compiler_name(record: dict) -> str:
     return "C"
 
 
+def failure_log(data: Path, record: dict, name: str, error: Exception) -> str:
+    details = str(error)
+    if isinstance(error, subprocess.CalledProcessError):
+        details += "\n" + (error.stdout or "") + "\n" + (error.stderr or "")
+    logs = data / "failures"
+    logs.mkdir(parents=True, exist_ok=True)
+    filename = f"{record['recorded_at'].replace(':', '-')}-{record['commit'][:12]}-{name}.log"
+    (logs / filename).write_text(details + "\n")
+    return f"failures/{filename}"
+
+
 def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: bool,
             only_loc: bool, data: Path, refresh_c: bool = False,
             worker_affinity: list[int] | None = None) -> dict:
@@ -287,41 +400,59 @@ def measure(snapshot: Path, commit: str, date: str, identity: str, worktree: boo
     record["standard_library"] = "bundled" if bundled else "source"
     record["failures"] = []
     cached = cached_c_reference(read_records(data), record) if not refresh_c else None
-    arguments = ["zig", "build", "--build-file", ".history.build.zig", "history-benchmark", "--seed=0", "-j1",
-                 f"-Dbundled-std={'true' if bundled else 'false'}", "--"]
+    build = ["zig", "build", "--build-file", str(snapshot / ".history.build.zig"), "--cache-dir", str(data / "zig-cache"),
+             "--seed=0", "-j1", f"-Dbundled-std={'true' if bundled else 'false'}"]
+    arguments = [*build, "history-benchmark", "--"]
     if cached is not None:
         arguments.append("--skip-c")
-        print("Reusing cached Clang reference (-O0 and -O3)", flush=True)
-    print(f"Benchmarking {identity[:12]} (ReleaseFast)", flush=True)
+    library = "bundled" if bundled else "source"
+    reference = "cached" if cached is not None else "measured"
+    print(f"  ReleaseFast, {library} std, Clang reference {reference}", flush=True)
+    print("  build   harness ...", flush=True)
+    started = time.monotonic()
+    try:
+        command([*build, "history-build"], snapshot, echo=False)
+        print(f"    ✓ built  [{elapsed(time.monotonic() - started)}]", flush=True)
+    except subprocess.CalledProcessError as error:
+        log = failure_log(data, record, "build", error)
+        record["failures"] = [{"case": case, "workers": workers, "log": log} for case, workers in WORKLOADS]
+        print(f"    ✗ failed, see {log}  [{elapsed(time.monotonic() - started)}]", flush=True)
+        return record
     measured = []
-    for case, workers in ((COMPILATION_CASE, 0), (COMPILATION_CASE, 8), (RUNTIME_CASE, 0)):
+    for case, workers in WORKLOADS:
         affinity = record["worker_affinity"] if workers else record["runner"]["affinity"]
         if workers > len(affinity):
             print(f"Warning: {workers} workers share only {len(affinity)} allowed CPU(s); "
                   "this measures oversubscription, not multicore scaling. "
                   "Use taskset with at least 8 CPUs for worker comparisons.",
                   file=sys.stderr, flush=True)
+        kind = "compile" if case == COMPILATION_CASE else "runtime"
+        parallel = case == COMPILATION_CASE and not workers
+        cpus = record["runner"]["affinity"][:PARALLEL_SAMPLES]
+        mode = f"{workers} workers" if workers else "serial"
+        if parallel:
+            mode += f" ×{PARALLEL_SAMPLES} on CPU{'s' if len(cpus) > 1 else ''} {','.join(map(str, cpus))}"
+        print(f"  {kind:<8}{case}, {mode} ...", flush=True)
+        started = time.monotonic()
         try:
             if workers and affinity != record["runner"]["affinity"]:
                 os.sched_setaffinity(0, affinity)
             worker_arguments = ["--workers=8"] if workers else []
-            rows = parse_samples(command([*arguments, f"--case={case}", *worker_arguments], snapshot), case)
+            if parallel:
+                rows = merge_parallel(parallel_commands([*arguments, f"--case={case}", "--samples=1"],
+                                                        snapshot, cpus, PARALLEL_SAMPLES))
+            else:
+                rows = parse_samples(command([*arguments, f"--case={case}", *worker_arguments], snapshot), case)
             if case == COMPILATION_CASE:
                 expected_lane = "workers-8" if workers else "normal"
                 if {sample["lane"] for sample in rows} != {expected_lane}:
                     raise ValueError(f"compilation benchmark must supply the {expected_lane} lane")
             measured.extend(rows)
+            print(f"    ✓ {summarize(rows)}  [{elapsed(time.monotonic() - started)}]", flush=True)
         except (subprocess.CalledProcessError, ValueError) as error:
-            details = str(error)
-            if isinstance(error, subprocess.CalledProcessError):
-                details += "\n" + (error.stdout or "") + "\n" + (error.stderr or "")
-            logs = data / "failures"
-            logs.mkdir(parents=True, exist_ok=True)
-            suffix = "-workers-8" if workers else ""
-            filename = f"{record['recorded_at'].replace(':', '-')}-{commit[:12]}-{case}{suffix}.log"
-            (logs / filename).write_text(details + "\n")
-            record["failures"].append({"case": case, "workers": workers, "log": f"failures/{filename}"})
-            print(f"  {case}{suffix}: unavailable (see failures/{filename})", flush=True)
+            log = failure_log(data, record, case + ("-workers-8" if workers else ""), error)
+            record["failures"].append({"case": case, "workers": workers, "log": log})
+            print(f"    ✗ failed, see {log}  [{elapsed(time.monotonic() - started)}]", flush=True)
         finally:
             if workers and affinity != record["runner"]["affinity"]:
                 os.sched_setaffinity(0, record["runner"]["affinity"])
@@ -516,14 +647,7 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
                 lanes = ("normal",) if runtime else COMPILATION_LANES
                 if not any(sample["lane"] in lanes for sample in selected):
                     continue
-                provenance = {"zig": record["zig"],
-                              "runner": {key: value for key, value in record["runner"].items() if key != "affinity"}}
-                if runtime:
-                    provenance["runtime_suite"] = runtime_identity(record)
-                    if "c_compiler" in record:
-                        provenance["c_compiler"] = record["c_compiler"]
-                configuration = json.dumps(provenance, sort_keys=True)
-                key = (configuration, benchmark["mode"])
+                key = (benchmark["mode"], runtime)
                 for lane in lanes:
                     lane_samples = [sample for sample in selected
                                     if sample["lane"] == lane or (runtime and sample["lane"] in C_LANES)]
@@ -533,7 +657,7 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
                     groups[key][point] = (record, {"mode": benchmark["mode"], "samples": lane_samples})
     benchmark_sections = []
     benchmark_images = []
-    for (configuration, mode), entries in groups.items():
+    for (mode, _), entries in groups.items():
         measurements = defaultdict(list)
         reference_record, reference_benchmark = max(entries.values(), key=lambda entry: entry[0]["recorded_at"])
         reference_samples = defaultdict(list)
@@ -568,14 +692,13 @@ def render(data: Path, history: list[tuple[str, str]]) -> Path:
         for (case, lane, phase), values in sorted(measurements.items()):
             label = "Runtime" if phase == "runtime" else COMPILATION_LANES[lane]
             plots[(case, phase)][label] = sorted(values)
-        configuration_id = hashlib.sha256((configuration + mode).encode()).hexdigest()[:12]
         for heading, runtime in (("ReleaseFast Compilation", False), ("Generated Program Runtime", True)):
             selected = {key: series for key, series in plots.items() if (key[1] == "runtime") == runtime}
             if not selected:
                 continue
             benchmark_sections.append(f"<section><h2>{html.escape(heading)}</h2><div class='plots'>")
             for (case, phase), series in sorted(selected.items()):
-                name = f"{mode}-{configuration_id}-{case}-{phase}"
+                name = f"{mode}-{case}-{phase}"
                 graph = graph_artifact(data, name, series, history, "s", f"{case} / {phase}",
                                        references=references.get(case) if runtime else None)
                 benchmark_sections.append("<article>" + graph + "</article>")
@@ -631,11 +754,26 @@ def main() -> None:
             attempted = {record["commit"] for record in previous
                          if "failures" in record and all(record.get(key) == value for key, value in current.items())
                          and record.get("worker_affinity", record["runner"]["affinity"]) == worker_affinity}
-            for commit, date in selected:
-                if args.backfill_loc and (commit, policy) in existing:
-                    continue
-                if args.backfill_benchmarks and commit in attempted and not args.refresh_c:
-                    continue
+            pending = [(commit, date) for commit, date in selected
+                       if not (args.backfill_loc and (commit, policy) in existing)
+                       and not (args.backfill_benchmarks and commit in attempted and not args.refresh_c)]
+            benchmarking = not (args.loc_only or args.backfill_loc)
+            if args.backfill_benchmarks:
+                print(f"Backfilling benchmarks: {len(pending)} of {len(selected)} first-parent commits pending, newest first", flush=True)
+            elif args.backfill_loc:
+                print(f"Backfilling LOC: {len(pending)} of {len(selected)} first-parent commits pending", flush=True)
+            started = time.monotonic()
+            failures = 0
+            for index, (commit, date) in enumerate(pending, 1):
+                label = f"{commit[:12]} {date[:10]}" + (" (worktree)" if args.worktree else "")
+                if len(pending) > 1:
+                    label = f"[{index}/{len(pending)}] {label}"
+                if benchmarking and index > 1:
+                    remaining = (time.monotonic() - started) / (index - 1) * (len(pending) - index + 1)
+                    label += f"  ~{elapsed(remaining)} remaining"
+                if benchmarking:
+                    print(label, flush=True)
+                commit_started = time.monotonic()
                 with tempfile.TemporaryDirectory(prefix="chimera-history-") as directory:
                     snapshot = Path(directory)
                     if args.worktree:
@@ -650,15 +788,29 @@ def main() -> None:
                     except OSError as error:
                         if not args.backfill_benchmarks:
                             raise
+                        print(f"  ✗ harness unavailable: {error}", flush=True)
                         record = measure(snapshot, commit, date, identity, False, True, data)
                         record.update(current)
                         record["worker_affinity"] = worker_affinity
                         record["failures"] = [{"case": case, "error": str(error)} for case in CORE_CASES]
                     save(data, record)
-                    if record.get("failures") and not args.backfill_benchmarks:
-                        failed = True
+                    if record.get("failures"):
+                        failures += 1
+                        if not args.backfill_benchmarks:
+                            failed = True
+                    lines = f"{record['loc']['code']:,} production lines"
+                    if not benchmarking:
+                        print(f"{label}  {lines}", flush=True)
+                        continue
                     count = sum(sample["lane"] in COMPILATION_LANES for benchmark in record["benchmarks"] for sample in benchmark["samples"])
-                    print(f"Recorded {commit[:12]}: {record['loc']['code']:,} production lines, {count} benchmark samples", flush=True)
+                    outcome = f", {len(record['failures'])} failed workload(s)" if record.get("failures") else ""
+                    print(f"  recorded {lines}, {count} compilation samples{outcome}  [{elapsed(time.monotonic() - commit_started)}]", flush=True)
+            if len(pending) > 1:
+                print(f"Recorded {len(pending)} commits in {elapsed(time.monotonic() - started)}"
+                      + (f", {failures} with failures" if failures else ""), flush=True)
+            elif not pending:
+                print("Nothing to record", flush=True)
+        print("Rendering report ...", flush=True)
         report = render(data, history)
         print(f"Report: {report}")
         print(f"Benchmarks: {data / 'benchmarks.html'}")

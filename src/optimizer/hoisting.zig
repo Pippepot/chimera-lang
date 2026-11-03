@@ -90,19 +90,15 @@ const Motion = struct {
         if (self.moved.contains(value)) return;
         const block = switch (self.function.definitions.items[@backingInt(value)]) {
             .argument => |argument| argument.block,
-            .instruction => |index| self.blockOf(index),
+            .instruction => |index| self.owner[index],
         };
         if (self.loop.contains(block)) self.outside = false;
-    }
-
-    fn blockOf(self: *Motion, index: u32) u32 {
-        return self.owner[index];
     }
 
     fn invariant(self: *Motion, instruction: Instruction, executes: bool) bool {
         const read = self.classify(instruction) orelse return false;
         self.outside = true;
-        function_ir.visitInstructionReferences(function_ir.tableView(self.function), &instruction, self, defined);
+        function_ir.visitInstructionReferences(self.function, &instruction, self, defined);
         if (!self.outside) return false;
         const resource = switch (read) {
             .pure => return true,
@@ -119,10 +115,7 @@ const Motion = struct {
         switch (instruction) {
             .numeric_binary, .numeric_unary => return if (instruction.numericMayTrap()) null else .pure,
             .const_numeric, .numeric_convert, .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => return .pure,
-            .divsi, .shli, .shrsi => |operands| {
-                const rhs = self.function.definition(operands.rhs) orelse return null;
-                return if (rhs == .const_int and instruction.integerRhsIsValid(rhs.const_int)) .pure else null;
-            },
+            .divsi, .shli, .shrsi => |operands| return if (function_ir.validConstantRhs(self.function, instruction, operands.rhs)) .pure else null,
             .field_access => |operation| return .{ .read = roots.root(operation.operand) },
             .value_copy => |copy| return if (copy.destination == null) .{ .read = roots.root(copy.source) } else null,
             .variant_tag => |operand| return .{ .read = roots.root(operand) },

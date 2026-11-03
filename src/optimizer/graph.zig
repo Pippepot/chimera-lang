@@ -7,8 +7,8 @@ pub const Incoming = struct {
     block: u32,
     ordinal: u1,
 
-    pub fn branch(self: Incoming, function: *Function) *structures.FunctionBranch {
-        return Function.edges(&function.blocks.items[self.block].terminator)[self.ordinal].?;
+    pub fn branch(self: Incoming, function: *const Function) *structures.FunctionBranch {
+        return function.blocks.items[self.block].terminator.branches()[self.ordinal].?;
     }
 };
 
@@ -34,8 +34,8 @@ pub const Graph = struct {
         @memset(incoming, .empty);
         for (function.blocks.items, reachable, 0..) |*block, kept, index| {
             if (!kept) continue;
-            for (Function.edges(&block.terminator), 0..) |maybe_edge, ordinal| if (maybe_edge) |edge| {
-                try incoming[@backingInt(Function.edgeTarget(edge))].append(scratch, .{
+            for (block.terminator.successors(), 0..) |maybe_target, ordinal| if (maybe_target) |target| {
+                try incoming[@backingInt(target.*)].append(scratch, .{
                     .block = @intCast(index),
                     .ordinal = @intCast(ordinal),
                 });
@@ -202,13 +202,9 @@ pub fn dominatesUses(function: *Function) !bool {
         if (!function.removed.items[instruction]) owner[instruction] = @intCast(index);
     };
     var uses: Uses = .{ .function = function, .graph = &graph, .owner = owner };
-    const tables = function_ir.tableView(function);
     for (graph.order) |block| {
         uses.site = block;
-        for (function.blocks.items[block].instructions.items) |index| {
-            if (!function.removed.items[index]) function_ir.visitInstructionReferences(tables, &function.instructions.items[index], &uses, Uses.check);
-        }
-        function_ir.visitTerminatorReferences(tables, &function.blocks.items[block].terminator, &uses, Uses.check);
+        function_ir.visitBlockReferences(function, &function.blocks.items[block], &uses, Uses.check);
     }
     return uses.sound;
 }

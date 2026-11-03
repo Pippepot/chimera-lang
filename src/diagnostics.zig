@@ -603,10 +603,6 @@ fn writeTypePair(types: anytype, writer: *std.Io.Writer, prefix: []const u8, fir
     try writeType(types, writer, second);
 }
 
-fn writeMismatch(types: anytype, writer: *std.Io.Writer, comptime prefix: []const u8, mismatch: structures.Diagnostic.TypeMismatch) !void {
-    try writeTypePair(types, writer, prefix ++ "expected ", mismatch.expected, ", found ", mismatch.found);
-}
-
 fn writeToken(writer: *std.Io.Writer, tag: structures.Token.Tag) !void {
     if (structures.Token.spelling(tag)) |text| return writer.print("`{s}`", .{text});
     switch (tag) {
@@ -648,22 +644,6 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
         },
         .invalid_expression => |tag| try writeTokenMessage(writer, "expected an expression, found ", tag, ""),
         .unsupported_syntax => |tag| try writeTokenMessage(writer, "", tag, " syntax is not implemented yet"),
-        .match_not_exhaustive => |type_id| {
-            try writer.writeAll("match is not exhaustive; uncovered values remain in ");
-            try writeType(types, writer, type_id);
-        },
-        .match_pattern_incompatible => |mismatch| {
-            try writer.writeAll("match pattern is incompatible with the subject: ");
-            try writeTypePair(types, writer, "expected ", mismatch.expected, ", found ", mismatch.found);
-        },
-        .match_literal_ambiguous => |type_id| {
-            try writer.writeAll("literal pattern has more than one matching type in ");
-            try writeType(types, writer, type_id);
-        },
-        .match_range_ambiguous => |type_id| {
-            try writer.writeAll("range pattern has more than one matching type in ");
-            try writeType(types, writer, type_id);
-        },
         .compile_time_panic => |message| {
             try writer.writeAll("panic during compile-time execution");
             const bytes = try types.byteString(message);
@@ -684,7 +664,6 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
                 .drop => try writer.writeAll("; expected `trivial`, `fieldwise`, `explicit`, or a hook function"),
             }
         },
-        .struct_ownership_hook_signature_mismatch => |mismatch| try writeMismatch(types, writer, "struct ownership hook signature mismatch: ", mismatch),
         .struct_ownership_property_incompatible_with_fields => |reason| switch (reason) {
             .trivial_move => try writer.writeAll("`move = trivial` requires every field to be trivially movable"),
             .fieldwise_move => try writer.writeAll("`move = fieldwise` requires every field to be movable"),
@@ -693,7 +672,6 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             .fieldwise_copy => try writer.writeAll("`copy = fieldwise` requires every field to be copyable"),
             .trivial_drop => try writer.writeAll("`drop = trivial` requires every field to have trivial drop behavior"),
         },
-        .static_initializer_type_mismatch => |mismatch| try writeMismatch(types, writer, "static initializer type mismatch: ", mismatch),
         .generic_struct_requires_specialization => {
             try writer.writeAll("struct must be specialized before initialization");
             if (span) |focus| try writer.print("; write `{s}(...){{...}}`", .{spanText(source, focus)});
@@ -702,54 +680,37 @@ fn writeKindMessage(types: anytype, writer: *std.Io.Writer, source: []const u8, 
             try writeType(types, writer, missing.receiver);
             try writer.print(" does not define operation `{s}`", .{missing.operation.spelling()});
         },
-        .compile_time_only_type => |type_id| try writeTypedMessage(types, writer, "compile-time-only type ", type_id, " cannot be materialized during runtime execution"),
         .ambiguous_conversion => |mismatch| try writeTypePair(types, writer, "multiple conversions apply from ", mismatch.found, " to ", mismatch.expected),
         .ambiguous_variant_member => |mismatch| try writeTypePair(types, writer, "both owned and reference alternatives accept ", mismatch.found, " in ", mismatch.expected),
         .destructure_length_mismatch => |counts| try writer.print("binding expects {d} elements, found {d}", .{ counts.expected, counts.found }),
         .tuple_member_count_mismatch => |counts| try writer.print("tuple expects {d} members, found {d}", .{ counts.expected, counts.found }),
-        .type_not_movable => |type_id| try writeTypedMessage(types, writer, "cannot transfer value of immovable type ", type_id, ""),
-        .relocation_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "a completed value of type ", type_id, " cannot move directly into another destination; construct it there, giving the result a known type if needed"),
         .type_not_copyable => |details| {
             try writeTypedMessage(types, writer, "cannot implicitly copy value of non-copyable type ", details.type_id, "");
             if (details.is_movable) try writer.writeAll("; use `^` to transfer ownership");
         },
-        .list_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "List requires an automatically droppable element type; found ", type_id, ""),
-        .list_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "List requires a directly movable element type for relocation; found ", type_id, ""),
-        .list_iteration_item_conflicts_with_end => |type_id| try writeTypedMessage(types, writer, "List consuming iteration cannot distinguish an owned End element from exhaustion; element type is ", type_id, ""),
-        .borrow_write_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "write requires an automatically droppable pointee type; found ", type_id, ""),
-        .borrow_write_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "write requires a directly movable pointee type; found ", type_id, ""),
-        .box_requires_automatic_drop => |type_id| try writeTypedMessage(types, writer, "Box requires an automatically droppable element type; found ", type_id, ""),
-        .box_extraction_requires_direct_move => |type_id| try writeTypedMessage(types, writer, "cannot extract a non-directly-movable value from Box; found ", type_id, ""),
-        .value_requires_explicit_drop => |type_id| try writeTypedMessage(types, writer, "", type_id, " must be transferred with `^` or passed to a `deinit` parameter before this scope ends"),
-        .struct_initializer_not_struct => |found| try writeTypedMessage(types, writer, "only a struct type can be initialized with `{...}`; found ", found, ""),
         .missing_struct_initializer_field => |details| {
             const definition = (try types.structDefinition(details.type_id)) orelse unreachable;
             try writer.print("struct initializer is missing required field `{s}`", .{definition.fields[details.field_index].name});
         },
-        .struct_initializer_field_type_mismatch => |mismatch| try writeMismatch(types, writer, "struct field initializer type mismatch: ", mismatch),
-        .field_access_not_struct => |found| try writeTypedMessage(types, writer, "field access requires a struct value, found ", found, ""),
-        .private_struct_field => |type_id| try writeTypedMessage(types, writer, "cannot name a private field of ", type_id, " outside its defining module"),
-        .assignment_type_mismatch => |mismatch| try writeMismatch(types, writer, "assignment type mismatch: ", mismatch),
-        .condition_not_bool => |found| try writeTypedMessage(types, writer, "condition requires bool, found ", found, ""),
         .iterator_result_requires_end => |mismatch| try writeTypePair(types, writer, "next must return an item variant with owned ", mismatch.expected, ", found ", mismatch.found),
-        .local_type_mismatch => |mismatch| try writeMismatch(types, writer, "initializer type mismatch: ", mismatch),
-        .comparison_operand_not_int => |found| try writeTypedMessage(types, writer, "comparison requires `int`, found ", found, ""),
-        .equality_operand_not_supported => |found| try writeTypedMessage(types, writer, "equality is not supported for ", found, ""),
-        .equality_operand_type_mismatch => |mismatch| try writeMismatch(types, writer, "equality operand type mismatch: ", mismatch),
-        .missing_return_value => |expected| try writeTypedMessage(types, writer, "function must return ", expected, " on every reachable path"),
-        .return_type_mismatch => |mismatch| try writeMismatch(types, writer, "return type mismatch: ", mismatch),
         .call_argument_count_mismatch => |count| try writer.print("expected {d} call argument{s}, found {d}", .{
             count.expected,
             if (count.expected == 1) "" else "s",
             count.found,
         }),
-        .call_argument_type_mismatch => |mismatch| try writeMismatch(types, writer, "argument type mismatch: ", mismatch),
-        inline else => |_, tag| {
-            const message = comptime structures.Diagnostic.message(tag);
-            if (message.source_label)
-                try writeSourceLabel(writer, message.text, source, span)
-            else
-                try writer.writeAll(message.text);
+        inline else => |payload, tag| {
+            const Diagnostic = structures.Diagnostic;
+            const definition = @field(Diagnostic.definitions, @tagName(tag));
+            switch (@TypeOf(definition)) {
+                Diagnostic.TypeMessage => try writeTypedMessage(types, writer, definition.prefix, payload, definition.suffix),
+                Diagnostic.MismatchMessage => try writeTypePair(types, writer, definition.prefix ++ "expected ", payload.expected, ", found ", payload.found),
+                Diagnostic.Message => if (definition.source_label)
+                    try writeSourceLabel(writer, definition.text, source, span)
+                else
+                    try writer.writeAll(definition.text),
+                type => @compileError("missing custom renderer for diagnostic " ++ @tagName(tag)),
+                else => try writer.writeAll(definition),
+            }
         },
     }
 }

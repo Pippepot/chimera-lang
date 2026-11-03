@@ -66,7 +66,7 @@ const Rules = struct {
     /// Pure scalar expansion cannot expose storage or change existing memory facts.
     fn emitScalar(self: *Rules, instruction: Instruction) !ValueId {
         const function = self.function;
-        std.debug.assert(compaction.isScalar(instruction.resultType()));
+        std.debug.assert(function_ir.scalar(instruction.resultType()));
         std.debug.assert(compaction.removableWhenUnused(function, instruction));
         if (self.rewritten.capacity == 0) try self.rewritten.appendSlice(function.scratch, self.source[0..self.position]);
         const origin = self.source[self.position];
@@ -91,7 +91,7 @@ const Rules = struct {
             .divsi => return self.simplifyDivision(instruction, result),
             .negi => |operand| return self.simplifyNegation(instruction, result, operand),
             .byte_to_int => |operand| {
-                const folded = self.constant(operand) orelse return false;
+                const folded = self.function.constantInt(operand) orelse return false;
                 instruction.* = .{ .const_int = folded };
                 return true;
             },
@@ -156,7 +156,7 @@ const Rules = struct {
                 return .{ .lower = @min(left.lower, right.lower), .upper = @max(left.upper, right.upper) };
             },
             .shrsi => |operands| {
-                const count_value = self.constant(operands.rhs) orelse return .{};
+                const count_value = self.function.constantInt(operands.rhs) orelse return .{};
                 if (count_value < 0 or count_value >= 32) return .{};
                 const source = self.integerBounds(operands.lhs, depth + 1);
                 return .{ .lower = source.lower >> @intCast(count_value), .upper = source.upper >> @intCast(count_value) };
@@ -166,23 +166,8 @@ const Rules = struct {
                 if (source.lower == std.math.minInt(i32)) return .{};
                 return .{ .lower = -source.upper, .upper = -source.lower };
             },
-            .addi, .subi, .muli => |operands| {
-                const operation: structures.numeric.Binary = switch (definition) {
-                    .addi => .add,
-                    .subi => .sub,
-                    .muli => .mul,
-                    else => unreachable,
-                };
-                const range = IntegerBounds.arithmetic(operation, self.integerBounds(operands.lhs, depth + 1), self.integerBounds(operands.rhs, depth + 1));
-                return if (range.fits()) range else .{};
-            },
-            .numeric_unary => |operation| {
-                if (operation.type_id != .int or operation.operation != .neg) return .{};
-                const source = self.integerBounds(operation.operand, depth + 1);
-                if (operation.overflow == .wrapping and source.lower == std.math.minInt(i32)) return .{};
-                return .{ .lower = @min(-source.upper, std.math.maxInt(i32)), .upper = @min(-source.lower, std.math.maxInt(i32)) };
-            },
-            .numeric_binary => |operation| {
+            .numeric_binary, .addi, .subi, .muli => {
+                const operation = integerOperation(definition).?;
                 if (operation.type_id != .int) return .{};
                 if (operation.operation != .add and operation.operation != .sub and operation.operation != .mul) return .{};
                 var range = IntegerBounds.arithmetic(operation.operation, self.integerBounds(operation.operands.lhs, depth + 1), self.integerBounds(operation.operands.rhs, depth + 1));
@@ -225,13 +210,13 @@ const Rules = struct {
                 };
             },
             .div => {
-                const divisor = self.constant(operands.rhs) orelse return false;
+                const divisor = self.function.constantInt(operands.rhs) orelse return false;
                 if (divisor == 0) return false;
                 if (divisor == -1 and operation.overflow != .wrapping) return false;
                 instruction.* = .{ .divsi = operands };
             },
             .shl, .shr => {
-                const count_value = self.constant(operands.rhs) orelse return false;
+                const count_value = self.function.constantInt(operands.rhs) orelse return false;
                 if (count_value < 0 or count_value >= 32) return false;
                 instruction.* = if (operation.operation == .shl) .{ .shli = operands } else .{ .shrsi = operands };
             },
@@ -278,24 +263,7 @@ const Rules = struct {
     }
 
     fn simplifyBinary(self: *Rules, instruction: *Instruction, result: ValueId) bool {
-        const operation: structures.NumericBinary = switch (instruction.*) {
-            .numeric_binary => |operation| operation,
-            inline .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands, tag| .{
-                .operation = switch (tag) {
-                    .addi => .add,
-                    .subi => .sub,
-                    .muli => .mul,
-                    .divsi => .div,
-                    .shli => .shl,
-                    .shrsi => .shr,
-                    else => unreachable,
-                },
-                .type_id = .int,
-                .overflow = .wrapping,
-                .operands = operands,
-            },
-            else => unreachable,
-        };
+        const operation = integerOperation(instruction.*).?;
         const operands = operation.operands;
         const lhs = if (self.numericConstant(operands.lhs)) |value| value.bits else null;
         const rhs = if (self.numericConstant(operands.rhs)) |value| value.bits else null;
@@ -354,7 +322,7 @@ const Rules = struct {
     fn simplifyDivision(self: *Rules, instruction: *Instruction, result: ValueId) !bool {
         if (self.simplifyBinary(instruction, result)) return true;
         const operands = instruction.divsi;
-        const divisor = self.constant(operands.rhs) orelse return false;
+        const divisor = self.function.constantInt(operands.rhs) orelse return false;
         if (self.isAddressTaken(result) or self.isAddressTaken(operands.lhs) or self.isAddressTaken(operands.rhs)) return false;
         if (!self.function.plainValue(operands.lhs)) return false;
         const magnitude: u32 = @intCast(if (divisor < 0) -@as(i64, divisor) else divisor);
@@ -371,7 +339,7 @@ const Rules = struct {
     }
 
     fn simplifyNegation(self: *Rules, instruction: *Instruction, result: ValueId, operand: ValueId) bool {
-        if (self.constant(operand)) |value| {
+        if (self.function.constantInt(operand)) |value| {
             instruction.* = .{ .const_int = -%value };
             return true;
         }
@@ -511,7 +479,7 @@ const Rules = struct {
     fn simplifyTerminator(self: *Rules, terminator: *Terminator) bool {
         if (terminator.* != .predicate_branch) return false;
         const predicate = terminator.predicate_branch;
-        if (predicate.operation == .eqb or predicate.operation == .neb) if (self.function.definition(predicate.operands.lhs)) |definition| if (definition == .compare) if (self.constantBool(predicate.operands.rhs)) |expected| {
+        if (predicate.operation == .eqb or predicate.operation == .neb) if (self.function.definition(predicate.operands.lhs)) |definition| if (definition == .compare) if (self.function.constantBool(predicate.operands.rhs)) |expected| {
             const holds = (predicate.operation == .eqb) == expected;
             const compare = definition.compare;
             terminator.predicate_branch.operation = if (holds) compare.operation else compare.operation.negated();
@@ -527,16 +495,11 @@ const Rules = struct {
 
     fn operandOrder(self: *const Rules, operands: structures.BinaryOperands) ?std.math.Order {
         if (operands.lhs == operands.rhs) return .eq;
-        return std.math.order(self.constant(operands.lhs) orelse return null, self.constant(operands.rhs) orelse return null);
-    }
-
-    fn constantBool(self: *const Rules, value: ValueId) ?bool {
-        const definition = self.function.definition(value) orelse return null;
-        return if (definition == .const_bool) definition.const_bool else null;
+        return std.math.order(self.function.constantInt(operands.lhs) orelse return null, self.function.constantInt(operands.rhs) orelse return null);
     }
 
     fn simplifyCompare(self: *Rules, instruction: *Instruction, operation: structures.CompareOperation, result: ValueId) bool {
-        if (operation.operation == .eqb or operation.operation == .neb) if (self.constantBool(operation.operands.rhs)) |expected| {
+        if (operation.operation == .eqb or operation.operation == .neb) if (self.function.constantBool(operation.operands.rhs)) |expected| {
             const holds = (operation.operation == .eqb) == expected;
             if (holds) return self.alias(result, operation.operands.lhs);
             if (self.function.definition(operation.operands.lhs)) |definition| if (definition == .compare) {
@@ -551,7 +514,7 @@ const Rules = struct {
 
     fn simplifySelect(self: *Rules, operation: structures.SelectOperation, result: ValueId) bool {
         if (operation.then_value == operation.else_value) return self.alias(result, operation.then_value);
-        const condition = self.constantBool(operation.condition) orelse return false;
+        const condition = self.function.constantBool(operation.condition) orelse return false;
         return self.alias(result, if (condition) operation.then_value else operation.else_value);
     }
 
@@ -560,16 +523,29 @@ const Rules = struct {
         self.function.replace(result, target);
         return true;
     }
-
-    fn constant(self: *const Rules, value: ValueId) ?i32 {
-        return switch (self.function.definition(value) orelse return null) {
-            .const_int => |integer| integer,
-            .const_bool => |boolean| @intFromBool(boolean),
-            .const_byte => |byte| byte,
-            else => null,
-        };
-    }
 };
+
+/// Views a numeric or wrapping i32 instruction as one binary operation.
+fn integerOperation(instruction: Instruction) ?structures.NumericBinary {
+    return switch (instruction) {
+        .numeric_binary => |operation| operation,
+        inline .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands, tag| .{
+            .operation = switch (tag) {
+                .addi => .add,
+                .subi => .sub,
+                .muli => .mul,
+                .divsi => .div,
+                .shli => .shl,
+                .shrsi => .shr,
+                else => comptime unreachable,
+            },
+            .type_id = .int,
+            .overflow = .wrapping,
+            .operands = operands,
+        },
+        else => null,
+    };
+}
 
 const AddressSet = struct {
     taken: []bool,
@@ -634,8 +610,7 @@ pub fn visitBranchAddresses(function: *const Function, branch: structures.Functi
     const parameters = function.blocks.items[@backingInt(branch.target)].parameters.items;
     const count = @min(arguments.len, parameters.len);
     for (arguments[0..count], parameters[0..count]) |argument, parameter| {
-        const data = function.definitions.items[@backingInt(parameter)].argument.data;
-        if (data.representation != .value or !function.direct(data.type_id)) visit(context, argument.value);
+        if (!function.directParameter(parameter)) visit(context, argument.value);
     }
     for (arguments[count..]) |argument| visit(context, argument.value);
 }

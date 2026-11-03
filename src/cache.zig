@@ -19,26 +19,19 @@ fn buildIdDigest() ?Key {
         if (phdr.type != .NOTE) continue;
         const size = std.math.cast(usize, phdr.filesz) orelse continue;
         const address = std.math.add(usize, base, @as(usize, @intCast(phdr.vaddr))) catch continue;
-        const bytes: []const u8 = @as([*]const u8, @ptrFromInt(address))[0..size];
-        var offset: usize = 0;
-        while (offset <= bytes.len and bytes.len - offset >= 12) {
-            const name_size = std.mem.readInt(u32, bytes[offset..][0..4], .little);
-            const desc_size = std.mem.readInt(u32, bytes[offset + 4 ..][0..4], .little);
-            const note_type = std.mem.readInt(u32, bytes[offset + 8 ..][0..4], .little);
-            const name_start = offset + 12;
-            const name_end = std.math.add(usize, name_start, name_size) catch break;
-            const desc_start = std.mem.alignForward(usize, name_end, 4);
-            const desc_end = std.math.add(usize, desc_start, desc_size) catch break;
-            if (desc_end > bytes.len) break;
-            if (note_type == std.elf.NT_GNU_BUILD_ID and
-                std.mem.eql(u8, bytes[name_start..name_end], "GNU\x00") and desc_size == 20)
-            {
+        var notes: std.Io.Reader = .fixed(@as([*]const u8, @ptrFromInt(address))[0..size]);
+        while (true) {
+            const name_size = notes.takeInt(u32, .little) catch break;
+            const desc_size = notes.takeInt(u32, .little) catch break;
+            const note_type = notes.takeInt(u32, .little) catch break;
+            const name = notes.take(std.mem.alignForward(usize, name_size, 4)) catch break;
+            const desc = notes.take(std.mem.alignForward(usize, desc_size, 4)) catch break;
+            if (note_type == std.elf.NT_GNU_BUILD_ID and std.mem.eql(u8, name[0..name_size], "GNU\x00") and desc_size == 20) {
                 var hasher = Sha256.init(.{});
                 hasher.update("Chimera compiler build ID");
-                hasher.update(bytes[desc_start..desc_end]);
+                hasher.update(desc[0..desc_size]);
                 return hasher.finalResult();
             }
-            offset = std.mem.alignForward(usize, desc_end, 4);
         }
     }
     return null;
@@ -63,17 +56,12 @@ pub fn compilerDigest(io: std.Io) !Key {
     // process replaces the binary on disk while this run is active.
     const compiler = try std.Io.Dir.cwd().openFile(io, "/proc/self/exe", .{});
     defer compiler.close(io);
-    var compiler_hasher = Sha256.init(.{});
     var buffer: [64 * 1024]u8 = undefined;
-    while (true) {
-        const n = compiler.readStreaming(io, &.{&buffer}) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
-        if (n == 0) continue;
-        compiler_hasher.update(buffer[0..n]);
-    }
-    return compiler_hasher.finalResult();
+    var compiler_reader = compiler.readerStreaming(io, &.{});
+    var hashing: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
+    _ = try compiler_reader.interface.streamRemaining(&hashing.writer);
+    try hashing.writer.flush();
+    return hashing.hasher.finalResult();
 }
 
 /// The executable result depends on all source and module inputs. Hash the

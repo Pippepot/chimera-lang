@@ -23,8 +23,8 @@ pub fn encode(db: *query.Database, allocator: std.mem.Allocator) ![]u8 {
     var portable: codec.Writer = .{ .allocator = allocator };
     defer portable.deinit();
     try db.writeInputs(queries.SourcePath, &portable);
-    try db.writePortableInterns(&portable, disk_cache.interners);
-    inline for (Loader.query_types) |Q| try db.writePortableQueries(Q, &portable, disk_cache.persisted_inputs, disk_cache.persisted_query_dependencies);
+    try db.writeInterns(&portable, disk_cache.interners);
+    inline for (Loader.query_types) |Q| try db.writeQueries(Q, &portable, .portable, disk_cache.persisted_inputs, disk_cache.persisted_query_dependencies);
     var scratch: std.heap.ArenaAllocator = .init(allocator);
     defer scratch.deinit();
     var reader: codec.Reader = .{ .allocator = scratch.allocator(), .bytes = portable.bytes.items };
@@ -181,7 +181,7 @@ pub fn install(db: *query.Database, bytes: []const u8) !*Loader {
     var reader: codec.Reader = .{ .allocator = db.allocator, .bytes = bytes };
     if (!std.mem.eql(u8, try reader.take(format.len), format)) return error.InvalidCache;
     loader.inline_limit = try reader.read(u32);
-    const file_count = try readCount(&reader);
+    const file_count = try reader.readCount();
     for (0..file_count) |_| {
         const file = try reader.read(structures.FileId);
         const path = try readBytes(&reader);
@@ -369,14 +369,8 @@ fn readBytes(reader: *codec.Reader) ![]const u8 {
     return reader.take(length);
 }
 
-fn readCount(reader: *codec.Reader) !usize {
-    const count = try reader.read(u64);
-    if (count > 1_000_000 or count > reader.bytes.len - reader.offset) return error.InvalidCache;
-    return @intCast(count);
-}
-
 fn readTable(reader: *codec.Reader, stride: usize) !Table {
-    const count = try readCount(reader);
+    const count = try reader.readCount();
     const length = std.math.cast(usize, try reader.read(u64)) orelse return error.InvalidCache;
     return .{ .index = try reader.take(count * stride), .data = try reader.take(length) };
 }

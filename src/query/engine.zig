@@ -9,6 +9,11 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 pub const PersistedInputRef = *InputEntry;
 pub const PersistedQueryRef = *Entry;
 
+/// Fingerprinted records compare dependency digests within one compiler's
+/// identities. Portable records retain dependency values in dependency order,
+/// so a receiving database can translate their identities first.
+pub const RecordFormat = enum { fingerprinted, portable };
+
 pub const QueryError = error{
     DuplicateInput,
     InputNotFound,
@@ -68,14 +73,12 @@ const EntryResult = union(enum) {
 const QueryOutput = struct {
     pointer: *anyopaque,
     storage: union(enum) {
-        heap,
         arena: std.heap.ArenaAllocator,
         inline_value,
-    } = .heap,
+    },
 
     fn deinit(output: *QueryOutput, allocator: std.mem.Allocator, destroy: DestroyValueFn) void {
         switch (output.storage) {
-            .heap => destroy(allocator, output.pointer, true),
             .arena => |*arena| {
                 destroy(arena.allocator(), output.pointer, true);
                 arena.deinit();
@@ -317,10 +320,12 @@ pub const Context = struct {
     pub fn get(ctx: *Context, comptime Q: type, input_value: Q.Input) anyerror!*const Q.Output {
         const input_copy = input_value;
         const key = queryKey(Q, &input_copy);
-        if (ctx.current.computation.?.deps.get(key)) |output| return @ptrCast(@alignCast(output));
+        if (ctx.current.computation.?.deps.getAdapted(key, DependencyKeyContext{})) |output| {
+            if (output) |observed| return @ptrCast(@alignCast(observed));
+        }
         const handle = try ctx.db.scheduleWithKey(Q, key, ctx, .deferred);
         const output = try handle.wait();
-        ctx.current.computation.?.deps.entries.items[handle.dependency_index.?].output = @ptrCast(output);
+        ctx.current.computation.?.deps.values()[handle.dependency_index.?] = @ptrCast(output);
         return output;
     }
 
@@ -588,7 +593,6 @@ pub const Database = struct {
             .destroy_value_fn = comptime destroyInputValueFn(I),
             .write_key_fn = comptime writeValueFn(I.Key),
             .write_value_fn = comptime writeValueFn(I.Value),
-            .fingerprint_fn = comptime fingerprintInputFn(I),
         };
         var stored_key = lookup_key;
         stored_key.value_ptr = key_box;
@@ -700,18 +704,8 @@ pub const Database = struct {
         }
     }
 
-    pub fn writeInternedValues(db: *Database, writer: *disk_codec.Writer) !void {
-        db.intern_mutex.lockUncancelable(db.io());
-        defer db.intern_mutex.unlock(db.io());
-        try writer.write(u64, @intCast(db.interned_values.len));
-        for (0..db.interned_values.len) |index| {
-            const entry = db.interned_values.at(index).*;
-            try writer.write([]const u8, entry.type_identity.name);
-            try entry.write_value_fn(writer, entry.value_ptr);
-        }
-    }
-
-    pub fn writePortableInterns(db: *Database, writer: *disk_codec.Writer, comptime interners: anytype) !void {
+    /// Records name their interner by its index in `interners`.
+    pub fn writeInterns(db: *Database, writer: *disk_codec.Writer, comptime interners: anytype) !void {
         db.intern_mutex.lockUncancelable(db.io());
         defer db.intern_mutex.unlock(db.io());
         try writer.write(u64, @intCast(db.interned_values.len));
@@ -748,7 +742,7 @@ pub const Database = struct {
         defer db.unlock();
         try db.ensureIdleLocked();
         const entry = db.inputs.get(lookup_key) orelse try db.insertInputLocked(I, lookup_key);
-        const actual = try entry.fingerprint_fn(db.allocator, entry.value_ptr);
+        const actual = try fingerprintWith(db.allocator, writeInputValue, entry);
         return if (std.mem.eql(u8, &actual, &digest)) entry else null;
     }
 
@@ -762,28 +756,19 @@ pub const Database = struct {
         var clean: std.AutoHashMap(*Entry, bool) = .init(db.allocator);
         defer clean.deinit();
         if (!(try db.persistedSubtreeClean(entry, &clean))) return null;
-        const actual = try entry.fingerprint_output_fn.?(db.allocator, entry.output.?.pointer);
+        const actual = try fingerprintWith(db.allocator, writeOutputValue, entry);
         return if (std.mem.eql(u8, &actual, &digest)) entry else null;
     }
 
-    pub fn importCompletedQuery(db: *Database, comptime Q: type, input_value: Q.Input, output_value: Q.Output, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
-        const output_box = try db.allocator.create(Q.Output);
-        errdefer db.allocator.destroy(output_box);
-        output_box.* = output_value;
-        try db.importQueryStorage(Q, input_value, .{ .pointer = @ptrCast(output_box) }, inputs, queries);
+    /// A fresh arena for a decoded output that importQuery will retain.
+    pub fn outputArena(db: *Database) std.heap.ArenaAllocator {
+        return .init(db.query_storage.arenaAllocator());
     }
 
-    /// Copy a borrowed decoded value into the same compact result ownership
-    /// used by ordinary query computations, without one heap owner per slice.
-    pub fn importQueryCopy(db: *Database, comptime Q: type, input_value: Q.Input, output_value: Q.Output, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
-        var arena = std.heap.ArenaAllocator.init(db.query_storage.arenaAllocator());
-        errdefer arena.deinit();
-        const output_box = try arena.allocator().create(Q.Output);
-        output_box.* = try value_operations.Owned(Q.Output).clone(arena.allocator(), output_value);
-        try db.importQueryStorage(Q, input_value, .{ .pointer = @ptrCast(output_box), .storage = .{ .arena = arena } }, inputs, queries);
-    }
-
-    fn importQueryStorage(db: *Database, comptime Q: type, input_value: Q.Input, output: QueryOutput, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
+    /// Retain a decoded output with the same compact ownership as computed
+    /// results. `arena` owns `output` and everything it references; the
+    /// database takes the arena when the import succeeds.
+    pub fn importQuery(db: *Database, comptime Q: type, input_value: Q.Input, arena: std.heap.ArenaAllocator, output: *Q.Output, inputs: []const PersistedInputRef, queries: []const PersistedQueryRef) !void {
         validateQuery(Q);
         const input_copy = input_value;
         const lookup_key = queryKey(Q, &input_copy);
@@ -792,9 +777,8 @@ pub const Database = struct {
         try db.ensureIdleLocked();
         if (db.entries.get(lookup_key)) |existing| {
             if (!settledLocked(db, existing) or existing.accums_in_subtree) return error.InvalidCache;
-            if (!existing.output_eql_fn(existing.output.?.pointer, output.pointer)) return error.InvalidCache;
-            var redundant = output;
-            redundant.deinit(db.allocator, comptime destroyValueFn(Q.Output));
+            if (!existing.output_eql_fn(existing.output.?.pointer, output)) return error.InvalidCache;
+            arena.deinit();
             return;
         }
         const entry = try db.insertEntryLocked(Q, lookup_key);
@@ -803,25 +787,23 @@ pub const Database = struct {
             db.destroyEntry(entry);
         }
         try entry.memo.input_deps.appendSlice(db.query_storage.allocator(), inputs);
-        for (queries) |dependency| _ = try entry.memo.deps.getOrPut(db.query_storage.allocator(), dependency);
-        entry.output = output;
+        for (queries) |dependency| try entry.memo.deps.put(db.query_storage.allocator(), dependency, null);
+        entry.output = .{ .pointer = @ptrCast(output), .storage = .{ .arena = arena } };
         entry.state = .complete;
     }
 
     /// Persist only successful, diagnostic-free subgraphs. Query boundaries
     /// retain equal-result invalidation, while the remaining edges terminate
-    /// at the exact inputs observed by the computation.
-    pub fn writeCompletedQueries(db: *Database, comptime Q: type, writer: *disk_codec.Writer) !void {
-        return db.writeQueryRecords(Q, writer, false, .{}, .{});
-    }
-
-    /// Portable artifacts retain dependency values so their identities can be
-    /// translated before comparing them with the receiving database.
-    pub fn writePortableQueries(db: *Database, comptime Q: type, writer: *disk_codec.Writer, comptime inputs: anytype, comptime queries: anytype) !void {
-        return db.writeQueryRecords(Q, writer, true, inputs, queries);
-    }
-
-    fn writeQueryRecords(db: *Database, comptime Q: type, writer: *disk_codec.Writer, comptime portable: bool, comptime input_types: anytype, comptime query_types: anytype) !void {
+    /// at the exact inputs observed by the computation. Dependencies name
+    /// their type by its index in `input_types` or `query_types`.
+    pub fn writeQueries(
+        db: *Database,
+        comptime Q: type,
+        writer: *disk_codec.Writer,
+        comptime format: RecordFormat,
+        comptime input_types: anytype,
+        comptime query_types: anytype,
+    ) !void {
         validateQuery(Q);
         comptime if (@typeInfo(Q.Output) != .optional) @compileError("persisted query output must be optional");
         db.lock();
@@ -840,6 +822,7 @@ pub const Database = struct {
             if (output.* == null) continue;
             if (try db.persistedSubtreeClean(entry, &clean)) try records.append(db.allocator, entry);
         }
+        const portable = format == .portable;
         if (portable) {
             var ordered: std.ArrayList(*Entry) = .empty;
             errdefer ordered.deinit(db.allocator);
@@ -867,26 +850,15 @@ pub const Database = struct {
             try db.collectPersistedDependencies(entry, &visited, &input_deps, &query_deps);
             try writer.write(u64, @intCast(input_deps.count()));
             for (input_deps.keys()) |dep| {
-                if (portable) try writeTypeIndex(writer, dep.type_identity, input_types) else try writer.write([]const u8, dep.type_identity.name);
+                try writeTypeIndex(writer, dep.type_identity, input_types);
                 try dep.write_key_fn(writer, dep.key_ptr);
-                if (portable) {
-                    try writer.write(bool, dep.value_ptr != null);
-                    if (dep.value_ptr) |value| try dep.write_value_fn(writer, value);
-                } else {
-                    const digest = try dep.fingerprint_fn(db.allocator, dep.value_ptr);
-                    try writer.bytes.appendSlice(writer.allocator, &digest);
-                }
+                try writeDependencyValue(writer, format, writeInputValue, dep);
             }
             try writer.write(u64, @intCast(query_deps.count()));
             for (query_deps.keys()) |dep| {
-                if (portable) try writeTypeIndex(writer, dep.type_identity, query_types) else try writer.write([]const u8, dep.type_identity.name);
+                try writeTypeIndex(writer, dep.type_identity, query_types);
                 try dep.write_input_fn(writer, dep.input_ptr);
-                if (portable) {
-                    try dep.write_output_fn.?(writer, dep.output.?.pointer);
-                } else {
-                    const digest = try dep.fingerprint_output_fn.?(db.allocator, dep.output.?.pointer);
-                    try writer.bytes.appendSlice(writer.allocator, &digest);
-                }
+                try writeDependencyValue(writer, format, writeOutputValue, dep);
             }
             if (portable) std.mem.writeInt(u64, writer.bytes.items[length_offset..][0..8], @intCast(writer.bytes.items.len - record_start), .little);
         }
@@ -894,7 +866,7 @@ pub const Database = struct {
 
     fn orderPortableRecords(db: *Database, comptime Q: type, entry: *Entry, visited: *std.AutoHashMapUnmanaged(*Entry, void), ordered: *std.ArrayList(*Entry)) anyerror!void {
         if ((try visited.getOrPut(db.allocator, entry)).found_existing) return;
-        for (entry.memo.deps.entries.items) |dependency| try db.orderPortableRecords(Q, dependency.entry, visited, ordered);
+        for (entry.memo.deps.keys()) |dependency| try db.orderPortableRecords(Q, dependency, visited, ordered);
         if (entry.type_identity != comptime typeIdentity(Q)) return;
         const output: *const Q.Output = @ptrCast(@alignCast(entry.output.?.pointer));
         if (output.* != null) try ordered.append(db.allocator, entry);
@@ -903,9 +875,9 @@ pub const Database = struct {
     fn persistedSubtreeClean(db: *Database, entry: *Entry, clean: *std.AutoHashMap(*Entry, bool)) !bool {
         if (clean.get(entry)) |result| return result;
         var result = settledLocked(db, entry) and !entry.accums_in_subtree;
-        for (entry.memo.deps.entries.items) |dependency| {
+        for (entry.memo.deps.keys()) |dependency| {
             if (!result) break;
-            result = try db.persistedSubtreeClean(dependency.entry, clean);
+            result = try db.persistedSubtreeClean(dependency, clean);
         }
         try clean.put(entry, result);
         return result;
@@ -922,11 +894,11 @@ pub const Database = struct {
     ) !void {
         if ((try visited.getOrPut(db.allocator, entry)).found_existing) return;
         for (entry.memo.input_deps.items) |input_entry| try input_deps.put(db.allocator, input_entry, {});
-        for (entry.memo.deps.entries.items) |dependency| {
-            if (dependency.entry.fingerprint_output_fn != null) {
-                try query_deps.put(db.allocator, dependency.entry, {});
+        for (entry.memo.deps.keys()) |dependency| {
+            if (dependency.write_output_fn != null) {
+                try query_deps.put(db.allocator, dependency, {});
             } else {
-                try db.collectPersistedDependencies(dependency.entry, visited, input_deps, query_deps);
+                try db.collectPersistedDependencies(dependency, visited, input_deps, query_deps);
             }
         }
     }
@@ -1051,7 +1023,6 @@ pub const Database = struct {
             .output_eql_fn = comptime outputEqlFn(Q),
             .write_input_fn = comptime writeValueFn(Q.Input),
             .write_output_fn = comptime if (@hasDecl(Q, "disk_boundary") and Q.disk_boundary) writeValueFn(Q.Output) else null,
-            .fingerprint_output_fn = comptime if (@hasDecl(Q, "disk_boundary") and Q.disk_boundary) fingerprintQueryOutputFn(Q) else null,
         };
         input_box.* = @as(*const Q.Input, @ptrCast(@alignCast(lookup_key.value_ptr))).*;
 
@@ -1087,7 +1058,8 @@ pub const Database = struct {
             }
 
             if (entry.state == .queued) {
-                if (entry.queue_owner) |index| db.workers[index].queue.remove(entry);
+                if (entry.queue_owner) |index| db.workers[index].queue.remove(&entry.queue_node);
+                entry.queue_owner = null;
                 entry.state = .running;
                 db.unlock();
                 db.runEntry(entry, preferred_worker);
@@ -1138,8 +1110,8 @@ pub const Database = struct {
         }
         if (result != .failure) {
             entry.verified_at = db.revision;
-            entry.accums_in_subtree = entry.memo.accums != null or for (entry.memo.deps.entries.items) |dependency| {
-                if (dependency.entry.state == .complete and dependency.entry.accums_in_subtree) break true;
+            entry.accums_in_subtree = entry.memo.accums != null or for (entry.memo.deps.keys()) |dependency| {
+                if (dependency.state == .complete and dependency.accums_in_subtree) break true;
             } else false;
             entry.state = .complete;
         }
@@ -1157,14 +1129,14 @@ pub const Database = struct {
         for (entry.memo.input_deps.items) |input_entry| {
             if (input_entry.changed_at > verified_at) return true;
         }
-        const dependencies = entry.memo.deps.entries.items;
+        const dependencies = entry.memo.deps.keys();
         var next: usize = 0;
         while (next < dependencies.len) {
             {
                 db.lock();
                 defer db.unlock();
                 while (next < dependencies.len) : (next += 1) {
-                    const dep = dependencies[next].entry;
+                    const dep = dependencies[next];
                     if (!settledLocked(db, dep)) break;
                     // A recovered child can equal its old memo while the parent still
                     // holds a fallback computed during that child's failure.
@@ -1173,7 +1145,7 @@ pub const Database = struct {
                 }
             }
             // Let Q.run handle dependency errors again, just as on first demand.
-            if (next < dependencies.len) db.verifyDependency(entry, dependencies[next].entry, worker_index) catch return true;
+            if (next < dependencies.len) db.verifyDependency(entry, dependencies[next], worker_index) catch return true;
         }
         return false;
     }
@@ -1234,18 +1206,20 @@ pub const Database = struct {
         const index = db.next_worker % db.workers.len;
         db.next_worker = (index + 1) % db.workers.len;
         entry.queue_owner = index;
-        db.workers[index].queue.pushBack(entry);
+        db.workers[index].queue.append(&entry.queue_node);
         db.work_available.signal(db.io());
     }
 
     /// Workers run their own newest work first and steal the oldest work
     /// queued for the others.
     fn takeWorkLocked(db: *Database, worker_index: usize) ?*Entry {
-        const entry = db.workers[worker_index].queue.popBack() orelse for (1..db.workers.len) |offset| {
+        const node = db.workers[worker_index].queue.popLast() orelse for (1..db.workers.len) |offset| {
             const victim = (worker_index + offset) % db.workers.len;
-            if (db.workers[victim].queue.popFront()) |stolen| break stolen;
+            if (db.workers[victim].queue.popFirst()) |stolen| break stolen;
         } else return null;
+        const entry: *Entry = @alignCast(@fieldParentPtr("queue_node", node));
         std.debug.assert(entry.state == .queued);
+        entry.queue_owner = null;
         entry.state = .running;
         return entry;
     }
@@ -1257,7 +1231,8 @@ pub const Database = struct {
         const deps = &parent_entry.computation.?.deps;
         const existing = try deps.getOrPut(db.query_storage.allocator(), child);
         if (existing.found_existing) return existing.index;
-        errdefer deps.rollback(child);
+        existing.value_ptr.* = null;
+        errdefer _ = deps.pop();
 
         if (!settledLocked(db, child) and db.reachesLocked(child, parent_entry)) return error.QueryCycle;
         return existing.index;
@@ -1314,8 +1289,8 @@ pub const Database = struct {
         if (entry.state != .complete or !entry.accums_in_subtree) return;
         if ((try seen.getOrPut(entry)).found_existing) return;
         for (accumulatorValues(entry.memo.accums, A)) |item| try appendClonedAccumValue(A, out, gpa, item);
-        for (entry.memo.deps.entries.items) |dependency| {
-            try db.appendAccumulatorValuesRecursive(dependency.entry, A, out, seen, gpa);
+        for (entry.memo.deps.keys()) |dependency| {
+            try db.appendAccumulatorValuesRecursive(dependency, A, out, seen, gpa);
         }
     }
 
@@ -1433,95 +1408,29 @@ const DestroyOpaqueFn = *const fn (std.mem.Allocator, *anyopaque) void;
 const DestroyValueFn = *const fn (std.mem.Allocator, *anyopaque, bool) void;
 const EqlOpaqueFn = *const fn (*const anyopaque, *const anyopaque) bool;
 const WriteOpaqueFn = *const fn (*disk_codec.Writer, *const anyopaque) anyerror!void;
-const FingerprintFn = *const fn (std.mem.Allocator, ?*anyopaque) anyerror![32]u8;
-const FingerprintQueryFn = *const fn (std.mem.Allocator, *const anyopaque) anyerror![32]u8;
 
-const DependencyMap = struct {
-    const Dependency = struct {
-        entry: *Entry,
-        output: ?*const anyopaque = null,
-    };
+/// Each query dependency maps to its output once `Context.get` observed it.
+const DependencyMap = std.ArrayHashMapUnmanaged(*Entry, ?*const anyopaque, DependencyContext, false);
 
-    entries: std.ArrayList(Dependency) = .empty,
-    buckets: []u32 = &.{},
-
-    const empty: DependencyMap = .{};
-
-    fn get(deps: *const DependencyMap, key: ErasedKey) ?*const anyopaque {
-        const position = deps.find(key.hash, key, matchesKey) orelse return null;
-        return deps.entries.items[position].output;
+const DependencyContext = struct {
+    pub fn hash(_: DependencyContext, entry: *Entry) u32 {
+        return @truncate(entry.key_hash);
     }
 
-    fn getOrPut(deps: *DependencyMap, allocator: std.mem.Allocator, entry: *Entry) !struct { found_existing: bool, index: usize } {
-        if (deps.find(entry.key_hash, entry, isEntry)) |position| return .{ .found_existing = true, .index = position };
-        if (deps.entries.items.len == std.math.maxInt(u32)) return error.OutOfMemory;
-        if (deps.buckets.len != 0 or deps.entries.items.len >= 16) try deps.ensureIndexCapacity(allocator);
-        try deps.entries.ensureUnusedCapacity(allocator, 1);
-        const position = deps.entries.items.len;
-        if (deps.buckets.len != 0) insertIndex(deps.buckets, position, entry.key_hash);
-        deps.entries.appendAssumeCapacity(.{ .entry = entry });
-        return .{ .found_existing = false, .index = position };
+    pub fn eql(_: DependencyContext, a: *Entry, b: *Entry, _: usize) bool {
+        return a == b;
+    }
+};
+
+/// Finds a recorded dependency by query key before scheduling it.
+const DependencyKeyContext = struct {
+    pub fn hash(_: DependencyKeyContext, key: ErasedKey) u32 {
+        return @truncate(key.hash);
     }
 
-    /// Small maps scan their edges; larger ones probe the bucket index.
-    inline fn find(deps: *const DependencyMap, hash: u64, target: anytype, comptime matches: anytype) ?usize {
-        if (deps.buckets.len == 0) {
-            for (deps.entries.items, 0..) |dependency, position| {
-                if (matches(target, dependency.entry)) return position;
-            }
-            return null;
-        }
-        const mask = deps.buckets.len - 1;
-        var bucket: usize = @as(usize, @truncate(hash)) & mask;
-        while (deps.buckets[bucket] != 0) : (bucket = (bucket + 1) & mask) {
-            const position = deps.buckets[bucket] - 1;
-            if (matches(target, deps.entries.items[position].entry)) return position;
-        }
-        return null;
-    }
-
-    inline fn matchesKey(key: ErasedKey, entry: *Entry) bool {
+    pub fn eql(_: DependencyKeyContext, key: ErasedKey, entry: *Entry, _: usize) bool {
         return key.hash == entry.key_hash and key.type_identity == entry.type_identity and
             key.eql_fn(key.value_ptr, entry.input_ptr);
-    }
-
-    inline fn isEntry(target: *Entry, entry: *Entry) bool {
-        return target == entry;
-    }
-
-    fn ensureIndexCapacity(deps: *DependencyMap, allocator: std.mem.Allocator) !void {
-        if (deps.buckets.len >= (deps.entries.items.len + 1) * 2) return;
-        const buckets = try allocator.alloc(u32, @max(64, deps.buckets.len * 2));
-        @memset(buckets, 0);
-        for (deps.entries.items, 0..) |dependency, position| insertIndex(buckets, position, dependency.entry.key_hash);
-        allocator.free(deps.buckets);
-        deps.buckets = buckets;
-    }
-
-    fn insertIndex(buckets: []u32, position: usize, hash: u64) void {
-        const mask = buckets.len - 1;
-        var bucket: usize = @as(usize, @truncate(hash)) & mask;
-        while (buckets[bucket] != 0) bucket = (bucket + 1) & mask;
-        buckets[bucket] = @intCast(position + 1);
-    }
-
-    fn rollback(deps: *DependencyMap, entry: *Entry) void {
-        std.debug.assert(deps.entries.items[deps.entries.items.len - 1].entry == entry);
-        if (deps.buckets.len != 0) {
-            const mask = deps.buckets.len - 1;
-            var bucket: usize = @as(usize, @truncate(entry.key_hash)) & mask;
-            while (deps.buckets[bucket] != deps.entries.items.len) {
-                std.debug.assert(deps.buckets[bucket] != 0);
-                bucket = (bucket + 1) & mask;
-            }
-            deps.buckets[bucket] = 0;
-        }
-        _ = deps.entries.pop();
-    }
-
-    fn deinit(deps: *DependencyMap, allocator: std.mem.Allocator) void {
-        deps.entries.deinit(allocator);
-        allocator.free(deps.buckets);
     }
 };
 
@@ -1541,8 +1450,8 @@ const Entry = struct {
     destroy_output_fn: DestroyValueFn,
     output_eql_fn: EqlOpaqueFn,
     write_input_fn: WriteOpaqueFn,
+    /// Present exactly for disk-boundary queries.
     write_output_fn: ?WriteOpaqueFn,
-    fingerprint_output_fn: ?FingerprintQueryFn,
     /// The edges and accumulator values of the committed computation.
     memo: Computation = .{},
     // Set at commit so accumulator collection can skip clean subtrees.
@@ -1554,8 +1463,7 @@ const Entry = struct {
     finished: std.atomic.Value(u32) = .init(0),
     waiters: std.atomic.Value(u32) = .init(0),
     queue_owner: ?usize = null,
-    queue_prev: ?*Entry = null,
-    queue_next: ?*Entry = null,
+    queue_node: std.DoublyLinkedList.Node = .{},
     visit_token: usize = 0,
 };
 
@@ -1568,7 +1476,6 @@ const InputEntry = struct {
     destroy_value_fn: DestroyOpaqueFn,
     write_key_fn: WriteOpaqueFn,
     write_value_fn: WriteOpaqueFn,
-    fingerprint_fn: FingerprintFn,
 };
 
 const stopped_interns = std.math.maxInt(u64);
@@ -1651,56 +1558,8 @@ const AccumBucket = struct {
 const Worker = struct {
     thread: std.Thread = undefined,
     thread_id: std.Thread.Id = undefined,
-    queue: WorkQueue = .{},
+    queue: std.DoublyLinkedList = .{},
     scratch_arenas: std.ArrayList(std.heap.ArenaAllocator.State) = .empty,
-};
-
-const WorkQueue = struct {
-    head: ?*Entry = null,
-    tail: ?*Entry = null,
-
-    fn pushBack(queue: *WorkQueue, entry: *Entry) void {
-        std.debug.assert(entry.queue_prev == null);
-        std.debug.assert(entry.queue_next == null);
-
-        entry.queue_prev = queue.tail;
-        if (queue.tail) |tail| {
-            tail.queue_next = entry;
-        } else {
-            queue.head = entry;
-        }
-        queue.tail = entry;
-    }
-
-    fn popBack(queue: *WorkQueue) ?*Entry {
-        const entry = queue.tail orelse return null;
-        queue.remove(entry);
-        return entry;
-    }
-
-    fn popFront(queue: *WorkQueue) ?*Entry {
-        const entry = queue.head orelse return null;
-        queue.remove(entry);
-        return entry;
-    }
-
-    fn remove(queue: *WorkQueue, entry: *Entry) void {
-        if (entry.queue_prev) |prev| {
-            prev.queue_next = entry.queue_next;
-        } else {
-            queue.head = entry.queue_next;
-        }
-
-        if (entry.queue_next) |next| {
-            next.queue_prev = entry.queue_prev;
-        } else {
-            queue.tail = entry.queue_prev;
-        }
-
-        entry.queue_prev = null;
-        entry.queue_next = null;
-        entry.queue_owner = null;
-    }
 };
 
 fn workerMain(db: *Database, worker_index: usize) void {
@@ -1729,13 +1588,13 @@ fn reachesVisit(db: *Database, entry: *Entry, target: *Entry, token: usize) bool
     }
 
     const deps = if (entry.computation) |*computation|
-        computation.deps.entries.items
+        computation.deps.keys()
     else if (entry.verified_at == db.revision)
-        entry.memo.deps.entries.items
+        entry.memo.deps.keys()
     else
         &.{};
     for (deps) |dependency| {
-        if (reachesVisit(db, dependency.entry, target, token)) return true;
+        if (reachesVisit(db, dependency, target, token)) return true;
     }
     if (entry.prefetches) |prefetches| for (prefetches.items) |prefetched| {
         if (reachesVisit(db, prefetched, target, token)) return true;
@@ -1837,7 +1696,7 @@ fn typeIdentity(comptime Owner: type) *const TypeIdentity {
     }.value;
 }
 
-pub fn identityName(comptime Owner: type) []const u8 {
+fn identityName(comptime Owner: type) []const u8 {
     return if (@hasDecl(Owner, "cache_name")) Owner.cache_name else @typeName(Owner);
 }
 
@@ -1871,29 +1730,30 @@ fn writeValueFn(comptime T: type) WriteOpaqueFn {
     }.write;
 }
 
-fn fingerprintQueryOutputFn(comptime Q: type) FingerprintQueryFn {
-    return struct {
-        fn fingerprintOutput(allocator: std.mem.Allocator, ptr: *const anyopaque) anyerror![32]u8 {
-            const output: *const Q.Output = @ptrCast(@alignCast(ptr));
-            return fingerprint(Q.Output, allocator, output.*);
-        }
-    }.fingerprintOutput;
+/// A missing input is encoded as an absent value.
+fn writeInputValue(writer: *disk_codec.Writer, entry: *const InputEntry) !void {
+    try writer.write(bool, entry.value_ptr != null);
+    if (entry.value_ptr) |value| try entry.write_value_fn(writer, value);
 }
 
-/// A missing input is fingerprinted as an absent value.
-fn fingerprintInputFn(comptime I: type) FingerprintFn {
-    return struct {
-        fn fingerprintInput(allocator: std.mem.Allocator, value_ptr: ?*anyopaque) anyerror![32]u8 {
-            const value: ?*const I.Value = @ptrCast(@alignCast(value_ptr));
-            return fingerprint(?I.Value, allocator, if (value) |present| present.* else null);
-        }
-    }.fingerprintInput;
+fn writeOutputValue(writer: *disk_codec.Writer, entry: *const Entry) !void {
+    try entry.write_output_fn.?(writer, entry.output.?.pointer);
+}
+
+fn writeDependencyValue(writer: *disk_codec.Writer, comptime format: RecordFormat, comptime write: anytype, dependency: anytype) !void {
+    if (format == .portable) return write(writer, dependency);
+    const digest = try fingerprintWith(writer.allocator, write, dependency);
+    try writer.bytes.appendSlice(writer.allocator, &digest);
 }
 
 pub fn fingerprint(comptime T: type, allocator: std.mem.Allocator, value: T) ![32]u8 {
+    return fingerprintWith(allocator, comptime writeValueFn(T), &value);
+}
+
+fn fingerprintWith(allocator: std.mem.Allocator, comptime write: anytype, subject: anytype) ![32]u8 {
     var writer: disk_codec.Writer = .{ .allocator = allocator };
     defer writer.deinit();
-    try writer.write(T, value);
+    try write(&writer, subject);
     var digest: [32]u8 = undefined;
     Sha256.hash(writer.bytes.items, &digest, .{});
     return digest;
@@ -1974,8 +1834,9 @@ fn computeFn(comptime Q: type) ComputeFn {
             // Spawned dependencies belong to this computation even when their
             // handles are discarded. Q.run decides which errors to propagate;
             // settling dependencies must not override errors it handled.
-            for (entry.computation.?.deps.entries.items) |dependency| {
-                if (dependency.output == null) db.waitForEntry(dependency.entry, worker_index) catch {};
+            const deps = &entry.computation.?.deps;
+            for (deps.keys(), deps.values()) |dependency, output| {
+                if (output == null) db.waitForEntry(dependency, worker_index) catch {};
             }
 
             if (comptime !typeContainsPointer(Q.Output) and @sizeOf(Q.Output) <= 32 and @alignOf(Q.Output) <= 16) {

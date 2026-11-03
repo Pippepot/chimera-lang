@@ -48,12 +48,9 @@ pub fn analyzeCallee(scratch: std.mem.Allocator, body: *const Body) !Facts {
     var function = try Function.init(scratch, body, &.{});
     if (!try @import("graph.zig").dominatesUses(&function)) return .{ .eligible = false };
     const entry = @backingInt(body.entry);
-    for (body.blocks) |*block| {
-        var terminator = block.terminator;
-        for (terminator.successors()) |successor| if (successor) |target| {
-            if (@backingInt(target.*) == entry) return .{ .eligible = false };
-        };
-    }
+    for (0..body.blocks.len) |block| for (function.successors(@intCast(block))) |successor| {
+        if (successor == entry) return .{ .eligible = false };
+    };
     const taken = try canonicalize.addressTaken(&function);
     const entry_taken = taken[body.blocks[entry].argument_start..body.blocks[entry].argument_end];
     const parameters = function.blocks.items[entry].parameters.items;
@@ -72,7 +69,7 @@ pub fn analyzeCallee(scratch: std.mem.Allocator, body: *const Body) !Facts {
         }
         for (parameters, entry_taken, ranges) |parameter, exposed, *range| {
             if (exposed or function.valueType(parameter) != .int or !function.plainValue(parameter)) continue;
-            const found = analysis.rangeAt(parameter, block);
+            const found = analysis.rangeAt(parameter, block, 16);
             if (range.*) |previous| {
                 range.* = .{ .lower = @min(previous.lower, found.lower), .upper = @max(previous.upper, found.upper) };
             } else range.* = found;
@@ -253,7 +250,8 @@ const Splice = struct {
         }
         var previous = after;
         for (body.blocks, splice.blocks, 0..) |_, *mapped, index| {
-            mapped.* = try function.addBlock(.diverge, splice.terminatorSpan(index), splice.terminatorFrame(index));
+            const source = splice.origin(body.terminator_spans, body.terminator_frames, index);
+            mapped.* = try function.addBlock(.diverge, source.span, source.frame);
             try function.placeAfter(mapped.*, previous);
             previous = mapped.*;
         }
@@ -271,24 +269,11 @@ const Splice = struct {
         return if (original == .root) self.root else self.frames[@backingInt(original)];
     }
 
-    fn spanned(self: *const Splice) bool {
-        return self.function.publishes_spans and self.callee.terminator_spans.len != 0;
-    }
+    const Origin = struct { span: SourceSpan, frame: InlineFrameId };
 
-    fn instructionSpan(self: *const Splice, index: usize) SourceSpan {
-        return if (self.spanned()) self.callee.instruction_spans[index] else self.span;
-    }
-
-    fn instructionFrame(self: *const Splice, index: usize) InlineFrameId {
-        return if (self.spanned() and self.callee.instruction_frames.len != 0) self.frame(self.callee.instruction_frames[index]) else self.root;
-    }
-
-    fn terminatorSpan(self: *const Splice, index: usize) SourceSpan {
-        return if (self.spanned()) self.callee.terminator_spans[index] else self.span;
-    }
-
-    fn terminatorFrame(self: *const Splice, index: usize) InlineFrameId {
-        return if (self.spanned() and self.callee.terminator_frames.len != 0) self.frame(self.callee.terminator_frames[index]) else self.root;
+    fn origin(self: *const Splice, spans: []const SourceSpan, frames: []const InlineFrameId, index: usize) Origin {
+        if (!self.function.publishes_spans or self.callee.terminator_spans.len == 0) return .{ .span = self.span, .frame = self.root };
+        return .{ .span = spans[index], .frame = if (frames.len != 0) self.frame(frames[index]) else self.root };
     }
 
     fn bindArguments(self: *Splice, call: structures.FunctionCall, site: u32) !void {
@@ -337,7 +322,8 @@ const Splice = struct {
                     const storage_type = instruction.result_storage;
                     instruction = .{ .local_storage = storage_type };
                 }
-                const copied = try function.newInstruction(instruction, self.instructionSpan(index), self.instructionFrame(index));
+                const source = self.origin(body.instruction_spans, body.instruction_frames, index);
+                const copied = try function.newInstruction(instruction, source.span, source.frame);
                 try function.blocks.items[self.blocks[block_index]].instructions.append(function.scratch, copied);
                 self.values[@backingInt(body.instructionValue(index))] = function.results.items[copied];
             }
@@ -364,11 +350,7 @@ const Splice = struct {
             },
             .aggregate => |*aggregate| aggregate.fields = try self.valueRange(&function.aggregate_fields, self.callee.aggregate_fields, aggregate.fields),
             inline .variant_coerce, .variant_extract => |*operation| operation.tag_mapping = try self.tagMapping(operation.tag_mapping),
-            .borrow_address => |*operation| {
-                const start: u32 = @intCast(function.borrow_fields.items.len);
-                try function.borrow_fields.appendSlice(scratch, self.callee.borrow_fields[operation.fields.start..operation.fields.end]);
-                operation.fields = .{ .start = start, .end = @intCast(function.borrow_fields.items.len) };
-            },
+            .borrow_address => |*operation| operation.fields = try function_ir.copyRange(structures.BorrowProjection, scratch, &function.borrow_fields, self.callee.borrow_fields, operation.fields),
             else => {},
         }
     }
@@ -380,11 +362,8 @@ const Splice = struct {
     }
 
     fn tagMapping(self: *Splice, mapping: ?Range) !?Range {
-        const range = mapping orelse return null;
         const function = self.function;
-        const start: u32 = @intCast(function.variant_coercion_tags.items.len);
-        try function.variant_coercion_tags.appendSlice(function.scratch, self.callee.variant_coercion_tags[range.start..range.end]);
-        return .{ .start = start, .end = @intCast(function.variant_coercion_tags.items.len) };
+        return try function_ir.copyRange(u32, function.scratch, &function.variant_coercion_tags, self.callee.variant_coercion_tags, mapping orelse return null);
     }
 
     fn use(self: *Splice, original: structures.FunctionValueUse) !structures.FunctionValueUse {
@@ -411,10 +390,7 @@ const Splice = struct {
     fn branch(self: *Splice, original: structures.FunctionBranch) !structures.FunctionBranch {
         const function = self.function;
         const start: u32 = @intCast(function.branch_arguments.items.len);
-        for (self.callee.branch_arguments[original.arguments.start..original.arguments.end]) |argument| {
-            const mapped = try self.use(argument);
-            try function.branch_arguments.append(function.scratch, mapped);
-        }
+        for (self.callee.branch_arguments[original.arguments.start..original.arguments.end]) |argument| try function.branch_arguments.append(function.scratch, try self.use(argument));
         return .{ .target = @fromBackingInt(self.blocks[@backingInt(original.target)]), .arguments = .{ .start = start, .end = @intCast(function.branch_arguments.items.len) } };
     }
 
@@ -425,14 +401,15 @@ const Splice = struct {
 
     fn copyTerminator(self: *Splice, original: Terminator, block: u32, exit: Exit) !void {
         const function = self.function;
-        const terminator: Terminator = switch (original) {
-            .branch => |target| .{ .branch = try self.branch(target) },
-            .predicate_branch => |predicate| .{ .predicate_branch = .{
-                .operation = predicate.operation,
-                .operands = .{ .lhs = self.value(predicate.operands.lhs), .rhs = self.value(predicate.operands.rhs) },
-                .then_branch = try self.branch(predicate.then_branch),
-                .else_branch = try self.branch(predicate.else_branch),
-            } },
+        var terminator = original;
+        for (terminator.operands()) |operand| if (operand) |reference| {
+            reference.* = self.value(reference.*);
+        };
+        for (terminator.branches()) |maybe_branch| if (maybe_branch) |edge| {
+            edge.* = try self.branch(edge.*);
+        };
+        function.blocks.items[block].terminator = switch (original) {
+            .branch, .predicate_branch, .diverge => terminator,
             .return_unit => try self.exitBranch(exit, null),
             .return_value => |returned| blk: {
                 const mapped = try self.use(returned);
@@ -442,9 +419,7 @@ const Splice = struct {
                 }
                 break :blk try self.exitBranch(exit, if (exit.parameter) mapped else null);
             },
-            .diverge => .diverge,
         };
-        function.blocks.items[block].terminator = terminator;
     }
 
     fn storeResult(self: *Splice, block: u32, returned: structures.FunctionValueUse, destination: ValueId) !void {
@@ -455,8 +430,6 @@ const Splice = struct {
             .{ .variant_coerce = .{ .operand = returned.value, .target_type = target, .tag_mapping = returned.variant_tag_mapping.?, .destination = destination } }
         else
             .{ .value_copy = .{ .source = returned.value, .type_id = return_type, .destination = destination } };
-        const target = &function.blocks.items[block];
-        const copied = try function.newInstruction(instruction, target.span, target.frame);
-        try function.blocks.items[block].instructions.append(function.scratch, copied);
+        _ = try function.appendInstruction(block, instruction, function.blocks.items[block].span, function.blocks.items[block].frame);
     }
 };

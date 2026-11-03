@@ -80,11 +80,6 @@ fn rewriteLoop(function: *Function, analysis: *const loops.Analysis, loop: Loop,
     return boundsChecks(function, analysis, loop, preheader);
 }
 
-fn boolean(function: *const Function, value: ValueId) ?bool {
-    const definition = function.definition(function.find(value)) orelse return null;
-    return if (definition == .const_bool) definition.const_bool else null;
-}
-
 const LoopParameters = struct {
     function: *Function,
     from: []const ValueId,
@@ -109,12 +104,10 @@ fn selectArm(function: *const Function, value: ValueId, condition: ValueId, take
 fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
     const header = function.blocks.items[loop.header];
     if (header.instructions.items.len != 0) return false;
-    const test_result = loops.exitTestWithArguments(function, loop) orelse return false;
-    const exit_branch = for (Function.edges(&function.blocks.items[loop.header].terminator)) |maybe_edge| {
-        if (maybe_edge) |edge| if (@backingInt(edge.target) == test_result.exit) break edge.*;
-    } else unreachable;
+    const test_result = loops.exitTestAt(function, loop, loop.header) orelse return false;
+    const exit_branch = function.branchTo(loop.header, test_result.exit).?.*;
     const exit_arguments = try function.scratch.dupe(structures.FunctionValueUse, function.branchArguments(exit_branch));
-    const compared = boolean(function, test_result.operands.rhs) orelse return false;
+    const compared = function.constantBool(test_result.operands.rhs) orelse return false;
     const exit_value = switch (test_result.operation) {
         .eqb => compared,
         .neb => !compared,
@@ -127,13 +120,11 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
     for (loop.blocks) |block| if (block != loop.header and !graph.dominates(body, block)) return false;
     const latch = loop.latches[0];
     const terminator = function.blocks.items[latch].terminator;
-    const back_branch = for (Function.edges(&function.blocks.items[latch].terminator)) |maybe_edge| {
-        if (maybe_edge) |edge| if (@backingInt(edge.target) == loop.header) break edge.*;
-    } else return false;
+    const back_branch = (function.branchTo(latch, loop.header) orelse return false).*;
     const back = function.branchArguments(back_branch);
     for (back) |argument| if (argument.coerce_to != null or argument.variant_tag_mapping != null) return false;
     const carried = function.definition(function.find(back[flag_position].value)) orelse return false;
-    if (carried != .select or boolean(function, carried.select.then_value) != exit_value or function.find(carried.select.else_value) != flag) return false;
+    if (carried != .select or function.constantBool(carried.select.then_value) != exit_value or function.find(carried.select.else_value) != flag) return false;
     const condition = function.find(carried.select.condition);
     const taken = try canonicalize.addressTaken(function);
     if (!function.plainValue(condition) or taken[@backingInt(condition)]) return false;
@@ -156,19 +147,14 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
         if (index == loop.header or graph.dominates(body, @intCast(index))) continue;
         if (private_exit and graph.dominates(test_result.exit, @intCast(index))) continue;
         var uses: LoopParameters = .{ .function = function, .from = header.parameters.items };
-        for (block.instructions.items) |instruction| {
-            if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &uses, LoopParameters.check);
-        }
-        function_ir.terminatorAllOperands(function, &block.terminator, &uses, LoopParameters.check);
+        function_ir.visitBlockOperands(function, block, &uses, LoopParameters.check);
         if (uses.found) return false;
     }
     if (terminator != .branch) {
         // Only this selected backedge needs the flag decision. Leave the
         // latch's other continuation intact, with no invented phi inputs.
         const split = try function.addBlock(.{ .branch = back_branch }, header.span, header.frame);
-        for (Function.edges(&function.blocks.items[latch].terminator)) |maybe_edge| if (maybe_edge) |edge| {
-            if (@backingInt(edge.target) == loop.header) edge.* = .{ .target = @fromBackingInt(split), .arguments = .{ .start = 0, .end = 0 } };
-        };
+        function.branchTo(latch, loop.header).?.* = .{ .target = @fromBackingInt(split), .arguments = .{ .start = 0, .end = 0 } };
         try function.placeAfter(split, latch);
         return true;
     }
@@ -191,22 +177,15 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
     var escaped: LoopParameters = .{ .function = function, .from = original, .to = exit_parameters };
     if (private_exit) {
         for (function.blocks.items, 0..) |*block, index| {
-            if (!graph.dominates(test_result.exit, @intCast(index))) continue;
-            for (block.instructions.items) |instruction| {
-                if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &escaped, LoopParameters.replace);
-            }
-            function_ir.terminatorAllOperands(function, &block.terminator, &escaped, LoopParameters.replace);
+            if (graph.dominates(test_result.exit, @intCast(index))) function_ir.visitBlockOperands(function, block, &escaped, LoopParameters.replace);
         }
     }
     var rewritten: LoopParameters = .{ .function = function, .from = original, .to = replacements };
     for (function.blocks.items, 0..) |*block, index| {
         if (!graph.dominates(body, @intCast(index))) continue;
-        for (block.instructions.items) |instruction| {
-            if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &rewritten, LoopParameters.replace);
-        }
-        function_ir.terminatorAllOperands(function, &block.terminator, &rewritten, LoopParameters.replace);
-        for (Function.edges(&block.terminator)) |maybe_branch| if (maybe_branch) |branch| {
-            if (private_exit and @backingInt(branch.target) == test_result.exit) try appendExitValues(function, branch, replacements);
+        function_ir.visitBlockOperands(function, block, &rewritten, LoopParameters.replace);
+        for (block.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
+            if (private_exit and @backingInt(branch.target) == test_result.exit) branch.arguments = try function.copyBranchArguments(branch.arguments, replacements);
         };
     }
     var exiting: std.ArrayList(structures.FunctionValueUse) = .empty;
@@ -224,9 +203,9 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
     }
     if (private_exit) try collision.appendSlice(function.scratch, exiting.items);
     const initial_arguments = try function.appendBranchArguments(initial.items);
-    for (Function.edges(&function.blocks.items[loop.header].terminator)) |maybe_edge| if (maybe_edge) |edge| {
+    for (function.blocks.items[loop.header].terminator.branches()) |maybe_edge| if (maybe_edge) |edge| {
         if (@backingInt(edge.target) == body) edge.arguments = initial_arguments;
-        if (private_exit and @backingInt(edge.target) == test_result.exit) try appendExitValues(function, edge, original);
+        if (private_exit and @backingInt(edge.target) == test_result.exit) edge.arguments = try function.copyBranchArguments(edge.arguments, original);
     };
     function.blocks.items[latch].terminator = .{ .predicate_branch = .{
         .operation = .eqb,
@@ -235,13 +214,6 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
         .else_branch = .{ .target = @fromBackingInt(body), .arguments = try function.appendBranchArguments(repeating.items) },
     } };
     return true;
-}
-
-fn appendExitValues(function: *Function, branch: *structures.FunctionBranch, values: []const ValueId) !void {
-    var arguments: std.ArrayList(structures.FunctionValueUse) = .empty;
-    try arguments.appendSlice(function.scratch, function.branchArguments(branch.*));
-    for (values) |value| try arguments.append(function.scratch, .{ .value = value });
-    branch.arguments = try function.appendBranchArguments(arguments.items);
 }
 
 fn soleExit(function: *Function, loop: Loop, header_exit: u32) bool {
@@ -277,9 +249,7 @@ fn removeDeadLoop(function: *Function, analysis: *const loops.Analysis, loop: Lo
     if (!analysis.iterationAcyclic(loop)) return false;
     var escape: Escape = .{ .analysis = analysis, .loop = loop };
     for (function.blocks.items, 0..) |*block, index| {
-        if (loop.contains(@intCast(index))) continue;
-        for (block.instructions.items) |instruction| if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &escape, Escape.check);
-        function_ir.terminatorAllOperands(function, &block.terminator, &escape, Escape.check);
+        if (!loop.contains(@intCast(index))) function_ir.visitBlockOperands(function, block, &escape, Escape.check);
     }
     if (escape.escapes) return false;
     if (needs_proof and !analysis.equalityRecurrenceSafe(preheader, controlled)) return false;
@@ -301,26 +271,44 @@ fn pure(function: *const Function, instruction: Instruction) bool {
     return switch (instruction) {
         .numeric_binary, .numeric_unary => !instruction.numericMayTrap(),
         .const_numeric, .numeric_convert, .const_int, .const_bool, .const_byte, .const_unit, .const_none, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .variant_tag, .field_access, .borrow_address, .borrow_read, .storage_projection, .allocation_element, .array_element, .cursor_offset, .cursor_element, .function_ref => true,
-        .divsi, .shli, .shrsi => |operands| if (function.definition(operands.rhs)) |rhs| rhs == .const_int and instruction.integerRhsIsValid(rhs.const_int) else false,
+        .divsi, .shli, .shrsi => |operands| function_ir.validConstantRhs(function, instruction, operands.rhs),
         inline .value_copy, .variant_extract, .variant_coerce => |operation| operation.destination == null,
         else => false,
     };
 }
 
-fn fill(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32) !bool {
-    if (loop.blocks.len != 2) return false;
+const CountedLoop = struct { parameter: ValueId, start: ValueId, bound: ValueId, exit: u32 };
+
+/// Matches a two-block loop whose empty header exits when its only parameter,
+/// stepping by `step` in the single branch latch, equals a bound.
+fn countedLoop(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32, step: i32) ?CountedLoop {
+    if (loop.blocks.len != 2) return null;
     const header = &function.blocks.items[loop.header];
-    if (header.parameters.items.len != 1) return false;
-    for (header.instructions.items) |index| if (!function.removed.items[index]) return false;
-    const test_result = loops.exitTest(function, loop) orelse return false;
-    if (test_result.operation != .eqi) return false;
+    if (header.parameters.items.len != 1) return null;
+    for (header.instructions.items) |index| if (!function.removed.items[index]) return null;
+    const test_result = loops.exitTest(function, loop) orelse return null;
+    if (test_result.operation != .eqi) return null;
     const parameter = header.parameters.items[0];
-    const matched = analysis.inductionExit(loop, preheader, test_result, parameter) orelse return false;
-    const counter = matched.induction;
-    if (counter.step != 1) return false;
-    const bound = matched.comparison.other;
+    const matched = analysis.inductionExit(loop, preheader, test_result, parameter) orelse return null;
+    if (matched.induction.step != step) return null;
     const body = test_result.stay;
-    if (body != loop.latches[0] or function.blocks.items[body].terminator != .branch) return false;
+    if (body != loop.latches[0] or function.blocks.items[body].terminator != .branch) return null;
+    return .{ .parameter = parameter, .start = matched.induction.start, .bound = matched.comparison.other, .exit = test_result.exit };
+}
+
+fn useCount(function: *const Function, block: u32, value: ValueId) u32 {
+    var users: Users = .{ .function = function, .value = value };
+    for (function.blocks.items[block].instructions.items) |index| {
+        if (!function.removed.items[index]) function_ir.visitInstructionReferences(function, &function.instructions.items[index], &users, Users.count);
+    }
+    return users.count_value;
+}
+
+fn fill(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32) !bool {
+    const counted = countedLoop(function, analysis, loop, preheader, 1) orelse return false;
+    const parameter = counted.parameter;
+    const bound = counted.bound;
+    const body = loop.latches[0];
     var element: ?structures.AllocationElement = null;
     var element_value: ?ValueId = null;
     var stored: ?structures.ValueCopy = null;
@@ -350,15 +338,13 @@ fn fill(function: *Function, analysis: *const loops.Analysis, loop: Loop, prehea
     if (function.find(store.destination.?) != element_value.? or store.type_id != target.type_id) return false;
     if (target.type_id != .int and target.type_id != .bool and target.type_id != .byte) return false;
     if (!analysis.definedOutside(loop, target.allocation) or !analysis.definedOutside(loop, store.source)) return false;
-    var users: Users = .{ .function = function, .value = element_value.? };
-    for (function.blocks.items[body].instructions.items) |index| if (!function.removed.items[index]) function_ir.allOperands(function, &function.instructions.items[index], &users, Users.count);
-    if (users.count_value != 1) return false;
+    if (useCount(function, body, element_value.?) != 1) return false;
 
-    if (guarded(function, analysis, preheader, counter.start, bound)) return false;
-    const span = header.span;
-    const frame = header.frame;
-    const start = counter.start;
-    const filled = try guard(function, preheader, start, bound, test_result.exit, span, frame);
+    const start = counted.start;
+    if (guarded(function, analysis, preheader, start, bound)) return false;
+    const span = function.blocks.items[loop.header].span;
+    const frame = function.blocks.items[loop.header].frame;
+    const filled = try guard(function, preheader, start, bound, counted.exit, span, frame);
     const count = try function.insertInstruction(filled, 0, .{ .subi = .{ .lhs = bound, .rhs = start } }, span, frame);
     const first = try function.insertInstruction(filled, 1, .{ .allocation_element = .{ .allocation = target.allocation, .index = start, .type_id = target.type_id } }, span, frame);
     _ = try function.insertInstruction(filled, 2, .{ .fill = .{ .first = first, .count = count, .value = store.source, .type_id = target.type_id } }, span, frame);
@@ -370,9 +356,7 @@ fn fill(function: *Function, analysis: *const loops.Analysis, loop: Loop, prehea
 fn replaceOutside(function: *Function, loop: Loop, parameter: ValueId, bound: ValueId) void {
     var outside: Replace = .{ .from = parameter, .to = bound };
     for (function.blocks.items, 0..) |*block, index| {
-        if (loop.contains(@intCast(index))) continue;
-        for (block.instructions.items) |instruction| if (!function.removed.items[instruction]) function_ir.allOperands(function, &function.instructions.items[instruction], &outside, Replace.apply);
-        function_ir.terminatorAllOperands(function, &block.terminator, &outside, Replace.apply);
+        if (!loop.contains(@intCast(index))) function_ir.visitBlockOperands(function, block, &outside, Replace.apply);
     }
 }
 
@@ -383,14 +367,14 @@ fn guard(function: *Function, preheader: u32, low: ValueId, high: ValueId, exit:
         .operation = .lei,
         .operands = .{ .lhs = low, .rhs = high },
         .then_branch = .{ .target = @fromBackingInt(block), .arguments = .{ .start = 0, .end = 0 } },
-        .else_branch = .{ .target = enter.target, .arguments = try function.copyBranchArguments(enter.arguments) },
+        .else_branch = .{ .target = enter.target, .arguments = try function.copyBranchArguments(enter.arguments, &.{}) },
     } }, span, frame);
-    const zero = try function.insertInstruction(preheader, function.blocks.items[preheader].instructions.items.len, .{ .const_int = 0 }, span, frame);
+    const zero = try function.appendInstruction(preheader, .{ .const_int = 0 }, span, frame);
     function.blocks.items[preheader].terminator = .{ .predicate_branch = .{
         .operation = .gei,
         .operands = .{ .lhs = low, .rhs = zero },
         .then_branch = .{ .target = @fromBackingInt(ordered), .arguments = .{ .start = 0, .end = 0 } },
-        .else_branch = .{ .target = enter.target, .arguments = try function.copyBranchArguments(enter.arguments) },
+        .else_branch = .{ .target = enter.target, .arguments = try function.copyBranchArguments(enter.arguments, &.{}) },
     } };
     try function.placeAfter(ordered, preheader);
     try function.placeAfter(block, ordered);
@@ -398,19 +382,8 @@ fn guard(function: *Function, preheader: u32, low: ValueId, high: ValueId, exit:
 }
 
 fn move(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32) !bool {
-    if (loop.blocks.len != 2) return false;
-    const header = &function.blocks.items[loop.header];
-    if (header.parameters.items.len != 1) return false;
-    for (header.instructions.items) |index| if (!function.removed.items[index]) return false;
-    const test_result = loops.exitTest(function, loop) orelse return false;
-    if (test_result.operation != .eqi) return false;
-    const parameter = header.parameters.items[0];
-    const matched = analysis.inductionExit(loop, preheader, test_result, parameter) orelse return false;
-    const counter = matched.induction;
-    if (counter.step != -1) return false;
-    const bound = matched.comparison.other;
-    const body = test_result.stay;
-    if (body != loop.latches[0] or function.blocks.items[body].terminator != .branch) return false;
+    const counted = countedLoop(function, analysis, loop, preheader, -1) orelse return false;
+    const body = loop.latches[0];
     const next = function.find(function.branchArguments(function.blocks.items[body].terminator.branch)[0].value);
     var source: ?structures.AllocationElement = null;
     var source_value: ?ValueId = null;
@@ -450,22 +423,18 @@ fn move(function: *Function, analysis: *const loops.Analysis, loop: Loop, prehea
     if (loaded == null or function.find(store.source) != loaded.? or function.find(store.destination.?) != destination_value.?) return false;
     if (from.type_id != to.type_id or store.type_id != to.type_id) return false;
     if (!analysis.definedOutside(loop, from.allocation) or !analysis.definedOutside(loop, to.allocation)) return false;
-    var users: Users = .{ .function = function, .value = source_value.? };
-    for (function.blocks.items[body].instructions.items) |index| if (!function.removed.items[index]) function_ir.allOperands(function, &function.instructions.items[index], &users, Users.count);
-    if (users.count_value != 1) return false;
-    users = .{ .function = function, .value = destination_value.? };
-    for (function.blocks.items[body].instructions.items) |index| if (!function.removed.items[index]) function_ir.allOperands(function, &function.instructions.items[index], &users, Users.count);
-    if (users.count_value != 1) return false;
+    if (useCount(function, body, source_value.?) != 1 or useCount(function, body, destination_value.?) != 1) return false;
 
-    if (guarded(function, analysis, preheader, bound, counter.start)) return false;
-    const span = header.span;
-    const frame = header.frame;
-    const moved = try guard(function, preheader, bound, counter.start, test_result.exit, span, frame);
-    const count = try function.insertInstruction(moved, 0, .{ .subi = .{ .lhs = counter.start, .rhs = bound } }, span, frame);
+    const bound = counted.bound;
+    if (guarded(function, analysis, preheader, bound, counted.start)) return false;
+    const span = function.blocks.items[loop.header].span;
+    const frame = function.blocks.items[loop.header].frame;
+    const moved = try guard(function, preheader, bound, counted.start, counted.exit, span, frame);
+    const count = try function.insertInstruction(moved, 0, .{ .subi = .{ .lhs = counted.start, .rhs = bound } }, span, frame);
     const first_destination = try function.insertInstruction(moved, 1, .{ .allocation_element = .{ .allocation = to.allocation, .index = bound, .type_id = to.type_id } }, span, frame);
     const first_source = try function.insertInstruction(moved, 2, .{ .allocation_element = .{ .allocation = from.allocation, .index = bound, .type_id = from.type_id } }, span, frame);
     _ = try function.insertInstruction(moved, 3, .{ .move = .{ .destination = first_destination, .source = first_source, .count = count, .type_id = to.type_id, .backward = true } }, span, frame);
-    replaceOutside(function, loop, parameter, bound);
+    replaceOutside(function, loop, counted.parameter, bound);
     return true;
 }
 
@@ -501,12 +470,12 @@ fn through(function: *Function, block: u32, edge: @import("graph.zig").Incoming,
 }
 
 const Users = struct {
-    function: *Function,
+    function: *const Function,
     value: ValueId,
     count_value: u32 = 0,
 
-    fn count(self: *Users, operand: *ValueId) void {
-        if (self.function.find(operand.*) == self.value) self.count_value += 1;
+    fn count(self: *Users, operand: ValueId) void {
+        if (self.function.find(operand) == self.value) self.count_value += 1;
     }
 };
 
@@ -535,7 +504,7 @@ fn boundsForCounter(function: *Function, analysis: *const loops.Analysis, loop: 
     const limit = counter.comparison.other;
     for (loop.blocks) |block| {
         if (!analysis.graph.dominates(test_result.stay, block)) continue;
-        const range = analysis.iterationRange(block, counter) orelse continue;
+        const range = analysis.iterationRange(block, counter, 16) orelse continue;
         for (function.blocks.items[block].instructions.items) |index| {
             if (function.removed.items[index] or function.results.items[index] != counter.induction.next) continue;
             const instruction = &function.instructions.items[index];

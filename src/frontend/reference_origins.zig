@@ -33,16 +33,11 @@ pub fn Store(comptime Origin: type, comptime Projection: type, comptime Transfor
             return index;
         }
 
+        /// Set membership ignores list links.
         inline fn sameOrigin(left: *const Origin, right: *const Origin) bool {
-            inline for (@typeInfo(Origin).@"struct".field_names) |name| {
-                if (comptime std.mem.eql(u8, name, "next")) continue;
-                const first = @field(left.*, name);
-                const second = @field(right.*, name);
-                if (comptime @typeInfo(@TypeOf(first)) == .@"union") {
-                    if (!std.meta.eql(first, second)) return false;
-                } else if (first != second) return false;
-            }
-            return true;
+            var first = left.*;
+            first.next = right.next;
+            return std.meta.eql(first, right.*);
         }
 
         pub fn merge(self: *@This(), allocator: std.mem.Allocator, first: ?u32, second: ?u32) !?u32 {

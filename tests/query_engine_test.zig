@@ -763,13 +763,17 @@ test "query imports retain equal live results and their computed dependencies" {
     defer db.deinit();
     try db.addInput(Version, {}, 0);
     const retained = try db.get(Text, {});
-    const imported: OwnedOutput = .{ .bytes = try testing.allocator.dupe(u8, "current") };
-    try db.importCompletedQuery(Text, {}, imported, &.{}, &.{});
+    var imported_arena = db.outputArena();
+    const imported = try imported_arena.allocator().create(Text.Output);
+    imported.* = .{ .bytes = try imported_arena.allocator().dupe(u8, "current") };
+    try db.importQuery(Text, {}, imported_arena, imported, &.{}, &.{});
     try testing.expectEqual(retained, try db.get(Text, {}));
     try testing.expectEqualStrings("current", retained.*.?.bytes);
-    const mismatched: OwnedOutput = .{ .bytes = try testing.allocator.dupe(u8, "different") };
-    defer testing.allocator.free(mismatched.bytes);
-    try testing.expectError(error.InvalidCache, db.importCompletedQuery(Text, {}, mismatched, &.{}, &.{}));
+    var mismatched_arena = db.outputArena();
+    defer mismatched_arena.deinit();
+    const mismatched = try mismatched_arena.allocator().create(Text.Output);
+    mismatched.* = .{ .bytes = try mismatched_arena.allocator().dupe(u8, "different") };
+    try testing.expectError(error.InvalidCache, db.importQuery(Text, {}, mismatched_arena, mismatched, &.{}, &.{}));
     try db.setInput(Version, {}, 1);
     try testing.expectEqualStrings("updated", (try db.get(Text, {})).*.?.bytes);
 }

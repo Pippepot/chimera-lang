@@ -7,8 +7,8 @@ pub const Tokenizer = struct {
     gpa: std.mem.Allocator,
     buffer: []const u8,
     index: u32,
-    at_line_start: bool,
-    indent: u32,
+    at_line_start: bool = true,
+    indent: u32 = 0,
     indent_levels: std.ArrayList(u32),
     previous_tag: ?Token.Tag = null,
 
@@ -21,15 +21,9 @@ pub const Tokenizer = struct {
     }
 
     fn initialState(gpa: std.mem.Allocator, buffer: []const u8, indent_levels: std.ArrayList(u32)) Tokenizer {
-        return .{
-            .gpa = gpa,
-            .buffer = buffer,
-            // Skip the UTF-8 BOM if present.
-            .index = if (std.mem.startsWith(u8, buffer, "\xEF\xBB\xBF")) 3 else 0,
-            .at_line_start = true,
-            .indent = 0,
-            .indent_levels = indent_levels,
-        };
+        // Skip the UTF-8 BOM if present.
+        const index: u32 = if (std.mem.startsWith(u8, buffer, "\xEF\xBB\xBF")) 3 else 0;
+        return .{ .gpa = gpa, .buffer = buffer, .index = index, .indent_levels = indent_levels };
     }
 
     pub fn tokenizeComptime(comptime buffer: []const u8) []const Token {
@@ -57,20 +51,6 @@ pub const Tokenizer = struct {
         self.indent_levels.deinit(self.gpa);
         self.* = undefined;
     }
-
-    const State = enum {
-        start,
-        identifier,
-        quoted_literal,
-        quoted_literal_backslash,
-        line_comment,
-        int,
-        int_exponent,
-        int_period,
-        float,
-        float_exponent,
-        invalid,
-    };
 
     fn current(self: *const Tokenizer) u8 {
         return if (self.index < self.buffer.len) self.buffer[self.index] else 0;
@@ -104,20 +84,14 @@ pub const Tokenizer = struct {
     }
 
     fn checkIndentation(self: *Tokenizer) !?Token {
-        line_start: while (true) {
+        while (true) {
             while (self.current() == ' ') {
                 self.index += 1;
                 self.indent += 1;
             }
-
             // Reset indentation counting on newline. This avoids bloating with dedent/indent that cancel out
-            if (newlineLength(self)) |token_count| {
-                self.index += token_count;
-                self.indent = 0;
-                continue :line_start;
-            }
-
-            break :line_start;
+            self.index += newlineLength(self) orelse break;
+            self.indent = 0;
         }
 
         // Comment-only lines and trailing spaces do not open or close blocks.
@@ -154,152 +128,111 @@ pub const Tokenizer = struct {
     }
 
     fn nextToken(self: *Tokenizer) !Token {
-        var result: Token = .{
-            .tag = undefined,
-            .loc = .{ .start = self.index, .end = undefined },
-        };
-
-        if (self.at_line_start) {
-            if (try checkIndentation(self)) |tok| return tok;
-            // checkIndentation may have skipped blank lines;
-            // start the token scan at the first byte of the actual line.
-            result.loc.start = self.index;
-        }
-
-        if (self.index == self.buffer.len) return self.eofOrDedent();
-
-        state: switch (State.start) {
-            .start => switch (self.current()) {
-                0 => if (self.index == self.buffer.len) return self.eofOrDedent() else continue :state .invalid,
+        while (true) {
+            if (self.at_line_start) {
+                if (try self.checkIndentation()) |token| return token;
+            }
+            const start = self.index;
+            switch (self.current()) {
+                0 => if (self.index == self.buffer.len) return self.eofOrDedent() else return self.invalid(start),
+                ' ', '\t' => self.index += 1,
                 '\n', '\r' => {
-                    if (newlineLength(self)) |token_count| {
-                        self.index += token_count;
-                        self.indent = 0;
-                        self.at_line_start = true;
-                        if (try checkIndentation(self)) |tok| return tok;
-                        result.loc.start = self.index;
-                        continue :state .start;
-                    } else continue :state .invalid;
+                    self.index += self.newlineLength() orelse return self.invalid(start);
+                    self.indent = 0;
+                    self.at_line_start = true;
                 },
-                ' ', '\t' => {
-                    self.index += 1;
-                    result.loc.start = self.index;
-                    continue :state .start;
-                },
-                '"' => {
-                    result.tag = .string_literal;
-                    continue :state .quoted_literal;
-                },
-                '\'' => {
-                    result.tag = .char_literal;
-                    continue :state .quoted_literal;
+                '#' => {
+                    while (true) {
+                        self.index += 1;
+                        switch (self.current()) {
+                            0 => if (self.index == self.buffer.len)
+                                return self.eofOrDedent()
+                            else
+                                return self.invalid(start),
+                            '\n', '\r' => {
+                                if (self.newlineLength() == null) return self.invalid(start);
+                                break;
+                            },
+                            0x01...0x09, 0x0b...0x0c, 0x0e...0x1f, 0x7f => return self.invalid(start),
+                            else => {},
+                        }
+                    }
                 },
                 'a'...'z', 'A'...'Z', '_' => {
-                    result.tag = .identifier;
-                    continue :state .identifier;
-                },
-                inline '=', '-', '(', ')', '[', ']', ';', ',', '?', ':', '{', '}', '~', '|', '%', '*', '+', '^', '/', '&', '<', '>', '.' => |byte| result.tag = self.scanPunctuation(&.{byte}),
-                '0'...'9' => {
-                    result.tag = .number_literal;
-                    self.index += 1;
-                    continue :state .int;
-                },
-                '#' => continue :state .line_comment,
-                else => continue :state .invalid,
-            },
-
-            .invalid => {
-                self.index += 1;
-                switch (self.current()) {
-                    0 => if (self.index == self.buffer.len) {
-                        result.tag = .invalid;
-                    } else continue :state .invalid,
-                    '\n' => result.tag = .invalid,
-                    else => continue :state .invalid,
-                }
-            },
-
-            .identifier => {
-                self.index += 1;
-                switch (self.current()) {
-                    'a'...'z', 'A'...'Z', '_', '0'...'9' => continue :state .identifier,
-                    else => {
-                        const ident = self.buffer[result.loc.start..self.index];
-                        if (Token.getKeyword(ident)) |tag| {
-                            result.tag = tag;
+                    while (true) {
+                        self.index += 1;
+                        switch (self.current()) {
+                            'a'...'z', 'A'...'Z', '_', '0'...'9' => {},
+                            else => break,
                         }
-                    },
-                }
-            },
-
-            inline .quoted_literal, .quoted_literal_backslash => |literal| {
-                self.index += 1;
-                switch (self.current()) {
-                    0 => {
-                        if (self.index != self.buffer.len) continue :state .invalid;
-                        result.tag = .invalid;
-                    },
-                    '\n' => result.tag = .invalid,
-                    0x01...0x09, 0x0b...0x1f, 0x7f => continue :state .invalid,
-                    else => |byte| {
-                        // An escaped byte never closes the literal.
-                        if (literal == .quoted_literal_backslash) continue :state .quoted_literal;
-                        if (byte == '\\') continue :state .quoted_literal_backslash;
-                        if (byte != self.buffer[result.loc.start]) continue :state .quoted_literal;
-                        self.index += 1;
-                    },
-                }
-            },
-
-            .line_comment => {
-                self.index += 1;
-                switch (self.current()) {
-                    0 => if (self.index == self.buffer.len) return self.eofOrDedent() else continue :state .invalid,
-                    // The start state validates and consumes the line ending.
-                    '\n', '\r' => continue :state .start,
-                    0x01...0x09, 0x0b...0x0c, 0x0e...0x1f, 0x7f => continue :state .invalid,
-                    else => continue :state .line_comment,
-                }
-            },
-
-            inline .int, .float => |number| switch (self.current()) {
-                '.' => if (number == .int and self.previous_tag != .period) {
-                    continue :state .int_period;
-                },
-                '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => {
-                    self.index += 1;
-                    continue :state if (number == .int) .int else .float;
-                },
-                'e', 'E', 'p', 'P' => {
-                    const hexadecimal = self.index >= result.loc.start + 2 and self.buffer[result.loc.start] == '0' and (self.buffer[result.loc.start + 1] == 'x' or self.buffer[result.loc.start + 1] == 'X');
-                    if (hexadecimal and self.current() != 'p' and self.current() != 'P') {
-                        self.index += 1;
-                        continue :state .int;
                     }
-                    continue :state if (number == .int) .int_exponent else .float_exponent;
+                    return self.scannedToken(
+                        Token.getKeyword(self.buffer[start..self.index]) orelse .identifier,
+                        start,
+                    );
                 },
-                else => {},
-            },
-            inline .int_exponent, .float_exponent => |exponent| {
-                self.index += 1;
-                if (self.current() == '-' or self.current() == '+') {
-                    self.index += 1;
-                    continue :state .float;
-                }
-                continue :state if (exponent == .int_exponent) .int else .float;
-            },
-            .int_period => {
-                self.index += 1;
-                switch (self.current()) {
-                    // Leave a period that starts no fraction or exponent for the next token.
-                    '_', 'a'...'z', 'A'...'Z', '0'...'9' => continue :state .float,
-                    else => self.index -= 1,
-                }
-            },
+                '"', '\'' => |quote| return self.scanQuoted(start, quote),
+                '0'...'9' => return self.scanNumber(start),
+                inline '=', '-', '(', ')', '[', ']', ';', ',', '?', ':', '{', '}', '~', '|', '%', '*', '+', '^', '/', '&', '<', '>', '.' => |byte| {
+                    return self.scannedToken(self.scanPunctuation(&.{byte}), start);
+                },
+                else => return self.invalid(start),
+            }
         }
+    }
 
-        result.loc.end = self.index;
-        return result;
+    fn scannedToken(self: *const Tokenizer, tag: Token.Tag, start: u32) Token {
+        return .{ .tag = tag, .loc = .{ .start = start, .end = self.index } };
+    }
+
+    fn invalid(self: *Tokenizer, start: u32) Token {
+        while (self.index < self.buffer.len and self.current() != '\n') self.index += 1;
+        return self.scannedToken(.invalid, start);
+    }
+
+    fn scanQuoted(self: *Tokenizer, start: u32, quote: u8) Token {
+        var escaped = false;
+        while (true) {
+            self.index += 1;
+            switch (self.current()) {
+                0...0x1f, 0x7f => return self.invalid(start),
+                else => |byte| {
+                    if (!escaped and byte == quote) {
+                        self.index += 1;
+                        return self.scannedToken(if (quote == '"') .string_literal else .char_literal, start);
+                    }
+                    escaped = !escaped and byte == '\\';
+                },
+            }
+        }
+    }
+
+    fn scanNumber(self: *Tokenizer, start: u32) Token {
+        var fractional = false;
+        self.index += 1;
+        while (true) switch (self.current()) {
+            '.' => {
+                if (fractional or self.previous_tag == .period) break;
+                const following = if (self.index + 1 < self.buffer.len) self.buffer[self.index + 1] else 0;
+                if (!std.ascii.isAlphanumeric(following) and following != '_') break;
+                self.index += 1;
+                fractional = true;
+            },
+            'e', 'E', 'p', 'P' => |byte| {
+                const hexadecimal = self.index >= start + 2 and self.buffer[start] == '0' and
+                    (self.buffer[start + 1] == 'x' or self.buffer[start + 1] == 'X');
+                self.index += 1;
+                if (hexadecimal and byte != 'p' and byte != 'P') {
+                    fractional = false;
+                } else if (self.current() == '-' or self.current() == '+') {
+                    self.index += 1;
+                    fractional = true;
+                }
+            },
+            '_', 'a'...'d', 'f'...'o', 'q'...'z', 'A'...'D', 'F'...'O', 'Q'...'Z', '0'...'9' => self.index += 1,
+            else => break,
+        };
+        return self.scannedToken(.number_literal, start);
     }
 };
 

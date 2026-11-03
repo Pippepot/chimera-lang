@@ -4,7 +4,6 @@ const Graph = @import("graph.zig").Graph;
 
 const Body = structures.FunctionBodyAnalysis;
 const ValueId = structures.FunctionValueId;
-const BlockId = structures.FunctionBlockId;
 const Instruction = structures.FunctionInstruction;
 const Terminator = structures.FunctionTerminator;
 const SourceSpan = structures.SourceSpan;
@@ -29,8 +28,6 @@ pub const Block = struct {
     span: SourceSpan,
     frame: InlineFrameId,
 };
-
-pub const Edge = *structures.FunctionBranch;
 
 pub const Function = struct {
     scratch: std.mem.Allocator,
@@ -199,6 +196,26 @@ pub const Function = struct {
         };
     }
 
+    /// Direct value parameters receive copies; other parameters alias their incoming storage.
+    pub fn directParameter(self: *const Function, parameter: ValueId) bool {
+        const data = self.definitions.items[@backingInt(parameter)].argument.data;
+        return data.representation == .value and self.direct(data.type_id);
+    }
+
+    pub fn constantInt(self: *const Function, value: ValueId) ?i32 {
+        return switch (self.definition(self.find(value)) orelse return null) {
+            .const_int => |integer| integer,
+            .const_bool => |boolean| @intFromBool(boolean),
+            .const_byte => |byte| byte,
+            else => null,
+        };
+    }
+
+    pub fn constantBool(self: *const Function, value: ValueId) ?bool {
+        const instruction = self.definition(self.find(value)) orelse return null;
+        return if (instruction == .const_bool) instruction.const_bool else null;
+    }
+
     pub fn plainValue(self: *const Function, value: ValueId) bool {
         return switch (self.definitions.items[@backingInt(value)]) {
             .argument => |argument| argument.data.representation == .value and (argument.block == self.entry or self.direct(argument.data.type_id)),
@@ -244,6 +261,10 @@ pub const Function = struct {
         const index = try self.newInstruction(instruction, span, frame);
         try self.blocks.items[block].instructions.insert(self.scratch, position, index);
         return self.results.items[index];
+    }
+
+    pub fn appendInstruction(self: *Function, block: u32, instruction: Instruction, span: SourceSpan, frame: InlineFrameId) !ValueId {
+        return self.insertInstruction(block, self.blocks.items[block].instructions.items.len, instruction, span, frame);
     }
 
     pub fn instructionSpan(self: *const Function, index: u32) SourceSpan {
@@ -298,21 +319,14 @@ pub const Function = struct {
         return .{ .start = start, .end = @intCast(self.branch_arguments.items.len) };
     }
 
-    pub fn copyBranchArguments(self: *Function, range: structures.FunctionValueRange) !structures.FunctionValueRange {
+    /// Copies a branch argument range, appending values for added target parameters.
+    pub fn copyBranchArguments(self: *Function, range: structures.FunctionValueRange, appended: []const ValueId) !structures.FunctionValueRange {
         self.invalidateOperands();
-        try self.branch_arguments.ensureUnusedCapacity(self.scratch, range.end - range.start);
+        try self.branch_arguments.ensureUnusedCapacity(self.scratch, range.end - range.start + appended.len);
         const start: u32 = @intCast(self.branch_arguments.items.len);
         for (range.start..range.end) |index| self.branch_arguments.appendAssumeCapacity(self.branch_arguments.items[index]);
+        for (appended) |value| self.branch_arguments.appendAssumeCapacity(.{ .value = value });
         return .{ .start = start, .end = @intCast(self.branch_arguments.items.len) };
-    }
-
-    pub fn appendBranchArgument(self: *Function, branch: *structures.FunctionBranch, value: ValueId) !void {
-        self.invalidateOperands();
-        const start: u32 = @intCast(self.branch_arguments.items.len);
-        try self.branch_arguments.ensureUnusedCapacity(self.scratch, branch.arguments.end - branch.arguments.start + 1);
-        for (branch.arguments.start..branch.arguments.end) |index| self.branch_arguments.appendAssumeCapacity(self.branch_arguments.items[index]);
-        self.branch_arguments.appendAssumeCapacity(.{ .value = value });
-        branch.arguments = .{ .start = start, .end = @intCast(self.branch_arguments.items.len) };
     }
 
     pub fn removeParameter(self: *Function, block: u32, position: usize, incoming: []const @import("graph.zig").Incoming) !void {
@@ -328,24 +342,19 @@ pub const Function = struct {
         }
     }
 
-    pub fn edges(terminator: *Terminator) [2]?Edge {
-        return switch (terminator.*) {
-            .branch => |*branch| .{ branch, null },
-            .predicate_branch => |*predicate| .{ &predicate.then_branch, &predicate.else_branch },
-            .return_unit, .return_value, .diverge => .{ null, null },
-        };
-    }
-
-    pub fn edgeTarget(edge: Edge) BlockId {
-        return edge.target;
-    }
-
-    pub fn successors(self: *Function, block: u32) [2]?u32 {
+    pub fn successors(self: *const Function, block: u32) [2]?u32 {
         var result: [2]?u32 = .{ null, null };
-        for (edges(&self.blocks.items[block].terminator), &result) |maybe_edge, *successor| {
-            if (maybe_edge) |edge| successor.* = @backingInt(edgeTarget(edge));
+        for (self.blocks.items[block].terminator.successors(), &result) |target, *successor| {
+            if (target) |id| successor.* = @backingInt(id.*);
         }
         return result;
+    }
+
+    pub fn branchTo(self: *const Function, block: u32, target: u32) ?*structures.FunctionBranch {
+        for (self.blocks.items[block].terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
+            if (@backingInt(branch.target) == target) return branch;
+        };
+        return null;
     }
 
     pub fn resolveReferences(self: *Function) void {
@@ -448,22 +457,55 @@ const StorageUses = struct {
 
 pub fn usesStorage(function: *const Function, instruction: *const Instruction) bool {
     var uses: StorageUses = .{ .function = function };
-    visitInstructionReferences(tableView(function), instruction, &uses, StorageUses.reference);
+    visitInstructionReferences(function, instruction, &uses, StorageUses.reference);
     return uses.found;
+}
+
+/// Appends a copy of `source[range]` to `table` and returns the copied range.
+pub fn copyRange(comptime T: type, scratch: std.mem.Allocator, table: *std.ArrayList(T), source: []const T, range: structures.FunctionValueRange) !structures.FunctionValueRange {
+    const start: u32 = @intCast(table.items.len);
+    try table.appendSlice(scratch, source[range.start..range.end]);
+    return .{ .start = start, .end = @intCast(table.items.len) };
 }
 
 pub fn scalar(type_id: structures.TypeId) bool {
     return type_id.numericType() != null or type_id == .bool;
 }
 
-pub fn visitInstructionReferences(tables: anytype, instruction: *const Instruction, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
+pub fn zero(type_id: structures.TypeId) Instruction {
+    return if (type_id == .bool) .{ .const_bool = false } else Instruction.numericConstantInstruction(type_id, 0);
+}
+
+/// Integer division and shifts are pure only for constant right operands they accept.
+pub fn validConstantRhs(function: *const Function, instruction: Instruction, rhs: ValueId) bool {
+    const constant = function.definition(rhs) orelse return false;
+    return constant == .const_int and instruction.integerRhsIsValid(constant.const_int);
+}
+
+pub fn visitInstructionReferences(function: *const Function, instruction: *const Instruction, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
     for (instruction.operands()) |operand| if (operand) |value| visit(context, value.*);
     switch (instruction.*) {
-        .call => |call| visitCallArguments(tables, call, context, visit),
-        .initializer_ref => |reference| for (tables.initializer_captures[reference.captures.start..reference.captures.end]) |capture| visit(context, capture),
-        .aggregate => |aggregate| for (tables.aggregate_fields[aggregate.fields.start..aggregate.fields.end]) |field| visit(context, field),
+        .call => |call| for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| visit(context, argument.valueId()),
+        .initializer_ref => |reference| for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |capture| visit(context, capture),
+        .aggregate => |aggregate| for (function.aggregate_fields.items[aggregate.fields.start..aggregate.fields.end]) |field| visit(context, field),
         else => {},
     }
+}
+
+/// Visits the live instructions and terminator of one block.
+pub fn visitBlockReferences(function: *const Function, block: *const Block, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
+    for (block.instructions.items) |index| {
+        if (!function.removed.items[index]) visitInstructionReferences(function, &function.instructions.items[index], context, visit);
+    }
+    visitTerminatorReferences(function, &block.terminator, context, visit);
+}
+
+/// Visits mutable operands of the live instructions and terminator of one block.
+pub fn visitBlockOperands(function: *Function, block: *Block, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
+    for (block.instructions.items) |index| {
+        if (!function.removed.items[index]) allOperands(function, &function.instructions.items[index], context, visit);
+    }
+    terminatorAllOperands(function, &block.terminator, context, visit);
 }
 
 pub fn allOperands(function: *Function, instruction: *Instruction, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
@@ -483,119 +525,46 @@ pub fn terminatorAllOperands(function: *Function, terminator: *Terminator, conte
     };
 }
 
+/// Visits operands whose values are read, excluding destinations and storage addresses.
 pub fn readOperands(function: *Function, instruction: *Instruction, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
     switch (instruction.*) {
-        .type_union, .addi, .subi, .muli, .divsi, .shli, .shrsi => |*operands| {
-            visit(context, &operands.lhs);
-            visit(context, &operands.rhs);
-        },
-        .compare => |*operation| {
-            visit(context, &operation.operands.lhs);
-            visit(context, &operation.operands.rhs);
-        },
-        .select => |*operation| {
-            visit(context, &operation.condition);
-            visit(context, &operation.then_value);
-            visit(context, &operation.else_value);
-        },
-        .numeric_binary => |*operation| {
-            visit(context, &operation.operands.lhs);
-            visit(context, &operation.operands.rhs);
-        },
-        inline .numeric_unary, .numeric_convert => |*operation| visit(context, &operation.operand),
-        .negi, .byte_to_int, .variant_tag => |*operand| visit(context, operand),
         .value_copy => |*operation| visit(context, &operation.source),
         inline .variant_coerce, .variant_extract => |*operation| visit(context, &operation.operand),
-        .field_access => |*operation| visit(context, &operation.operand),
-        .allocation_element => |*operation| {
-            visit(context, &operation.allocation);
-            visit(context, &operation.index);
-        },
         .array_element => |*operation| visit(context, &operation.index),
-        .cursor_offset, .cursor_element => |*operation| {
-            visit(context, &operation.cursor);
-            visit(context, &operation.index);
-        },
-        .borrow_read => |*operation| visit(context, &operation.source),
         .borrow_address => |*operation| if (operation.base_is_reference) visit(context, &operation.source),
-        .borrow_write => |*operation| {
-            visit(context, &operation.reference);
-            visit(context, &operation.value);
-        },
         .fill => |*operation| {
             visit(context, &operation.count);
             visit(context, &operation.value);
         },
         .move => |*operation| visit(context, &operation.count),
         .aggregate => |aggregate| for (function.aggregate_fields.items[aggregate.fields.start..aggregate.fields.end]) |*field| visit(context, field),
-        .call => |*call| callReadOperands(function, call, context, visit),
-        else => {},
-    }
-}
-
-fn callReadOperands(function: *Function, call: *structures.FunctionCall, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
-    if (call.target == .indirect) visit(context, &call.target.indirect);
-    for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |*argument| {
-        if (argument.* == .prepared) visit(context, &argument.prepared.value);
+        .call => |*call| {
+            if (call.target == .indirect) visit(context, &call.target.indirect);
+            for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |*argument| {
+                if (argument.* == .prepared) visit(context, &argument.prepared.value);
+            }
+        },
+        .static_conversion, .storage_projection, .storage_cursor => {},
+        else => for (instruction.operands()) |operand| if (operand) |value| visit(context, value),
     }
 }
 
 pub fn terminatorReadOperands(function: *Function, terminator: *Terminator, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
-    switch (terminator.*) {
-        .predicate_branch => |*predicate| {
-            visit(context, &predicate.operands.lhs);
-            visit(context, &predicate.operands.rhs);
-        },
-        .return_value => |*use| visit(context, &use.value),
-        .branch, .return_unit, .diverge => {},
-    }
+    for (terminator.operands()) |operand| if (operand) |value| visit(context, value);
     for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
-        const all_arguments = function.branchArguments(branch.*);
-        const all_parameters = function.blocks.items[@backingInt(branch.target)].parameters.items;
-        const count = @min(all_arguments.len, all_parameters.len);
-        for (all_arguments[0..count], all_parameters[0..count]) |*argument, parameter| {
-            const data = function.definitions.items[@backingInt(parameter)].argument.data;
-            if (data.representation == .value and function.direct(data.type_id)) visit(context, &argument.value);
+        const arguments = function.branchArguments(branch.*);
+        const parameters = function.blocks.items[@backingInt(branch.target)].parameters.items;
+        const count = @min(arguments.len, parameters.len);
+        for (arguments[0..count], parameters[0..count]) |*argument, parameter| {
+            if (function.directParameter(parameter)) visit(context, &argument.value);
         }
     };
 }
 
-pub fn visitTerminatorOperands(_: anytype, terminator: *const Terminator, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
+pub fn visitTerminatorReferences(function: *const Function, terminator: *const Terminator, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
     for (terminator.operands()) |operand| if (operand) |value| visit(context, value.*);
-}
-
-pub fn visitTerminatorReferences(tables: anytype, terminator: *const Terminator, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    visitTerminatorOperands(tables, terminator, context, visit);
-    switch (terminator.*) {
-        .branch => |branch| visitBranchArguments(tables, branch, context, visit),
-        .predicate_branch => |predicate| {
-            visitBranchArguments(tables, predicate.then_branch, context, visit);
-            visitBranchArguments(tables, predicate.else_branch, context, visit);
-        },
-        .return_unit, .return_value, .diverge => {},
-    }
-}
-
-fn visitCallArguments(tables: anytype, call: structures.FunctionCall, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    for (tables.call_arguments[call.arguments.start..call.arguments.end]) |argument| visit(context, argument.valueId());
-}
-
-fn visitBranchArguments(tables: anytype, branch: structures.FunctionBranch, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    for (tables.branch_arguments[branch.arguments.start..branch.arguments.end]) |argument| visit(context, argument.value);
-}
-
-pub const TableView = struct {
-    call_arguments: []const structures.FunctionCallArgument,
-    branch_arguments: []const structures.FunctionValueUse,
-    initializer_captures: []const ValueId,
-    aggregate_fields: []const ValueId,
-};
-
-pub fn tableView(function: *const Function) TableView {
-    return .{
-        .call_arguments = function.call_arguments.items,
-        .branch_arguments = function.branch_arguments.items,
-        .initializer_captures = function.initializer_captures.items,
-        .aggregate_fields = function.aggregate_fields.items,
+    var targets = terminator.*;
+    for (targets.branches()) |maybe_branch| if (maybe_branch) |branch| {
+        for (function.branchArguments(branch.*)) |argument| visit(context, argument.value);
     };
 }

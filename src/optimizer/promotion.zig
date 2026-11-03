@@ -1,7 +1,6 @@
 const std = @import("std");
 const structures = @import("../structures.zig");
 const function_ir = @import("function.zig");
-const compaction = @import("compaction.zig");
 const canonicalize = @import("canonicalize.zig");
 const Graph = @import("graph.zig").Graph;
 
@@ -91,14 +90,13 @@ fn collectSlots(function: *Function, graph: Graph) ![]const Slot {
         try slots.append(scratch, .{ .storage = storage, .instruction = index, .type_id = instruction.local_storage });
     };
     var scan: Scan = .{ .allocator = scratch, .mapping = mapping, .slots = slots.items, .site = undefined };
-    const tables = function_ir.tableView(function);
     for (graph.order) |block_index| {
         const block = &function.blocks.items[block_index];
         for (block.instructions.items) |index| {
             if (function.removed.items[index]) continue;
             scan.site = .{ .block = block_index, .instruction = index };
             const instruction = &function.instructions.items[index];
-            function_ir.visitInstructionReferences(tables, instruction, &scan, Scan.reference);
+            function_ir.visitInstructionReferences(function, instruction, &scan, Scan.reference);
             if (instruction.* == .value_copy) if (instruction.value_copy.destination) |destination| {
                 if (destination != instruction.value_copy.source and instruction.value_copy.type_id == function.valueType(destination)) {
                     var storage = destination;
@@ -108,7 +106,7 @@ fn collectSlots(function: *Function, graph: Graph) ![]const Slot {
             function_ir.readOperands(function, instruction, &scan, Scan.accept);
         }
         scan.site = .{ .block = block_index, .instruction = null };
-        function_ir.visitTerminatorReferences(tables, &block.terminator, &scan, Scan.reference);
+        function_ir.visitTerminatorReferences(function, &block.terminator, &scan, Scan.reference);
         function_ir.terminatorReadOperands(function, &block.terminator, &scan, Scan.accept);
     }
     if (scan.failed) return error.OutOfMemory;
@@ -154,7 +152,7 @@ fn promoteLocal(function: *Function, address_taken: []const bool, slot: Slot, si
     if (sites.len != 0) {
         const stored_first = if (sites[0].instruction) |index| storedValue(function.instructions.items[index], slot.storage) != null else false;
         if (!stored_first) {
-            if (!compaction.isScalar(slot.type_id)) return false;
+            if (!function_ir.scalar(slot.type_id)) return false;
             rewrite.current = try undefinedValue(function, slot, undefined_values);
         }
     }
@@ -270,7 +268,7 @@ fn promoteShared(function: *Function, address_taken: []const bool, slots: []cons
     const enabled = try scratch.alloc(bool, slots.len);
     const frontiers = try (try function.controlFlow()).dominanceFrontiers(scratch);
     for (slots, definitions, 0..) |slot, blocks, slot_index| {
-        enabled[slot_index] = !live_in.contains(function.entry, slot_index) or compaction.isScalar(slot.type_id);
+        enabled[slot_index] = !live_in.contains(function.entry, slot_index) or function_ir.scalar(slot.type_id);
         if (!enabled[slot_index]) continue;
         pending.clearRetainingCapacity();
         try pending.appendSlice(scratch, blocks.items);
@@ -334,8 +332,8 @@ fn promoteShared(function: *Function, address_taken: []const bool, slots: []cons
             };
         }
         function_ir.terminatorReadOperands(function, &function.blocks.items[block].terminator, &rename, Renaming.substitute);
-        for (Function.edges(&function.blocks.items[block].terminator)) |maybe_edge| if (maybe_edge) |edge| {
-            for (phis[@backingInt(edge.target)].items) |phi| try function.appendBranchArgument(edge, rename.current[phi.slot]);
+        for (function.blocks.items[block].terminator.branches()) |maybe_edge| if (maybe_edge) |edge| {
+            for (phis[@backingInt(edge.target)].items) |phi| edge.arguments = try function.copyBranchArguments(edge.arguments, &.{rename.current[phi.slot]});
         };
         try stack.append(scratch, .{ .block = block, .restore = position });
         var child = graph.first_child[block];
@@ -372,13 +370,7 @@ fn rewriteSite(function: *Function, address_taken: []const bool, slot: Slot, sit
 fn undefinedValue(function: *Function, slot: Slot, cache: *[@backingInt(structures.TypeId.f64) + 1]?ValueId) !ValueId {
     const index: usize = @backingInt(slot.type_id);
     if (cache[index]) |value| return value;
-    const instruction: Instruction = switch (slot.type_id) {
-        .int => .{ .const_int = 0 },
-        .bool => .{ .const_bool = false },
-        .byte => .{ .const_byte = 0 },
-        else => .{ .const_numeric = .{ .type_id = slot.type_id, .bits = 0 } },
-    };
-    const value = try function.insertInstruction(function.entry, 0, instruction, function.instructionSpan(slot.instruction), function.instructionFrame(slot.instruction));
+    const value = try function.insertInstruction(function.entry, 0, function_ir.zero(slot.type_id), function.instructionSpan(slot.instruction), function.instructionFrame(slot.instruction));
     cache[index] = value;
     return value;
 }

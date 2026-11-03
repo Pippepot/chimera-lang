@@ -15,18 +15,8 @@ pub const Type = enum {
     f64,
 
     pub fn zigType(comptime self: Type) type {
-        return switch (self) {
-            .i8 => i8,
-            .i16 => i16,
-            .i32 => i32,
-            .i64, .isize => i64,
-            .u8 => u8,
-            .u16 => u16,
-            .u32 => u32,
-            .u64, .usize => u64,
-            .f32 => f32,
-            .f64 => f64,
-        };
+        if (self.isFloat()) return if (self == .f32) f32 else f64;
+        return @Int(if (self.isSigned()) .signed else .unsigned, self.width());
     }
     pub fn width(self: Type) u7 {
         return switch (self) {

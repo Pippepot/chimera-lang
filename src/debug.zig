@@ -134,7 +134,11 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
     const instruction = ssa.instructions[instruction_index];
     try writer.print("    %{d} = {s}", .{ @backingInt(ssa.instructionValue(instruction_index)), @tagName(instruction) });
     switch (instruction) {
-        .type_union => |operands| try writer.print(" %{d}, %{d}", .{ @backingInt(operands.lhs), @backingInt(operands.rhs) }),
+        .type_union, .storage_cursor, .borrow_read, .cursor_offset, .cursor_element, .byte_to_int, .variant_tag, .negi, .borrow_write, .addi, .subi, .muli, .divsi, .shli, .shrsi, .select, .fill => {
+            for ((&instruction).operands(), 0..) |operand, index| {
+                if (operand) |value| try writer.print("{s}%{d}", .{ if (index == 0) " " else ", ", @backingInt(value.*) });
+            }
+        },
         .const_numeric => |number| try writer.print(" {s} 0x{x}", .{ @tagName(number.type_id), number.bits }),
         .numeric_binary => |operation| try writer.print(" {s} {s} {s} %{d}, %{d}", .{ @tagName(operation.operation), @tagName(operation.type_id), @tagName(operation.overflow), @backingInt(operation.operands.lhs), @backingInt(operation.operands.rhs) }),
         .numeric_unary => |operation| try writer.print(" {s} {s} {s} %{d}", .{ @tagName(operation.operation), @tagName(operation.type_id), @tagName(operation.overflow), @backingInt(operation.operand) }),
@@ -147,9 +151,6 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
             try renderType(db, constant.type_id, writer);
         },
         .const_storage_cursor => |cursor| try writer.print(" {any}", .{cursor}),
-        .storage_cursor, .borrow_read => |operation| try writer.print(" %{d}", .{@backingInt(operation.source)}),
-        .cursor_offset, .cursor_element => |operation| try writer.print(" %{d}, %{d}", .{ @backingInt(operation.cursor), @backingInt(operation.index) }),
-        .byte_to_int, .variant_tag, .negi => |value| try writer.print(" %{d}", .{@backingInt(value)}),
         .const_bool => |value| try writer.print(" {s}", .{if (value) "true" else "false"}),
         .const_type, .local_storage, .result_storage => |type_id| {
             try writer.writeByte(' ');
@@ -173,14 +174,10 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
         .allocation_element => |operation| try writer.print(" %{d}[%{d}]", .{ @backingInt(operation.allocation), @backingInt(operation.index) }),
         .array_element => |operation| try writer.print(" %{d}[%{d}]", .{ @backingInt(operation.array), @backingInt(operation.index) }),
         .borrow_address => |operation| try renderBorrowAddress(db, ssa, operation, writer),
-        .borrow_write => |operation| try writer.print(" %{d}, %{d}", .{ @backingInt(operation.reference), @backingInt(operation.value) }),
         .value_copy => |operation| try writer.print(" %{d}", .{@backingInt(operation.source)}),
         .field_access => |operation| try writer.print(" %{d}, {d}", .{ @backingInt(operation.operand), operation.field_index }),
         .call => |call| try renderCall(db, ssa, call, writer),
-        .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands| try writer.print(" %{d}, %{d}", .{ @backingInt(operands.lhs), @backingInt(operands.rhs) }),
         .compare => |operation| try writer.print(" {s} %{d}, %{d}", .{ @tagName(operation.operation), @backingInt(operation.operands.lhs), @backingInt(operation.operands.rhs) }),
-        .select => |operation| try writer.print(" %{d}, %{d}, %{d}", .{ @backingInt(operation.condition), @backingInt(operation.then_value), @backingInt(operation.else_value) }),
-        .fill => |operation| try writer.print(" %{d}, %{d}, %{d}", .{ @backingInt(operation.first), @backingInt(operation.count), @backingInt(operation.value) }),
         .move => |operation| try writer.print(" %{d}, %{d}, %{d}{s}", .{ @backingInt(operation.destination), @backingInt(operation.source), @backingInt(operation.count), if (operation.backward) " backward" else "" }),
         .aggregate => |operation| {
             try writer.writeByte(' ');

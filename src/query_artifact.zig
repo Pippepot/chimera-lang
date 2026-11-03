@@ -7,7 +7,6 @@ const modules = @import("modules.zig");
 const structures = @import("structures.zig");
 
 pub const format = "CHIMERAART10";
-const max_records = 1_000_000;
 
 pub const ImportResult = struct {
     bodies: usize = 0,
@@ -21,9 +20,9 @@ pub fn encode(db: *query.Database, allocator: std.mem.Allocator) ![]u8 {
     defer writer.deinit();
     try writer.bytes.appendSlice(allocator, format);
     try db.writeInputs(queries.SourcePath, &writer);
-    try db.writePortableInterns(&writer, disk_cache.interners);
-    try db.writePortableQueries(queries.AnalyzeFunctionInstance, &writer, disk_cache.persisted_inputs, disk_cache.persisted_query_dependencies);
-    try db.writePortableQueries(queries.CompileFunction, &writer, disk_cache.persisted_inputs, disk_cache.persisted_query_dependencies);
+    try db.writeInterns(&writer, disk_cache.interners);
+    try db.writeQueries(queries.AnalyzeFunctionInstance, &writer, .portable, disk_cache.persisted_inputs, disk_cache.persisted_query_dependencies);
+    try db.writeQueries(queries.CompileFunction, &writer, .portable, disk_cache.persisted_inputs, disk_cache.persisted_query_dependencies);
     return writer.bytes.toOwnedSlice(allocator);
 }
 
@@ -34,7 +33,7 @@ pub fn restore(db: *query.Database, payload: []const u8, registry: *const module
     if (!std.mem.eql(u8, try reader.take(format.len), format)) return error.InvalidCache;
     var identities: Identities = .{ .allocator = db.allocator };
     defer identities.deinit();
-    const file_count = try readCount(&reader);
+    const file_count = try reader.readCount();
     for (0..file_count) |_| {
         defer _ = scratch.reset(.retain_capacity);
         const original = try reader.read(structures.FileId);
@@ -45,7 +44,7 @@ pub fn restore(db: *query.Database, payload: []const u8, registry: *const module
         if (entry.found_existing) return error.InvalidCache;
         entry.value_ptr.* = current;
     }
-    const intern_count = try readCount(&reader);
+    const intern_count = try reader.readCount();
     try identities.interns.ensureTotalCapacity(db.allocator, intern_count);
     for (0..intern_count) |_| {
         defer _ = scratch.reset(.retain_capacity);
@@ -225,7 +224,7 @@ pub fn readIntern(db: *query.Database, reader: *codec.Reader, identities: *Ident
 }
 
 fn restoreRecords(comptime Q: type, db: *query.Database, stream: *codec.Reader, identities: *Identities, scratch: *std.heap.ArenaAllocator, compatible: bool) !usize {
-    const count = try readCount(stream);
+    const count = try stream.readCount();
     var imported: usize = 0;
     for (0..count) |_| {
         defer _ = scratch.reset(.retain_capacity);
@@ -236,71 +235,53 @@ fn restoreRecords(comptime Q: type, db: *query.Database, stream: *codec.Reader, 
         // This also covers snapshots of results originally loaded from std.
         if (!compatible) continue;
         const reader = &record;
-        var output = try reader.read(Q.Output);
-        defer codec.freeValue(Q.Output, reader.allocator, &output);
+        var arena = db.outputArena();
+        var transferred = false;
+        defer if (!transferred) arena.deinit();
+        const output = try arena.allocator().create(Q.Output);
+        output.* = try reader.readUsing(Q.Output, arena.allocator());
         identities.reset();
         try identities.translate(Q.Input, &key);
-        try identities.translate(Q.Output, &output);
-        if (output == null) return error.InvalidCache;
+        try identities.translate(Q.Output, output);
+        if (output.* == null) return error.InvalidCache;
         var valid = identities.available and identities.compatible;
-        if (valid) valid = try disk_cache.validateIds(Q.Input, db, key) and try disk_cache.validateIds(Q.Output, db, output);
+        if (valid) valid = try disk_cache.validateIds(Q.Input, db, key) and try disk_cache.validateIds(Q.Output, db, output.*);
         var inputs: std.ArrayList(query.PersistedInputRef) = .empty;
         defer inputs.deinit(reader.allocator);
         var dependencies: std.ArrayList(query.PersistedQueryRef) = .empty;
         defer dependencies.deinit(reader.allocator);
-        try restoreDependencies(query.PersistedInputRef, disk_cache.persisted_inputs, db, reader, identities, &valid, &inputs);
-        try restoreDependencies(query.PersistedQueryRef, disk_cache.persisted_query_dependencies, db, reader, identities, &valid, &dependencies);
+        const values: PortableValues = .{ .identities = identities };
+        try disk_cache.restoreDependencies(query.PersistedInputRef, disk_cache.persisted_inputs, db, reader, values, &valid, &inputs);
+        try disk_cache.restoreDependencies(query.PersistedQueryRef, disk_cache.persisted_query_dependencies, db, reader, values, &valid, &dependencies);
         if (!reader.finished()) return error.InvalidCache;
         if (!valid) continue;
-        if (!try disk_cache.validOutput(Q, db, output)) return error.InvalidCache;
-        try db.importQueryCopy(Q, key, output, inputs.items, dependencies.items);
+        if (!try disk_cache.validOutput(Q, db, output.*)) return error.InvalidCache;
+        try db.importQuery(Q, key, arena, output, inputs.items, dependencies.items);
+        transferred = true;
         imported += 1;
     }
     return imported;
 }
 
-fn restoreDependencies(comptime Ref: type, comptime candidates: anytype, db: *query.Database, reader: *codec.Reader, identities: *Identities, valid: *bool, matched: *std.ArrayList(Ref)) !void {
-    const count = try readCount(reader);
-    for (0..count) |_| {
-        const kind = try reader.read(u8);
-        var found = false;
-        inline for (candidates, 0..) |Owner, index| {
-            if (kind == index) {
-                found = true;
-                const is_input = Ref == query.PersistedInputRef;
-                const Key = if (is_input) Owner.Key else Owner.Input;
-                const Value = if (is_input) ?Owner.Value else Owner.Output;
-                var key = try reader.read(Key);
-                var expected = try reader.read(Value);
-                defer codec.freeValue(Value, reader.allocator, &expected);
-                identities.reset();
-                try identities.key(Owner, &key);
-                if (is_input) {
-                    try identities.inputValue(Owner, &expected);
-                } else if (Owner == queries.StandardLibraryUnchanged) {
-                    if (expected) |*files| for (files) |*file| {
-                        file.* = try identities.file(file.*);
-                    };
-                } else try identities.translate(Value, &expected);
-                valid.* = valid.* and identities.available and identities.compatible;
-                if (valid.*) {
-                    const digest = try query.fingerprint(Value, reader.allocator, expected);
-                    const dependency = if (is_input) try db.matchPersistedInput(Owner, key, digest) else try db.matchPersistedQuery(Owner, key, digest);
-                    if (dependency) |entry| {
-                        try matched.append(reader.allocator, entry);
-                    } else {
-                        valid.* = false;
-                    }
-                }
-                break;
-            }
-        }
-        if (!found) return error.InvalidCache;
-    }
-}
+const PortableValues = struct {
+    identities: *Identities,
 
-fn readCount(reader: *codec.Reader) !usize {
-    const count = try reader.read(u64);
-    if (count > max_records or count > reader.bytes.len - reader.offset) return error.InvalidCache;
-    return @intCast(count);
-}
+    /// Translates a recorded dependency value into this database's identities.
+    pub fn digest(self: PortableValues, comptime Owner: type, comptime is_input: bool, reader: *codec.Reader, key: anytype, check: bool) !?[32]u8 {
+        const Value = if (is_input) ?Owner.Value else Owner.Output;
+        var expected = try reader.read(Value);
+        defer codec.freeValue(Value, reader.allocator, &expected);
+        const identities = self.identities;
+        identities.reset();
+        try identities.key(Owner, key);
+        if (is_input) {
+            try identities.inputValue(Owner, &expected);
+        } else if (Owner == queries.StandardLibraryUnchanged) {
+            if (expected) |*files| for (files) |*file| {
+                file.* = try identities.file(file.*);
+            };
+        } else try identities.translate(Value, &expected);
+        if (!check or !identities.available or !identities.compatible) return null;
+        return try query.fingerprint(Value, reader.allocator, expected);
+    }
+};

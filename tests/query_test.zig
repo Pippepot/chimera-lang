@@ -9469,7 +9469,7 @@ test "reference contracts reuse acyclic bodies and recover after recursive edits
             if (index == 0) {
                 var entries = db.entries.valueIterator();
                 while (entries.next()) |entry| {
-                    try testing.expect(!std.mem.eql(u8, entry.*.type_identity.name, @typeName(queries.ReferenceCallees)));
+                    try testing.expect(!std.mem.eql(u8, entry.*.type_identity.name, queries.ReferenceCallees.cache_name));
                 }
             }
         }

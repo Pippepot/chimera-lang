@@ -42,25 +42,18 @@ pub fn prepareProgram(io: std.Io, gpa: std.mem.Allocator, bytes: []const u8) !Pr
     errdefer gpa.free(filename);
     var atomic = try writeProgramToAtomic(io, bytes);
     defer atomic.deinit(io);
-    const linked = blk: {
-        atomic.file.hardLink(io, std.Io.Dir.cwd(), filename, .{}) catch |err| switch (err) {
-            error.OperationUnsupported => break :blk false,
-            else => return err,
-        };
-        break :blk true;
-    };
-    if (!linked) {
+    atomic.file.hardLink(io, std.Io.Dir.cwd(), filename, .{}) catch |err| switch (err) {
         // Some filesystems cannot hard-link open files. Preserve the private
         // executable guarantee by writing a second copy there.
-        const file = try std.Io.Dir.cwd().createFile(io, filename, .{
-            .exclusive = true,
-            .permissions = .executable_file,
-        });
-        errdefer std.Io.Dir.cwd().deleteFile(io, filename) catch {};
-        defer file.close(io);
-        try file.writeStreamingAll(io, bytes);
-        try file.setPermissions(io, .executable_file);
-    }
+        error.OperationUnsupported => {
+            const file = try std.Io.Dir.cwd().createFile(io, filename, .{ .exclusive = true, .permissions = .executable_file });
+            errdefer std.Io.Dir.cwd().deleteFile(io, filename) catch {};
+            defer file.close(io);
+            try file.writeStreamingAll(io, bytes);
+            try file.setPermissions(io, .executable_file);
+        },
+        else => return err,
+    };
     errdefer std.Io.Dir.cwd().deleteFile(io, filename) catch {};
     try atomic.replace(io);
     return .{ .path = filename, .allocator = gpa };

@@ -20,15 +20,16 @@ pub fn build(b: *std.Build) void {
         const precompiler_module = b.createModule(.{
             .root_source_file = b.path("src/precompile_std.zig"),
             .target = b.graph.host,
-            .optimize = .safe,
+            .optimize = .debug,
         });
         precompiler_module.addImport("standard_library", standard_library);
-        const precompiler = b.addExecutable(.{ .name = "history-precompile-std", .root_module = precompiler_module });
+        const precompiler = b.addExecutable(.{ .name = "history-precompile-std", .root_module = precompiler_module, .use_llvm = false });
         const precompile = b.addRunArtifact(precompiler);
         const bundle = precompile.addOutputFileArg("std.chimera-artifact");
         driver.addAnonymousImport("standard_bundle", .{ .root_source_file = bundle });
     }
     const executable = b.addExecutable(.{ .name = "history_benchmark", .root_module = driver, .use_llvm = true });
+    b.step("history-build", "Build the fixed history suite against this compiler").dependOn(&executable.step);
     const run = b.addRunArtifact(executable);
     run.addPassthruArgs();
     b.step("history-benchmark", "Measure the fixed history suite against this compiler").dependOn(&run.step);

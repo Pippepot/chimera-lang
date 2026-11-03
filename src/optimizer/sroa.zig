@@ -80,13 +80,12 @@ fn splitOnce(function: *Function, context: anytype, order: []const u32, layouts:
     @memset(mapping, null);
     for (slots.items, 0..) |slot, index| mapping[@backingInt(slot.storage)] = @intCast(index);
     var uses: Uses = .{ .mapping = mapping, .slots = slots.items };
-    const tables = function_ir.tableView(function);
     for (order) |block_index| {
         const block = &function.blocks.items[block_index];
         for (block.instructions.items) |index| {
             if (function.removed.items[index]) continue;
             const instruction = &function.instructions.items[index];
-            function_ir.visitInstructionReferences(tables, instruction, &uses, Uses.reference);
+            function_ir.visitInstructionReferences(function, instruction, &uses, Uses.reference);
             switch (instruction.*) {
                 .storage_projection => |projection| if (uses.lookupSlot(projection.owner)) |slot| {
                     if (projection.projection != .field) {
@@ -110,7 +109,7 @@ fn splitOnce(function: *Function, context: anytype, order: []const u32, layouts:
             }
             function_ir.readOperands(function, instruction, &uses, Uses.accept);
         }
-        function_ir.visitTerminatorReferences(tables, &block.terminator, &uses, Uses.reference);
+        function_ir.visitTerminatorReferences(function, &block.terminator, &uses, Uses.reference);
         function_ir.terminatorReadOperands(function, &block.terminator, &uses, Uses.accept);
     }
     var changed = false;

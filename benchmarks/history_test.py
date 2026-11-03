@@ -42,6 +42,16 @@ def encode(rows):
     return output.getvalue()
 
 
+def parallel_outputs(arguments, cwd, cpus, count):
+    assert "--samples=1" in arguments and len(cpus) >= 1
+    return [encode([dict(row, sample=0, sample_count=1, stable=False, nanoseconds=row["nanoseconds"] + index * 1000)
+                    for row in samples() if row["sample"] == 0]) for index in range(count)]
+
+
+def parallel_samples():
+    return history.merge_parallel(parallel_outputs(["--samples=1"], None, [0], history.PARALLEL_SAMPLES))
+
+
 def record():
     return {"schema": 1, "commit": "abc", "commit_date": "2026-10-23T10:00:00Z",
             "snapshot": "tree", "worktree": False, "recorded_at": "2026-10-23T11:00:00Z",
@@ -157,13 +167,19 @@ class HistoryTests(unittest.TestCase):
             data = snapshot / "data"
             previous = record()
 
-            def command(arguments, cwd=history.ROOT):
+            def command(arguments, cwd=history.ROOT, echo=True):
+                if "history-build" in arguments:
+                    return ""
                 case = next(argument.removeprefix("--case=") for argument in arguments if argument.startswith("--case="))
                 if case == history.COMPILATION_CASE:
                     raise subprocess.CalledProcessError(1, arguments, output="", stderr="unsupported String conversion")
                 return encode([row for row in samples(include_c=True) if row["case"] == case])
 
+            def parallel(arguments, cwd, cpus, count):
+                raise subprocess.CalledProcessError(1, arguments, output="", stderr="unsupported String conversion")
+
             with patch.object(history, "command", side_effect=command), \
+                    patch.object(history, "parallel_commands", side_effect=parallel), \
                     patch.object(history, "prepare", return_value=False), \
                     patch.object(history, "environment", return_value={key: previous[key] for key in ("suite", "protocol", "runtime_suite", "zig", "runner")}), \
                     patch.object(history, "loc", return_value=previous["loc"]):
@@ -175,6 +191,60 @@ class HistoryTests(unittest.TestCase):
             for failure in measured["failures"]:
                 self.assertEqual(failure["case"], history.COMPILATION_CASE)
                 self.assertIn("unsupported String conversion", (data / failure["log"]).read_text())
+
+    def test_failed_build_marks_every_workload_without_measuring(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = Path(directory)
+            data = snapshot / "data"
+            previous = record()
+            calls = []
+
+            def command(arguments, cwd=history.ROOT, echo=True):
+                calls.append(arguments)
+                raise subprocess.CalledProcessError(1, arguments, output="", stderr="harness does not compile")
+
+            with patch.object(history, "command", side_effect=command), \
+                    patch.object(history, "prepare", return_value=False), \
+                    patch.object(history, "environment", return_value={key: previous[key] for key in ("suite", "protocol", "runtime_suite", "zig", "runner")}), \
+                    patch.object(history, "loc", return_value=previous["loc"]):
+                measured = history.measure(snapshot, "abc", previous["commit_date"], "tree", False, False, data)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("history-build", calls[0])
+            self.assertEqual(measured["benchmarks"], [])
+            self.assertEqual([(failure["case"], failure["workers"]) for failure in measured["failures"]],
+                             list(history.WORKLOADS))
+            self.assertEqual(len({failure["log"] for failure in measured["failures"]}), 1)
+            self.assertIn("harness does not compile", (data / measured["failures"][0]["log"]).read_text())
+
+    def test_parallel_runs_merge_into_one_fixed_measurement(self):
+        merged = parallel_samples()
+        for phase in history.CORE_CASES[history.COMPILATION_CASE]:
+            group = [row for row in merged if row["phase"] == phase]
+            self.assertEqual([row["sample"] for row in group], list(range(history.PARALLEL_SAMPLES)))
+            self.assertTrue(all(row["parallel"] and row["sample_count"] == history.PARALLEL_SAMPLES for row in group))
+            self.assertEqual({row["stable"] for row in group}, {history.is_stable([row["nanoseconds"] for row in group])})
+        self.assertEqual(history.sampling_note(merged[0]), "; 5 simultaneous runs; stable (<=2% range)")
+        outputs = parallel_outputs(["--samples=1"], None, [0], history.PARALLEL_SAMPLES)
+        for broken in (outputs[:2], outputs[:-1] + [encode(samples())], outputs[:-1] + [encode(samples(include_runtime=True))]):
+            with self.assertRaises(ValueError):
+                history.merge_parallel(broken)
+        cold = [row for row in merged if row["phase"] == "cold"]
+        cold[-1]["parallel"] = False
+        with self.assertRaisesRegex(ValueError, "mixed serial and parallel"):
+            history.validate_measurement(cold)
+
+    def test_parallel_commands_pin_each_copy_and_batch_by_cpu(self):
+        cpus = sorted(history.os.sched_getaffinity(0))[:2]
+        script = "import os; print(sorted(os.sched_getaffinity(0)), os.path.basename(os.getcwd()))"
+        with tempfile.TemporaryDirectory() as directory:
+            for count in (1, 3):
+                outputs = history.parallel_commands([history.sys.executable, "-c", script], Path(directory), cpus, count)
+                expected = [f"[{cpus[index % len(cpus)]}] .parallel-{index % len(cpus)}" for index in range(count)]
+                self.assertEqual(outputs, expected)
+            failing = [history.sys.executable, "-c", "import sys; sys.stderr.write('boom'); sys.exit(3)"]
+            with self.assertRaises(subprocess.CalledProcessError) as error:
+                history.parallel_commands(failing, Path(directory), cpus, 2)
+        self.assertEqual((error.exception.returncode, error.exception.stderr), (3, "boom"))
 
     def test_runtime_csv_round_trip_and_incomplete_sample_rejection(self):
         rows = samples(include_runtime=True)
@@ -276,24 +346,34 @@ class HistoryTests(unittest.TestCase):
                     self.assertEqual(pid, 0)
                     active_affinity[:] = cpus
 
-                def command(arguments, cwd=history.ROOT):
+                def command(arguments, cwd=history.ROOT, echo=True):
                     if arguments == ["clang", "--version"]:
                         return "clang version 22.1.8"
                     if arguments == ["zig", "version"]:
                         return previous["zig"]
                     self.assertEqual(arguments[:2], ["zig", "build"])
+                    self.assertIn(str(data / "zig-cache"), arguments)
+                    if "history-build" in arguments:
+                        return ""
                     self.assertEqual("--skip-c" in arguments, hit)
                     self.assertEqual(cwd, snapshot)
                     expected_affinity = (worker_affinity or affinity) if "--workers=8" in arguments else affinity
                     self.assertEqual(active_affinity, expected_affinity)
                     case = next(argument.removeprefix("--case=") for argument in arguments if argument.startswith("--case="))
                     rows = [row for row in samples(include_runtime=True, include_c=not hit) if row["case"] == case]
-                    if "--workers=8" in arguments:
-                        self.assertEqual(case, history.COMPILATION_CASE)
+                    if case == history.COMPILATION_CASE:
+                        self.assertIn("--workers=8", arguments)
                         rows = [dict(row, lane="workers-8") for row in rows]
                     return encode(rows)
 
+                def parallel(arguments, cwd, cpus, count):
+                    self.assertEqual(cwd, snapshot)
+                    self.assertEqual(cpus, affinity[:history.PARALLEL_SAMPLES])
+                    self.assertEqual(active_affinity, affinity)
+                    return parallel_outputs(arguments, cwd, cpus, count)
+
                 with patch.object(history, "command", side_effect=command), \
+                    patch.object(history, "parallel_commands", side_effect=parallel), \
                     patch.object(history, "prepare", return_value=True), \
                         patch.object(history, "loc", return_value=previous["loc"]), \
                         patch.object(history, "runner", return_value=previous["runner"]), \
@@ -306,7 +386,7 @@ class HistoryTests(unittest.TestCase):
                 self.assertEqual(measured["runner"]["affinity"], affinity)
                 self.assertEqual(measured["worker_affinity"], worker_affinity or affinity)
                 self.assertEqual(active_affinity, affinity)
-                expected = samples() + [dict(sample, lane="workers-8") for sample in samples()]
+                expected = parallel_samples() + [dict(sample, lane="workers-8") for sample in samples()]
                 expected.extend(sample for sample in samples(include_c=True) if sample["case"] == history.RUNTIME_CASE)
                 self.assertEqual(measured["benchmarks"][0]["samples"], expected)
                 self.assertEqual(measured["c_reference"]["snapshot"], "tree" if hit else "new-tree")
@@ -325,7 +405,9 @@ class HistoryTests(unittest.TestCase):
                 self.assertEqual(pid, 0)
                 active_affinity[:] = cpus
 
-            def command(arguments, cwd=history.ROOT):
+            def command(arguments, cwd=history.ROOT, echo=True):
+                if "history-build" in arguments:
+                    return ""
                 case = next(argument.removeprefix("--case=") for argument in arguments if argument.startswith("--case="))
                 if "--workers=8" in arguments:
                     self.assertEqual(active_affinity, worker_affinity)
@@ -338,6 +420,7 @@ class HistoryTests(unittest.TestCase):
                     patch.object(history, "prepare", return_value=True), \
                     patch.object(history, "loc", return_value=current["loc"]), \
                     patch.object(history, "command", side_effect=command), \
+                    patch.object(history, "parallel_commands", side_effect=parallel_outputs), \
                     patch.object(history.os, "sched_setaffinity", side_effect=set_affinity):
                 measured = history.measure(data, "abc", current["commit_date"], "tree", False, False, data,
                                            worker_affinity=worker_affinity)
@@ -480,7 +563,7 @@ class HistoryTests(unittest.TestCase):
                   if "stroke-dasharray:" in path.get("style", "")]
         self.assertGreaterEqual(len(dotted), 3)
 
-    def test_report_separates_machines_and_deduplicates_reruns(self):
+    def test_report_joins_machines_and_toolchains_and_deduplicates_reruns(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             first = record()
@@ -494,17 +577,19 @@ class HistoryTests(unittest.TestCase):
             other = copy.deepcopy(first)
             other["recorded_at"] = "2026-10-23T13:00:00Z"
             other["runner"]["host"] = "other & host"
+            other["runner"]["kernel"] = "other kernel"
+            other["zig"] = "0.18.0"
             other["worktree"] = True
             history.save(data, other)
             report = history.render(data, [("abc", first["commit_date"])])
             content = report.read_text()
-            self.assertEqual(content.count("<section>"), 3)
+            self.assertEqual(content.count("<section>"), 2)
             for detail in ("other &amp; host", "CPU", "affinity", "suite", "0.17.0", "uncommitted", "Debug", "Shipped", "Source"):
                 self.assertNotIn(detail, content)
             self.assertNotIn("<a ", content)
             self.assertNotIn("<nav", content)
             graphs = list((data / "graphs").glob("*.svg"))
-            self.assertEqual(len(graphs), 1 + 2 * 2)
+            self.assertEqual(len(graphs), 1 + 2)
             namespace = {"svg": "http://www.w3.org/2000/svg"}
             self.assertEqual(sum(len(ElementTree.parse(path).findall(".//svg:title", namespace))
                                  for path in graphs), 2 * 2)
@@ -527,7 +612,7 @@ class HistoryTests(unittest.TestCase):
             self.assertNotIn("<h2>Lines of Code</h2>", benchmarks)
             self.assertNotIn("<a ", benchmarks)
             self.assertNotIn("<nav", benchmarks)
-            self.assertEqual(benchmarks.count("<object"), 2 * 2)
+            self.assertEqual(benchmarks.count("<object"), 2)
             self.assertNotIn("Benchmark Overview PNG", benchmarks)
             self.assertEqual(history.read_records(data), [first, second, other])
 
@@ -631,7 +716,7 @@ class HistoryTests(unittest.TestCase):
                             self.assertAlmostEqual(call.kwargs["references"]["C -O3"][0], 16.01)
                     self.assertEqual(history.read_records(data), [previous, current])
 
-    def test_runtime_report_labels_and_separates_gcc_and_clang_references(self):
+    def test_runtime_history_spans_c_compiler_changes_with_latest_reference(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             gcc = record()
@@ -647,7 +732,7 @@ class HistoryTests(unittest.TestCase):
                 history.render(data, [(gcc["commit"], gcc["commit_date"])])
             references = [set(call.kwargs["references"]) for call in graph.call_args_list
                           if "Runtime" in call.args[2]]
-            self.assertEqual(references, [{"GCC -O0", "GCC -O3"}, {"Clang -O0", "Clang -O3"}])
+            self.assertEqual(references, [{"Clang -O0", "Clang -O3"}])
             self.assertEqual(history.read_records(data), [gcc, clang])
 
     def test_runtime_report_uses_latest_medians_in_legend(self):

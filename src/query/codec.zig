@@ -60,6 +60,8 @@ pub const Writer = struct {
     }
 };
 
+const max_records = 1_000_000;
+
 pub const Reader = struct {
     allocator: std.mem.Allocator,
     bytes: []const u8,
@@ -115,6 +117,13 @@ pub const Reader = struct {
         }
     }
 
+    pub fn readUsing(self: *Reader, comptime T: type, allocator: std.mem.Allocator) anyerror!T {
+        const previous = self.allocator;
+        self.allocator = allocator;
+        defer self.allocator = previous;
+        return self.read(T);
+    }
+
     fn readBool(self: *Reader) !bool {
         const byte = (try self.take(1))[0];
         if (byte > 1) return error.InvalidCache;
@@ -166,6 +175,13 @@ pub const Reader = struct {
             element.* = try self.read(T);
             initialized += 1;
         }
+    }
+
+    /// Each counted record occupies at least one byte.
+    pub fn readCount(self: *Reader) !usize {
+        const count = try self.read(u64);
+        if (count > max_records or count > self.bytes.len - self.offset) return error.InvalidCache;
+        return @intCast(count);
     }
 
     pub fn finished(self: Reader) bool {
