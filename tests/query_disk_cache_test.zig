@@ -8,6 +8,75 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "nominal variant snapshots restore compact layouts and refresh converters and declarations" {
+    const source =
+        \\static Payload = int
+        \\static Cases = .Value: Payload | .Empty
+        \\static Alias = Cases
+        \\func run() int
+        \\    const value: Alias = Alias.Value{42}
+        \\    if value is Cases.Value
+        \\        const payload: Payload = value
+        \\        return wrap(int, payload)
+        \\    return 1
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "Payload = int", "Payload = byte");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(42);
+    const renamed = try std.mem.replaceOwned(u8, std.testing.allocator, changed, ".Value", ".Success");
+    defer std.testing.allocator.free(renamed);
+    try fixture.db.setInput(queries.SourceText, 0, renamed);
+    try fixture.expectExit(42);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "nominal generic and static payload snapshots retain converter specialization" {
+    const source =
+        \\func Optional(static T: type) type -> .Some: T | .Empty
+        \\static Cases = Optional(int)
+        \\static StaticCases = .Value: int_literal | .Empty
+        \\static wrapper = StaticCases.Value{40}
+        \\static payload: int_literal = wrapper
+        \\func run() int
+        \\    const value: Cases = Cases.Some{payload + 2}
+        \\    if value is Cases.Some -> return value
+        \\    return 1
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "{40}", "{41}");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(43);
+}
+
+test "nominal snapshots refresh declaration inherited constructor visibility" {
+    const entry =
+        \\import lib
+        \\static Case = lib.caseType()
+        \\func run() int
+        \\    const value = Case{42}
+        \\    return int(value)
+        \\exit(run())
+    ;
+    const library: modules.SourceFile = .{ .path = "lib/cases.chi", .module_path = "lib", .source = "pub static Cases = .Value: int | .Empty\npub func caseType() type -> Cases.Value" };
+    const fixture = try Fixture.restoreSources(entry, &.{library}, &.{library}, null);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    try fixture.db.setInput(queries.SourceText, 1, "static Cases = .Value: int | .Empty\npub func caseType() type -> Cases.Value");
+    try fixture.expectDiagnostic(.private_struct_field);
+    try fixture.db.setInput(queries.SourceText, 1, library.source);
+    try fixture.expectExit(42);
+}
+
 test "static callable sort snapshots restore comparator identities and invalidate edits" {
     const source =
         \\func ascending(imm left: int, imm right: int) bool -> left < right

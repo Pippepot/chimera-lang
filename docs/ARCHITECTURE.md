@@ -124,6 +124,18 @@ length identity, not generated fields. `ResolveTypeNamespace` associates types
 with source namespaces independently of struct identity; visibility remains a
 use-site decision.
 
+Inline variant cases reuse nominal struct identities with one anonymous payload
+component and ordinary aggregate storage. Their declaration-owned namespaces and
+generic specializations preserve identity through structural union composition;
+qualified case lookup can forward through aliases and composed unions.
+Synthesized payload converters have ordinary callable identities and bodies;
+the backend has no case-specific instruction. Payload declarations validate
+copyability and public exposure before consumers see their definitions.
+Variant layouts select one-, two-, or four-byte tags from the alternative count;
+unit/none-only variants need only the tag, and singleton unions remain tag-free.
+Native tag writes also zero the existing prefix alignment padding (up to four
+bytes), allowing full-width tag reads without increasing storage.
+
 Structural subtyping is shared by static constraints, runtime type tests, and
 value typing. The frontend constructs changed tuple representations with ordinary
 field and variant operations before publishing IR, preserving ownership and

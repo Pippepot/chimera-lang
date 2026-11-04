@@ -56,6 +56,8 @@ diagnostics, execution, ownership, and incremental/cache behavior.
 - Local `static` declarations. Remove `comptime` only after verified equivalence
   across lexical scope, type-valued results, specialization, effects, and caching.
 - Temporary-projection borrowing and lifetime extension.
+- Non-copyable nominal variant payloads: define borrowing and consuming payload
+  extraction before lifting the current copyability restriction.
 - Shared ownership: atomic reference counts, access synchronization guarantees,
   and cycle policy. No upgradeable weak-reference API is proposed.
 - Capturing closures, local function literals, `sizeof`, and return inference.

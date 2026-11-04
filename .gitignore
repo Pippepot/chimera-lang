@@ -3,6 +3,7 @@ main
 chimera.asm
 chimera.o
 zig-out/
+.venv
 .zig-cache
 .chimera-cache/
 .chimera-run-*

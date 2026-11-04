@@ -1841,22 +1841,38 @@ reassigned = int_or_float_value
 # Variant reads narrow only with a control-flow proof, as described under
 # Variants and flow typing. The declared storage type remains unchanged.
 
-# Inline named variant cases (planned)
-# A variant declaration may introduce named cases alongside ordinary type
-# alternatives. A case without a payload annotation has an implicit unit payload
-# and requires no payload storage; the variant may still need a discriminant.
-# Named cases have distinct identities even when their payload types coincide.
-# A payload-free case is neither bare unit nor bare none, so it does not itself
-# change the meaning of none. Existing type alternatives remain ordinary
-# members rather than becoming wrapped cases.
-# These cases are not the foundation of error handling: marked nominal structs
-# and ordinary unions already provide informative errors. Declaration syntax
-# below is a sketch; case construction,
-# matching, visibility, and identity across aliases/composed variants remain open.
-static Message =
-    .Empty
-    .Text: String
-    CustomMessageType
+# Inline nominal variant alternatives
+# .Name: T declares a nominal wrapper with an anonymous payload of type T.
+# .Name abbreviates .Name: unit. It is neither bare unit nor bare none.
+# Payloads must support copy; non-copyable payload declarations and generic
+# specializations are rejected. Ordinary type alternatives remain unwrapped.
+# A payload annotation binds one primary type; group union and tuple payloads.
+# Each case belongs to the enclosing named declaration, with identity preserved
+# through aliases and composition and distinct across generic specializations.
+# Duplicate case declarations in one namespace are errors. Qualified lookup
+# through an alias or composed variant resolves the original case. Composing
+# distinct cases with the same name is legal, but lookup of that name is ambiguous.
+# Cases and generated converters inherit the variant declaration's visibility.
+# A public variant cannot expose private alternatives or payload types, including
+# private generic arguments.
+static Message = .Empty | .Text: StaticString | CustomMessageType
+const empty = Message.Empty{}
+const text = Message.Text{"hello"}
+static ExtendedMessage = Message | .Cancelled
+# ExtendedMessage.Text and Message.Text denote the same case type.
+# Brace construction takes exactly one positional payload initializer; {} is
+# also valid for unit and none payloads. No implicit named payload field exists.
+# The generated converter to T copies the payload, preserving the wrapper.
+# Neither unit nor none payloads have a generated converter, and no reverse
+# converter is generated. Existing converter resolution, type patterns, and
+# flow-sensitive narrowing apply. Compile-time-only payloads convert statically.
+# Case payloads use ordinary storage and ownership. Unit and none payloads need
+# no bytes; a variant containing only unit/none alternatives and cases with
+# unit/none payloads stores only its discriminator.
+# Discriminators use one byte through 256 alternatives, two through 65,536,
+# and four beyond that; singleton unions need no discriminator.
+# See docs/NOMINALVARIANTS.md for examples. These cases do not replace marked
+# nominal structs and ordinary unions as the foundation of error handling.
 
 
 # Converters

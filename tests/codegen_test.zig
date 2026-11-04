@@ -1064,7 +1064,7 @@ const TestTypes = struct {
 
     pub fn variantLayout(self: @This(), type_id: structures.TypeId) !structures.VariantLayout {
         std.debug.assert(try self.variantMembers(type_id) != null);
-        return .{ .layout = try self.layout(type_id), .payload_offset = 4 };
+        return .{ .layout = try self.layout(type_id), .payload_offset = 4, .tag_size = 4 };
     }
 
     pub fn structLayout(_: @This(), _: structures.TypeId) !?structures.StructLayout {

@@ -31,7 +31,7 @@ pub fn build(b: *std.Build) void {
         .root_module = root_module,
         .use_llvm = use_llvm,
     });
-    compiler.incremental = true;
+    compiler.incremental = false;
     compiler.build_id = .sha1;
     b.installArtifact(compiler);
 
@@ -109,6 +109,7 @@ pub fn build(b: *std.Build) void {
         "tests/text_test.zig",
         "tests/panic_test.zig",
         "tests/converter_test.zig",
+        "tests/nominal_variant_test.zig",
         "tests/comptime_interpreter_test.zig",
     };
     var matched_sources: usize = 0;

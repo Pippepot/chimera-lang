@@ -7,6 +7,45 @@ const artifact = sources.query_artifact;
 const bundle = sources.standard_bundle_loader;
 const structures = sources.structures;
 
+test "portable nominal variants remap case and converter identities" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\pub static Cases = .Value: int | .Empty
+        \\pub func run() int
+        \\    const value: Cases = Cases.Value{42}
+        \\    if value is Cases.Value -> return value
+        \\    return 1
+    ;
+    const library: modules.SourceFile = .{ .path = "lib/cases.chi", .module_path = "lib", .source = source };
+    const entry = "import lib\nexit(lib.run())";
+    const original = try sources.SourceFixture.initFiles(entry, &.{library});
+    defer original.deinit();
+    try original.db.addInput(queries.InlineLimit, {}, 0);
+    try original.expectExit(0, 42);
+    const bytes = try artifact.encode(original.db, allocator);
+    defer allocator.free(bytes);
+    const db = try query.Database.init(allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    try db.addInput(queries.InlineLimit, {}, 0);
+    var registry: modules.SourceRegistry = .{ .entry_path = "relocated.chi" };
+    defer registry.deinit(allocator);
+    try registry.update(db, allocator, entry, &.{
+        .{ .path = "padding.chi", .module_path = "", .source = "static Padding = .First | .Second" },
+        library,
+    }, &.{});
+    _ = try db.get(queries.ModuleDeclarations, try db.intern(queries.ModulePaths, .{ .path = "" }));
+    _ = try db.intern(queries.Types, .{ .array = .{ .element_type = .byte, .length = 9 } });
+    const restored = try artifact.restore(db, bytes, &registry);
+    try std.testing.expect(restored.bodies > 0);
+    try std.testing.expect(restored.functions > 0);
+    const fixture: sources.SourceFixture = .{ .db = db };
+    try fixture.expectExit(0, 42);
+    const changed = try std.mem.replaceOwned(u8, allocator, source, ".Value: int", ".Value: byte");
+    defer allocator.free(changed);
+    try db.setInput(queries.SourceText, registry.fileId(library.path).?, changed);
+    try fixture.expectDiagnostic(registry.fileId(library.path).?, .return_type_mismatch);
+}
+
 test "portable functions remap files and interned identities and recompute after edits" {
     const allocator = std.testing.allocator;
     const library: modules.SourceFile = .{ .path = "lib/answer.chi", .module_path = "lib", .source =

@@ -463,6 +463,13 @@ pub fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structure
     }
     if (try types.structName(type_id)) |name| {
         if (try types.structIdentity(type_id)) |identity| {
+            var instance: structures.InstanceId = undefined;
+            switch (identity) {
+                .declared => |item| instance = .{ .item = item },
+                .generated => |generated| instance = generated.owner,
+            }
+            if ((try types.itemLocation(instance.item)).is_nominal_case)
+                return writeFunctionName(types, writer, instance);
             if (identity == .generated and identity.generated.owner.specialization != null) {
                 try writeFunctionName(types, writer, identity.generated.owner);
                 if (std.mem.eql(u8, name, "anonymous struct")) try writer.writeAll("::{anonymous struct}");
@@ -579,6 +586,10 @@ fn writeStaticAggregate(types: anytype, writer: *std.Io.Writer, type_id: structu
     try writer.writeByte('{');
     const definition = (try types.structDefinition(type_id)) orelse return error.Unavailable;
     std.debug.assert(values.len == definition.fields.len);
+    if (definition.anonymousPayload()) |payload| {
+        if (payload != .unit and payload != .none) try writeStaticValue(types, writer, values[0]);
+        return writer.writeByte('}');
+    }
     for (definition.fields, values, 0..) |field, value, index| {
         if (index != 0) try writer.writeAll(", ");
         try writer.print("{s} = ", .{field.name});

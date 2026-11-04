@@ -327,6 +327,12 @@ fn internGeneratedStructType(ctx: anytype, identity: structures.GeneratedStructI
     return .fromInterned(try ctx.intern(Types, .{ .structure = .{ .generated = identity } }));
 }
 
+fn nominalCaseIdentity(ctx: anytype, type_id: structures.TypeId) !?structures.StructIdentity {
+    const identity = (try typePayload(ctx, type_id, .structure)) orelse return null;
+    const location = try ctx.lookupInterned(ItemLocations, structOwnerItem(identity));
+    return if (location.is_nominal_case) identity else null;
+}
+
 fn semanticValue(ctx: anytype, file_id: structures.FileId, instance: ?structures.InstanceId, result: anytype) !@FieldType(@typeInfo(@TypeOf(result)).error_union.payload, "success") {
     switch (try result) {
         .success => |value| return value,
@@ -584,6 +590,8 @@ pub fn TypeFacts(comptime Context: type) type {
             return switch (identity) {
                 .declared => |item_id| (try self.ctx.lookupInterned(ItemLocations, item_id)).name.text(),
                 .generated => |generated| blk: {
+                    const location = try self.ctx.lookupInterned(ItemLocations, generated.owner.item);
+                    if (location.is_nominal_case) break :blk location.name.text();
                     const item_source = (try itemSource(self.ctx, generated.owner.item)) orelse return error.Unavailable;
                     if (!semantic.isDirectlyReturnedStructSite(&item_source.parsed, item_source.resolved.declaration, generated.node_offset)) break :blk "anonymous struct";
                     break :blk (try self.ctx.lookupInterned(ItemLocations, generated.owner.item)).name.text();
@@ -1618,6 +1626,65 @@ pub fn AnalysisContext(comptime Context: type) type {
             return internGeneratedStructType(self.ctx, .{ .owner = owner, .node_offset = node_offset });
         }
 
+        pub fn nominalCaseType(self: @This(), node: structures.Node.Index) !structures.TypeId {
+            const parsed = (try self.ctx.get(ParseFile, self.file_id.?)).* orelse return error.Unavailable;
+            var owner = self.instance orelse try self.reject(nodeSpan(&parsed, node), .nominal_case_requires_declaration);
+            while (true) {
+                const location = try self.ctx.lookupInterned(ItemLocations, owner.item);
+                if (!location.is_nominal_case and !std.mem.eql(u8, location.name.text(), "$payload") and !std.mem.eql(u8, location.name.text(), "$static_payload")) break;
+                owner = (try enclosingInstance(self.ctx, owner, false)) orelse unreachable;
+            }
+            const source = (try self.ctx.input(SourceText, self.file_id.?)).*;
+            const token = parsed.tokens[parsed.nodes[node.index()].token_index];
+            const location = try self.ctx.lookupInterned(ItemLocations, owner.item);
+            const item = try self.ctx.intern(ItemLocations, .{
+                .origin = location.origin,
+                .owner = owner.item,
+                .kind = .structure,
+                .name = .{ .identifier = source[token.loc.start..token.loc.end] },
+                .is_nominal_case = true,
+            });
+            if ((try self.ctx.get(ResolveItem, item)).* == null)
+                try self.reject(nodeSpan(&parsed, node), .nominal_case_requires_declaration);
+            owner.item = item;
+            owner.environment = try self.staticEnvironment();
+            const value = (try self.staticItem(owner)) orelse return error.Unavailable;
+            const type_id = (try self.lookupCompileTimeValue(value)).type;
+            _ = (try self.facts().structDefinition(type_id)) orelse return error.Unavailable; // Validate the declared payload, even without construction.
+            return type_id;
+        }
+
+        pub fn nominalSelfType(self: @This()) !structures.TypeId {
+            const owner = (try enclosingInstance(self.ctx, self.instance.?, false)) orelse unreachable;
+            const location = try self.ctx.lookupInterned(ItemLocations, owner.item);
+            std.debug.assert(location.is_nominal_case);
+            const value = (try self.staticItem(owner)) orelse return error.Unavailable;
+            return (try self.lookupCompileTimeValue(value)).type;
+        }
+
+        pub fn nominalDeclarationIsPublic(self: @This()) !bool {
+            return self.declarationIsPublic(self.instance.?.item);
+        }
+
+        pub fn isPublicNominalPayload(self: @This(), type_id: structures.TypeId) !bool {
+            var exposure = self;
+            exposure.instance = null;
+            return exposure.isPublicFieldType(type_id);
+        }
+
+        pub fn validateNominalVariant(self: @This(), type_id: structures.TypeId, span: structures.SourceSpan) !void {
+            const members = (try self.facts().variantMembers(type_id)) orelse &.{type_id};
+            var has_cases = false;
+            for (members) |member| {
+                if (try nominalCaseIdentity(self.ctx, member) != null) {
+                    has_cases = true;
+                    break;
+                }
+            }
+            if (has_cases and try self.nominalDeclarationIsPublic() and !try self.isPublicNominalPayload(type_id))
+                try self.reject(span, .public_variant_private_type);
+        }
+
         fn staticParameter(self: @This(), name: []const u8) !?structures.CompileTimeValueId {
             for (try self.staticBindings()) |binding| if (std.mem.eql(u8, binding.name, name)) return binding.value;
             var instance = self.instance orelse return null;
@@ -1789,6 +1856,7 @@ pub fn AnalysisContext(comptime Context: type) type {
                 std.debug.assert(field.index < fields.len);
                 return .{ .constant = fields[field.index] };
             }
+            if (try self.nominalCaseMember(value.type, name, span)) |member| return member;
             if (std.meta.stringToEnum(structures.OwnershipMember, name)) |operation| {
                 if (try self.ownershipMember(value.type, operation)) |instance| return try self.callableMember(instance);
                 try self.reject(span, .unknown_namespace_member);
@@ -1810,6 +1878,24 @@ pub fn AnalysisContext(comptime Context: type) type {
             else
                 .unknown_namespace_member;
             try self.reject(span, kind);
+        }
+
+        fn nominalCaseMember(self: @This(), type_id: structures.TypeId, name: []const u8, span: structures.SourceSpan) !?structures.NameReference {
+            const members = (try self.facts().variantMembers(type_id)) orelse &.{type_id};
+            var selected: ?structures.TypeId = null;
+            for (members) |member| {
+                const identity = (try nominalCaseIdentity(self.ctx, member)) orelse continue;
+                const item = structOwnerItem(identity);
+                const location = try self.ctx.lookupInterned(ItemLocations, item);
+                if (!std.mem.eql(u8, location.name.text(), name)) continue;
+                if (selected != null and selected.? != member) try self.reject(span, .ambiguous_nominal_case);
+                if (location.origin.module != try self.currentModule() and !try self.declarationIsPublic(item))
+                    try self.reject(span, .private_access);
+                selected = member;
+            }
+            const member = selected orelse return null;
+            _ = (try self.facts().structDefinition(member)) orelse return error.Unavailable; // Validate a selected case's payload.
+            return .{ .constant = try self.ctx.intern(CompileTimeValues, .{ .type = member }) };
         }
 
         const ConversionMember = union(enum) {
@@ -2033,8 +2119,8 @@ fn variantLayout(ctx: anytype, type_id: structures.TypeId) anyerror!structures.V
         payload_alignment = @max(payload_alignment, member_layout.byte_alignment);
     }
 
-    const tag_size: u32 = @sizeOf(u32);
-    const tag_alignment: u32 = @alignOf(u32);
+    const tag_size: u32 = if (members.len <= 256) 1 else if (members.len <= 65536) 2 else 4;
+    const tag_alignment = tag_size;
     const byte_alignment = @max(tag_alignment, payload_alignment);
     const payload_offset = try alignForward(tag_size, payload_alignment);
     const unaligned_size = std.math.add(u32, payload_offset, payload_size) catch return error.TypeTooLarge;
@@ -2044,6 +2130,7 @@ fn variantLayout(ctx: anytype, type_id: structures.TypeId) anyerror!structures.V
             .byte_alignment = byte_alignment,
         },
         .payload_offset = payload_offset,
+        .tag_size = tag_size,
     };
 }
 
@@ -2324,7 +2411,7 @@ fn indexItems(ctx: anytype, file_id: structures.FileId) anyerror!?structures.Ite
         const item_id = try ctx.intern(ItemLocations, loc);
         item_ids[index] = item_id;
         if (entries.contains(item_id)) {
-            try rejectDeclaration(ctx, file_id, &parsed, item.declaration, .duplicate_struct_member);
+            try rejectDeclaration(ctx, file_id, &parsed, item.declaration, if (loc.is_nominal_case) .duplicate_nominal_case else .duplicate_struct_member);
             entries.deinit(ctx.allocator());
             return null;
         }
@@ -2517,6 +2604,42 @@ fn conversionCandidates(ctx: anytype, key: struct { source: ConversionSource, ta
         switch (match) {
             .mismatch => {},
             .candidate => |candidate| try candidates.append(ctx.allocator(), candidate),
+        }
+    }
+    if (try key.source.typeId(ctx)) |source_type| {
+        if (try nominalCaseIdentity(ctx, source_type)) |identity| {
+            const facts: TypeFacts(@TypeOf(ctx)) = .{ .ctx = ctx };
+            const definition = (try facts.structDefinition(source_type)) orelse return null;
+            const payload = definition.anonymousPayload().?;
+            const targets = (try facts.variantMembers(key.target)) orelse &.{};
+            if (payload != .unit and payload != .none and (payload == key.target or std.mem.indexOfScalar(structures.TypeId, targets, payload) != null)) {
+                const owner = structOwnerItem(identity);
+                const location = try ctx.lookupInterned(ItemLocations, owner);
+                const analysis: AnalysisContext(@TypeOf(ctx)) = .{ .ctx = ctx };
+                if (location.origin.module == key.requester or try analysis.declarationIsPublic(owner)) {
+                    const static_source = !try facts.isRuntimeCapable(source_type);
+                    if (!static_source or key.source == .constant) {
+                        const item = try ctx.intern(ItemLocations, .{
+                            .origin = location.origin,
+                            .owner = owner,
+                            .kind = .function,
+                            .name = .{ .identifier = if (static_source) "$static_payload" else "$payload" },
+                        });
+                        var instance: structures.InstanceId = .{ .item = item };
+                        if (identity == .generated) {
+                            instance.specialization = identity.generated.owner.specialization;
+                            instance.environment = identity.generated.owner.environment;
+                        }
+                        if (static_source) instance = try analysis.specializeFunction(instance, &.{key.source.constant});
+                        try candidates.append(ctx.allocator(), .{
+                            .instance = instance,
+                            .input_type = source_type,
+                            .target_type = payload,
+                            .source_mode = if (static_source) .static else .imm,
+                        });
+                    }
+                }
+            }
         }
     }
     return try candidates.toOwnedSlice(ctx.allocator());
@@ -3233,7 +3356,7 @@ fn resolveStaticInstance(ctx: anytype, instance: structures.InstanceId) anyerror
         return try ctx.intern(CompileTimeValues, .{ .type = try internStructType(ctx, item_id) });
     const parsed = (try ctx.get(ParseFile, resolved.file_id)).* orelse return null;
     if (loc.kind == .structure) {
-        const initializer = parsed.nodes[resolved.declaration].data.node_node.b;
+        const initializer: structures.Node.Index = if (loc.is_nominal_case) @fromBackingInt(resolved.declaration) else parsed.nodes[resolved.declaration].data.node_node.b;
         const type_id = try internGeneratedStructType(ctx, .{ .owner = instance, .node_offset = @as(i64, initializer.index()) - @as(i64, resolved.declaration) });
         return try ctx.intern(CompileTimeValues, .{ .type = type_id });
     }
@@ -3241,7 +3364,10 @@ fn resolveStaticInstance(ctx: anytype, instance: structures.InstanceId) anyerror
     const analysis_context: AnalysisContext(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = resolved.file_id, .instance = instance };
     const plan = (try availableSemanticValue(ctx, resolved.file_id, instance, semantic.analyzer(&parsed, source, analysis_context, ctx.allocator()).run("analyzeStaticDeclaration", .{resolved.declaration}))) orelse return null;
     const runtime_annotation = switch (plan) {
-        .type_value => |type_id| return try ctx.intern(CompileTimeValues, .{ .type = type_id }),
+        .type_value => |type_id| {
+            try analysis_context.validateNominalVariant(type_id, nodeSpan(&parsed, @fromBackingInt(resolved.declaration)));
+            return try ctx.intern(CompileTimeValues, .{ .type = type_id });
+        },
         .interpret => |type_id| type_id,
     };
 
@@ -3257,8 +3383,12 @@ fn resolveStaticInstance(ctx: anytype, instance: structures.InstanceId) anyerror
         .returned => |returned| returned,
         .exit => return null,
     };
-    const expected_type = runtime_annotation orelse return value_id;
     const value = (try ctx.lookupInterned(CompileTimeValues, value_id)).*;
+    if (runtime_annotation == null) {
+        if (value == .type) try analysis_context.validateNominalVariant(value.type, nodeSpan(&parsed, initializer));
+        return value_id;
+    }
+    const expected_type = runtime_annotation.?;
     if (value == .type) {
         try typing.emitSemanticIssue(ctx, resolved.file_id, .{
             .span = nodeSpan(&parsed, initializer),
@@ -3795,9 +3925,18 @@ fn reserveStructNamespaceFields(ctx: anytype, identity: NamespaceIdentity, names
     const source = (try ctx.input(SourceText, item_source.resolved.file_id)).*;
     const struct_index: structures.Node.Index = if (identity == .generated) generated: {
         const position = std.math.cast(u32, @as(i64, item_source.resolved.declaration) + identity.generated.node_offset) orelse return false;
-        if (position >= item_source.parsed.nodes.len or item_source.parsed.nodes[position].tag != .@"struct") return false;
+        if (position >= item_source.parsed.nodes.len) return false;
+        const tag = item_source.parsed.nodes[position].tag;
+        if (tag == .nominal_case) return true;
+        if (tag != .@"struct") return false;
         break :generated @fromBackingInt(@intCast(position));
-    } else item_source.parsed.nodes[item_source.resolved.declaration].data.node_node.b;
+    } else named: {
+        const declaration = item_source.parsed.nodes[item_source.resolved.declaration];
+        if (declaration.tag == .nominal_case) return true;
+        const value = if (declaration.tag == .static_binding) declaration.data.node_node.b else @as(structures.Node.Index, @fromBackingInt(item_source.resolved.declaration));
+        if (item_source.parsed.nodes[value.index()].tag != .@"struct") return true;
+        break :named value;
+    };
     if (try semantic.validateStructNamespace(&item_source.parsed, source, struct_index, ctx.allocator())) |issue| {
         try typing.emitSemanticIssue(ctx, item_source.resolved.file_id, issue);
         return false;
@@ -3833,7 +3972,9 @@ fn generatedStructDefinition(ctx: anytype, identity: structures.GeneratedStructI
     const declaration = (try declarationSource(ctx, identity.owner)) orelse return null;
     const node_position = @as(i64, declaration.resolved.declaration) + @as(i64, identity.node_offset);
     const node_index = std.math.cast(u32, node_position) orelse return null;
-    if (node_index >= declaration.parsed.nodes.len or declaration.parsed.nodes[node_index].tag != .@"struct") return null;
+    if (node_index >= declaration.parsed.nodes.len) return null;
+    const node_tag = declaration.parsed.nodes[node_index].tag;
+    if (node_tag != .@"struct" and node_tag != .nominal_case) return null;
     const struct_node: structures.Node.Index = @fromBackingInt(@intCast(node_index));
     const file_id = declaration.resolved.file_id;
     return availableSemanticValue(ctx, file_id, identity.owner, semantic.analyzer(&declaration.parsed, declaration.source, declaration.analysis, ctx.allocator()).run("analyzeGeneratedStructDefinition", .{ struct_node, identity }));

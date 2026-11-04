@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIMERAQRY50";
+const format = "CHIMERAQRY52";
 // Snapshot records name their interner, input, or query boundary by its index here.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
 pub const persisted_inputs = .{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile, queries.InlineLimit };

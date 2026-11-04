@@ -9,6 +9,13 @@ fn SemanticResult(comptime Success: type) type {
     return union(enum) { success: Success, unsupported: Issue };
 }
 
+fn parameterName(ast: *const structures.Ast, source: []const u8, parameter: structures.Node) []const u8 {
+    if (parameter.data.parameter.annotation.unwrap()) |annotation| {
+        if (ast.nodes[annotation.index()].tag == .nominal_self) return "$payload";
+    }
+    return tokenText(ast, source, parameter.token_index);
+}
+
 pub fn analyzer(ast: *const structures.Ast, source: []const u8, analysis_context: anytype, gpa: std.mem.Allocator) Analyzer(@TypeOf(analysis_context)) {
     return .{ .ast = ast, .source = source, .analysis_context = analysis_context, .gpa = gpa };
 }
@@ -314,7 +321,7 @@ fn Analyzer(comptime AnalysisServices: type) type {
                 std.debug.assert(parameter.tag == .param);
                 const mode = parameter_shape.mode;
                 const name_span = self.ast.tokenSpan(parameter.token_index);
-                const name = self.source[name_span.start..name_span.end];
+                const name = parameterName(self.ast, self.source, parameter);
                 if (try self.analysis_context.resolveLocalConflict(name) != null)
                     return self.rejectIssue(.{ .span = name_span, .kind = .duplicate_parameter });
                 const annotation = parameter.data.parameter.annotation.unwrap().?;
@@ -374,6 +381,8 @@ fn Analyzer(comptime AnalysisServices: type) type {
 
         fn typeValue(self: *@This(), node_index: structures.Node.Index, unsupported_kind: structures.Diagnostic.Kind) anyerror!structures.TypeId {
             const node = self.ast.nodes[node_index.index()];
+            if (node.tag == .nominal_case) return self.analysis_context.nominalCaseType(node_index);
+            if (node.tag == .nominal_self) return self.analysis_context.nominalSelfType();
             if (node.tag == .reference_type) return self.reject(node_index, unsupported_kind);
             if (node.tag == .implicit_type) return .type;
             if (node.tag == .unit_literal) return .unit;
@@ -436,7 +445,10 @@ fn Analyzer(comptime AnalysisServices: type) type {
             std.debug.assert(members.items.len >= 1);
             if (node.tag == .type_tuple or node.tag == .tuple_literal) return self.analysis_context.facts().internTuple(members.items);
 
-            return self.analysis_context.facts().internVariantMembers(members.items);
+            const variant = try self.analysis_context.facts().internVariantMembers(members.items);
+            if (containsNominalCases(self.ast, node_index))
+                try self.analysis_context.validateNominalVariant(variant, nodeFocusSpan(self.ast, node_index));
+            return variant;
         }
 
         fn typeOfValue(self: *@This(), node_index: structures.Node.Index, value_id: structures.CompileTimeValueId) !structures.TypeId {
@@ -450,6 +462,8 @@ fn Analyzer(comptime AnalysisServices: type) type {
             const binding = self.ast.nodes[declaration];
             std.debug.assert(binding.tag == .static_binding);
             const initializer = binding.data.node_node.b.unwrap() orelse unreachable;
+            if (binding.data.node_node.a == .null and containsNominalCases(self.ast, initializer))
+                return .{ .type_value = try self.typeValue(initializer, .static_initializer_not_supported) };
             const annotation = binding.data.node_node.a.unwrap() orelse return .{ .interpret = null };
             if (isMetaTypeAnnotation(self.ast, self.source, annotation)) {
                 return .{ .type_value = try self.typeValue(initializer, .static_initializer_not_supported) };
@@ -461,6 +475,8 @@ fn Analyzer(comptime AnalysisServices: type) type {
 
         pub fn analyzeStructDefinition(self: *@This(), item_id: structures.ItemId, declaration: u32) !structures.StructDefinition {
             const binding = self.ast.nodes[declaration];
+            if (binding.tag == .nominal_case)
+                return self.analyzeNominalCase(@fromBackingInt(declaration));
             std.debug.assert(binding.tag == .static_binding);
             const initializer = binding.data.node_node.b.unwrap() orelse unreachable;
             if (binding.data.node_node.a.unwrap()) |annotation| {
@@ -471,7 +487,24 @@ fn Analyzer(comptime AnalysisServices: type) type {
         }
 
         pub fn analyzeGeneratedStructDefinition(self: *@This(), struct_index: structures.Node.Index, identity: structures.GeneratedStructIdentity) !structures.StructDefinition {
+            if (self.ast.nodes[struct_index.index()].tag == .nominal_case)
+                return self.analyzeNominalCase(struct_index);
             return self.analyzeStructMembers(struct_index, .{ .generated = identity });
+        }
+
+        fn analyzeNominalCase(self: *@This(), index: structures.Node.Index) !structures.StructDefinition {
+            const payload_node = self.ast.nodeList(index)[0];
+            const payload = try self.typeValue(payload_node, .local_type_not_supported);
+            const capabilities = (try self.analysis_context.facts().ownershipCapabilities(payload)) orelse return error.Unavailable;
+            if (capabilities.copy == .none) return self.reject(payload_node, .{ .nominal_payload_not_copyable = payload });
+            const is_public = try self.analysis_context.nominalDeclarationIsPublic();
+            if (is_public and !try self.analysis_context.isPublicNominalPayload(payload))
+                return self.reject(payload_node, .public_variant_private_type);
+            const name = try self.gpa.dupe(u8, "");
+            errdefer self.gpa.free(name);
+            const fields = try self.gpa.alloc(structures.StructField, 1);
+            fields[0] = .{ .name = name, .type_id = payload, .is_public = is_public, .span = nodeFocusSpan(self.ast, payload_node) };
+            return .{ .fields = fields, .ownership = .{ .copy = .{ .capability = .fieldwise, .span = nodeFocusSpan(self.ast, index) } } };
         }
 
         fn analyzeStructMembers(self: *@This(), struct_index: structures.Node.Index, identity: structures.StructIdentity) !structures.StructDefinition {
@@ -916,7 +949,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             for (parameters) |parameter_index| {
                 const parameter = self.ast.nodes[parameter_index.index()];
                 const span = self.ast.tokenSpan(parameter.token_index);
-                const name = self.source[span.start..span.end];
+                const name = parameterName(self.ast, self.source, parameter);
                 if (parameterMode(parameter).? == .static) {
                     const value_id = (try self.analysis_context.resolveStatic(name)) orelse unreachable;
                     try self.declare(name, switch (try self.analysis_context.lookupCompileTimeValue(value_id)) {
@@ -1313,6 +1346,8 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .none_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .none } else .none),
                 .type, .implicit_type, .type_func, .type_tuple, .reference_type => return self.appendTypeValue(index),
                 .type_variant => return self.appendPipe(index),
+                .nominal_case => return self.appendTypeValue(index),
+                .nominal_payload => return self.appendNominalPayload(index),
                 .comptime_expr => return self.appendComptime(index),
                 .call => return self.appendCall(index),
                 .panic_expr => return self.appendPanic(index),
@@ -1448,23 +1483,53 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .{ .inferred = reference.?.declaration }
             else
                 .{ .concrete = try self.analyzeTypeOrReject(parts[0], .local_type_not_supported) };
+            const positional = parts.len == 1 or self.ast.nodes[parts[1].index()].tag == .struct_init_positional;
+            const definition = if (target == .concrete and positional)
+                try self.analysis_context.facts().structDefinition(target.concrete)
+            else
+                null;
+            const anonymous_payload = if (definition) |shape| shape.anonymousPayload() else null;
+            if (anonymous_payload) |payload| {
+                if (parts.len > 2 or (parts.len == 2 and self.ast.nodes[parts[1].index()].tag != .struct_init_positional))
+                    return self.reject(index, .invalid_nominal_initializer);
+                if (parts.len == 1 and payload != .unit and payload != .none)
+                    return self.reject(index, .invalid_nominal_initializer);
+            }
             const scratch_start = self.scratch.items.len;
             defer self.scratch.shrinkRetainingCapacity(scratch_start);
             for (parts[1..]) |field_index| {
                 const field = self.ast.nodes[field_index.index()];
-                std.debug.assert(field.tag == .struct_init_field);
+                if (field.tag == .struct_init_positional and anonymous_payload == null)
+                    return self.reject(field_index, .positional_initializer_not_nominal);
+                std.debug.assert(field.tag == .struct_init_field or field.tag == .struct_init_positional);
                 try self.scratch.append(self.gpa, try self.appendUse(field.data.node, false));
             }
             const start: u32 = @intCast(self.struct_field_values.items.len);
             for (parts[1..], self.scratch.items[scratch_start..]) |field_index, value| {
                 const name_span = self.ast.tokenSpan(self.ast.nodes[field_index.index()].token_index);
-                try self.struct_field_values.append(self.gpa, .{ .name = self.source[name_span.start..name_span.end], .name_span = name_span, .value = value });
+                const name = if (self.ast.nodes[field_index.index()].tag == .struct_init_positional) "" else self.source[name_span.start..name_span.end];
+                try self.struct_field_values.append(self.gpa, .{ .name = name, .name_span = name_span, .value = value });
             }
+            if (anonymous_payload) |payload| if (parts.len == 1) {
+                try self.struct_field_values.append(self.gpa, .{
+                    .name = "",
+                    .name_span = nodeFocusSpan(self.ast, index),
+                    .value = .{ .value = try self.appendExpression(index, if (payload == .unit) .unit else .none), .span = nodeFocusSpan(self.ast, index) },
+                });
+            };
             return self.appendExpression(index, .{ .struct_init = .{
                 .target = target,
                 .type_span = nodeFocusSpan(self.ast, parts[0]),
                 .fields = .{ .start = start, .end = @intCast(self.struct_field_values.items.len) },
             } });
+        }
+
+        fn appendNominalPayload(self: *Self, index: structures.Node.Index) !ValueId {
+            const operand = if (self.parameters.len == 0) static: {
+                const value = (try self.analysis_context.resolveStatic("$payload")) orelse return error.Unavailable;
+                break :static try self.appendCompileTimeValue(index, (try self.analysis_context.lookupCompileTimeValue(value)).runtime);
+            } else @as(ValueId, @fromBackingInt(0));
+            return self.appendExpression(index, .{ .field_access = .{ .operand = .{ .value = operand, .span = nodeFocusSpan(self.ast, index) }, .name = "" } });
         }
 
         fn namedExpression(self: *Self, index: structures.Node.Index) !?structures.NameReference {
@@ -1686,6 +1751,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
         }
 
         fn appendPipe(self: *Self, index: structures.Node.Index) !ValueId {
+            if (containsNominalCases(self.ast, index)) return self.appendTypeValue(index);
             const members = self.ast.nodeList(index);
             var left = try self.appendUse(members[0], true);
             for (members[1..]) |member| {
@@ -2297,7 +2363,7 @@ pub fn analyzeFunctionShape(ast: *const structures.Ast, source: []const u8, decl
         const mode = parameterMode(parameter) orelse
             return .{ .unsupported = issueAt(ast, parameter_index.index(), .parameter_mode_not_supported) };
         const name_span = ast.tokenSpan(parameter.token_index);
-        const name = source[name_span.start..name_span.end];
+        const name = parameterName(ast, source, parameter);
         if ((try names.getOrPut(name)).found_existing)
             return .{ .unsupported = .{ .span = name_span, .kind = .duplicate_parameter } };
         const annotation = parameter.data.parameter.annotation.unwrap() orelse
@@ -2542,7 +2608,7 @@ const ParameterScope = struct {
         for (self.parameters) |index| {
             const parameter = self.ast.nodes[index.index()];
             if ((parameterMode(parameter) == .static) != self.static_only) continue;
-            if (std.mem.eql(u8, name, tokenText(self.ast, self.source, parameter.token_index))) return true;
+            if (std.mem.eql(u8, name, parameterName(self.ast, self.source, parameter))) return true;
         }
         return false;
     }
@@ -2902,6 +2968,17 @@ const ItemDiscovery = struct {
             // Other declarations have their own discovery roots. In particular,
             // entry traversal must not claim members inside module declarations.
             if (index != declaration and node.tag == .static_binding) continue;
+            if (node.tag == .nominal_case) {
+                const parts = self.ast.nodeList(index);
+                const child = try self.appendItem(.structure, .{ .identifier = tokenText(self.ast, self.source, node.token_index) }, index.index(), self.items.items[parent].is_public, parent, null);
+                self.items.items[child].loc.is_nominal_case = true;
+                if (parts.len == 3) {
+                    _ = try self.appendItem(.function, .{ .identifier = "$payload" }, parts[1].index(), self.items.items[parent].is_public, child, null);
+                    _ = try self.appendItem(.function, .{ .identifier = "$static_payload" }, parts[2].index(), self.items.items[parent].is_public, child, null);
+                }
+                try pending.append(self.gpa, parts[0]);
+                continue;
+            }
             if (node.tag == .@"struct") {
                 const site = @as(i64, index.index()) - @as(i64, declaration.index());
                 try self.discoverStructItems(index, parent, site);
@@ -2959,6 +3036,14 @@ const ItemDiscovery = struct {
         return index;
     }
 };
+
+fn containsNominalCases(ast: *const structures.Ast, index: structures.Node.Index) bool {
+    const node = ast.nodes[index.index()];
+    if (node.tag == .nominal_case) return true;
+    if (node.tag != .type_variant and node.tag != .type_tuple and node.tag != .tuple_literal) return false;
+    for (ast.nodeList(index)) |member| if (containsNominalCases(ast, member)) return true;
+    return false;
+}
 
 test "unresolved function body cleans up every allocation failure" {
     if (!@import("test_options").allocation_failures) return error.SkipZigTest;
@@ -3118,6 +3203,19 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
 }
 
 const TestAnalysisContext = struct {
+    pub fn nominalCaseType(_: @This(), _: structures.Node.Index) !structures.TypeId {
+        unreachable;
+    }
+    pub fn nominalSelfType(_: @This()) !structures.TypeId {
+        unreachable;
+    }
+    pub fn nominalDeclarationIsPublic(_: @This()) !bool {
+        return false;
+    }
+    pub fn isPublicNominalPayload(_: @This(), _: structures.TypeId) !bool {
+        return true;
+    }
+    pub fn validateNominalVariant(_: @This(), _: structures.TypeId, _: structures.SourceSpan) !void {}
     pub fn staticBindings(_: @This()) ![]const structures.StaticBinding {
         return &.{};
     }

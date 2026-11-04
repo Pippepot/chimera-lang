@@ -220,6 +220,10 @@ pub const Node = struct {
         struct_property,
         struct_init,
         struct_init_field,
+        struct_init_positional,
+        nominal_case,
+        nominal_self,
+        nominal_payload,
         type,
         implicit_type,
         type_func,
@@ -259,13 +263,13 @@ pub const Node = struct {
 
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
         return switch (self.tag) {
-            .break_nothing, .continue_expr, .return_nothing, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type => .none,
-            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .bit_not, .from_end, .reference_type, .move_expr, .propagate_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .@"pub", .collection_spread => .node,
+            .break_nothing, .continue_expr, .return_nothing, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type, .nominal_self, .nominal_payload => .none,
+            .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .bit_not, .from_end, .reference_type, .move_expr, .propagate_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .struct_init_positional, .@"pub", .collection_spread => .node,
             .add, .sub, .mul, .div, .rem, .bit_and, .bit_xor, .shift_left, .shift_right, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .membership, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .bit_and_assign, .bit_or_assign, .bit_xor_assign, .shift_left_assign, .shift_right_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .binding_else, .func, .type_func, .@"if", .collection_if, .match_arm, .match_guard => .node_node,
             .param => .parameter,
             .struct_field => .field,
             .signature => .signature,
-            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .collection_literal, .tuple_literal, .binding_tuple, .binding_sequence, .import, .selective_import, .overload, .match_expr, .match_tuple, .catch_expr => .ref,
+            .block, .for_loop, .collection_for, .call_arg_list, .param_list, .type_list, .type_variant, .type_tuple, .where_clauses, .if_else, .@"struct", .struct_init, .nominal_case, .collection_literal, .tuple_literal, .binding_tuple, .binding_sequence, .import, .selective_import, .overload, .match_expr, .match_tuple, .catch_expr => .ref,
             else => null,
         };
     }
@@ -545,6 +549,7 @@ pub const ItemLoc = struct {
     owner: ?ItemId = null,
     source_site: ?i64 = null,
     is_hook: bool = false,
+    is_nominal_case: bool = false,
     kind: ItemKind,
     name: Name,
 
@@ -909,7 +914,7 @@ pub const TypeLayout = struct { byte_size: u32, byte_alignment: u32 };
 
 pub const ArgumentPassing = enum { direct, indirect };
 
-pub const VariantLayout = struct { layout: TypeLayout, payload_offset: u32 };
+pub const VariantLayout = struct { layout: TypeLayout, payload_offset: u32, tag_size: u32 };
 
 pub const StructField = struct {
     name: []const u8,
@@ -926,6 +931,11 @@ pub const StructDefinition = struct {
     is_error: bool = false,
 
     pub const ResolvedField = struct { index: u32, type_id: TypeId };
+
+    pub fn anonymousPayload(self: StructDefinition) ?TypeId {
+        if (self.fields.len != 1 or self.fields[0].name.len != 0) return null;
+        return self.fields[0].type_id;
+    }
 
     pub fn resolveField(self: StructDefinition, name: []const u8) ?ResolvedField {
         for (self.fields, 0..) |field, index| {
@@ -1900,6 +1910,11 @@ pub const Diagnostic = struct {
         .overload_requires_callable_context = "an overload reference requires a function-type annotation",
         .struct_member_not_supported = "struct bodies support fields, namespace declarations, and `move`, `copy`, `drop`, or `error` properties",
         .duplicate_struct_member = Message{ .text = "struct member is already declared", .source_label = true },
+        .duplicate_nominal_case = Message{ .text = "nominal case is already declared", .source_label = true },
+        .ambiguous_nominal_case = Message{ .text = "nominal case name is ambiguous; qualify its original variant", .source_label = true },
+        .nominal_case_requires_declaration = "a nominal case requires an enclosing named declaration",
+        .nominal_payload_not_copyable = TypeMessage{ .prefix = "nominal case payload must support copy; found " },
+        .public_variant_private_type = "a public variant cannot expose private alternatives or payload types",
         .reserved_ownership_member = Message{ .text = "`copy` and `move` are reserved for ownership capabilities", .source_label = true },
         .duplicate_struct_property = Message{ .text = "struct property is already declared", .source_label = true },
         .invalid_error_property = "the `error` property requires a Boolean literal",
@@ -1996,6 +2011,8 @@ pub const Diagnostic = struct {
         .struct_initializer_not_struct = TypeMessage{ .prefix = "only a struct type can be initialized with `{...}`; found " },
         .unknown_struct_field = Message{ .text = "unknown struct field", .source_label = true },
         .duplicate_struct_initializer_field = Message{ .text = "struct field is initialized more than once", .source_label = true },
+        .invalid_nominal_initializer = "a nominal case requires one positional payload initializer, or `{}` for unit or none",
+        .positional_initializer_not_nominal = "positional brace initialization requires a nominal case",
         .missing_struct_initializer_field = struct { type_id: TypeId, field_index: u32 },
         .struct_initializer_field_type_mismatch = MismatchMessage{ .prefix = "struct field initializer type mismatch: " },
         .field_access_not_struct = TypeMessage{ .prefix = "field access requires a struct value, found " },

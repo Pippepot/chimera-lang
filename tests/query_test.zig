@@ -3473,8 +3473,8 @@ test "host type layout reports size and alignment for variants" {
     const first_layout = try db.get(queries.HostTypeLayout, unit_or_none);
     try testing.expectEqual(
         structures.TypeLayout{
-            .byte_size = 4,
-            .byte_alignment = 4,
+            .byte_size = 1,
+            .byte_alignment = 1,
         },
         first_layout.*,
     );

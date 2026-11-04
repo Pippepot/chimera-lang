@@ -1027,7 +1027,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 .storage_cursor => |operation| try self.emitStorageCursor(operation, destination),
                 .cursor_offset, .cursor_element => |operation| try self.emitCursorElement(operation, destination),
                 .byte_to_int => |operand| try self.emitUnary(.byte, operand, null, destination),
-                .variant_tag => |operand| try self.emitUnary(.dword, operand, null, destination),
+                .variant_tag => |operand| try self.emitVariantTag(operand, destination),
                 .negi => |operand| try self.emitUnary(.dword, operand, .neg_eax, destination),
                 inline .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands, operation| try self.emitIntegerBinary(operation, operands, destination),
                 .function_ref => |reference| try self.emitFunctionReference(reference, destination),
@@ -1524,11 +1524,11 @@ fn FunctionEmitter(comptime Types: type) type {
             const members = (try self.types.facts().variantMembers(operation.result_type)).?;
             try self.storeNumeric(target, destination, layout.payload_offset);
             try self.encoder.immediate(.mov_eax, @intCast(std.mem.indexOfScalar(structures.TypeId, members, operation.destination_type).?));
-            try self.storeComponent(.dword, destination, 0);
+            try self.storeComponent(variantTagWidth(layout), destination, 0);
             const done = try self.encoder.patchable(.jmp);
             for (failures.items) |field| try self.encoder.patchHere(field);
             try self.encoder.immediate(.mov_eax, @intCast(std.mem.indexOfScalar(structures.TypeId, members, .none).?));
-            try self.storeComponent(.dword, destination, 0);
+            try self.storeComponent(variantTagWidth(layout), destination, 0);
             try self.encoder.patchHere(done);
         }
 
@@ -2038,6 +2038,21 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.storeResult(destination);
         }
 
+        fn loadVariantTag(self: *Self, type_id: structures.TypeId, source: ValueLocation) !void {
+            const layout = try self.types.variantLayout(type_id);
+            const width = variantTagWidth(layout);
+            try self.loadComponent(width, source, 0);
+            if (source == .register or source == .eax) {
+                if (width == .byte) try self.encoder.emit(.movzx_eax_al);
+                if (width == .word) try self.encoder.emit(.movzx_eax_ax);
+            }
+        }
+
+        fn emitVariantTag(self: *Self, operand: structures.FunctionValueId, destination: ValueLocation) !void {
+            try self.loadVariantTag(self.valueType(operand), self.valueLocation(operand));
+            try self.storeResult(destination);
+        }
+
         fn emitUseToMemory(self: *Self, use: structures.FunctionValueUse, offset: u32) !void {
             const target_type = use.coerce_to orelse self.valueType(use.value);
             try self.emitUse(use, target_type, .{ .stack = offset });
@@ -2079,11 +2094,11 @@ fn FunctionEmitter(comptime Types: type) type {
             if (actual_members == null) {
                 _ = (try self.types.facts().variantMembers(target_type)) orelse unreachable;
                 std.debug.assert(tag_mapping.len == 1);
-                const target_payload_offset = (try self.types.variantLayout(target_type)).payload_offset;
+                const target_layout = try self.types.variantLayout(target_type);
                 const actual_layout = try self.types.layout(actual_type);
-                try self.copyRange(source, 0, .{ .value = destination }, target_payload_offset, actual_layout.byte_size);
+                try self.copyRange(source, 0, .{ .value = destination }, target_layout.payload_offset, actual_layout.byte_size);
                 try self.encoder.immediate(.mov_eax, std.math.cast(i32, tag_mapping[0]) orelse return error.FunctionTooLarge);
-                try self.storeComponent(.dword, destination, 0);
+                try self.storeComponent(variantTagWidth(target_layout), destination, 0);
                 return;
             }
 
@@ -2101,9 +2116,9 @@ fn FunctionEmitter(comptime Types: type) type {
             const target_layout = try self.types.variantLayout(target_type);
             const target_payload_size = target_layout.layout.byte_size - target_layout.payload_offset;
             try self.copyRange(source, actual_payload_offset, .{ .value = destination }, target_layout.payload_offset, @min(actual_payload_size, target_payload_size));
-            try self.loadComponent(.dword, source, 0);
+            try self.loadVariantTag(actual_type, source);
             try self.remapVariantTag(tag_mapping);
-            try self.storeComponent(.dword, destination, 0);
+            try self.storeComponent(variantTagWidth(target_layout), destination, 0);
         }
 
         fn remapVariantTag(self: *Self, tag_mapping: []const u32) !void {
@@ -2675,19 +2690,25 @@ fn signatureLayout(types: anytype, signature: structures.FunctionSignature, gpa:
     return CallLayout.init(types, signature.return_type, parameters, gpa);
 }
 
-const OptionalReturn = struct { tag: u32, payload: u32, present: i32, absent: i32 };
+// Zero existing tag padding so full-width register reads need no mask.
+fn variantTagWidth(layout: structures.VariantLayout) Width {
+    return .ofBytes(@min(4, layout.payload_offset));
+}
+
+const OptionalReturn = struct { tag: u32, payload: u32, tag_width: Width, present: i32, absent: i32 };
 
 fn optionalReturn(types: anytype, type_id: structures.TypeId) !OptionalReturn {
     const members = (try types.facts().variantMembers(type_id)).?;
     std.debug.assert(members.len == 2);
     const absent = std.mem.indexOfScalar(structures.TypeId, members, .none).?;
     const layout = try types.variantLayout(type_id);
-    return .{ .tag = 8, .payload = 8 + layout.payload_offset, .present = @intCast(1 - absent), .absent = @intCast(absent) };
+    std.debug.assert(layout.tag_size == 1);
+    return .{ .tag = 8, .payload = 8 + layout.payload_offset, .tag_width = variantTagWidth(layout), .present = @intCast(1 - absent), .absent = @intCast(absent) };
 }
 
 fn emitOptionalReturn(encoder: *Encoder, result: OptionalReturn, present: bool) !void {
     try encoder.immediate(.mov_eax, if (present) result.present else result.absent);
-    try encoder.offset(.mov_rsp_eax, result.tag);
+    try encoder.offset(result.tag_width.select(&store_rsp), result.tag);
     try encoder.emit(.ret);
 }
 
