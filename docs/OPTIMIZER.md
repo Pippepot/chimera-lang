@@ -35,6 +35,9 @@ instruction tags. Unreferenced side-table entries are inert.
 
 Plain values are immutable. Indirectly passed parameters alias argument storage,
 so block merging substitutes them rather than treating them as snapshots.
+Cursor construction, offsets, and element-address results are immutable address
+snapshots. Copy elimination may share those addresses; reads through them still
+observe mutable pointees. Static strings are immutable snapshots too.
 Logical type, addressability, move capability, and argument passing remain
 independent. Addressable values require private, unwritten storage before a
 rewrite can alias them as immutable snapshots.
@@ -123,6 +126,7 @@ function and invalidate on relevant operand, value, replacement, or CFG mutation
 Reachability, reverse postorder, incoming edges, dominators, and tree intervals
 are computed lazily. Only promotion needs dominance frontiers. Value rewrites,
 parameter edits, and motion preserve CFG analyses; edge and block changes do not.
+Canonical loop membership and latch facts use the same invalidation boundary.
 Incoming edges retain source block and ordinal, never mutable-array pointers.
 Any back edge reaches a block that does not follow its source in reverse
 postorder, so graphs without such an edge need no loop analysis and one
@@ -178,6 +182,11 @@ contents, immutable values, and unknown roots. Distinct slots do not alias, nor
 does allocation contents alias a stack slot. Private slots cannot be modified
 through escaped references. Address-taken results and block parameters remain
 mutable roots even when their producing instruction is a plain value.
+Independent top-level fields of a private slot have separate write resources;
+whole-slot writes overlap every field. Variant payload projections discard
+field separation, and parameter/heap aliasing remains conservative. Local load
+numbering invalidates overlapping reads rather than clearing every read after
+each known write. Unknown calls retain conservative invalidation.
 
 Numbering needs roots and address-taking facts; hoisting additionally needs
 exposure. Hoist only invariant pure instructions or reads untouched by loop
@@ -199,6 +208,10 @@ value. Redundant merge parameters disappear when all incoming values agree,
 including unchanged backedges. Variant joins can pass a common injected payload
 and rebuild the variant only for remaining users. Immutable struct joins preserve
 common fields without inventing relationships between changing fields.
+Aggregate joins consumed only by unaddressed field reads split into their used
+direct fields when every incoming aggregate supplies stable snapshots. Unchanged
+backedges forward the new field parameters independently. Whole-value, borrowed,
+and exposed uses preserve ordinary aggregate storage.
 
 Mixed variants used only by tags and primitive payload reads may split into tag
 and scalar parameters. Inactive scalar payloads use valid zero values; aggregate,
@@ -241,6 +254,12 @@ checked constant-offset starts, nonzero constant strides, invariant bounds, and
 strict/inclusive exits. Proved-safe latch arithmetic becomes modular only when
 the widened range includes its final update. Fill/move
 uses `0 <= start <= end` guards and retains the original loop as its fallback.
+Single-block terminal equality fills include the bound, using `end - start + 1`
+elements and forwarding each independent modular initialization count by that
+many steps. Exit arguments retain both current and updated counter values.
+The inclusive count must fit a signed integer; unproved ordering or count bounds
+use runtime guards with the original loop as fallback. Checked carried updates
+remain until their overflow has been ruled out by range analysis.
 
 Integer exits may follow a flag test inside the loop body when their staying
 edge dominates the latch and the proof site. Counter matching follows
@@ -288,6 +307,21 @@ Ranges intersect dominating predicates only where one successor dominates
 the proof site; a guard on one path through a join is insufficient. Body proofs
 combine numeric intervals with relationships to the same invariant limit.
 These are local proofs, not a general range solver or vectorizer.
+Dominating relational guards propagate bounds from another immutable value,
+using the same bounded interval derivation. A loop-stage sweep also removes
+dominated redundant predicates and proves checked arithmetic at its execution
+site. It removes edges in a batch before rebuilding analyses.
+Range queries memoize by value, block, derivation context, and depth for one
+analysis. Rebuilding the analysis discards these facts; cache allocation refusal
+falls back to ordinary derivation.
+
+Boolean entry parameters controlling a loop can select separate loop versions.
+The dispatch precedes either version, including empty-loop paths; effects and
+traps stay in their original iterations. Local definitions and edge arguments
+are cloned together, and unrepresented escaping loop values prevent versioning.
+All versions share a growth budget fixed from the original loop-stage body,
+so successive rewrites cannot multiply the permitted size. Computed invariant
+conditions remain unversioned pending a separate profitability case.
 
 ## Native Machine Stage
 
@@ -305,6 +339,10 @@ does not exclude the other three from the entire function.
 Eligible locals retain the backward-positioned-edge gate, except single-use
 scalar call results; repeated unaddressed scalar parameters are separate
 candidates with incoming ABI spill homes.
+Candidates include 32/64-bit integers, references, cursors, and function values.
+Wide ABI loads and copies preserve all bits, and high cursor fields extract
+their part of a register snapshot. Addressed storage and aggregate construction
+retain their ordinary memory representation.
 Temporaries allocate first, then parameters use spare caller-saved registers.
 Unallocated parameters need no entry load; addressed values retain storage.
 
@@ -315,7 +353,7 @@ insertion. Uninterrupted single-use accumulator store/reload pairs coalesce befo
 allocation, retaining 32-bit zero-extension when upper bits can be observed.
 Labels, other uses, and intervening instructions prevent this rewrite.
 
-Frames finalize after allocation. Unused private spill homes disappear; retained
+Frames finalize after allocation. Private homes without emitted accesses disappear; retained
 objects keep alignment and internal offsets. Explicit machine stack accesses pin
 their slots regardless of virtual register allocation. Incoming accesses, initializer
 captures, and panic-trace frame sizes relocate together. Only used preserved
@@ -372,6 +410,12 @@ preserves narrowing writes in coalesced copies; wide or unknown definitions keep
 the explicit extension. Cursor offsets retain signed extension.
 Final branch relocation bypasses edge stubs whose copies encode to nothing, while
 retaining every actual write and preserving jump cycles.
+Single-use dereference/copy pairs read or write the pointee directly. A consumed,
+unaddressed private snapshot may supply a same-size wrapper or first-field
+snapshot's storage, avoiding redundant aggregate copies. Variable 32-bit stores
+can use indexed register/stack addressing; spilled bases and live scratch retain
+ordinary lowering. Terminal nonreturning blocks follow normal blocks so error
+handling does not interrupt loop bodies. Calls retain their source trace sites.
 Allocated results load directly into their assigned registers; spilled result
 stores remain explicit. Bounds and numeric traps are unchanged.
 

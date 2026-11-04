@@ -81,8 +81,12 @@ pub fn bounds(context: anytype, value: ValueId, depth: u32) Interval {
     const function = context.function;
     const resolved = function.find(value);
     if (!context.trusted(resolved)) return .{};
-    const range = structure(context, resolved, depth) orelse context.leaf(resolved, depth) orelse return context.narrow(resolved, .{});
-    return context.narrow(resolved, range);
+    // Guards cannot refine an immutable literal on a reachable path.
+    if (function.constantInt(resolved)) |number| return Interval.point(number);
+    if (@hasDecl(@TypeOf(context), "cached")) if (context.cached(resolved, depth)) |range| return range;
+    const range = context.narrow(resolved, structure(context, resolved, depth) orelse context.leaf(resolved, depth) orelse .{}, depth);
+    if (@hasDecl(@TypeOf(context), "remember")) context.remember(resolved, depth, range);
+    return range;
 }
 
 /// The unclamped result of an integer `+ - *` over its operands' bounds.

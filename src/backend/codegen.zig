@@ -290,6 +290,23 @@ const LocationPlan = struct {
         return .{ .indirect = try reserveLocalStack(local_end, slots, gpa, indirect_layout) };
     }
 
+    /// A consumed private snapshot can supply the storage of a wrapper or a
+    /// whole-size field read. Its bytes and observable storage identity agree.
+    fn consumedSnapshot(ssa: *const structures.FunctionBodyAnalysis, types: anytype, instruction: structures.FunctionInstruction, index: usize, locations: []const ValueLocation, value_types: []const structures.TypeId, uses: []const Usage, addressable: []const bool) !?ValueLocation {
+        if (addressable[index]) return null;
+        const source = switch (instruction) {
+            .aggregate => |aggregate| if (aggregate.fields.end - aggregate.fields.start == 1) ssa.aggregate_fields[aggregate.fields.start] else return null,
+            .field_access => |field| if (field.field_index == 0) field.operand else return null,
+            else => return null,
+        };
+        const from = @backingInt(source);
+        if (from >= index or uses[from] != .used or addressable[from] or locations[from] != .stack) return null;
+        const source_layout = try types.layout(value_types[from]);
+        const target_layout = try types.layout(value_types[index]);
+        if (source_layout.byte_size != target_layout.byte_size) return null;
+        return locations[from];
+    }
+
     fn init(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator) !LocationPlan {
         const needed = try gpa.alloc(Usage, ssa.valueCount());
         errdefer gpa.free(needed);
@@ -420,6 +437,8 @@ const LocationPlan = struct {
                 if (needed[value_index] == .unused and
                     (instruction != .call or try types.facts().argumentPassing(value_types[value_index]) != .indirect))
                     break :location_blk .discarded;
+                if (try consumedSnapshot(ssa, types, instruction, value_index, locations, value_types, needed, addressable)) |shared|
+                    break :location_blk shared;
                 const layout = try valueSlotLayout(types, value_types[value_index]);
                 if (needed[value_index] == .returned and value_types[value_index] == .int and !addressable[value_index]) {
                     break :location_blk .eax;
@@ -442,7 +461,7 @@ const LocationPlan = struct {
                 if (needed[index] != .unused) locations[index] = .{ .indirect = try reserveLocalStack(&local_end, &stack_slots, gpa, indirect_layout) };
             }
         }
-        const spills = try promoteRegisters(ssa, gpa, locations, value_types, addressable, needed);
+        const spills = try promoteRegisters(ssa, types, gpa, locations, value_types, addressable, needed);
         errdefer gpa.free(spills);
         var allocation_bases: []bool = &.{};
         errdefer gpa.free(allocation_bases);
@@ -505,7 +524,16 @@ const LocationPlan = struct {
         };
     }
 
-    fn promoteRegisters(ssa: *const structures.FunctionBodyAnalysis, gpa: std.mem.Allocator, locations: []ValueLocation, types: []const structures.TypeId, addressable: []const bool, uses: []const Usage) ![]u32 {
+    fn registerScalar(types: anytype, type_id: structures.TypeId) !bool {
+        if (type_id == .bool) return true;
+        if (type_id.numericType()) |numeric| return !numeric.isFloat() and (numeric.width() == 32 or numeric.width() == 64);
+        if (type_id.isPrimitive()) return false;
+        return try types.facts().borrowElement(type_id) != null or
+            try types.facts().storageCursorAccess(type_id) != null or
+            try types.facts().callable(type_id) != null;
+    }
+
+    fn promoteRegisters(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator, locations: []ValueLocation, value_types: []const structures.TypeId, addressable: []const bool, uses: []const Usage) ![]u32 {
         const promote_locals = for (ssa.blocks, 0..) |block, index| {
             var terminator = block.terminator;
             for (terminator.successors()) |successor| if (successor) |target| {
@@ -516,8 +544,8 @@ const LocationPlan = struct {
         const entry = ssa.blocks[@backingInt(ssa.entry)];
         var spills: []u32 = &.{};
         errdefer gpa.free(spills);
-        for (locations, types, addressable, 0..) |*location, type_id, taken, index| {
-            if (taken or (type_id != .int and type_id != .bool)) continue;
+        for (locations, value_types, addressable, 0..) |*location, type_id, taken, index| {
+            if (taken) continue;
             const parameter = index >= entry.argument_start and index < entry.argument_end;
             if (parameter) {
                 if (ssa.is_initializer_region or uses[index] != .shared) continue;
@@ -533,7 +561,9 @@ const LocationPlan = struct {
             } else {
                 const instruction = ssa.instructions[index - ssa.block_arguments.len];
                 if (instruction == .storage_projection or instruction == .local_storage or instruction == .initializer_ref) continue;
+                if (instruction == .aggregate) continue;
             }
+            if (!try registerScalar(types, type_id)) continue;
             if (spills.len == 0) {
                 spills = try gpa.alloc(u32, locations.len);
                 @memset(spills, 0);
@@ -567,17 +597,7 @@ const FrameLayout = struct {
     fn init(plan: *const LocationPlan, ssa: *const structures.FunctionBodyAnalysis, stream: *const machine.Function, allocation: registers.Allocation, gpa: std.mem.Allocator) !FrameLayout {
         const slots = try gpa.alloc(Slot, plan.stack_slots.len);
         errdefer gpa.free(slots);
-        for (plan.stack_slots, slots) |original, *slot| slot.* = .{ .original = original, .relocated = original.offset };
-        for (plan.locations, 0..) |location, index| {
-            if (location != .register) continue;
-            const offset = plan.spills[index];
-            if (offset >= plan.stack_size) continue;
-            const position = std.sort.upperBound(Slot, slots, offset, compareOffset);
-            std.debug.assert(position != 0);
-            const slot = &slots[position - 1];
-            std.debug.assert(slot.original.offset == offset);
-            slot.relocated = null;
-        }
+        for (plan.stack_slots, slots) |original, *slot| slot.* = .{ .original = original, .relocated = null };
         for (stream.instructions.items) |instruction| {
             if (instruction == .fixed and x86.hasStackOffset(instruction.fixed.operation) and instruction.fixed.bits < plan.stack_size) {
                 const position = std.sort.upperBound(Slot, slots, @as(u32, @intCast(instruction.fixed.bits)), compareOffset);
@@ -691,6 +711,20 @@ fn emissionOrder(ssa: *const structures.FunctionBodyAnalysis, allocator: std.mem
     }
     std.debug.assert(count == order.len);
     std.debug.assert(order[0] == ssa.entry);
+    // Preserve reverse postorder among normal blocks while moving terminal
+    // failure/exit blocks away from loop bodies. Entry must stay first.
+    var warm: usize = 1;
+    var cold: usize = 0;
+    for (order[1..]) |block| {
+        if (ssa.blocks[@backingInt(block)].terminator == .diverge) {
+            stack[cold].block = block;
+            cold += 1;
+        } else {
+            order[warm] = block;
+            warm += 1;
+        }
+    }
+    for (stack[0..cold], order[warm..]) |frame, *block| block.* = frame.block;
     placeLoopTestsAfterBodies(ssa, order);
     return order;
 }
@@ -815,7 +849,11 @@ fn FunctionEmitter(comptime Types: type) type {
                 for (entry.argument_start..entry.argument_end) |index| {
                     const location = self.plan.locations[index];
                     if (location != .register) continue;
-                    try stream.instructions.append(self.gpa, .{ .parameter = .{ .value = location.register, .offset = self.plan.spills[index] } });
+                    try stream.instructions.append(self.gpa, .{ .parameter = .{
+                        .value = location.register,
+                        .offset = self.plan.spills[index],
+                        .wide = (try self.types.layout(self.valueType(@fromBackingInt(@intCast(index))))).byte_size == 8,
+                    } });
                 }
             }
             const order = try emissionOrder(ssa, self.gpa);
@@ -883,7 +921,7 @@ fn FunctionEmitter(comptime Types: type) type {
                     try self.encoder.scratchDead();
                     continue;
                 }
-                if ((ssa.instructions[instruction_index] == .allocation_element or ssa.instructions[instruction_index] == .array_element) and
+                if ((ssa.instructions[instruction_index] == .allocation_element or ssa.instructions[instruction_index] == .array_element or ssa.instructions[instruction_index] == .borrow_read) and
                     try self.emitElementCopy(instruction_index, block.instruction_end))
                 {
                     instruction_index += 1;
@@ -918,6 +956,7 @@ fn FunctionEmitter(comptime Types: type) type {
             switch (self.ssa.instructions[index]) {
                 .allocation_element => |element| try self.emitAllocationElementAddress(element),
                 .array_element => |element| try self.emitElementAddress(self.valueLocation(element.array), true, element.index, element.type_id, .element),
+                .borrow_read => |read| try self.loadAddress(self.valueLocation(read.source)),
                 else => unreachable,
             }
             const width = Width.ofBytes(size);
@@ -1976,9 +2015,14 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn storeAddress(self: *Self, location: ValueLocation) !void {
             switch (location) {
-                .stack, .return_buffer => |offset| try self.encoder.offset(.mov_rsp_rax, offset),
+                .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(.mov_rsp_rax, offset),
+                .register => |register| try self.encoder.register(.store_rax, register),
+                .indirect => |offset| {
+                    try self.encoder.offset(.mov_rdi_rsp, offset);
+                    try self.encoder.offset(.mov_rdi_rax_offset, 0);
+                },
                 .discarded => {},
-                .immediate, .eax, .register, .incoming_argument, .indirect => unreachable,
+                .immediate, .eax => unreachable,
             }
         }
 
@@ -2166,6 +2210,19 @@ fn FunctionEmitter(comptime Types: type) type {
         fn copyRange(self: *Self, source: ValueLocation, source_start: u32, destination: CopyDestination, destination_start: u32, byte_size: u32) !void {
             if (byte_size == 0) return;
             if (destination == .value and destination.value == .discarded) return;
+            if (destination == .value and source_start == destination_start and std.meta.eql(source, destination.value)) return;
+            if (byte_size == @sizeOf(u64) and (source == .register or (destination == .value and destination.value == .register))) {
+                if (destination == .reference) {
+                    try self.loadAddress(destination.reference);
+                    try self.encoder.emit(.mov_rdi_rax);
+                }
+                try self.loadComponent(.qword, source, source_start);
+                switch (destination) {
+                    .value => |location| try self.storeComponent(.qword, location, destination_start),
+                    .reference => try self.encoder.offset(.mov_rdi_rax_offset, destination_start),
+                }
+                return;
+            }
             if (byte_size > @sizeOf(u32)) return self.copyMemoryRange(source, source_start, destination, destination_start, byte_size);
             if (destination == .reference) {
                 try self.loadAddress(destination.reference);
@@ -2237,18 +2294,18 @@ fn FunctionEmitter(comptime Types: type) type {
         }
 
         fn loadComponent(self: *Self, width: Width, location: ValueLocation, component_offset: u32) !void {
-            std.debug.assert(width != .qword);
             switch (location) {
                 .immediate => |value| try self.encoder.immediate(.mov_eax, immediateComponent(width, value, component_offset)),
                 .eax => std.debug.assert(component_offset == 0),
                 .register => |register| {
-                    std.debug.assert(component_offset == 0);
-                    try self.encoder.register(.load_eax, register);
+                    std.debug.assert(component_offset + width.bytes() <= 8);
+                    try self.encoder.register(if (width == .qword or component_offset != 0) .load_rax else .load_eax, register);
+                    if (component_offset != 0) try self.encoder.byteImmediate(.shr_rax, @intCast(component_offset * 8));
                 },
                 .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(width.select(&load_rsp), std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
                 .indirect => |offset| {
                     try self.encoder.offset(.mov_rax_rsp, offset);
-                    try self.encoder.offset(width.select(&.{ .movzx_eax_rax, .movzx_eax_word_rax, .mov_eax_rax }), component_offset);
+                    try self.encoder.offset(width.select(&.{ .movzx_eax_rax, .movzx_eax_word_rax, .mov_eax_rax, .mov_rax_rax_offset }), component_offset);
                 },
                 .discarded => unreachable,
             }
@@ -2260,7 +2317,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 .eax => std.debug.assert(component_offset == 0),
                 .register => |register| {
                     std.debug.assert(component_offset == 0);
-                    try self.encoder.register(.store_eax, register);
+                    try self.encoder.register(if (width == .qword) .store_rax else .store_eax, register);
                 },
                 .discarded => {},
                 .immediate => unreachable,

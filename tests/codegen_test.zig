@@ -127,6 +127,68 @@ test "machine parameter loads disappear when the ABI home is retained" {
     }
 }
 
+test "machine wide parameter homes retain high bits and cannot supply narrow indices" {
+    var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+    defer function.deinit();
+    try function.instructions.append(std.testing.allocator, .{ .parameter = .{ .value = @fromBackingInt(0), .offset = 128, .wide = true } });
+    try function.register(.load_eax, @fromBackingInt(0), 0);
+    try function.emit(.mov_ecx_eax);
+    try function.offset(.lea_rax_rsp, 16);
+    try function.emit(.lea_rax_rax_rcx_4);
+    try function.offset(.mov_eax_rax, 0);
+    try function.register(.store_eax, @fromBackingInt(1), 0);
+    try function.instructions.append(std.testing.allocator, .scratch_dead);
+    var encoded = try function.encode(&.{ .r8, .r9 }, &.{ 128, 136 }, &.{});
+    defer encoded.deinit(std.testing.allocator);
+    try std.testing.expectEqualSlices(u8, &.{ 0x4c, 0x8b, 0x84, 0x24, 128, 0, 0, 0, 0x44, 0x89, 0xc1 }, encoded.code.items[0..11]);
+}
+
+test "machine indexed variable stores retain spills labels and live address scratch" {
+    for (0..6) |mode| {
+        var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
+        defer function.deinit();
+        if (mode == 1) {
+            try function.offset(.lea_rax_rsp, 128);
+        } else try function.register(.load_rax, @fromBackingInt(0), 0);
+        try function.emit(.lea_rax_rax_rcx_4);
+        try function.emit(.mov_rdi_rax);
+        if (mode == 4) _ = try function.position();
+        try function.register(.load_eax, @fromBackingInt(1), 0);
+        try function.offset(.mov_rdi_eax, 0);
+        if (mode != 5) try function.instructions.append(std.testing.allocator, .scratch_dead);
+        var encoded = try function.encode(&.{ if (mode == 3) null else .rbx, if (mode == 2) null else .r8 }, &.{ 256, 264 }, &.{});
+        defer encoded.deinit(std.testing.allocator);
+        const listing = try test_sources.disasm.disassemble(encoded.code.items, std.testing.allocator);
+        defer std.testing.allocator.free(listing);
+        try std.testing.expect(std.mem.indexOf(u8, listing, "  db ") == null);
+        if (mode == 0) try std.testing.expectEqualSlices(u8, &.{ 0x44, 0x89, 0x04, 0x8b }, encoded.code.items);
+        if (mode == 1) try std.testing.expectEqualSlices(u8, &.{ 0x44, 0x89, 0x84, 0x8c, 128, 0, 0, 0 }, encoded.code.items);
+        if (mode == 2) try std.testing.expectEqualStrings("  mov eax, [rsp+264]\n  mov [rbx+rcx*4], eax\n", listing);
+        if (mode >= 3) try std.testing.expect(std.mem.indexOf(u8, listing, "lea rax, [rax+rcx*4]") != null);
+    }
+}
+
+test "wide loop registers preserve variant payloads calls and outgoing snapshots" {
+    const program =
+        \\func identity(value: u64) u64 -> value
+        \\func calculate(value: u64, limit: int) u64 | none
+        \\    var total = value
+        \\    for index in 0..limit
+        \\        total = wrapping(total + identity(value))
+        \\    return total
+        \\func run() int
+        \\    const result = calculate(4294967303, 5)
+        \\    if not (result is u64) -> return 90
+        \\    if result <> 25769803818 -> return 91
+        \\    return wrap(int, result)
+    ;
+    try test_sources.SourceFixture.expectParity(program, 42);
+    const fixture = try test_sources.SourceFixture.init(program ++ "\nexit(run())");
+    defer fixture.deinit();
+    try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+}
+
 test "machine parameter caching does not displace local values" {
     for ([_]usize{ 4, 10 }) |local_count| {
         var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };

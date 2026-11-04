@@ -111,7 +111,7 @@ const Rules = struct {
             .variant_extract => |operation| return self.simplifyVariantExtract(operation, result),
             .compare => |operation| return self.simplifyCompare(instruction, operation, result),
             .borrow_write => |operation| return self.simplifyBorrowWrite(instruction, operation),
-            .select => |operation| return self.simplifySelect(operation, result),
+            .select => |operation| return self.simplifySelect(instruction, operation, result),
             .call => |*call| return self.simplifyCall(call),
             else => return false,
         }
@@ -464,10 +464,19 @@ const Rules = struct {
         return true;
     }
 
-    fn simplifySelect(self: *Rules, operation: structures.SelectOperation, result: ValueId) bool {
+    fn simplifySelect(self: *Rules, instruction: *Instruction, operation: structures.SelectOperation, result: ValueId) bool {
         if (operation.then_value == operation.else_value) return self.alias(result, operation.then_value);
-        const condition = self.function.constantBool(operation.condition) orelse return false;
-        return self.alias(result, if (condition) operation.then_value else operation.else_value);
+        if (self.function.constantBool(operation.condition)) |condition|
+            return self.alias(result, if (condition) operation.then_value else operation.else_value);
+        if (operation.type_id != .bool) return false;
+        const when_true = self.function.constantBool(operation.then_value) orelse return false;
+        const when_false = self.function.constantBool(operation.else_value) orelse return false;
+        if (when_true and !when_false) return self.alias(result, operation.condition);
+        if (!when_true and when_false) {
+            instruction.* = .{ .compare = .{ .operation = .eqb, .operands = .{ .lhs = operation.condition, .rhs = operation.then_value } } };
+            return true;
+        }
+        return false;
     }
 
     fn alias(self: *Rules, result: ValueId, target: ValueId) bool {
@@ -490,7 +499,7 @@ const Structure = struct {
         return null;
     }
 
-    pub fn narrow(_: Structure, _: ValueId, range: ranges.Interval) ranges.Interval {
+    pub fn narrow(_: Structure, _: ValueId, range: ranges.Interval, _: u32) ranges.Interval {
         return range;
     }
 

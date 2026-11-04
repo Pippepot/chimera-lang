@@ -71,10 +71,12 @@ fn transformLoops(scratch: std.mem.Allocator, function: *Function, context: anyt
     // Store identities survive cleanup even when fallback latch blocks merge.
     // Keep them across rounds so bulk rewrites cannot version their fallback.
     var bulk_fallbacks: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    // All loop versions together may add at most the original loop-stage size.
+    var loop_growth = function.instructions.items.len + function.blocks.items.len;
     var needs_simplification = try measured(.optimization_hoist, hoisting.hoist, .{function});
     try check(function);
     while (true) {
-        const transformed = try measured(.optimization_idioms, idioms.transform, .{ function, context, callees, &bulk_fallbacks });
+        const transformed = try measured(.optimization_idioms, idioms.transform, .{ function, context, callees, &bulk_fallbacks, &loop_growth });
         try check(function);
         if (!needs_simplification and !transformed) break;
         try simplify(function, context, numbering_workspace, field_layouts, .loop_rewrite);

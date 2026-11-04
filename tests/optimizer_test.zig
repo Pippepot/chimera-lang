@@ -332,7 +332,8 @@ test "guarded dynamic loop ranges remove redundant checks for ascending strides"
         const fixture = try Fixture.init(program);
         defer fixture.deinit();
         const body = (try optimizedBody(fixture, "scan")).*.?;
-        try testing.expectEqual(@as(usize, 3), countPredicates(body));
+        try testing.expect(!hasConstant(body, -100));
+        try testing.expect(!hasConstant(body, -200));
     };
 }
 
@@ -526,7 +527,7 @@ test "loop rewrites compose and recompute range proofs after source edits" {
     try fixture.expectExit(0, 42);
     const recomputed = try optimizedBody(fixture, "scan");
     try testing.expect(original != recomputed);
-    try testing.expectEqual(@as(usize, 5), countPredicates(recomputed.*.?));
+    try testing.expectEqual(@as(usize, 3), countPredicates(recomputed.*.?));
 }
 
 test "carried exit rotation preserves empty and final range iterations" {
@@ -606,7 +607,7 @@ test "range engine proves counters carried beside a terminal range counter" {
     const fixture = try Fixture.init(program);
     defer fixture.deinit();
     const body = (try optimizedBody(fixture, "tally")).*.?;
-    try testing.expectEqual(@as(usize, 2), countChecked(body));
+    try testing.expectEqual(@as(usize, 1), countChecked(body));
     try testing.expectEqual(@as(usize, 1), count(body, &.{.select}));
 }
 
@@ -1047,6 +1048,161 @@ test "inlined element reads snapshot the value before later writes to the same s
     , 42);
 }
 
+test "cursor address copies preserve pointee snapshots mutation and incremental edits" {
+    const program =
+        \\func calculate(mut view: Span(int), index: int) int
+        \\    const saved = view[index]
+        \\    view[index] += 1
+        \\    return saved * 2 + view[index]
+        \\func run() int
+        \\    var values: Array(int, 2) = [10, 20]
+        \\    var view = values.span()
+        \\    return calculate(view, 0) + 11
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program ++ "\nexit(run())");
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "calculate")).*.?;
+    for (body.instructions) |instruction| {
+        if (instruction != .value_copy or instruction.value_copy.destination != null) continue;
+        const operand = @backingInt(instruction.value_copy.source);
+        if (operand < body.block_arguments.len) continue;
+        const producer = body.instructions[operand - body.block_arguments.len];
+        try testing.expect(producer != .cursor_element);
+        try testing.expect(producer != .cursor_offset);
+        try testing.expect(producer != .storage_cursor);
+    }
+    try fixture.expectExit(0, 42);
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, program ++ "\nexit(run())", "view[index] += 1", "view[index] += 2");
+    defer testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    try fixture.expectExit(0, 43);
+}
+
+test "cursor snapshots retain their backing across descriptor replacement" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var first: Array(int, 2) = [10, 11]
+        \\    var second: Array(int, 2) = [20, 21]
+        \\    var view = first.span()
+        \\    const saved = view
+        \\    var total = 0
+        \\    for index in 0..2
+        \\        total += saved[index]
+        \\        view = second.span()
+        \\    return total + view[0] + 1
+    , 42);
+}
+
+test "invariant boolean loop versions preserve calls empty loops and both polarities" {
+    const program =
+        \\func step(mut total: int, amount: int) -> total += amount
+        \\func calculate(enabled: bool, limit: int) int
+        \\    var total = 0
+        \\    for index in 0..limit
+        \\        if enabled -> step(total, index)
+        \\        else step(total, 2)
+        \\    return total
+        \\func opposite(enabled: bool, limit: int) int
+        \\    var total = 0
+        \\    for index in 0..limit
+        \\        if not enabled -> total += index
+        \\        else total += 2
+        \\    return total
+        \\func run() int
+        \\    return calculate(true, 5) + calculate(false, 5) + opposite(false, 5) + opposite(true, 5) + calculate(false, 0) + opposite(true, -1) + 2
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program ++ "\nexit(run())");
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+}
+
+test "dynamic relational guards preserve later overflow and skipped effects" {
+    const program =
+        \\func scan(first: int, limit: int) int
+        \\    if first < 0 or first > limit or limit > 8 -> return 0
+        \\    var values: Array(int, 8) = [1, 2, 3, 4, 5, 6, 7, 8]
+        \\    var total = 0
+        \\    for index in first..limit
+        \\        if index < first -> panic "impossible lower bound"
+        \\        if index >= limit -> panic "impossible upper bound"
+        \\        total += values[index]
+        \\    return total
+        \\func run() int -> scan(0, 8) + scan(3, 3) + scan(-1, 4) + 6
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(
+        \\func scan(first: int, limit: int) int
+        \\    var index = first
+        \\    var total = 0
+        \\    loop
+        \\        total += 1
+        \\        index += 1
+        \\        if index >= limit -> break
+        \\    return total
+        \\exit(scan(2147483647, 2147483647))
+    );
+    defer fixture.deinit();
+    try fixture.expectExit(0, 134);
+}
+
+test "aggregate joins split independent fields without changing snapshots" {
+    const program =
+        \\struct Pair
+        \\    copy = trivial
+        \\    pub number: int
+        \\    pub enabled: bool
+        \\func choose(flag: bool, number: int) Pair
+        \\    if flag -> return Pair{number = number, enabled = true}
+        \\    return Pair{number = number + 1, enabled = false}
+        \\func calculate(flag: bool, number: int) int
+        \\    const selected = choose(flag, number)
+        \\    var total = selected.number
+        \\    if selected.enabled -> total += 1
+        \\    return total
+        \\func run() int -> calculate(true, 20) + calculate(false, 20)
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "calculate")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{ .aggregate, .field_access }));
+}
+
+test "disjoint private field writes preserve reads while whole writes invalidate them" {
+    const program =
+        \\struct Pair
+        \\    copy = trivial
+        \\    pub first: int
+        \\    pub second: int
+        \\func inspect(ref pair: Pair) int -> pair.first
+        \\func replace(mut pair: Pair) -> pair = Pair{first = pair.first + 1, second = 0}
+        \\func stable(limit: int) int
+        \\    var pair = Pair{first = 10, second = 1}
+        \\    const observed = inspect(pair)
+        \\    var total = 0
+        \\    for index in 0..limit
+        \\        total += pair.first
+        \\        pair.second += 1
+        \\    return total + pair.second + observed - 2
+        \\func changing() int
+        \\    var pair = Pair{first = 10, second = 1}
+        \\    var total = 0
+        \\    for index in 0..2
+        \\        total += pair.first
+        \\        replace(pair)
+        \\    return total + pair.first
+        \\func run() int -> stable(3) + changing() - 33
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program ++ "\nexit(run())");
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
+}
+
 test "integer algebra shares width-correct identities across overflow modes" {
     for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "isize", "usize" }) |kind| {
         for ([_][]const u8{ "", "wrapping", "saturating" }) |mode| {
@@ -1342,6 +1498,129 @@ const pipeline_source =
     \\        _ -> ()
     \\    return 90
 ;
+
+test "rotated List filled loops become fills and preserve initialized lengths" {
+    for ([_]struct { element_type: []const u8, value: []const u8 }{
+        .{ .element_type = "int", .value = "7" },
+        .{ .element_type = "bool", .value = "true" },
+        .{ .element_type = "byte", .value = "255" },
+    }) |element| {
+        const program = try test_sources.renderTemplate(testing.allocator,
+            \\func calculate(length: int) int
+            \\    const value: $element_type = $value
+            \\    var values = List($element_type).filled(value, length)
+            \\    if not (values is List($element_type)) -> return 0
+            \\    if length == 0 -> return values.len()
+            \\    if values[0] <> value or values[length - 1] <> value -> return 90
+            \\    return values.len() + 14
+            \\func run() int -> calculate(-1) + calculate(0) + calculate(1) + calculate(13)
+        , element);
+        defer testing.allocator.free(program);
+        try Fixture.expectParity(program, 42);
+        const fixture = try Fixture.init(program);
+        defer fixture.deinit();
+        const body = (try optimizedBody(fixture, "calculate")).*.?;
+        try testing.expectEqual(@as(usize, 1), count(body, &.{.fill}));
+    }
+}
+
+test "terminal fills preserve nonzero starts and independent carried counts" {
+    const program =
+        \\import std.memory.{Allocation}
+        \\func calculate(first: int, last: int, initial: int) int
+        \\    if first < 0 or last > 8 or first > last -> return 0
+        \\    var values = Allocation(int).allocate(last + 1)
+        \\    if not (values is Allocation(int)) -> return 90
+        \\    var initialized = initial
+        \\    var index = first
+        \\    var finished = false
+        \\    loop
+        \\        if finished -> break
+        \\        values.unsafe_initialize(index, 3)
+        \\        initialized = wrapping(initialized + 1)
+        \\        if index == last -> finished = true else index = wrapping(index + 1)
+        \\    var result = wrapping(initialized + index)
+        \\    for position in first..=last
+        \\        result = wrapping(result + values.unsafe_take(position))
+        \\    values.deallocate()
+        \\    return result
+        \\func run() int
+        \\    if calculate(2, 4, 2147483646) <> -2147483634 -> return 90
+        \\    return calculate(2, 4, 5) + calculate(1, 1, 0) + calculate(0, 2, 2)
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "calculate")).*.?;
+    try testing.expectEqual(@as(usize, 1), count(body, &.{.fill}));
+}
+
+test "terminal fill overflow guard retains the signed maximum fallback" {
+    const program =
+        \\import std.memory.{Allocation}
+        \\func fillMaximum(bound: int) int
+        \\    var values = Allocation(int).allocate(4)
+        \\    if not (values is Allocation(int)) -> return 90
+        \\    var initialized = 0
+        \\    var index = 0
+        \\    var finished = false
+        \\    loop
+        \\        if finished -> break
+        \\        values.unsafe_initialize(index, 7)
+        \\        initialized = wrapping(initialized + 1)
+        \\        if index == bound -> finished = true else index = wrapping(index + 1)
+        \\    values.deallocate()
+        \\    return initialized
+        \\func run() int -> fillMaximum(3) + 38
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const guarded_body = (try optimizedBody(fixture, "fillMaximum")).*.?;
+    try testing.expectEqual(@as(usize, 1), count(guarded_body, &.{.fill}));
+    try testing.expect(hasConstant(guarded_body, std.math.maxInt(i32)));
+
+    // 2^31 elements do not fit a signed fill count. Compile this boundary
+    // without executing its unsafe writes beyond the small allocation.
+    const maximum = try std.mem.replaceOwned(u8, testing.allocator, program, "index == bound", "index == 2147483647");
+    defer testing.allocator.free(maximum);
+    try fixture.db.setInput(queries.SourceText, 0, maximum);
+    const body = (try optimizedBody(fixture, "fillMaximum")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{.fill}));
+    try testing.expectEqual(@as(usize, 1), count(body, &.{.allocation_element}));
+
+    // Starting at one fits exactly INT_MAX elements, so this adjacent case
+    // must become a fill even though the terminal index is still INT_MAX.
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, maximum, "var index = 0", "var index = 1");
+    defer testing.allocator.free(edited);
+    try fixture.db.setInput(queries.SourceText, 0, edited);
+    const fitting = (try optimizedBody(fixture, "fillMaximum")).*.?;
+    try testing.expectEqual(@as(usize, 1), count(fitting, &.{.fill}));
+    try fixture.db.setInput(queries.SourceText, 0, maximum);
+    const restored = (try optimizedBody(fixture, "fillMaximum")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(restored, &.{.fill}));
+}
+
+test "terminal fills retain carried increment panics" {
+    const fixture = try Fixture.init(
+        \\import std.memory.{Allocation}
+        \\func calculate(initial: int) int
+        \\    var values = Allocation(int).allocate(2)
+        \\    if not (values is Allocation(int)) -> return 90
+        \\    var initialized = initial
+        \\    for index in 0..2
+        \\        values.unsafe_initialize(index, 7)
+        \\        initialized += 1
+        \\    values.deallocate()
+        \\    return initialized
+        \\exit(calculate(2147483647))
+    );
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "calculate")).*.?;
+    try testing.expectEqual(@as(usize, 0), count(body, &.{.fill}));
+    try testing.expect(countChecked(body) != 0);
+    try fixture.expectExit(0, 134);
+}
 
 test "bulk loop fallbacks converge across simplification within bounded memory" {
     const program =

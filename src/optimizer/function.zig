@@ -68,6 +68,7 @@ pub const Function = struct {
     direct_types: std.HashMapUnmanaged(structures.TypeId, bool, TypeContext, 80) = .empty,
     classified_values: usize = 0,
     control_flow: ?Graph = null,
+    canonical_loops: ?[]const @import("loops.zig").Loop = null,
     operands_dirty: bool = false,
     address_taken: ?[]const bool = null,
     storage_possible: bool = true,
@@ -109,6 +110,7 @@ pub const Function = struct {
 
     pub fn invalidateControlFlow(self: *Function) void {
         self.control_flow = null;
+        self.canonical_loops = null;
         self.invalidateOperands();
     }
 
@@ -234,7 +236,8 @@ pub const Function = struct {
         return switch (self.definitions.items[@backingInt(value)]) {
             .argument => |argument| argument.data.representation == .value and (argument.block == self.entry or self.direct(argument.data.type_id)),
             .instruction => |index| switch (self.instructions.items[index]) {
-                .const_numeric, .numeric_binary, .numeric_unary, .numeric_convert, .const_int, .const_bool, .const_byte, .const_unit, .const_none, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .variant_tag, .field_access, .compare, .select, .aggregate, .function_ref, .borrow_address => true,
+                // Cursor operations snapshot an address, not the contents it points to.
+                .const_numeric, .numeric_binary, .numeric_unary, .numeric_convert, .const_int, .const_bool, .const_byte, .const_unit, .const_none, .const_static_string, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .variant_tag, .field_access, .compare, .select, .aggregate, .function_ref, .borrow_address, .const_storage_cursor, .storage_cursor, .cursor_offset, .cursor_element => true,
                 inline .value_copy, .call, .variant_coerce, .variant_extract => |operation| operation.destination == null,
                 else => false,
             },

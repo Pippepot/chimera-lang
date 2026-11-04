@@ -10,6 +10,7 @@ const Function = function_ir.Function;
 pub const Resource = union(enum) {
     immutable,
     slot: ValueId,
+    field: struct { slot: ValueId, index: u32 },
     parameter,
     heap,
     unknown,
@@ -38,7 +39,7 @@ pub const Stability = struct {
         const index = @backingInt(value);
         if (index >= memory.roots.address_taken.len or !memory.roots.address_taken[index]) return false;
         const root = memory.roots.root(value);
-        return root != .slot or memory.slotExposed(root.slot);
+        return if (Roots.slotOwner(root)) |slot| memory.slotExposed(slot) else true;
     }
 
     pub fn stable(self: *Stability, value: ValueId) !bool {
@@ -55,7 +56,8 @@ pub const Stability = struct {
         const index = @backingInt(value);
         if (index >= memory.roots.address_taken.len or !memory.roots.address_taken[index]) return true;
         const root = memory.roots.root(value);
-        return root == .slot and !memory.slotExposed(root.slot) and !self.writes.?.slots.contains(root.slot);
+        const slot = Roots.slotOwner(root) orelse return false;
+        return !memory.slotExposed(slot) and self.writes.?.preserves(memory, root);
     }
 };
 
@@ -69,29 +71,66 @@ pub const Roots = struct {
 
     pub fn root(self: *const Roots, value: ValueId) Resource {
         var current = value;
+        var field: ?u32 = null;
         for (0..64) |_| {
             switch (self.function.definitions.items[@backingInt(current)]) {
                 .argument => |argument| {
                     if (argument.block == self.function.entry) return .parameter;
-                    if (self.address_taken[@backingInt(current)]) return .{ .slot = current };
+                    if (self.address_taken[@backingInt(current)]) return slotResource(current, field);
                     return if (self.function.directParameter(current)) .immutable else .unknown;
                 },
                 .instruction => |index| switch (self.function.instructions.items[index]) {
-                    .local_storage => return .{ .slot = current },
+                    .local_storage => return slotResource(current, field),
                     .result_storage => return .parameter,
                     .storage_projection => |projection| switch (projection.projection) {
-                        .field, .variant => current = projection.owner,
+                        .field => |field_index| {
+                            field = field_index;
+                            current = projection.owner;
+                        },
+                        .variant => {
+                            field = null;
+                            current = projection.owner;
+                        },
                         .allocation_array => return .heap,
                     },
                     .array_element => |element| current = element.array,
                     .allocation_element => return .heap,
                     .cursor_element => return .unknown,
                     .borrow_read => |read| return self.referent(read.source),
-                    else => return if (self.address_taken[@backingInt(current)]) .{ .slot = current } else if (self.function.plainValue(current)) .immutable else .unknown,
+                    else => return if (self.address_taken[@backingInt(current)]) slotResource(current, field) else if (self.function.plainValue(current)) .immutable else .unknown,
                 },
             }
         }
         return .unknown;
+    }
+
+    fn slotResource(slot: ValueId, field: ?u32) Resource {
+        return if (field) |index| .{ .field = .{ .slot = slot, .index = index } } else .{ .slot = slot };
+    }
+
+    pub fn fieldResource(self: *const Roots, owner: ValueId, index: u32) Resource {
+        const resource = self.root(owner);
+        return if (resource == .slot) .{ .field = .{ .slot = resource.slot, .index = index } } else resource;
+    }
+
+    pub fn overlaps(first: Resource, second: Resource) bool {
+        if (first == .immutable or second == .immutable) return false;
+        if (first == .unknown or second == .unknown) return true;
+        const first_slot = slotOwner(first);
+        const second_slot = slotOwner(second);
+        if (first_slot != null or second_slot != null) {
+            if (first_slot == null or second_slot == null or first_slot.? != second_slot.?) return false;
+            return first != .field or second != .field or first.field.index == second.field.index;
+        }
+        return true;
+    }
+
+    pub fn slotOwner(resource: Resource) ?ValueId {
+        return switch (resource) {
+            .slot => |value| value,
+            .field => |value| value.slot,
+            else => null,
+        };
     }
 
     pub fn referent(self: *const Roots, reference: ValueId) Resource {
@@ -135,7 +174,7 @@ pub const Memory = struct {
 
     fn expose(self: *Memory, value: ValueId) void {
         const resource = self.roots.root(value);
-        if (resource == .slot) self.exposed[@backingInt(resource.slot)] = true;
+        if (Roots.slotOwner(resource)) |slot| self.exposed[@backingInt(slot)] = true;
     }
 
     pub fn slotExposed(self: *const Memory, slot: ValueId) bool {
@@ -145,6 +184,7 @@ pub const Memory = struct {
 
 pub const Writes = struct {
     slots: std.AutoHashMapUnmanaged(ValueId, void) = .empty,
+    fields: std.AutoHashMapUnmanaged(@FieldType(Resource, "field"), void) = .empty,
     parameter: bool = false,
     heap: bool = false,
     unknown: bool = false,
@@ -154,6 +194,7 @@ pub const Writes = struct {
         switch (resource) {
             .immutable => {},
             .slot => |slot| try self.slots.put(scratch, slot, {}),
+            .field => |field| try self.fields.put(scratch, field, {}),
             .parameter => self.parameter = true,
             .heap => self.heap = true,
             .unknown => self.unknown = true,
@@ -177,9 +218,18 @@ pub const Writes = struct {
     pub fn preserves(self: *const Writes, memory: *const Memory, resource: Resource) bool {
         return switch (resource) {
             .immutable => true,
-            .slot => |slot| !self.slots.contains(slot) and (!memory.slotExposed(slot) or !(self.unknown or self.call)),
+            .slot, .field => self.preservesSlot(memory, resource),
             .parameter, .heap => !(self.parameter or self.heap or self.unknown or self.call),
-            .unknown => !(self.parameter or self.heap or self.unknown or self.call) and self.slots.count() == 0,
+            .unknown => !(self.parameter or self.heap or self.unknown or self.call) and self.slots.count() == 0 and self.fields.count() == 0,
         };
+    }
+
+    fn preservesSlot(self: *const Writes, memory: *const Memory, resource: Resource) bool {
+        const slot = Roots.slotOwner(resource).?;
+        if (self.slots.contains(slot) or (memory.slotExposed(slot) and (self.unknown or self.call))) return false;
+        if (resource == .field) return !self.fields.contains(resource.field);
+        var fields = self.fields.keyIterator();
+        while (fields.next()) |field| if (field.slot == slot) return false;
+        return true;
     }
 };

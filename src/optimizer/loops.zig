@@ -30,12 +30,15 @@ pub const Analysis = struct {
     instruction_blocks: []const u32,
     instruction_positions: []const u32,
     address_taken: []const bool,
+    range_cache: *RangeCache,
     call_arguments: []const CallArgumentRange = &.{},
     pub const CallArgumentRange = struct {
         instruction: u32,
         value: ValueId,
         range: Interval,
     };
+
+    const RangeCache = std.AutoHashMapUnmanaged(u128, Interval);
 
     pub fn init(function: *Function, graph: Graph, found: []const Loop) !Analysis {
         const instruction_blocks = try function.scratch.alloc(u32, function.instructions.items.len);
@@ -46,6 +49,8 @@ pub const Analysis = struct {
             instruction_blocks[instruction] = @intCast(index);
             instruction_positions[instruction] = @intCast(position);
         };
+        const range_cache = try function.scratch.create(RangeCache);
+        range_cache.* = .empty;
         return .{
             .function = function,
             .graph = graph,
@@ -53,6 +58,7 @@ pub const Analysis = struct {
             .instruction_blocks = instruction_blocks,
             .instruction_positions = instruction_positions,
             .address_taken = try value_rules.addressTaken(function),
+            .range_cache = range_cache,
         };
     }
 
@@ -295,6 +301,63 @@ pub const Analysis = struct {
         return ranges.bounds(At{ .analysis = &self, .function = self.function, .block = at }, value, depth);
     }
 
+    pub fn arithmeticFitsAt(self: Analysis, operation: structures.NumericBinary, result: ValueId, at: u32) bool {
+        const exact = ranges.exact(At{ .analysis = &self, .function = self.function, .block = at, .derive_parameters = false }, operation, result, 16) orelse return false;
+        return exact.fits();
+    }
+
+    pub fn predicateAt(self: Analysis, operation: structures.PredicateOperation, operands: structures.BinaryOperands, at: u32) ?bool {
+        if (!self.immutable(operands.lhs) or !self.immutable(operands.rhs)) return null;
+        const integer = operation != .eqb and operation != .neb and operation != .eqt and operation != .net;
+        if (integer) {
+            if (self.integerConstant(operands.rhs)) |bound| {
+                const range = ranges.bounds(At{ .analysis = &self, .function = self.function, .block = at, .derive_parameters = false }, operands.lhs, 16);
+                if (range.known(operation, bound)) |known| return known;
+            }
+        }
+        var block = at;
+        while (block != self.function.entry) {
+            block = self.graph.dominator[block];
+            const predicate = self.pathPredicate(block, at, null) orelse continue;
+            if ((operation == .eqi or operation == .nei or !integer) and self.sameEquality(predicate.operands, operands)) {
+                if (predicate.operation == operation) return true;
+                if (predicate.operation == operation.negated()) return false;
+            }
+            if (!integer) continue;
+            const comparison = IntegerComparison.init(self.function, predicate.operation, predicate.operands, self.function.find(operands.lhs)) orelse continue;
+            if (self.function.find(comparison.other) != self.function.find(operands.rhs)) continue;
+            if (comparison.operation == operation) return true;
+            if (comparison.operation == operation.negated()) return false;
+            var relative: Interval = .{};
+            relative.refine(comparison.operation, 0);
+            if (relative.known(operation, 0)) |known| return known;
+        }
+        return null;
+    }
+
+    pub fn selectedAt(self: Analysis, selection: structures.SelectOperation, at: u32) ?ValueId {
+        const condition = self.function.find(selection.condition);
+        if (!self.immutable(condition)) return null;
+        const definition = self.function.definition(condition);
+        if (definition != null and definition.? == .compare) {
+            const comparison = definition.?.compare;
+            if (comparison.operation == .eqt or comparison.operation == .net) return null;
+            const taken = self.predicateAt(comparison.operation, comparison.operands, at) orelse return null;
+            return if (taken) selection.then_value else selection.else_value;
+        }
+        var block = at;
+        while (block != self.function.entry) {
+            block = self.graph.dominator[block];
+            const predicate = self.pathPredicate(block, at, null) orelse continue;
+            if (predicate.operation != .eqb and predicate.operation != .neb) continue;
+            if (self.function.find(predicate.operands.lhs) != condition) continue;
+            const expected = self.function.constantBool(predicate.operands.rhs) orelse continue;
+            const taken = expected == (predicate.operation == .eqb);
+            return if (taken) selection.then_value else selection.else_value;
+        }
+        return null;
+    }
+
     fn inductionRange(self: Analysis, value: ValueId, at: u32, depth: u32) ?Interval {
         if (depth == 0) return null;
         const parameter = self.function.find(value);
@@ -306,6 +369,7 @@ pub const Analysis = struct {
                 const exit = exitTestAt(self.function, loop, block) orelse continue;
                 if (!self.graph.dominates(exit.stay, at)) continue;
                 const counter = self.invariantInductionExit(loop, entry, exit, parameter) orelse continue;
+                if (counter.induction.terminal_bound == null and self.graph.incoming[exit.stay].items.len != 1) continue;
                 if (!self.immutable(counter.comparison.other)) continue;
                 const range = self.iterationRange(at, counter, depth - 1) orelse continue;
                 return range.absolute;
@@ -435,12 +499,29 @@ const At = struct {
     analysis: *const Analysis,
     function: *const Function,
     block: u32,
+    derive_parameters: bool = true,
+    relational: bool = true,
+
+    fn key(self: At, value: ValueId, depth: u32) u128 {
+        return @as(u128, @backingInt(value)) | (@as(u128, self.block) << 32) |
+            (@as(u128, depth) << 64) | (@as(u128, @intFromBool(self.derive_parameters)) << 96) |
+            (@as(u128, @intFromBool(self.relational)) << 97);
+    }
+
+    pub fn cached(self: At, value: ValueId, depth: u32) ?Interval {
+        return self.analysis.range_cache.get(self.key(value, depth));
+    }
+
+    pub fn remember(self: At, value: ValueId, depth: u32, range: Interval) void {
+        self.analysis.range_cache.put(self.function.scratch, self.key(value, depth), range) catch {};
+    }
 
     pub fn trusted(self: At, value: ValueId) bool {
         return self.analysis.immutable(value);
     }
 
     pub fn leaf(self: At, value: ValueId, depth: u32) ?Interval {
+        if (!self.derive_parameters) return null;
         const analysis = self.analysis;
         return switch (self.function.definitions.items[@backingInt(value)]) {
             .argument => analysis.inductionRange(value, self.block, depth) orelse analysis.parameterRange(value, null, depth, &.{}),
@@ -451,7 +532,7 @@ const At = struct {
         };
     }
 
-    pub fn narrow(self: At, value: ValueId, range: Interval) Interval {
+    pub fn narrow(self: At, value: ValueId, range: Interval, depth: u32) Interval {
         const analysis = self.analysis;
         var narrowed = range;
         var block = self.block;
@@ -459,7 +540,25 @@ const At = struct {
             block = analysis.graph.dominator[block];
             const predicate = analysis.pathPredicate(block, self.block, null) orelse continue;
             const comparison = IntegerComparison.init(self.function, predicate.operation, predicate.operands, value) orelse continue;
-            narrowed.refine(comparison.operation, analysis.integerConstant(comparison.other) orelse continue);
+            if (analysis.integerConstant(comparison.other)) |constant| {
+                narrowed.refine(comparison.operation, constant);
+                continue;
+            }
+            if (depth <= 1 or !self.relational) continue;
+            var bound_context = self;
+            bound_context.derive_parameters = false;
+            bound_context.relational = false;
+            const other = ranges.bounds(bound_context, comparison.other, depth - 1);
+            switch (comparison.operation) {
+                .lti, .lei => narrowed.refine(comparison.operation, other.upper),
+                .gti, .gei => narrowed.refine(comparison.operation, other.lower),
+                .eqi => {
+                    narrowed.lower = @max(narrowed.lower, other.lower);
+                    narrowed.upper = @min(narrowed.upper, other.upper);
+                },
+                .nei => if (other.lower == other.upper) narrowed.refine(.nei, other.lower),
+                else => unreachable,
+            }
         }
         return narrowed;
     }
@@ -634,9 +733,13 @@ fn deeperFirst(_: void, left: Loop, right: Loop) bool {
 /// membership of every other loop's latches intact, so one analysis serves the
 /// whole round, in the same order as repeating the analysis after each fix.
 pub fn canonicalLoops(function: *Function) ![]const Loop {
+    if (function.canonical_loops) |found| return found;
     const scratch = function.scratch;
     while (true) {
-        if (!(try function.controlFlowEdges()).cyclic) return &.{};
+        if (!(try function.controlFlowEdges()).cyclic) {
+            function.canonical_loops = &.{};
+            return &.{};
+        }
         const graph = (try function.controlFlow()).*;
         const loops = try find(scratch, function, graph);
         var changed = false;
@@ -644,7 +747,10 @@ pub fn canonicalLoops(function: *Function) ![]const Loop {
             changed = (try insertPreheader(function, graph, loop)) or changed;
             changed = (try mergeLatches(function, loop)) or changed;
         }
-        if (!changed) return loops;
+        if (!changed) {
+            function.canonical_loops = loops;
+            return loops;
+        }
     }
 }
 
@@ -800,6 +906,45 @@ fn expectBranch(function: *const Function, branch: structures.FunctionBranch, ta
     const actual = function.branchArguments(branch);
     try std.testing.expectEqual(arguments.len, actual.len);
     for (arguments, actual) |expected, found| try std.testing.expectEqualDeep(expected, found);
+}
+
+test "canonical loop facts survive value edits and refresh after an edge is removed" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var function: Function = .{
+        .scratch = arena.allocator(),
+        .return_type = .unit,
+        .is_initializer_region = false,
+        .parameter_modes = &.{},
+        .publishes_spans = false,
+        .root_instance = null,
+        .entry = 0,
+    };
+    const span: structures.SourceSpan = .{ .start = 0, .end = 0 };
+    for (0..4) |_| {
+        const block = try function.addBlock(.return_unit, span, .root);
+        try function.order.append(function.scratch, block);
+    }
+    const zero = try function.appendInstruction(0, .{ .const_int = 0 }, span, .root);
+    const limit = try function.appendInstruction(0, .{ .const_int = 10 }, span, .root);
+    const one = try function.appendInstruction(0, .{ .const_int = 1 }, span, .root);
+    const counter = try function.addParameter(1, .{ .type_id = .int });
+    const next = try function.appendInstruction(2, .{ .addi = .{ .lhs = counter, .rhs = one } }, span, .root);
+    const empty: structures.FunctionValueRange = .{ .start = 0, .end = 0 };
+    function.blocks.items[0].terminator = .{ .branch = .{ .target = @fromBackingInt(1), .arguments = try function.appendBranchArguments(&.{.{ .value = zero }}) } };
+    function.blocks.items[1].terminator = .{ .predicate_branch = .{
+        .operation = .lti,
+        .operands = .{ .lhs = counter, .rhs = limit },
+        .then_branch = .{ .target = @fromBackingInt(2), .arguments = empty },
+        .else_branch = .{ .target = @fromBackingInt(3), .arguments = empty },
+    } };
+    function.blocks.items[2].terminator = .{ .branch = .{ .target = @fromBackingInt(1), .arguments = try function.appendBranchArguments(&.{.{ .value = next }}) } };
+    try std.testing.expectEqual(@as(usize, 1), (try canonicalLoops(&function)).len);
+    _ = try function.appendInstruction(2, .{ .const_int = 7 }, span, .root);
+    try std.testing.expectEqual(@as(u32, 1), (try canonicalLoops(&function))[0].header);
+    function.blocks.items[2].terminator = .{ .branch = .{ .target = @fromBackingInt(3), .arguments = empty } };
+    function.invalidateControlFlow();
+    try std.testing.expectEqual(@as(usize, 0), (try canonicalLoops(&function)).len);
 }
 
 test "iteration ranges agree with wrapping executions at signed boundaries" {

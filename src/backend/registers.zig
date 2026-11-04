@@ -340,7 +340,15 @@ fn loopDepths(scratch: std.mem.Allocator, successors: []const [2]?u32) ![]u32 {
 // satisfy the complete expanded-stream liveness and fixed-register constraints.
 fn collectPreferences(allocator: std.mem.Allocator, instructions: []const machine.Instruction, mapping: []const ?u32, depth: []const u32, preferences: []std.ArrayList(Preference)) !void {
     for (instructions, 0..) |instruction, index| {
-        if (instruction != .register or instruction.register.operation != .load_eax) continue;
+        if (instruction != .register) continue;
+        if (instruction.register.operation == .load_rax) {
+            if (index + 2 >= instructions.len) continue;
+            if (instructions[index + 1] != .register or instructions[index + 1].register.operation != .store_rax) continue;
+            if (instructions[index + 2] != .scratch_dead) continue;
+            try prefer(allocator, mapping, preferences, instruction.register.value, instructions[index + 1].register.value, loopWeight(depth[index]));
+            continue;
+        }
+        if (instruction.register.operation != .load_eax) continue;
         if (index + 2 >= instructions.len) continue;
         const lhs = instruction.register.value;
         var destination = index + 1;

@@ -321,11 +321,101 @@ const ParameterSimplifier = struct {
                 if (!try self.stable(parameter) or !try self.stable(value)) continue;
                 function.replace(parameter, value);
             }
-            if (function.find(parameter) == parameter and !try self.selectParameter(block, position)) continue;
+            if (function.find(parameter) == parameter) {
+                if (try self.splitAggregate(block, position)) {
+                    changed = true;
+                    continue;
+                }
+                if (!try self.selectParameter(block, position)) continue;
+            }
             try function.removeParameter(block, position, self.incoming[block].items);
             changed = true;
         }
         return changed;
+    }
+
+    const FieldRead = struct { instruction: u32, field: u32 };
+    const CountUses = struct {
+        parameter: ValueId,
+        count: usize = 0,
+
+        fn visit(self: *CountUses, value: ValueId) void {
+            if (value == self.parameter) self.count += 1;
+        }
+    };
+
+    fn splitAggregate(self: *ParameterSimplifier, block: u32, position: usize) !bool {
+        const function = self.function;
+        const parameter = function.blocks.items[block].parameters.items[position];
+        if (function.valueType(parameter).isPrimitive() or (try self.addressTaken())[@backingInt(parameter)]) return false;
+        const edges = self.incoming[block].items;
+        var shape: ?structures.AggregateOperation = null;
+        for (edges) |edge| {
+            const argument = function.branchArguments(edge.branch(function).*)[position];
+            if (argument.coerce_to != null) return false;
+            const value = function.find(argument.value);
+            if (value == parameter) continue;
+            const definition = function.definition(value) orelse return false;
+            if (definition != .aggregate or !try self.stable(value)) return false;
+            shape = definition.aggregate;
+        }
+        const aggregate = shape orelse return false;
+        var reads: std.ArrayList(FieldRead) = .empty;
+        for (function.blocks.items) |*body| {
+            for (body.instructions.items) |index| {
+                if (function.removed.items[index]) continue;
+                const instruction = function.instructions.items[index];
+                var uses: CountUses = .{ .parameter = parameter };
+                function_ir.visitInstructionReferences(function, &instruction, &uses, CountUses.visit);
+                if (uses.count == 0) continue;
+                if (instruction != .field_access or uses.count != 1) return false;
+                if ((try self.addressTaken())[@backingInt(function.results.items[index])]) return false;
+                try reads.append(function.scratch, .{ .instruction = index, .field = instruction.field_access.field_index });
+            }
+            for (body.terminator.operands()) |operand| if (operand) |value| {
+                if (value.* == parameter) return false;
+            };
+            for (body.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
+                for (function.branchArguments(branch.*), 0..) |argument, index| {
+                    if (argument.value == parameter and (@backingInt(branch.target) != block or index != position or argument.coerce_to != null)) return false;
+                }
+            };
+        }
+        if (reads.items.len == 0) return false;
+        const fields = try function.scratch.alloc(?ValueId, aggregate.fields.end - aggregate.fields.start);
+        @memset(fields, null);
+        for (edges) |edge| {
+            const value = function.find(function.branchArguments(edge.branch(function).*)[position].value);
+            if (value == parameter) continue;
+            const source = function.definition(value).?.aggregate.fields;
+            for (reads.items) |read| {
+                const field = function.find(function.aggregate_fields.items[source.start + read.field]);
+                if (!function.direct(function.valueType(field)) or !try self.stable(field)) return false;
+            }
+        }
+        for (reads.items) |read| {
+            fields[read.field] = function.results.items[read.instruction];
+        }
+        for (fields) |*field| if (field.*) |read| {
+            field.* = try function.addParameter(block, .{ .type_id = function.valueType(read) });
+        };
+        var arguments: std.ArrayList(ValueId) = .empty;
+        for (edges) |edge| {
+            const branch = edge.branch(function);
+            const value = function.find(function.branchArguments(branch.*)[position].value);
+            arguments.clearRetainingCapacity();
+            for (fields, 0..) |field, index| if (field) |replacement| {
+                const source = if (value == parameter) replacement else function.aggregate_fields.items[function.definition(value).?.aggregate.fields.start + index];
+                try arguments.append(function.scratch, source);
+            };
+            branch.arguments = try function.copyBranchArguments(branch.arguments, arguments.items);
+        }
+        for (reads.items) |read| {
+            function.replace(function.results.items[read.instruction], fields[read.field].?);
+            function.removed.items[read.instruction] = true;
+        }
+        try function.removeParameter(block, position, edges);
+        return true;
     }
 
     const Arm = struct { fork: u32, ordinal: u1 };

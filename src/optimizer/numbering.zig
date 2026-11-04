@@ -155,7 +155,7 @@ pub fn number(function: *Function, workspace: *Workspace) !function_ir.Changes {
                         eliminate(function, index, entry.value_ptr.*, &changes);
                     } else entry.value_ptr.* = result;
                 },
-                .write => if (loads.count() != 0) loads.clearRetainingCapacity(),
+                .write => if (loads.count() != 0) invalidateLoads(loads, &roots, instruction),
                 .none => {},
             }
         }
@@ -182,7 +182,7 @@ const Kind = enum { pure, load, write, none };
 fn kind(roots: *const effects.Roots, instruction: Instruction) Kind {
     return switch (instruction) {
         .const_numeric, .numeric_binary, .numeric_unary, .numeric_convert, .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .compare, .select, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => .pure,
-        .field_access => |operation| read(roots, operation.operand),
+        .field_access => |operation| if (roots.fieldResource(operation.operand, operation.field_index) == .immutable) .pure else .load,
         .variant_tag => |operand| read(roots, operand),
         .value_copy => |copy| if (copy.destination == null) read(roots, copy.source) else .write,
         inline .variant_extract, .variant_coerce => |operation| if (operation.destination == null) read(roots, operation.operand) else .write,
@@ -194,6 +194,29 @@ fn kind(roots: *const effects.Roots, instruction: Instruction) Kind {
 
 fn read(roots: *const effects.Roots, value: ValueId) Kind {
     return if (roots.root(value) == .immutable) .pure else .load;
+}
+
+fn invalidateLoads(loads: *std.HashMapUnmanaged(Instruction, ValueId, Context, 80), roots: *const effects.Roots, instruction: Instruction) void {
+    const written: effects.Resource = switch (instruction) {
+        inline .value_copy, .variant_coerce, .variant_extract => |copy| roots.root(copy.destination.?),
+        .borrow_write => |write| roots.referent(write.reference),
+        .fill => |fill| roots.root(fill.first),
+        .move => |move| roots.root(move.destination),
+        else => .unknown,
+    };
+    if (written == .unknown) return loads.clearRetainingCapacity();
+    var entries = loads.keyIterator();
+    while (entries.next()) |key| {
+        const resource: effects.Resource = switch (key.*) {
+            .field_access => |field| roots.fieldResource(field.operand, field.field_index),
+            .value_copy => |copy| roots.root(copy.source),
+            .variant_extract, .variant_coerce => |operation| roots.root(operation.operand),
+            .variant_tag => |value| roots.root(value),
+            .allocation_element => |element| roots.root(element.allocation),
+            else => unreachable,
+        };
+        if (effects.Roots.overlaps(written, resource)) _ = loads.remove(key.*);
+    }
 }
 
 test "optimizer numbering reuses scratch capacity without retaining candidates" {
