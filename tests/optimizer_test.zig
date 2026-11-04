@@ -592,6 +592,39 @@ test "terminal range counters prove guarded array bounds and withdraw edited gua
     }
 }
 
+test "range engine proves counters carried beside a terminal range counter" {
+    const program =
+        \\func tally(limit: int) int
+        \\    if limit < 2 or limit == 2147483647 -> return 0
+        \\    var found = 0
+        \\    for number in 2..(limit + 1)
+        \\        if number % 2 == 0 -> found += 1
+        \\    return found
+        \\func run() int -> tally(10) + tally(1) + 37
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "tally")).*.?;
+    try testing.expectEqual(@as(usize, 2), countChecked(body));
+    try testing.expectEqual(@as(usize, 1), count(body, &.{.select}));
+}
+
+test "range engine keeps carried overflow reachable" {
+    const fixture = try Fixture.init(
+        \\func tally(start: int) int
+        \\    var found = start
+        \\    for number in 2..=20
+        \\        found += 1
+        \\    return found
+        \\exit(tally(2147483640))
+    );
+    defer fixture.deinit();
+    const body = (try optimizedBody(fixture, "tally")).*.?;
+    try testing.expect(countChecked(body) != 0);
+    try fixture.expectExit(0, 134);
+}
+
 test "carried exit rotation preserves a conditional backedge and its separate return" {
     const program =
         \\func scan(first: int, limit: int, empty: bool) int
@@ -1233,6 +1266,14 @@ test "promotion batches loop carried slots across bitset words" {
     const body = (try optimizedBody(fixture, "many")).*.?;
     try testing.expectEqual(@as(usize, 0), countLocalStorage(body, .int));
     try testing.expectEqual(@as(usize, 0), count(body, &.{.value_copy}));
+}
+
+fn countChecked(body: structures.FunctionBodyAnalysis) usize {
+    var total: usize = 0;
+    for (body.instructions) |instruction| {
+        if (instruction == .numeric_binary and instruction.numeric_binary.overflow == .checked) total += 1;
+    }
+    return total;
 }
 
 fn countCalls(body: structures.FunctionBodyAnalysis) usize {

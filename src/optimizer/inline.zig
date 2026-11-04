@@ -23,7 +23,7 @@ pub const Callee = struct {
 pub const Facts = struct {
     eligible: bool,
     entry_taken: []const bool = &.{},
-    normal_return_ranges: []const ?@import("loops.zig").IntegerRange = &.{},
+    normal_return_ranges: []const ?@import("ranges.zig").Interval = &.{},
 };
 
 /// Constants copied from callees live once in the entry block, which dominates
@@ -105,7 +105,7 @@ pub fn analyzeCallee(scratch: std.mem.Allocator, body: *const Body) !Facts {
     const loops = @import("loops.zig");
     const graph = (try function.controlFlow()).*;
     const analysis = try loops.Analysis.init(&function, graph, &.{});
-    const ranges = try scratch.alloc(?loops.IntegerRange, parameters.len);
+    const ranges = try scratch.alloc(?@import("ranges.zig").Interval, parameters.len);
     @memset(ranges, null);
     for (graph.order) |block| {
         switch (function.blocks.items[block].terminator) {

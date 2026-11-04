@@ -3,6 +3,9 @@ const structures = @import("../structures.zig");
 const function_ir = @import("function.zig");
 const graph_ir = @import("graph.zig");
 const value_rules = @import("canonicalize.zig");
+const ranges = @import("ranges.zig");
+
+const Interval = ranges.Interval;
 
 const ValueId = structures.FunctionValueId;
 const Function = function_ir.Function;
@@ -28,11 +31,10 @@ pub const Analysis = struct {
     instruction_positions: []const u32,
     address_taken: []const bool,
     call_arguments: []const CallArgumentRange = &.{},
-
     pub const CallArgumentRange = struct {
         instruction: u32,
         value: ValueId,
-        range: IntegerRange,
+        range: Interval,
     };
 
     pub fn init(function: *Function, graph: Graph, found: []const Loop) !Analysis {
@@ -289,21 +291,11 @@ pub const Analysis = struct {
         return source orelse resolved;
     }
 
-    pub fn rangeAt(self: Analysis, value: ValueId, at: u32, depth: u32) IntegerRange {
-        if (!self.immutable(value)) return .{};
-        if (self.integerConstant(value)) |number| return .{ .lower = number, .upper = number };
-        var range = self.inductionRange(value, at, depth) orelse self.parameterRange(value, depth, &.{}) orelse self.shiftedRange(value, at, depth);
-        var block = at;
-        while (block != self.function.entry) {
-            block = self.graph.dominator[block];
-            const predicate = self.pathPredicate(block, at, null) orelse continue;
-            const comparison = IntegerComparison.init(self.function, predicate.operation, predicate.operands, value) orelse continue;
-            range.refine(comparison.operation, self.integerConstant(comparison.other) orelse continue);
-        }
-        return range;
+    pub fn rangeAt(self: Analysis, value: ValueId, at: u32, depth: u32) Interval {
+        return ranges.bounds(At{ .analysis = &self, .function = self.function, .block = at }, value, depth);
     }
 
-    fn inductionRange(self: Analysis, value: ValueId, at: u32, depth: u32) ?IntegerRange {
+    fn inductionRange(self: Analysis, value: ValueId, at: u32, depth: u32) ?Interval {
         if (depth == 0) return null;
         const parameter = self.function.find(value);
         for (self.loops) |loop| {
@@ -322,7 +314,85 @@ pub const Analysis = struct {
         return null;
     }
 
-    fn parameterRange(self: Analysis, value: ValueId, depth: u32, visited: []const ValueId) ?IntegerRange {
+    /// Whether a checked add or subtract of a constant to a header parameter
+    /// cannot overflow. A parameter that changes by a bounded step per iteration
+    /// moves at most as far as the unit-stride `counter` has, which `travelled`
+    /// bounds at the operation.
+    pub fn shiftFits(self: Analysis, loop: Loop, entry: u32, counter: InductionExit, travelled: Interval, operation: structures.NumericBinary) bool {
+        if (operation.type_id != .int or operation.overflow != .checked) return false;
+        if (operation.operation != .add and operation.operation != .sub) return false;
+        const function = self.function;
+        const parameters = function.blocks.items[loop.header].parameters.items;
+        const lhs = function.find(operation.operands.lhs);
+        const rhs = function.find(operation.operands.rhs);
+        const parameter, const offset = if (std.mem.indexOfScalar(ValueId, parameters, lhs) != null)
+            .{ lhs, self.integerConstant(rhs) orelse return false }
+        else if (operation.operation == .add and std.mem.indexOfScalar(ValueId, parameters, rhs) != null)
+            .{ rhs, self.integerConstant(lhs) orelse return false }
+        else
+            return false;
+        var base = travelled;
+        if (parameter != counter.induction.parameter) {
+            if (counter.induction.step != 1 and counter.induction.step != -1) return false;
+            const position = std.mem.indexOfScalar(ValueId, parameters, parameter).?;
+            const back = function.branchArguments((function.branchTo(loop.latches[0], loop.header) orelse return false).*)[position];
+            const first = function.branchArguments(function.blocks.items[entry].terminator.branch)[position];
+            if (back.coerce_to != null or first.coerce_to != null) return false;
+            const step = self.change(loop, back.value, parameter, 16) orelse return false;
+            const start = self.rangeAt(first.value, entry, 16);
+            const iterations: i128 = travelled.upper - travelled.lower;
+            base = .{
+                .lower = @intCast(std.math.clamp(start.lower + iterations * @min(0, step.lower), std.math.minInt(i32), std.math.maxInt(i32))),
+                .upper = @intCast(std.math.clamp(start.upper + iterations * @max(0, step.upper), std.math.minInt(i32), std.math.maxInt(i32))),
+            };
+        }
+        const shift: i64 = if (operation.operation == .sub) -@as(i64, offset) else offset;
+        return Interval.fits(.{ .lower = base.lower + shift, .upper = base.upper + shift });
+    }
+
+    /// What one iteration adds to `parameter` along the value its latch forwards.
+    fn change(self: Analysis, loop: Loop, value: ValueId, parameter: ValueId, depth: u32) ?Interval {
+        if (depth == 0) return null;
+        const function = self.function;
+        const resolved = function.find(value);
+        if (resolved == parameter) return Interval.point(0);
+        if (!self.immutable(resolved)) return null;
+        switch (function.definitions.items[@backingInt(resolved)]) {
+            .argument => |argument| {
+                if (argument.block == loop.header or !loop.contains(argument.block)) return null;
+                const position = std.mem.indexOfScalar(ValueId, function.blocks.items[argument.block].parameters.items, resolved).?;
+                var joined: ?Interval = null;
+                for (self.graph.incoming[argument.block].items) |edge| {
+                    const use = function.branchArguments(edge.branch(function).*)[position];
+                    if (use.coerce_to != null or use.variant_tag_mapping != null) return null;
+                    const found = self.change(loop, use.value, parameter, depth - 1) orelse return null;
+                    joined = if (joined) |previous| previous.join(found) else found;
+                }
+                return joined;
+            },
+            .instruction => |index| {
+                const instruction = function.instructions.items[index];
+                if (instruction == .select) {
+                    const first = self.change(loop, instruction.select.then_value, parameter, depth - 1) orelse return null;
+                    return first.join(self.change(loop, instruction.select.else_value, parameter, depth - 1) orelse return null);
+                }
+                const update = Offset.init(instruction) orelse return null;
+                if (!update.checked) return null;
+                const operands = update.operands;
+                const offset = if (function.find(operands.lhs) == parameter)
+                    self.integerConstant(operands.rhs) orelse return null
+                else if (!update.subtract and function.find(operands.rhs) == parameter)
+                    self.integerConstant(operands.lhs) orelse return null
+                else
+                    return null;
+                return Interval.point(if (update.subtract) -@as(i64, offset) else offset);
+            },
+        }
+    }
+
+    /// The join over every edge into a block parameter, or over one field of the
+    /// aggregate each edge forwards.
+    fn parameterRange(self: Analysis, value: ValueId, field: ?u32, depth: u32, visited: []const ValueId) ?Interval {
         const resolved = self.function.find(value);
         if (std.mem.indexOfScalar(ValueId, visited, resolved) != null) return null;
         if (depth == 0) return .{};
@@ -336,47 +406,77 @@ pub const Analysis = struct {
         @memcpy(path[0..visited.len], visited);
         path[visited.len] = resolved;
         const position = std.mem.indexOfScalar(ValueId, self.function.blocks.items[block].parameters.items, resolved).?;
-        var range: ?IntegerRange = null;
+        var range: ?Interval = null;
         for (incoming) |edge| {
             const argument = self.function.branchArguments(edge.branch(self.function).*)[position];
             if (argument.coerce_to != null or argument.variant_tag_mapping != null) return .{};
-            const source = self.function.find(argument.value);
+            var source = self.function.find(argument.value);
             if (!self.immutable(source)) return .{};
+            if (field) |index| {
+                if (source == resolved) continue;
+                const aggregate = self.function.definition(source) orelse return .{};
+                if (aggregate != .aggregate) return .{};
+                source = self.function.find(self.function.aggregate_fields.items[aggregate.aggregate.fields.start + index]);
+            }
             const source_definition = self.function.definitions.items[@backingInt(source)];
             const found = if (source_definition == .argument and source_definition.argument.block != self.function.entry)
-                self.parameterRange(source, depth - 1, path[0 .. visited.len + 1]) orelse continue
+                self.parameterRange(source, field, depth - 1, path[0 .. visited.len + 1]) orelse continue
             else
                 self.rangeAt(source, edge.block, depth - 1);
-            if (range) |previous| {
-                range = .{ .lower = @min(previous.lower, found.lower), .upper = @max(previous.upper, found.upper) };
-            } else {
-                range = found;
-            }
+            range = if (range) |previous| previous.join(found) else found;
         }
         return range;
     }
+};
 
-    fn shiftedRange(self: Analysis, value: ValueId, at: u32, depth: u32) IntegerRange {
-        if (depth == 0) return .{};
-        const update = Offset.init(self.function.definition(self.function.find(value)) orelse return .{}) orelse return .{};
-        const operands = update.operands;
-        const offset = self.integerConstant(operands.rhs) orelse return .{};
-        const shift: i64 = if (update.subtract) -@as(i64, offset) else offset;
-        var base = self.rangeAt(operands.lhs, at, depth - 1);
-        const producer = self.function.instructionIndex(self.function.find(value)).?;
-        for (self.call_arguments) |argument| {
-            if (self.function.find(argument.value) != self.function.find(operands.lhs)) continue;
-            const call_block = self.instruction_blocks[argument.instruction];
-            const producer_block = self.instruction_blocks[producer];
-            if (!self.graph.dominates(call_block, producer_block)) continue;
-            if (call_block == producer_block and self.instruction_positions[argument.instruction] >= self.instruction_positions[producer]) continue;
-            base.lower = @max(base.lower, argument.range.lower);
-            base.upper = @min(base.upper, argument.range.upper);
+/// Range context at one block: guards that dominate it and facts from calls
+/// that returned normally narrow what definitions alone give.
+const At = struct {
+    analysis: *const Analysis,
+    function: *const Function,
+    block: u32,
+
+    pub fn trusted(self: At, value: ValueId) bool {
+        return self.analysis.immutable(value);
+    }
+
+    pub fn leaf(self: At, value: ValueId, depth: u32) ?Interval {
+        const analysis = self.analysis;
+        return switch (self.function.definitions.items[@backingInt(value)]) {
+            .argument => analysis.inductionRange(value, self.block, depth) orelse analysis.parameterRange(value, null, depth, &.{}),
+            .instruction => |index| switch (analysis.function.instructions.items[index]) {
+                .field_access => |access| analysis.parameterRange(access.operand, access.field_index, depth, &.{}),
+                else => null,
+            },
+        };
+    }
+
+    pub fn narrow(self: At, value: ValueId, range: Interval) Interval {
+        const analysis = self.analysis;
+        var narrowed = range;
+        var block = self.block;
+        while (block != self.function.entry) {
+            block = analysis.graph.dominator[block];
+            const predicate = analysis.pathPredicate(block, self.block, null) orelse continue;
+            const comparison = IntegerComparison.init(self.function, predicate.operation, predicate.operands, value) orelse continue;
+            narrowed.refine(comparison.operation, analysis.integerConstant(comparison.other) orelse continue);
         }
-        const lower = base.lower + shift;
-        const upper = base.upper + shift;
-        if (!update.checked and (lower < std.math.minInt(i32) or upper > std.math.maxInt(i32))) return .{};
-        return .{ .lower = @max(lower, std.math.minInt(i32)), .upper = @min(upper, std.math.maxInt(i32)) };
+        return narrowed;
+    }
+
+    pub fn facts(self: At, value: ValueId, range: Interval, user: ?ValueId) Interval {
+        const analysis = self.analysis;
+        const index = self.function.instructionIndex(user orelse return range) orelse return range;
+        var narrowed = range;
+        for (analysis.call_arguments) |argument| {
+            if (self.function.find(argument.value) != self.function.find(value)) continue;
+            const call_block = analysis.instruction_blocks[argument.instruction];
+            if (!analysis.graph.dominates(call_block, analysis.instruction_blocks[index])) continue;
+            if (call_block == analysis.instruction_blocks[index] and analysis.instruction_positions[argument.instruction] >= analysis.instruction_positions[index]) continue;
+            narrowed.lower = @max(narrowed.lower, argument.range.lower);
+            narrowed.upper = @min(narrowed.upper, argument.range.upper);
+        }
+        return narrowed;
     }
 };
 
@@ -461,46 +561,11 @@ pub const IntegerComparison = struct {
     }
 };
 
-pub const IntegerRange = struct {
-    lower: i64 = std.math.minInt(i32),
-    upper: i64 = std.math.maxInt(i32),
-
-    fn refine(self: *IntegerRange, operation: structures.PredicateOperation, bound: i64) void {
-        switch (operation) {
-            .lti => self.upper = @min(self.upper, bound - 1),
-            .lei => self.upper = @min(self.upper, bound),
-            .gti => self.lower = @max(self.lower, bound + 1),
-            .gei => self.lower = @max(self.lower, bound),
-            .eqi => {
-                self.lower = @max(self.lower, bound);
-                self.upper = @min(self.upper, bound);
-            },
-            .nei => {
-                if (self.lower == bound) self.lower += 1;
-                if (self.upper == bound) self.upper -= 1;
-            },
-            else => unreachable,
-        }
-    }
-
-    pub fn known(self: IntegerRange, operation: structures.PredicateOperation, bound: i64) ?bool {
-        return switch (operation) {
-            .lti => if (self.upper < bound) true else if (self.lower >= bound) false else null,
-            .lei => if (self.upper <= bound) true else if (self.lower > bound) false else null,
-            .gti => if (self.lower > bound) true else if (self.upper <= bound) false else null,
-            .gei => if (self.lower >= bound) true else if (self.upper < bound) false else null,
-            .eqi => if (self.lower == bound and self.upper == bound) true else if (bound < self.lower or bound > self.upper) false else null,
-            .nei => if (self.lower == bound and self.upper == bound) false else if (bound < self.lower or bound > self.upper) true else null,
-            else => unreachable,
-        };
-    }
-};
-
 const IterationRange = struct {
-    absolute: IntegerRange,
-    relative: IntegerRange,
+    absolute: Interval,
+    relative: Interval,
 
-    fn init(step: i32, operation: structures.PredicateOperation, start: IntegerRange, bound: IntegerRange) ?IterationRange {
+    fn init(step: i32, operation: structures.PredicateOperation, start: Interval, bound: Interval) ?IterationRange {
         var range = start;
         if (step > 0) {
             if (operation != .gei and operation != .gti) return null;
@@ -511,7 +576,7 @@ const IterationRange = struct {
             range.lower = bound.lower + @as(i64, @intFromBool(operation == .lei));
             if (range.lower + step < std.math.minInt(i32)) return null;
         } else return null;
-        var relative: IntegerRange = .{ .lower = range.lower - bound.upper, .upper = range.upper - bound.lower };
+        var relative: Interval = .{ .lower = range.lower - bound.upper, .upper = range.upper - bound.lower };
         relative.refine(operation.negated(), 0);
         return .{ .absolute = range, .relative = relative };
     }

@@ -81,6 +81,7 @@ optimize: (inline -> prepare passes)* -> hoist -> (loop idioms -> prepare passes
 | Value numbering | `numbering.zig` | Dominance, local memory reads |
 | Cleanup | `cleanup.zig` | Jump threading, block merging, selects |
 | Hoisting | `hoisting.zig` | Loops, resource reads and writes |
+| Ranges | `ranges.zig` | Intervals of successful integer results |
 | Loop idioms | `idioms.zig` | Counters, exits, proven ranges |
 | Compaction | `compaction.zig` | Liveness from users |
 
@@ -249,7 +250,13 @@ carried count after its checked increment, including across nested generation
 loops. Bounded derivation falls back to unknown when its budget is exhausted.
 Loop-invariant arithmetic may supply a bound without being hoisted or losing its
 trap; bulk-loop replacement still requires the bound to be defined outside.
-Offset derivation can also use a non-inlined callee's normal-return range when
+`ranges.zig` is the single interval engine: constants, copies, selects, and
+integer `+ - *` evaluate over their operands, and a context supplies what its
+analysis adds. Canonicalization supplies none, so a definition alone bounds a
+value; loops add induction ranges, joins of block parameters (including a field
+of a join of aggregates), dominating guards, and call facts. The same evaluator
+decides canonicalization's lowering of checked arithmetic and loop proofs.
+Arithmetic uses a non-inlined callee's normal-return range when
 the call dominates and precedes that arithmetic producer. Only immutable scalar
 arguments qualify. A later guard cannot justify removing an earlier trap, and
 an unguarded normal return withdraws the fact through ordinary query dependencies.
@@ -270,6 +277,12 @@ own dominating guard excludes that terminal value. This preserves inclusive
 iteration at signed endpoints and unconditional final-update panics. Ordered
 dynamic starts also follow dominating relational guards, allowing nested ranges
 to share an invariant limit.
+
+A checked add or subtract of a constant to a loop parameter that changes by a
+bounded checked step per iteration is also proven: the parameter moves at most
+as far as a unit-stride counter of the same loop, whose range bounds the
+iterations. Counts incremented beside a range counter therefore stay modular
+and let a conditional increment become a select.
 
 Ranges intersect dominating predicates only where one successor dominates
 the proof site; a guard on one path through a join is insufficient. Body proofs

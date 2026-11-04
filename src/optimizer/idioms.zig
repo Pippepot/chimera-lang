@@ -493,21 +493,28 @@ fn boundsChecks(function: *Function, analysis: *const loops.Analysis, loop: Loop
         for (loop.blocks) |block| {
             const test_result = loops.exitTestAt(function, loop, block) orelse continue;
             const counter = analysis.invariantInductionExit(loop, preheader, test_result, parameter) orelse continue;
-            if (boundsForCounter(function, analysis, loop, counter, test_result)) return true;
+            if (boundsForCounter(function, analysis, loop, preheader, counter, test_result)) return true;
         }
     }
     return false;
 }
 
-fn boundsForCounter(function: *Function, analysis: *const loops.Analysis, loop: Loop, counter: loops.InductionExit, test_result: loops.ExitTest) bool {
+fn boundsForCounter(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32, counter: loops.InductionExit, test_result: loops.ExitTest) bool {
     var changed = false;
     const limit = counter.comparison.other;
     for (loop.blocks) |block| {
         if (!analysis.graph.dominates(test_result.stay, block)) continue;
         const range = analysis.iterationRange(block, counter, 16) orelse continue;
         for (function.blocks.items[block].instructions.items) |index| {
-            if (function.removed.items[index] or function.results.items[index] != counter.induction.next) continue;
+            if (function.removed.items[index]) continue;
             const instruction = &function.instructions.items[index];
+            if (function.results.items[index] != counter.induction.next) {
+                if (instruction.* == .numeric_binary and analysis.shiftFits(loop, preheader, counter, range.absolute, instruction.numeric_binary)) {
+                    instruction.numeric_binary.overflow = .wrapping;
+                    changed = true;
+                }
+                continue;
+            }
             if (instruction.* == .numeric_binary and instruction.numeric_binary.overflow == .checked) {
                 instruction.numeric_binary.overflow = .wrapping;
                 changed = true;

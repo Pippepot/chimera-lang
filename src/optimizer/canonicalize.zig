@@ -3,6 +3,7 @@ const structures = @import("../structures.zig");
 const function_ir = @import("function.zig");
 const compaction = @import("compaction.zig");
 const effects = @import("effects.zig");
+const ranges = @import("ranges.zig");
 
 const ValueId = structures.FunctionValueId;
 const Instruction = structures.FunctionInstruction;
@@ -128,62 +129,8 @@ const Rules = struct {
         return true;
     }
 
-    /// Bounds describe successful i32 results. A trapping producer remains live
-    /// independently, so narrowing its successful result never suppresses a panic.
-    const IntegerBounds = struct {
-        lower: i64 = std.math.minInt(i32),
-        upper: i64 = std.math.maxInt(i32),
-
-        fn fits(self: IntegerBounds) bool {
-            return self.lower >= std.math.minInt(i32) and self.upper <= std.math.maxInt(i32);
-        }
-        fn arithmetic(operation: structures.numeric.Binary, left: IntegerBounds, right: IntegerBounds) IntegerBounds {
-            switch (operation) {
-                .add => return .{ .lower = left.lower + right.lower, .upper = left.upper + right.upper },
-                .sub => return .{ .lower = left.lower - right.upper, .upper = left.upper - right.lower },
-                .mul => {
-                    const products = [_]i64{ left.lower * right.lower, left.lower * right.upper, left.upper * right.lower, left.upper * right.upper };
-                    return .{ .lower = std.mem.min(i64, &products), .upper = std.mem.max(i64, &products) };
-                },
-                else => unreachable,
-            }
-        }
-    };
-
-    fn integerBounds(self: *const Rules, value: ValueId, depth: u8) IntegerBounds {
-        if (depth >= 16 or self.isAddressTaken(value) or !self.function.plainValue(value)) return .{};
-        const definition = self.function.definition(value) orelse return .{};
-        switch (definition) {
-            .const_int => |integer| return .{ .lower = integer, .upper = integer },
-            .value_copy => |copy| return self.integerBounds(copy.source, depth + 1),
-            .select => |selection| {
-                const left = self.integerBounds(selection.then_value, depth + 1);
-                const right = self.integerBounds(selection.else_value, depth + 1);
-                return .{ .lower = @min(left.lower, right.lower), .upper = @max(left.upper, right.upper) };
-            },
-            .shrsi => |operands| {
-                const count_value = self.function.constantInt(operands.rhs) orelse return .{};
-                if (count_value < 0 or count_value >= 32) return .{};
-                const source = self.integerBounds(operands.lhs, depth + 1);
-                return .{ .lower = source.lower >> @intCast(count_value), .upper = source.upper >> @intCast(count_value) };
-            },
-            .negi => |operand| {
-                const source = self.integerBounds(operand, depth + 1);
-                if (source.lower == std.math.minInt(i32)) return .{};
-                return .{ .lower = -source.upper, .upper = -source.lower };
-            },
-            .numeric_binary, .addi, .subi, .muli => {
-                const operation = integerOperation(definition).?;
-                if (operation.type_id != .int) return .{};
-                if (operation.operation != .add and operation.operation != .sub and operation.operation != .mul) return .{};
-                var range = IntegerBounds.arithmetic(operation.operation, self.integerBounds(operation.operands.lhs, depth + 1), self.integerBounds(operation.operands.rhs, depth + 1));
-                if (operation.overflow == .wrapping and !range.fits()) return .{};
-                range.lower = std.math.clamp(range.lower, std.math.minInt(i32), std.math.maxInt(i32));
-                range.upper = std.math.clamp(range.upper, std.math.minInt(i32), std.math.maxInt(i32));
-                return range;
-            },
-            else => return .{},
-        }
+    fn structure(self: *const Rules) Structure {
+        return .{ .rules = self, .function = self.function };
     }
 
     fn lowerNumericBinary(self: *Rules, instruction: *Instruction, operation: structures.NumericBinary) bool {
@@ -205,8 +152,8 @@ const Rules = struct {
         switch (operation.operation) {
             .add, .sub, .mul => {
                 if (operation.overflow != .wrapping) {
-                    const bounds = IntegerBounds.arithmetic(operation.operation, self.integerBounds(operands.lhs, 0), self.integerBounds(operands.rhs, 0));
-                    if (!bounds.fits()) return false;
+                    const result = ranges.exact(self.structure(), operation, null, 16) orelse return false;
+                    if (!result.fits()) return false;
                 }
                 instruction.* = switch (operation.operation) {
                     .add => .{ .addi = operands },
@@ -233,7 +180,7 @@ const Rules = struct {
 
     fn lowerNumericUnary(self: *Rules, instruction: *Instruction, operation: structures.NumericUnary) bool {
         if (operation.type_id != .int or operation.operation != .neg) return false;
-        if (operation.overflow != .wrapping and self.integerBounds(operation.operand, 0).lower == std.math.minInt(i32)) return false;
+        if (operation.overflow != .wrapping and ranges.bounds(self.structure(), operation.operand, 16).lower == std.math.minInt(i32)) return false;
         instruction.* = .{ .negi = operation.operand };
         return true;
     }
@@ -530,8 +477,30 @@ const Rules = struct {
     }
 };
 
+/// Range context without control flow: definitions alone bound a value.
+const Structure = struct {
+    rules: *const Rules,
+    function: *const Function,
+
+    pub fn trusted(self: Structure, value: ValueId) bool {
+        return !self.rules.isAddressTaken(value) and self.function.plainValue(value);
+    }
+
+    pub fn leaf(_: Structure, _: ValueId, _: u32) ?ranges.Interval {
+        return null;
+    }
+
+    pub fn narrow(_: Structure, _: ValueId, range: ranges.Interval) ranges.Interval {
+        return range;
+    }
+
+    pub fn facts(_: Structure, _: ValueId, range: ranges.Interval, _: ?ValueId) ranges.Interval {
+        return range;
+    }
+};
+
 /// Views a numeric or wrapping i32 instruction as one binary operation.
-fn integerOperation(instruction: Instruction) ?structures.NumericBinary {
+pub fn integerOperation(instruction: Instruction) ?structures.NumericBinary {
     return switch (instruction) {
         .numeric_binary => |operation| operation,
         inline .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands, tag| .{
