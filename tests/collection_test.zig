@@ -2,6 +2,23 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const Fixture = test_sources.SourceFixture;
 
+test "unsafe_at reads and writes in range elements of Array List and Span" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var array = [1, 2, 3, 4]
+        \\    var list = List(int).filled(0, 4)
+        \\    if not (list is List(int)) -> return 90
+        \\    for index in 0..4
+        \\        list.unsafe_at(index) = array.unsafe_at(3 - index) * 10
+        \\    var view = list[1..4]
+        \\    view.unsafe_at(0) += 1
+        \\    array.unsafe_at(0) = view.unsafe_at(2)
+        \\    if list[0] <> 40 or list[1] <> 31 or list[2] <> 20 or list[3] <> 10 -> return 91
+        \\    if array[0] <> 10 or array[3] <> 4 -> return 92
+        \\    return 42
+    , 42);
+}
+
 test "collection search methods accept array literals and type-qualified calls" {
     try Fixture.expectParity(
         \\func is_at(imm result: int | none, expected: int) bool

@@ -607,7 +607,8 @@ test "range engine proves counters carried beside a terminal range counter" {
     const fixture = try Fixture.init(program);
     defer fixture.deinit();
     const body = (try optimizedBody(fixture, "tally")).*.?;
-    try testing.expectEqual(@as(usize, 1), countChecked(body));
+    // The remainder test became a mask, leaving no unproven checked operation.
+    try testing.expectEqual(@as(usize, 0), countChecked(body));
     try testing.expectEqual(@as(usize, 1), count(body, &.{.select}));
 }
 
@@ -2078,7 +2079,8 @@ test "power of two division rewrites to signed shifts and preserves truncation" 
         try fixture.expectExit(0, 42);
         const body = (try optimizedBody(fixture, "divide")).*.?;
         try testing.expectEqual(@as(usize, 0), count(body, &.{.divsi}));
-        try testing.expectEqual(@as(usize, 1), count(body, &.{.shrsi}));
+        // One shift extracts the sign for the truncation bias and one divides.
+        try testing.expectEqual(@as(usize, 2), count(body, &.{.shrsi}));
     }
 }
 
@@ -2154,6 +2156,146 @@ test "scalar expansion preserves repeated rewrites and aliases of newly emitted 
     try fixture.db.addInput(queries.InlineLimit, {}, 0);
     try fixture.expectExit(0, 42);
     const body = (try optimizedBody(fixture, "expanded")).*.?;
-    try testing.expectEqual(@as(usize, 0), count(body, &.{ .divsi, .negi }));
-    try testing.expectEqual(@as(usize, 3), count(body, &.{.shrsi}));
+    try testing.expectEqual(@as(usize, 0), count(body, &.{.divsi}));
+    // Only the unit-scale truncation bias of the division by two negates; the
+    // other negations of divisors and products cancel.
+    try testing.expectEqual(@as(usize, 1), count(body, &.{.negi}));
+    // One shared sign word plus one quotient shift for each divisor.
+    try testing.expectEqual(@as(usize, 4), count(body, &.{.shrsi}));
+}
+
+fn onCycle(body: structures.FunctionBodyAnalysis, start: usize) bool {
+    var visited: [64]bool = @splat(false);
+    var pending: [64]usize = undefined;
+    var size: usize = 1;
+    pending[0] = start;
+    var first = true;
+    while (size != 0) {
+        size -= 1;
+        const block = pending[size];
+        if (!first) {
+            if (block == start) return true;
+            if (visited[block]) continue;
+            visited[block] = true;
+        }
+        first = false;
+        var terminator = body.blocks[block].terminator;
+        for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
+            pending[size] = @backingInt(branch.target);
+            size += 1;
+        };
+    }
+    return false;
+}
+
+test "scalar element writes leave parameter object reads loop invariant" {
+    const fixture = try Fixture.init(
+        \\struct Header
+        \\    pub scale: int
+        \\    pub flag: bool
+        \\func fill(mut header: Header, mut values: List(int)) int
+        \\    var total = 0
+        \\    for index in 0..values.len()
+        \\        values[index] = header.scale
+        \\        total += 1
+        \\    return total
+        \\func run() int
+        \\    var header = Header{scale = 2, flag = true}
+        \\    var values = List(int).filled(1, 40)
+        \\    if not (values is List(int)) -> return 90
+        \\    return fill(header, values) + values[39]
+        \\exit(run())
+    );
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const body = (try optimizedBody(fixture, "fill")).*.?;
+    var header_reads: usize = 0;
+    for (body.blocks, 0..) |block, index| {
+        for (body.instructions[block.instruction_start..block.instruction_end]) |instruction| {
+            if (instruction != .field_access or instruction.field_access.field_index != 0) continue;
+            if (body.valueType(instruction.field_access.operand) != body.block_arguments[0].type_id) continue;
+            header_reads += 1;
+            try testing.expect(!onCycle(body, index));
+        }
+    }
+    try testing.expect(header_reads != 0);
+}
+
+fn countRemainders(body: structures.FunctionBodyAnalysis) usize {
+    var total: usize = 0;
+    for (body.instructions) |instruction| {
+        if (instruction == .numeric_binary and instruction.numeric_binary.operation == .rem) total += 1;
+    }
+    return total;
+}
+
+test "zero tests of power of two remainders use masks and recompute after edits" {
+    const program =
+        \\func even(value: int) bool -> value % 2 == 0
+        \\func aligned(value: i64) bool -> value % 64 <> 0
+        \\func other(value: int) bool -> value % 7 == 0
+        \\func kept(value: int) int
+        \\    const remainder = value % 8
+        \\    if remainder == 0 -> return remainder + 1
+        \\    return remainder
+        \\func run() int
+        \\    var total = kept(-13) + kept(16)
+        \\    if even(-40) and not even(7) and aligned(65) and other(14) -> total += 26
+        \\    return total
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    // kept(-13) = -5, kept(16) = 1
+    try fixture.expectExit(0, 22);
+    const original = try optimizedBody(fixture, "even");
+    try testing.expectEqual(@as(usize, 0), countRemainders(original.*.?));
+    try testing.expectEqual(@as(usize, 1), count(original.*.?, &.{.numeric_binary}));
+    try testing.expectEqual(@as(usize, 0), countRemainders((try optimizedBody(fixture, "aligned")).*.?));
+    try testing.expectEqual(@as(usize, 1), countRemainders((try optimizedBody(fixture, "other")).*.?));
+    try testing.expectEqual(@as(usize, 1), countRemainders((try optimizedBody(fixture, "kept")).*.?));
+    const changed = try std.mem.replaceOwned(u8, testing.allocator, program, "% 2 == 0", "% 3 == 0");
+    defer testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    // even(-40) is now false: -40 % 3 is not zero.
+    try fixture.expectExit(0, 252);
+    try testing.expect(original != try optimizedBody(fixture, "even"));
+    try testing.expectEqual(@as(usize, 1), countRemainders((try optimizedBody(fixture, "even")).*.?));
+}
+
+test "iteration carriers thread through their tag test and leave no variants in loops" {
+    const program =
+        \\func total(values: Array(int, 8)) int
+        \\    var sum = 0
+        \\    for value in values
+        \\        sum += value
+        \\    return sum
+        \\func listed(values: List(int)) int
+        \\    var sum = 0
+        \\    for value in values
+        \\        if value == 4 -> continue
+        \\        if value > 100 -> break
+        \\        sum += value
+        \\    return sum
+        \\func viewed(mut values: Array(int, 8)) int
+        \\    var sum = 0
+        \\    for ref value in values
+        \\        value += 1
+        \\        sum += value
+        \\    return sum
+        \\func run() int
+        \\    var array: Array(int, 8) = [1, 2, 3, 4, 5, 6, 7, 8]
+        \\    var list = List(int).from(9, [1, 2, 3, 4, 5, 6, 200, 7, 8])
+        \\    if not (list is List(int)) -> return 90
+        \\    return total(array) + listed(list) + viewed(array) - 55
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    // total = 36, listed = 1+2+3+5+6 = 17, viewed = 2+3+...+9 = 44
+    try fixture.expectExit(0, 42);
+    for ([_][]const u8{ "total", "listed", "viewed" }) |name| {
+        const body = (try optimizedBody(fixture, name)).*.?;
+        try testing.expectEqual(@as(usize, 0), count(body, &.{ .variant_tag, .variant_coerce, .variant_extract }));
+    }
 }

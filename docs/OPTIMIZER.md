@@ -90,9 +90,16 @@ optimize: (inline -> prepare passes)* -> hoist -> (loop idioms -> prepare passes
 
 Canonicalization expands signed division by a constant power of two into a
 sign-dependent bias, wrapping addition, and arithmetic right shift, followed by
-negation for a negative divisor. The bias preserves truncation toward zero,
-including the minimum integer divisor. Mutable/address-exposed inputs retain
-ordinary division. Local rules share a pure scalar emitter that inherits the
+negation for a negative divisor. The sign word (0 or -1) scaled by
+-(magnitude - 1) is the bias, which preserves truncation toward zero, including
+the minimum integer divisor. A remainder by 1 or -1 is zero, and comparing a
+remainder by a power of two with zero becomes the mask test `x & (2^k - 1)`, which
+holds for every sign; the remainder stays only for its other users. Division,
+remainder, and shifts by constants they accept cannot trap, so they are removable
+and movable when unused. Mutable/address-exposed inputs retain ordinary division.
+Native code reduces the remaining constant divisions and remainders of every
+integer width to multiplies and shifts. Local
+rules share a pure scalar emitter that inherits the
 matched instruction's span and inline frame. The canonicalizer rebuilds only
 expanded block instruction lists, once in execution order. Existing address and
 memory facts stay conservative because emitted scalar values are private and
@@ -184,9 +191,15 @@ through escaped references. Address-taken results and block parameters remain
 mutable roots even when their producing instruction is a plain value.
 Independent top-level fields of a private slot have separate write resources;
 whole-slot writes overlap every field. Variant payload projections discard
-field separation, and parameter/heap aliasing remains conservative. Local load
+field separation. Memory is typed: an allocation block holds elements of one
+type and is never part of another object. Heap resources therefore carry their
+allocation type, so writes to different allocation types are disjoint, and a
+write of a whole scalar element cannot touch a parameter whose type is not a
+scalar. Other parameter/heap aliasing remains conservative. Local load
 numbering invalidates overlapping reads rather than clearing every read after
-each known write. Unknown calls retain conservative invalidation.
+each known write. Unknown calls retain conservative invalidation. Within a
+block, a field or tag read of a snapshot copy reads the copied storage directly
+until a write overlaps it, so the copy usually dies.
 
 Numbering needs roots and address-taking facts; hoisting additionally needs
 exposure. Hoist only invariant pure instructions or reads untouched by loop
@@ -219,7 +232,10 @@ reference, owning, or addressable uses retain their normal representation. Use
 facts are indexed once, parameters removed together, and incoming arguments
 rebuilt once per block. A known incoming predicate may bypass an empty join when
 the selected continuation does not use its parameters before re-entering the
-join. Predicates and outgoing arguments resolve aliases introduced by earlier
+join. A join whose only instruction reads the tag of one of its variant
+parameters is bypassed the same way when the edge injects exactly one alternative,
+so iteration carriers (`T | End`) never survive loops; the continuation must use
+neither the variant parameter nor the tag result. Predicates and outgoing arguments resolve aliases introduced by earlier
 block merges before substituting incoming values; cleanup is never skipped and
 no payload is fabricated. A boolean join in a diamond may select operands
 already available at the fork without speculating either arm's effects or traps.
@@ -339,7 +355,8 @@ does not exclude the other three from the entire function.
 Eligible locals retain the backward-positioned-edge gate, except single-use
 scalar call results; repeated unaddressed scalar parameters are separate
 candidates with incoming ABI spill homes.
-Candidates include 32/64-bit integers, references, cursors, and function values.
+Candidates include bools, 32/64-bit integers, references, cursors, and function values.
+Bools use zero-extended register values with one-byte parameter and spill homes.
 Wide ABI loads and copies preserve all bits, and high cursor fields extract
 their part of a register snapshot. Addressed storage and aggregate construction
 retain their ordinary memory representation.
@@ -373,6 +390,21 @@ parameter copies use out-of-line edge stubs, leaving the sibling edge free to
 fall through. Their labels, copies, and jumps participate in expanded machine
 liveness before allocation, including parallel-copy cycles. Edge copies, branch
 targets, relocations, and panic metadata retain their ordinary mappings.
+
+Constant division and remainder never use a divide instruction. Each width reaches
+`src/backend/division.zig` sign- or zero-extended to 64 bits: signed divisors use the
+Granlund-Montgomery multiply-high form (powers of two a biased shift), unsigned
+ones a multiply-high with a fix-up (powers of two shifts and masks), and the 32-bit
+`int` division a 64-bit multiply. The divisor needs no zero or `MIN / -1` check.
+Integer comparisons use `setcc` rather than a branch diamond; one whose only use is
+the branch ending its block, or a compare whose only use is the select after it,
+feeds the flags to `jcc` or `cmovcc` without materializing a bool. Float `<`, `<=`,
+`>`, `>=` compare so that unordered operands fail "above"; equality keeps its parity
+check. 64-bit add, subtract, multiply, bitwise operations, and compares read a
+register, stack slot, pointer, or immediate operand in place, as the 32-bit forms
+do. Float operands in stack slots feed SSE instructions directly, and a stack store
+followed by its reload skips the reload. Scalar branch arguments of any numeric
+width copy in place when no source is overwritten before it is read.
 
 Arithmetic may reuse a legal operand register when scratch results are dead;
 subtraction reuses only its left operand. Direct register/stack arithmetic avoids

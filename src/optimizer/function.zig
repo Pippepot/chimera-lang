@@ -493,6 +493,28 @@ pub fn zero(type_id: structures.TypeId) Instruction {
     return if (type_id == .bool) .{ .const_bool = false } else Instruction.numericConstantInstruction(type_id, 0);
 }
 
+/// Whether a typed numeric operation can still trap. Division and shifts by a constant
+/// right operand they accept never do.
+pub inline fn numericMayTrap(function: *const Function, instruction: Instruction) bool {
+    if (!instruction.numericMayTrap()) return false;
+    if (instruction != .numeric_binary) return true;
+    return switch (instruction.numeric_binary.operation) {
+        .div, .rem, .shl, .shr => constantRightMayTrap(function, instruction.numeric_binary),
+        else => true,
+    };
+}
+
+fn constantRightMayTrap(function: *const Function, operation: structures.NumericBinary) bool {
+    const kind = operation.type_id.numericType().?;
+    const constant = (function.definition(function.find(operation.operands.rhs)) orelse return true).numericConstant() orelse return true;
+    const value = structures.numeric.asInteger(kind, constant.bits);
+    return switch (operation.operation) {
+        .div, .rem => value == 0 or (kind.isSigned() and value == -1),
+        .shl, .shr => value < 0 or value >= kind.width(),
+        else => unreachable,
+    };
+}
+
 /// Integer division and shifts are pure only for constant right operands they accept.
 pub fn validConstantRhs(function: *const Function, instruction: Instruction, rhs: ValueId) bool {
     const constant = function.definition(rhs) orelse return false;

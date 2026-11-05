@@ -381,3 +381,284 @@ test "cold numeric traps preserve the failed operation source location" {
         try std.testing.expect(std.mem.indexOf(u8, result.stderr, location) != null);
     }
 }
+
+test "division and remainder by constants match runtime divisors across the integer range" {
+    const divisors = [_]i32{ 2, 3, 4, 5, 6, 7, 8, 10, 25, 60, 63, 65, 100, 641, 1024, 65535, 65537, 1000003, 1073741824, 1073741825, 2147483647, -2, -3, -4, -7, -8, -1000, -65537, -2147483647, -2147483648 };
+    var program: std.ArrayList(u8) = .empty;
+    defer program.deinit(std.testing.allocator);
+    try program.appendSlice(std.testing.allocator,
+        \\func zero(n: int) int
+        \\    if n <= 0 -> return 0
+        \\    return zero(n - 1)
+        \\func check(x: int) int
+        \\
+    );
+    for (divisors, 0..) |divisor, index| {
+        // The literal divisor is a compile-time constant; zero(3) hides the variable one from the optimizer.
+        try program.print(std.testing.allocator,
+            \\    const v{d} = wrapping({d} + zero(3))
+            \\    if x / {d} <> x / v{d} -> return {d}
+            \\    if x % {d} <> x % v{d} -> return {d}
+            \\
+        , .{ index, divisor, divisor, index, 100 + index, divisor, index, 200 + index });
+    }
+    try program.appendSlice(std.testing.allocator,
+        \\    return 0
+        \\func run() int
+        \\    const edges = [0, 1, -1, 2, -2, 7, -7, 2147483647, 2147483646, -2147483647, wrapping(0 - 2147483647 - 1)]
+        \\    for edge in edges
+        \\        const bad = check(edge)
+        \\        if bad <> 0 -> return bad
+        \\    var state = 12345
+        \\    for step in 0..400
+        \\        state = wrapping(state * 1103515245 + 12345)
+        \\        var x = state
+        \\        if step % 4 == 1 -> x = state / 65536
+        \\        if step % 4 == 2 -> x = state / 16777216
+        \\        const bad = check(x)
+        \\        if bad <> 0 -> return bad
+        \\    return 42
+    );
+    try Fixture.expectParity(program.items, 42);
+}
+
+test "constant division and remainder agree with runtime divisors for every integer width" {
+    const Case = struct { name: []const u8, signed: bool, bits: u7 };
+    const cases = [_]Case{
+        .{ .name = "i8", .signed = true, .bits = 8 },    .{ .name = "i16", .signed = true, .bits = 16 },
+        .{ .name = "i32", .signed = true, .bits = 32 },  .{ .name = "i64", .signed = true, .bits = 64 },
+        .{ .name = "u8", .signed = false, .bits = 8 },   .{ .name = "u16", .signed = false, .bits = 16 },
+        .{ .name = "u32", .signed = false, .bits = 32 }, .{ .name = "u64", .signed = false, .bits = 64 },
+    };
+    const divisors = [_]i128{ 2, 3, 4, 5, 6, 7, 8, 10, 16, 25, 100, 127, 128, 255, 256, 641, 1000, 32767, 32768, 65535, 65537, 1000003, 2147483647, 2147483648, 4294967295, 4294967297, 1099511627776, 9223372036854775807, 9223372036854775808, 18446744073709551615, -2, -3, -4, -7, -8, -100, -128, -1000, -32768, -2147483648, -9223372036854775808 };
+    for (cases) |case| {
+        var program: std.ArrayList(u8) = .empty;
+        defer program.deinit(std.testing.allocator);
+        try program.appendSlice(std.testing.allocator,
+            \\func zero(n: int) int
+            \\    if n <= 0 -> return 0
+            \\    return zero(n - 1)
+            \\
+        );
+        try program.print(std.testing.allocator, "func check(x: {s}) int\n", .{case.name});
+        const minimum: i128 = if (case.signed) -(@as(i128, 1) << (case.bits - 1)) else 0;
+        const maximum: i128 = if (case.signed) (@as(i128, 1) << (case.bits - 1)) - 1 else (@as(i128, 1) << case.bits) - 1;
+        var slot: usize = 0;
+        for (divisors) |divisor| {
+            if (divisor < minimum or divisor > maximum) continue;
+            // The literal divisor is a compile-time constant; zero(3) hides the variable one from the optimizer.
+            try program.print(std.testing.allocator,
+                \\    const v{d}: {s} = wrapping(wrap({s}, zero(3)) + {d})
+                \\    if x / {d} <> x / v{d} -> return {d}
+                \\    if x % {d} <> x % v{d} -> return {d}
+                \\
+            , .{ slot, case.name, case.name, divisor, divisor, slot, 100 + slot, divisor, slot, 200 + slot });
+            slot += 1;
+        }
+        try program.print(std.testing.allocator,
+            \\    return 0
+            \\func run() int
+            \\    const edges: Array({s}, 7) = [0, 1, 2, 100, {d}, {d}, {d}]
+            \\    for edge in edges
+            \\        const bad = check(edge)
+            \\        if bad <> 0 -> return bad
+            \\    var state: i64 = 12345
+            \\    for step in 0..300
+            \\        state = wrapping(state * 6364136223846793005 + 1442695040888963407)
+            \\        var x = wrap({s}, state)
+            \\        if step % 3 == 1 -> x = wrap({s}, state >> 20)
+            \\        if step % 3 == 2 -> x = wrap({s}, state >> 44)
+            \\        const bad = check(x)
+            \\        if bad <> 0 -> return bad
+            \\    return 42
+        , .{ case.name, maximum, minimum, minimum + 1, case.name, case.name, case.name });
+        try Fixture.expectParity(program.items, 42);
+    }
+}
+
+test "integer comparisons branch select and materialize identically in both engines for every width" {
+    const Case = struct { name: []const u8, signed: bool, bits: u7 };
+    const cases = [_]Case{
+        .{ .name = "i8", .signed = true, .bits = 8 },    .{ .name = "i16", .signed = true, .bits = 16 },
+        .{ .name = "i32", .signed = true, .bits = 32 },  .{ .name = "i64", .signed = true, .bits = 64 },
+        .{ .name = "u8", .signed = false, .bits = 8 },   .{ .name = "u16", .signed = false, .bits = 16 },
+        .{ .name = "u32", .signed = false, .bits = 32 }, .{ .name = "u64", .signed = false, .bits = 64 },
+    };
+    for (cases) |case| {
+        const minimum: i128 = if (case.signed) -(@as(i128, 1) << (case.bits - 1)) else 0;
+        const maximum: i128 = if (case.signed) (@as(i128, 1) << (case.bits - 1)) - 1 else (@as(i128, 1) << case.bits) - 1;
+        var buffers: [4][48]u8 = undefined;
+        const source = try sources.renderTemplate(std.testing.allocator,
+            \\func relations(a: $T, b: $T) int
+            \\    var total = 0
+            \\    if a < b -> total += 1
+            \\    if a <= b -> total += 2
+            \\    if a > b -> total += 4
+            \\    if a >= b -> total += 8
+            \\    if a == b -> total += 16
+            \\    if a <> b -> total += 32
+            \\    const less = a < b
+            \\    const equal = a == b
+            \\    if less == equal -> total += 64
+            \\    var low = a
+            \\    if b < low -> low = b
+            \\    var high = a
+            \\    if b > high -> high = b
+            \\    if low == b -> total += 128
+            \\    if high == b -> total += 256
+            \\    var chosen = 0
+            \\    if a >= b -> chosen = 1
+            \\    else chosen = 2
+            \\    return total + chosen * 512
+            \\func constants(a: $T) int
+            \\    var total = 0
+            \\    if a < 100 -> total += 1
+            \\    if a >= 100 -> total += 2
+            \\    if a == 0 -> total += 4
+            \\    if a <> 1 -> total += 8
+            \\    if a > 2 -> total += 16
+            \\    if a <= 127 -> total += 32
+            \\    return total
+            \\func run() int
+            \\    const values: Array($T, 9) = [0, 1, 2, 100, 127, $maximum, $minimum, $minimum_next, $maximum_prev]
+            \\    var checksum = 0
+            \\    for a in values
+            \\        checksum = (checksum * 7 + constants(a)) % 1000003
+            \\        for b in values
+            \\            checksum = (checksum * 31 + relations(a, b)) % 1000003
+            \\    return checksum % 251
+        , .{ .T = case.name, .maximum = try std.fmt.bufPrint(&buffers[0], "{d}", .{maximum}), .minimum = try std.fmt.bufPrint(&buffers[1], "{d}", .{minimum}), .minimum_next = try std.fmt.bufPrint(&buffers[2], "{d}", .{minimum + 1}), .maximum_prev = try std.fmt.bufPrint(&buffers[3], "{d}", .{maximum - 1}) });
+        defer std.testing.allocator.free(source);
+        try Fixture.expectEnginesAgree(source);
+    }
+}
+
+test "float arithmetic and ordered comparisons agree between engines including NaN and infinities" {
+    for ([_][]const u8{ "f32", "f64" }) |kind| {
+        const source = try sources.renderTemplate(std.testing.allocator,
+            \\func zero(n: int) $T
+            \\    if n <= 0 -> return 0.0
+            \\    return zero(n - 1)
+            \\func relations(a: $T, b: $T) int
+            \\    var total = 0
+            \\    if a < b -> total += 1
+            \\    if a <= b -> total += 2
+            \\    if a > b -> total += 4
+            \\    if a >= b -> total += 8
+            \\    if a == b -> total += 16
+            \\    if a <> b -> total += 32
+            \\    const greater = a > b
+            \\    const less = b < a
+            \\    if greater == less -> total += 64
+            \\    if not (a < b) and not (a >= b) -> total += 128
+            \\    if (a > b or a == b) -> total += 256
+            \\    return total
+            \\func arithmetic(a: $T, b: $T) int
+            \\    const sum = a + b
+            \\    const difference = a - b
+            \\    const product = a * b
+            \\    const quotient = a / b
+            \\    var total = 0
+            \\    if sum > a -> total += 1
+            \\    if difference < a -> total += 2
+            \\    if product >= b -> total += 4
+            \\    if quotient <= a -> total += 8
+            \\    if sum == difference -> total += 16
+            \\    return total
+            \\func run() int
+            \\    const z = zero(2)
+            \\    const nan = z / z
+            \\    const infinity = (z + 1.0) / z
+            \\    const values: Array($T, 7) = [z, z + 1.5, z - 2.25, z + 100.0, nan, infinity, z - infinity]
+            \\    var checksum = 0
+            \\    for a in values
+            \\        for b in values
+            \\            checksum = (checksum * 31 + relations(a, b)) % 1000003
+            \\            checksum = (checksum * 7 + arithmetic(a, b)) % 1000003
+            \\    return checksum % 251
+        , .{ .T = kind });
+        defer std.testing.allocator.free(source);
+        try Fixture.expectEnginesAgree(source);
+    }
+}
+
+test "integer arithmetic and bitwise operands in registers stack slots and constants agree between engines" {
+    for ([_][]const u8{ "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64" }) |kind| {
+        const source = try sources.renderTemplate(std.testing.allocator,
+            \\func fold(value: $T) int -> wrap(i32, value)
+            \\func mix(a: $T, b: $T, c: $T, d: $T) int
+            \\    const e = wrapping(a + b)
+            \\    const f = wrapping(b - c)
+            \\    const g = wrapping(c * d)
+            \\    const h = a & d
+            \\    const i = b | c
+            \\    const j = c ^ a
+            \\    const k = wrapping(e + f)
+            \\    const l = wrapping(g - h)
+            \\    const m = wrapping(i * j)
+            \\    const n = (k & l) | (m ^ e)
+            \\    const o = wrapping(a + 7)
+            \\    const p = wrapping(b * 3)
+            \\    const q = wrapping(c - 100)
+            \\    const r = d & 15
+            \\    const s = a | 1
+            \\    const t = b ^ 85
+            \\    const u = wrapping(o + p) ^ wrapping(q - r)
+            \\    var total = 0
+            \\    total = wrapping(total * 31 + fold(e))
+            \\    total = wrapping(total * 31 + fold(f))
+            \\    total = wrapping(total * 31 + fold(g))
+            \\    total = wrapping(total * 31 + fold(h))
+            \\    total = wrapping(total * 31 + fold(i))
+            \\    total = wrapping(total * 31 + fold(j))
+            \\    total = wrapping(total * 31 + fold(k))
+            \\    total = wrapping(total * 31 + fold(l))
+            \\    total = wrapping(total * 31 + fold(m))
+            \\    total = wrapping(total * 31 + fold(n))
+            \\    total = wrapping(total * 31 + fold(o))
+            \\    total = wrapping(total * 31 + fold(p))
+            \\    total = wrapping(total * 31 + fold(q))
+            \\    total = wrapping(total * 31 + fold(r))
+            \\    total = wrapping(total * 31 + fold(s))
+            \\    total = wrapping(total * 31 + fold(t))
+            \\    total = wrapping(total * 31 + fold(u))
+            \\    return total
+            \\func divisible(value: $T) int
+            \\    var total = 0
+            \\    if value % 2 == 0 -> total += 1
+            \\    if value % 8 <> 0 -> total += 2
+            \\    if value % 64 == 0 -> total += 4
+            \\    if value % 3 == 0 -> total += 8
+            \\    return total
+            \\func run() int
+            \\    const values: Array($T, 8) = [0, 1, 2, 3, 100, $maximum, $minimum, $odd]
+            \\    var checksum = 0
+            \\    for a in values
+            \\        checksum = wrapping(checksum * 7 + divisible(a))
+            \\        for b in values
+            \\            checksum = wrapping(checksum * 13 + mix(a, b, a, b) + mix(b, a, b, a))
+            \\            checksum = wrapping(checksum * 13 + mix(a, b, wrapping(a + b), wrapping(a - b)))
+            \\    return checksum % 251
+        , .{ .T = kind, .maximum = maximumLiteral(kind), .minimum = minimumLiteral(kind), .odd = oddLiteral(kind) });
+        defer std.testing.allocator.free(source);
+        try Fixture.expectEnginesAgree(source);
+    }
+}
+
+fn maximumLiteral(kind: []const u8) []const u8 {
+    return std.StaticStringMap([]const u8).initComptime(.{
+        .{ "i8", "127" }, .{ "i16", "32767" }, .{ "i32", "2147483647" }, .{ "i64", "9223372036854775807" },
+        .{ "u8", "255" }, .{ "u16", "65535" }, .{ "u32", "4294967295" }, .{ "u64", "18446744073709551615" },
+    }).get(kind).?;
+}
+
+fn minimumLiteral(kind: []const u8) []const u8 {
+    return std.StaticStringMap([]const u8).initComptime(.{
+        .{ "i8", "-128" }, .{ "i16", "-32768" }, .{ "i32", "-2147483648" }, .{ "i64", "-9223372036854775808" },
+        .{ "u8", "0" },    .{ "u16", "0" },      .{ "u32", "0" },           .{ "u64", "0" },
+    }).get(kind).?;
+}
+
+fn oddLiteral(kind: []const u8) []const u8 {
+    return if (kind.len == 2 and kind[1] == '8') "77" else "12345";
+}

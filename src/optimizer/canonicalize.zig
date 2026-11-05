@@ -93,7 +93,7 @@ const Rules = struct {
     fn simplify(self: *Rules, instruction: *Instruction, result: ValueId) !bool {
         if (self.function.find(result) != result) return false;
         switch (instruction.*) {
-            .numeric_binary, .numeric_unary, .numeric_convert => return self.simplifyNumeric(instruction, result),
+            .numeric_binary, .numeric_unary, .numeric_convert => return try self.rewriteDivisibilityTest(instruction) or self.simplifyNumeric(instruction, result),
             .addi, .subi, .muli, .shli, .shrsi => return self.simplifyBinary(instruction, result),
             .divsi => return self.simplifyDivision(instruction, result),
             .negi => |operand| return self.simplifyNegation(instruction, result, operand),
@@ -255,7 +255,7 @@ const Rules = struct {
         const zero = switch (operation.operation) {
             .sub, .bit_xor => same,
             .mul, .bit_and => rhs == 0,
-            .rem => rhs == 1,
+            .rem => rhs == 1 or (kind.isSigned() and rhs == all_bits),
             else => false,
         };
         if (zero or (operation.operation == .bit_or and rhs == all_bits)) {
@@ -272,6 +272,38 @@ const Rules = struct {
         return false;
     }
 
+    /// The constant power-of-two divisor of an unlowered remainder, for the types whose
+    /// remainder and mask agree on divisibility: `x % 2^k == 0` exactly when `x & (2^k - 1) == 0`.
+    fn powerOfTwoRemainder(self: *const Rules, value: ValueId) ?struct { operation: structures.NumericBinary, mask: u64 } {
+        const definition = self.function.definition(self.function.find(value)) orelse return null;
+        if (definition != .numeric_binary or definition.numeric_binary.operation != .rem) return null;
+        const remainder = definition.numeric_binary;
+        const kind = remainder.type_id.numericType() orelse return null;
+        if (kind.isFloat()) return null;
+        const divisor = self.numericConstant(remainder.operands.rhs) orelse return null;
+        const magnitude: u128 = @abs(structures.numeric.asInteger(kind, divisor.bits));
+        if (magnitude < 2 or !std.math.isPowerOfTwo(magnitude)) return null;
+        return .{ .operation = remainder, .mask = @intCast(magnitude - 1) };
+    }
+
+    /// Tests the remainder by a power of two against zero with a mask instead, which needs
+    /// no sign correction. The remainder itself stays for any other users.
+    fn rewriteDivisibilityTest(self: *Rules, instruction: *Instruction) !bool {
+        if (instruction.* != .numeric_binary) return false;
+        const comparison = instruction.numeric_binary;
+        if (comparison.operation != .eq and comparison.operation != .ne) return false;
+        const zero = self.numericConstant(comparison.operands.rhs) orelse return false;
+        if (zero.bits != 0) return false;
+        const found = self.powerOfTwoRemainder(comparison.operands.lhs) orelse return false;
+        const dividend = found.operation.operands.lhs;
+        if (self.isAddressTaken(dividend) or !self.function.plainValue(dividend)) return false;
+        const type_id = found.operation.type_id;
+        const mask = try self.emitScalar(Instruction.numericConstantInstruction(type_id, found.mask));
+        const masked = try self.emitScalar(.{ .numeric_binary = .{ .operation = .bit_and, .type_id = type_id, .overflow = .wrapping, .operands = .{ .lhs = dividend, .rhs = mask } } });
+        instruction.numeric_binary.operands.lhs = masked;
+        return true;
+    }
+
     fn simplifyDivision(self: *Rules, instruction: *Instruction, result: ValueId) !bool {
         if (self.simplifyBinary(instruction, result)) return true;
         const operands = instruction.divsi;
@@ -280,11 +312,13 @@ const Rules = struct {
         if (!self.function.plainValue(operands.lhs)) return false;
         const magnitude: u32 = @intCast(if (divisor < 0) -@as(i64, divisor) else divisor);
         if (magnitude <= 1 or !std.math.isPowerOfTwo(magnitude)) return false;
-        const zero = try self.emitScalar(.{ .const_int = 0 });
         const count = try self.emitScalar(.{ .const_int = @intCast(@ctz(magnitude)) });
-        const mask = try self.emitScalar(.{ .const_int = @intCast(magnitude - 1) });
-        const negative = try self.emitScalar(.{ .compare = .{ .operation = .lti, .operands = .{ .lhs = operands.lhs, .rhs = zero } } });
-        const bias = try self.emitScalar(.{ .select = .{ .condition = negative, .then_value = mask, .else_value = zero, .type_id = .int } });
+        // The sign word is 0 or -1, so scaling it by -(magnitude - 1) yields the
+        // truncation bias for negative dividends without a compare and select.
+        const sign_shift = try self.emitScalar(.{ .const_int = 31 });
+        const scale = try self.emitScalar(.{ .const_int = -@as(i32, @intCast(magnitude - 1)) });
+        const sign = try self.emitScalar(.{ .shrsi = .{ .lhs = operands.lhs, .rhs = sign_shift } });
+        const bias = try self.emitScalar(.{ .muli = .{ .lhs = sign, .rhs = scale } });
         const rounded = try self.emitScalar(.{ .addi = .{ .lhs = operands.lhs, .rhs = bias } });
         const quotient: Instruction = .{ .shrsi = .{ .lhs = rounded, .rhs = count } };
         instruction.* = if (divisor > 0) quotient else .{ .negi = try self.emitScalar(quotient) };

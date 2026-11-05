@@ -555,22 +555,25 @@ const Sweep = struct {
             const target = @backingInt(edge.target);
             if (target == block or self.dirty[target]) continue;
             const join = function.blocks.items[target];
-            if (join.instructions.items.len != 0 or join.terminator != .predicate_branch) continue;
+            if (join.terminator != .predicate_branch) continue;
             const predicate = join.terminator.predicate_branch;
             if (predicate.operation == .eqt or predicate.operation == .net) continue;
-            const lhs = self.incomingValue(join, edge.*, predicate.operands.lhs) orelse continue;
-            const rhs = self.incomingValue(join, edge.*, predicate.operands.rhs) orelse continue;
-            const order = if (lhs == rhs) .eq else std.math.order(function.constantInt(lhs) orelse continue, function.constantInt(rhs) orelse continue);
+            const tag = self.tagTest(join, predicate);
+            if (join.instructions.items.len != 0 and tag == null) continue;
+            const order = self.joinOrder(join, edge.*, predicate, tag) orelse continue;
             const selected = if (predicate.operation.holds(order)) predicate.then_branch else predicate.else_branch;
             if (@backingInt(selected.target) == target) continue;
             if (self.dirty[@backingInt(selected.target)]) continue;
             for (join.parameters.items) |parameter| {
-                if (!function.valueType(parameter).isPrimitive() or !function.plainValue(parameter) or self.address_taken[@backingInt(parameter)]) break;
+                // A tag test may bypass a variant parameter that the exit never reads.
+                if (!function.plainValue(parameter) or self.address_taken[@backingInt(parameter)] or (tag == null and !function.valueType(parameter).isPrimitive())) break;
             } else {
-                if (!try self.independentExit(target, @backingInt(selected.target), join.parameters.items)) continue;
+                if (!try self.independentExit(target, @backingInt(selected.target), join.parameters.items, if (tag) |test_| test_.result else null)) continue;
                 var arguments: std.ArrayList(structures.FunctionValueUse) = .empty;
                 for (function.branchArguments(selected)) |argument| {
                     var forwarded = argument;
+                    // The tag result exists only in the bypassed join.
+                    if (tag) |test_| if (function.find(argument.value) == test_.result) break;
                     forwarded.value = self.incomingValue(join, edge.*, argument.value) orelse break;
                     try arguments.append(function.scratch, forwarded);
                 } else {
@@ -586,14 +589,14 @@ const Sweep = struct {
     // Bypassing a join cannot leave its parameters in use along the selected
     // continuation. Re-entering the join defines them again, so it is a barrier
     // rather than a reason to reject loop exits and outer-loop continuations.
-    fn independentExit(self: *Sweep, join: u32, start: u32, parameters: []const ValueId) !bool {
+    fn independentExit(self: *Sweep, join: u32, start: u32, parameters: []const ValueId, tag_result: ?ValueId) !bool {
         const function = self.function;
         var visited = try std.DynamicBitSetUnmanaged.initEmpty(function.scratch, function.blocks.items.len);
         var pending: std.ArrayList(u32) = .empty;
         try pending.append(function.scratch, start);
         visited.set(start);
         visited.set(join);
-        var uses: ParameterUses = .{ .function = function, .parameters = parameters };
+        var uses: ParameterUses = .{ .function = function, .parameters = parameters, .extra = tag_result };
         while (pending.pop()) |block| {
             function_ir.visitBlockReferences(function, &function.blocks.items[block], &uses, ParameterUses.reference);
             if (uses.found) return false;
@@ -604,6 +607,47 @@ const Sweep = struct {
             };
         }
         return true;
+    }
+
+    const TagTest = struct { result: ValueId, parameter: ValueId };
+
+    /// A join whose only instruction reads the tag of one of its parameters for its branch.
+    fn tagTest(self: *Sweep, join: function_ir.Block, predicate: @FieldType(structures.FunctionTerminator, "predicate_branch")) ?TagTest {
+        const function = self.function;
+        if (join.instructions.items.len != 1) return null;
+        const index = join.instructions.items[0];
+        const instruction = function.instructions.items[index];
+        if (function.removed.items[index] or instruction != .variant_tag) return null;
+        const result = function.results.items[index];
+        const parameter = function.find(instruction.variant_tag);
+        if (std.mem.indexOfScalar(ValueId, join.parameters.items, parameter) == null) return null;
+        if (function.find(predicate.operands.lhs) != result or function.constantInt(function.find(predicate.operands.rhs)) == null) return null;
+        return .{ .result = result, .parameter = parameter };
+    }
+
+    /// How the join's branch compares on this edge, where the incoming operands are known.
+    fn joinOrder(self: *Sweep, join: function_ir.Block, edge: structures.FunctionBranch, predicate: @FieldType(structures.FunctionTerminator, "predicate_branch"), tag: ?TagTest) ?std.math.Order {
+        const function = self.function;
+        if (tag) |known| {
+            const position = std.mem.indexOfScalar(ValueId, join.parameters.items, known.parameter).?;
+            const alternative = self.injectedTag(function.branchArguments(edge)[position]) orelse return null;
+            return std.math.order(alternative, function.constantInt(function.find(predicate.operands.rhs)).?);
+        }
+        const lhs = self.incomingValue(join, edge, predicate.operands.lhs) orelse return null;
+        const rhs = self.incomingValue(join, edge, predicate.operands.rhs) orelse return null;
+        return if (lhs == rhs) .eq else std.math.order(function.constantInt(lhs) orelse return null, function.constantInt(rhs) orelse return null);
+    }
+
+    /// The tag of a variant argument built by injecting exactly one alternative.
+    fn injectedTag(self: *Sweep, argument: structures.FunctionValueUse) ?i32 {
+        const function = self.function;
+        const mapping = if (argument.coerce_to != null) argument.variant_tag_mapping orelse return null else mapping: {
+            const definition = function.definition(function.find(argument.value)) orelse return null;
+            if (definition != .variant_coerce or definition.variant_coerce.destination != null) return null;
+            break :mapping definition.variant_coerce.tag_mapping orelse return null;
+        };
+        if (mapping.end - mapping.start != 1) return null;
+        return @intCast(function.variant_coercion_tags.items[mapping.start]);
     }
 
     fn incomingValue(self: *Sweep, join: function_ir.Block, edge: structures.FunctionBranch, operand: ValueId) ?ValueId {
@@ -750,10 +794,12 @@ const Sweep = struct {
 const ParameterUses = struct {
     function: *const Function,
     parameters: []const ValueId,
+    extra: ?ValueId = null,
     found: bool = false,
 
     fn reference(self: *ParameterUses, value: ValueId) void {
-        if (std.mem.indexOfScalar(ValueId, self.parameters, self.function.find(value)) != null) self.found = true;
+        const resolved = self.function.find(value);
+        if (std.mem.indexOfScalar(ValueId, self.parameters, resolved) != null or self.extra == resolved) self.found = true;
     }
 };
 

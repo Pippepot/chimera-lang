@@ -2075,7 +2075,7 @@ pub const HostTypeLayout = CompilerQuery("HostTypeLayout", .type_facts, hostType
 fn primitiveLayout(type_id: structures.TypeId) ?structures.TypeLayout {
     if (type_id.numericType()) |number| return .{ .byte_size = number.width() / 8, .byte_alignment = number.width() / 8 };
     switch (type_id) {
-        .bool => return .{ .byte_size = 4, .byte_alignment = 4 },
+        .bool => return .{ .byte_size = 1, .byte_alignment = 1 },
         .unit, .none, .never => return .{ .byte_size = 0, .byte_alignment = 1 },
         else => return null,
     }
@@ -4652,7 +4652,7 @@ fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?s
     if (intrinsics.hasTypedBody(symbol)) return compileTypedFunction(ctx, instance_id);
     return switch (symbol) {
         .static_iteration_item => null,
-        .primitive_operation, .numeric_converter, .copy_value, .move_value, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => unreachable,
+        .primitive_operation, .numeric_converter, .copy_value, .move_value, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .allocation_count, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => unreachable,
         .io_read, .io_write => try codegen.compileExternalByteIo(symbol == .io_read, signature, types, ctx.allocator()),
         .exit => try codegen.compileExternalExit(ctx.allocator()),
         .panic_message => try codegen.compileExternalPanic(signature, types, ctx.allocator()),
@@ -4665,10 +4665,6 @@ fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?s
             if (!try validateRuntimeType(ctx, types.facts(), element_type, resolved.file_id, null, instance_id)) return null;
             const layout = (try ctx.get(HostTypeLayout, element_type)).*;
             break :blk try codegen.compileExternalAllocateHostTypedStorage(signature, types, ctx.allocator(), layout);
-        },
-        .allocation_count => blk: {
-            const layout = (try ctx.get(StructLayout, signature.parameters[0].type_id)).* orelse unreachable;
-            break :blk try codegen.compileExternalAllocationCount(ctx.allocator(), layout.field_offsets[1]);
         },
     };
 }

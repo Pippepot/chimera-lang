@@ -8,12 +8,12 @@ pub const Instruction = union(enum) {
     scratch_dead,
     fixed: struct { bits: u64 = 0, target: u32 = 0, operation: x86.Operation },
     register: struct { operation: x86.RegisterOperation, value: ValueId },
-    parameter: struct { value: ValueId, offset: u32, wide: bool = false },
+    parameter: struct { value: ValueId, offset: u32, width: enum { byte, dword, qword } = .dword },
     preserve: struct { restore: bool, offset: u32 },
 
     pub fn registerAccess(self: Instruction) ?struct { value: ValueId, write: bool } {
         return switch (self) {
-            .register => |operation| .{ .value = operation.value, .write = operation.operation == .store_eax or operation.operation == .store_rax },
+            .register => |operation| .{ .value = operation.value, .write = operation.operation == .store_byte or operation.operation == .store_eax or operation.operation == .store_rax },
             .parameter => |parameter| .{ .value = parameter.value, .write = true },
             .label, .scratch_dead, .fixed, .preserve => null,
         };
@@ -78,7 +78,7 @@ pub const Function = struct {
     pub fn register(self: *Function, operation: x86.RegisterOperation, value: ValueId, bits: u32) !void {
         std.debug.assert(bits == 0);
         switch (operation) {
-            .load_eax, .store_eax, .load_rax, .store_rax, .add_eax, .sub_eax, .imul_eax, .cmp_eax, .load_ecx => {},
+            .load_byte, .store_byte, .load_eax, .store_eax, .load_rax, .store_rax, .add_eax, .sub_eax, .imul_eax, .cmp_eax, .add_rax, .sub_rax, .imul_rax, .cmp_rax, .and_eax, .or_eax, .xor_eax, .and_rax, .or_rax, .xor_rax, .load_ecx => {},
             else => unreachable,
         }
         try self.instructions.append(self.gpa, .{ .register = .{ .operation = operation, .value = value } });
@@ -173,8 +173,15 @@ pub const Function = struct {
                     else => return false,
                 },
                 .fixed => |fixed| switch (fixed.operation) {
+                    // These overwrite the whole accumulator and read at most its low half.
                     .mov_eax, .mov_eax_rsp, .mov_rax, .mov_rax_rsp, .lea_rax_rsp, .mov_eax_eax, .call_relative => return true,
-                    .mov_rsp_eax, .mov_ecx_eax, .mov_edi_eax => {},
+                    .add_eax, .sub_eax, .imul_eax, .add_eax_rsp, .sub_eax_rsp, .imul_eax_rsp, .add_eax_ecx, .sub_eax_ecx, .imul_eax_ecx => return true,
+                    .add_eax_rcx, .sub_eax_rcx, .imul_eax_rcx, .shl_eax, .sar_eax, .shl_eax_cl, .sar_eax_cl, .neg_eax => return true,
+                    .movzx_eax_al, .movzx_eax_ax, .movzx_eax_rsp, .movzx_eax_word_rsp, .mov_eax_rsi_offset, .movzx_eax_rsi_offset, .cmove_eax_ecx => return true,
+                    // These read at most the low half and leave the accumulator intact.
+                    .mov_rsp_eax, .mov_ecx_eax, .mov_edi_eax, .mov_edx_eax, .mov_esi_eax, .mov_rdi_eax, .mov_rsp_al, .mov_rdi_al, .mov_rsp_ax, .mov_rdi_ax => {},
+                    .cmp_eax, .cmp_eax_rsp, .cmp_eax_rcx, .test_eax, .movsxd_rcx_eax, .cdq => {},
+                    .sete_al, .setne_al, .setl_al, .setg_al, .setle_al, .setge_al => {},
                     else => return false,
                 },
                 .label, .parameter, .preserve => return false,
@@ -199,7 +206,7 @@ pub const Function = struct {
             const access = instruction.registerAccess() orelse continue;
             if (!access.write) continue;
             const width = &widths[@backingInt(access.value)];
-            if ((instruction == .register and instruction.register.operation == .store_rax) or (instruction == .parameter and instruction.parameter.wide)) {
+            if ((instruction == .register and instruction.register.operation == .store_rax) or (instruction == .parameter and instruction.parameter.width == .qword)) {
                 width.* = .wide;
             } else if (width.* == .unwritten) width.* = .narrow;
         }
@@ -223,20 +230,29 @@ pub const Function = struct {
                 .scratch_dead => {},
                 .fixed => |fixed| {
                     if (last_store) |store| {
-                        const reload: x86.Operation = if (store.operation == .mov_rsp_eax) .mov_eax_rsp else .mov_rax_rsp;
+                        const reload: x86.Operation = switch (store.operation) {
+                            .mov_rsp_eax => .mov_eax_rsp,
+                            .movsd_rsp_xmm0 => .movsd_xmm0_rsp,
+                            .movss_rsp_xmm0 => .movss_xmm0_rsp,
+                            else => .mov_rax_rsp,
+                        };
                         if (store.end == encoded.code.items.len and store.offset == fixed.bits and fixed.operation == reload) continue;
                     }
                     const encoding = x86.selectedEncoding(fixed.operation, fixed.bits);
                     field.* = std.math.add(u32, positions[index], @intCast(encoding.prefix.len)) catch return error.FunctionTooLarge;
                     try x86.appendPattern(&encoded.code, self.gpa, encoding, fixed.bits);
                     if (fixed.target != 0) try patches.append(self.gpa, .{ .field = field.*, .target = fixed.target });
-                    if (fixed.operation == .mov_rsp_eax or fixed.operation == .mov_rsp_rax) {
+                    if (fixed.operation == .mov_rsp_eax or fixed.operation == .mov_rsp_rax or fixed.operation == .movsd_rsp_xmm0 or fixed.operation == .movss_rsp_xmm0) {
                         last_store = .{ .operation = fixed.operation, .offset = fixed.bits, .end = encoded.code.items.len };
                     }
                 },
                 .register => |operation| try self.encodeRegister(&encoded.code, operation, registers, spills),
                 .parameter => |parameter| if (registers[@backingInt(parameter.value)]) |selected| {
-                    try x86.appendRegister(&encoded.code, self.gpa, if (parameter.wide) .load_stack_64 else .load_stack, selected, parameter.offset);
+                    try x86.appendRegister(&encoded.code, self.gpa, switch (parameter.width) {
+                        .byte => .load_stack_byte,
+                        .dword => .load_stack,
+                        .qword => .load_stack_64,
+                    }, selected, parameter.offset);
                 },
                 .preserve => |operation| {
                     var offset_value = operation.offset;
@@ -483,6 +499,8 @@ pub const Function = struct {
         const value = @backingInt(operation.value);
         if (registers[value]) |selected| return x86.appendRegister(code, self.gpa, operation.operation, selected, 0);
         const spilled: x86.Operation = switch (operation.operation) {
+            .load_byte => .movzx_eax_rsp,
+            .store_byte => .mov_rsp_al,
             .load_eax => .mov_eax_rsp,
             .store_eax => .mov_rsp_eax,
             .load_rax => .mov_rax_rsp,
@@ -491,6 +509,16 @@ pub const Function = struct {
             .sub_eax => .sub_eax_rsp,
             .imul_eax => .imul_eax_rsp,
             .cmp_eax => .cmp_eax_rsp,
+            .and_rax => .and_rax_rsp,
+            .or_rax => .or_rax_rsp,
+            .xor_rax => .xor_rax_rsp,
+            .and_eax => .and_eax_rsp,
+            .or_eax => .or_eax_rsp,
+            .xor_eax => .xor_eax_rsp,
+            .add_rax => .add_rax_rsp,
+            .sub_rax => .sub_rax_rsp,
+            .imul_rax => .imul_rax_rsp,
+            .cmp_rax => .cmp_rax_rsp,
             .load_ecx => .mov_ecx_rsp,
             else => unreachable,
         };

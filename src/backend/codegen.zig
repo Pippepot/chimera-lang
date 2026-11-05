@@ -1,5 +1,6 @@
 const std = @import("std");
 const x86 = @import("x86_encoding.zig");
+const division = @import("division.zig");
 const registers = @import("registers.zig");
 const machine = @import("machine.zig");
 const structures = @import("../structures.zig");
@@ -750,6 +751,105 @@ fn placeLoopTestsAfterBodies(ssa: *const structures.FunctionBodyAnalysis, order:
     }
 }
 
+/// An x86 condition code, which also distinguishes unsigned from signed order.
+const Condition = enum {
+    equal,
+    not_equal,
+    less,
+    greater_equal,
+    greater,
+    less_equal,
+    below,
+    above_equal,
+    above,
+    below_equal,
+
+    fn of(operation: structures.PredicateOperation) Condition {
+        return switch (operation) {
+            .lti => .less,
+            .gti => .greater,
+            .lei => .less_equal,
+            .gei => .greater_equal,
+            .eqi, .eqb => .equal,
+            .nei, .neb => .not_equal,
+            .eqt, .net => unreachable,
+        };
+    }
+
+    fn ofNumeric(operation: structures.numeric.Binary, signed: bool) Condition {
+        return switch (operation) {
+            .eq => .equal,
+            .ne => .not_equal,
+            .lt => if (signed) .less else .below,
+            .gt => if (signed) .greater else .above,
+            .le => if (signed) .less_equal else .below_equal,
+            .ge => if (signed) .greater_equal else .above_equal,
+            else => unreachable,
+        };
+    }
+
+    fn negated(self: Condition) Condition {
+        return switch (self) {
+            .equal => .not_equal,
+            .not_equal => .equal,
+            .less => .greater_equal,
+            .greater_equal => .less,
+            .greater => .less_equal,
+            .less_equal => .greater,
+            .below => .above_equal,
+            .above_equal => .below,
+            .above => .below_equal,
+            .below_equal => .above,
+        };
+    }
+
+    fn jump(self: Condition) x86.Operation {
+        return switch (self) {
+            .equal => .je,
+            .not_equal => .jne,
+            .less => .jl,
+            .greater_equal => .jge,
+            .greater => .jg,
+            .less_equal => .jle,
+            .below => .jb,
+            .above_equal => .jae,
+            .above => .ja,
+            .below_equal => .jbe,
+        };
+    }
+
+    fn set(self: Condition) x86.Operation {
+        return switch (self) {
+            .equal => .sete_al,
+            .not_equal => .setne_al,
+            .less => .setl_al,
+            .greater_equal => .setge_al,
+            .greater => .setg_al,
+            .less_equal => .setle_al,
+            .below => .setb_al,
+            .above_equal => .setae_al,
+            .above => .seta_al,
+            .below_equal => .setbe_al,
+        };
+    }
+
+    /// Replaces eax with ecx when the condition holds.
+    fn move(self: Condition) x86.Operation {
+        return switch (self) {
+            .equal => .cmove_eax_ecx,
+            .not_equal => .cmovne_eax_ecx,
+            .less => .cmovl_eax_ecx,
+            .greater_equal => .cmovge_eax_ecx,
+            .greater => .cmovg_eax_ecx,
+            .less_equal => .cmovle_eax_ecx,
+            .below => .cmovb_eax_ecx,
+            .above_equal => .cmovae_eax_ecx,
+            .above => .cmova_eax_ecx,
+            .below_equal => .cmovbe_eax_ecx,
+        };
+    }
+};
+
 fn FunctionEmitter(comptime Types: type) type {
     return struct {
         const Self = @This();
@@ -852,7 +952,12 @@ fn FunctionEmitter(comptime Types: type) type {
                     try stream.instructions.append(self.gpa, .{ .parameter = .{
                         .value = location.register,
                         .offset = self.plan.spills[index],
-                        .wide = (try self.types.layout(self.valueType(@fromBackingInt(@intCast(index))))).byte_size == 8,
+                        .width = switch ((try self.types.layout(self.valueType(@fromBackingInt(@intCast(index))))).byte_size) {
+                            1 => .byte,
+                            4 => .dword,
+                            8 => .qword,
+                            else => unreachable,
+                        },
                     } });
                 }
             }
@@ -910,14 +1015,21 @@ fn FunctionEmitter(comptime Types: type) type {
             self.block_offsets[block_index] = try self.encoder.position();
             std.debug.assert(block.instruction_start <= block.instruction_end);
             std.debug.assert(block.instruction_end <= ssa.instructions.len);
+            const fused_comparison = self.fusedBranchComparison(block);
             var instruction_index = block.instruction_start;
             while (instruction_index < block.instruction_end) : (instruction_index += 1) {
+                if (instruction_index == fused_comparison) continue;
                 self.current_span = if (ssa.instruction_spans.len == ssa.instructions.len) ssa.instruction_spans[instruction_index] else null;
                 self.current_frame = if (ssa.instruction_frames.len != 0) ssa.instruction_frames[instruction_index] else .root;
                 if ((ssa.instructions[instruction_index] == .compare or ssa.instructions[instruction_index] == .addi) and
                     try self.emitConditionalIncrement(instruction_index, block.instruction_end))
                 {
                     instruction_index += 2;
+                    try self.encoder.scratchDead();
+                    continue;
+                }
+                if (ssa.instructions[instruction_index] == .compare and try self.emitFusedSelect(instruction_index, block.instruction_end)) {
+                    instruction_index += 1;
                     try self.encoder.scratchDead();
                     continue;
                 }
@@ -939,7 +1051,9 @@ fn FunctionEmitter(comptime Types: type) type {
             }
             self.current_span = if (ssa.terminator_spans.len == ssa.blocks.len) ssa.terminator_spans[block_index] else null;
             self.current_frame = if (ssa.terminator_frames.len != 0) ssa.terminator_frames[block_index] else .root;
-            try self.emitTerminator(block.terminator, fallthrough);
+            if (fused_comparison) |index| {
+                try self.emitFusedComparisonBranch(block, index, fallthrough);
+            } else try self.emitTerminator(block.terminator, fallthrough);
         }
 
         fn emitElementCopy(self: *Self, index: usize, end: usize) !bool {
@@ -1013,7 +1127,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 .numeric_convert => |operation| try self.emitNumericConversion(operation, destination),
                 inline .const_int, .const_byte, .const_bool => |value| if (destination == .stack) {
                     try self.encoder.immediate(.mov_eax, if (@TypeOf(value) == bool) @intFromBool(value) else value);
-                    try self.storeComponent(if (@TypeOf(value) == u8) .byte else .dword, destination, 0);
+                    try self.storeComponent(if (@TypeOf(value) == i32) .dword else .byte, destination, 0);
                 },
                 .const_unit, .const_none, .local_storage, .result_storage => {},
                 .type_union, .const_type, .const_int_literal, .const_string_literal, .static_conversion => unreachable,
@@ -1182,9 +1296,264 @@ fn FunctionEmitter(comptime Types: type) type {
             return self.loadNumeric(operation.type_id, source);
         }
 
+        fn constantOperand(self: *const Self, value: structures.FunctionValueId) ?structures.NumericConstant {
+            const index = @backingInt(value);
+            if (index < self.ssa.block_arguments.len) return null;
+            return self.ssa.instructions[index - self.ssa.block_arguments.len].numericConstant();
+        }
+
+        /// Divides or takes the remainder of a normalized dividend by a constant of
+        /// magnitude two or more without a divide instruction. Dividends of every
+        /// width are sign- or zero-extended in rax, so the 64-bit forms cover them.
+        fn emitConstantDivision(self: *Self, operation: structures.NumericBinary, constant: structures.NumericConstant, destination: ValueLocation) !bool {
+            const kind = operation.type_id.numericType().?;
+            const signed = kind.isSigned();
+            const divisor = structures.numeric.asInteger(kind, constant.bits);
+            if (@abs(divisor) < 2) return false;
+            const magnitude: u64 = @intCast(@abs(divisor));
+            const remainder = operation.operation == .rem;
+            const power: ?u6 = if (std.math.isPowerOfTwo(magnitude)) @intCast(@ctz(magnitude)) else null;
+            const signed_magic = if (signed and power == null) division.Signed.of(@intCast(divisor)) else null;
+            const unsigned_magic = if (!signed and power == null) division.Unsigned.of(magnitude) else null;
+            if (power == null and signed_magic == null and unsigned_magic == null) return false;
+            try self.loadNumeric(operation.type_id, self.valueLocation(operation.operands.lhs));
+            const encoder = &self.encoder;
+            if (power) |bits| {
+                if (!signed) {
+                    if (remainder) try self.andRax(magnitude - 1) else try encoder.byteImmediate(.shr_rax, bits);
+                } else {
+                    // The bias, magnitude - 1 for a negative dividend, makes the shift truncate toward zero.
+                    try encoder.emit(.mov_rsi_rax);
+                    try encoder.byteImmediate(.sar_rsi, 63);
+                    try encoder.byteImmediate(.shr_rsi, 64 - @as(u8, bits));
+                    try encoder.emit(.add_rax_rsi);
+                    if (remainder) {
+                        try self.andRax(magnitude - 1);
+                        try encoder.emit(.sub_rax_rsi);
+                    } else {
+                        try encoder.byteImmediate(.sar_rax, bits);
+                        if (divisor < 0) try encoder.emit(.neg_rax);
+                    }
+                }
+                return self.finishConstantDivision(kind, destination);
+            }
+            try encoder.emit(.mov_rdi_rax);
+            if (signed_magic) |magic| {
+                try encoder.absolute(.mov_rcx, @bitCast(magic.multiplier));
+                try encoder.emit(.imul_rcx_wide);
+                try encoder.emit(.mov_rax_rdx);
+                try encoder.emit(.add_rax_rdi);
+                if (magic.shift != 0) try encoder.byteImmediate(.sar_rax, magic.shift);
+                try encoder.emit(.mov_rsi_rdi);
+                try encoder.byteImmediate(.shr_rsi, 63);
+                try encoder.emit(.add_rax_rsi);
+                if (divisor < 0) try encoder.emit(.neg_rax);
+            } else {
+                const magic = unsigned_magic.?;
+                try encoder.absolute(.mov_rcx, magic.multiplier);
+                try encoder.emit(.mul_rcx);
+                try encoder.emit(.mov_rax_from_rdi);
+                try encoder.emit(.sub_rax_rdx);
+                try encoder.byteImmediate(.shr_rax, 1);
+                try encoder.emit(.add_rax_rdx);
+                if (magic.shift != 0) try encoder.byteImmediate(.shr_rax, magic.shift);
+            }
+            if (remainder) {
+                try encoder.absolute(.mov_rcx, @truncate(@as(u128, @bitCast(divisor))));
+                try encoder.emit(.imul_rax_rcx);
+                try encoder.emit(.mov_rcx_rax);
+                try encoder.emit(.mov_rax_from_rdi);
+                try encoder.emit(.sub_rax_rcx);
+            }
+            return self.finishConstantDivision(kind, destination);
+        }
+
+        fn andRax(self: *Self, mask: u64) !void {
+            if (mask <= std.math.maxInt(i32)) return self.encoder.immediate(.and_rax, @intCast(mask));
+            try self.encoder.absolute(.mov_rcx, mask);
+            try self.encoder.emit(.and_rax_rcx);
+        }
+
+        fn finishConstantDivision(self: *Self, kind: structures.numeric.Type, destination: ValueLocation) !bool {
+            try self.storeNumeric(kind, destination, 0);
+            return true;
+        }
+
+        const WideOperations = struct { immediate: x86.Operation, register: x86.RegisterOperation, stack: x86.Operation, indirect: x86.Operation };
+
+        const wide_add: WideOperations = .{ .immediate = .add_rax, .register = .add_rax, .stack = .add_rax_rsp, .indirect = .add_rax_mem_rcx };
+        const wide_sub: WideOperations = .{ .immediate = .sub_rax, .register = .sub_rax, .stack = .sub_rax_rsp, .indirect = .sub_rax_mem_rcx };
+        const wide_mul: WideOperations = .{ .immediate = .imul_rax, .register = .imul_rax, .stack = .imul_rax_rsp, .indirect = .imul_rax_mem_rcx };
+        const wide_and: WideOperations = .{ .immediate = .and_rax, .register = .and_rax, .stack = .and_rax_rsp, .indirect = .and_rax_mem_rcx };
+        const wide_or: WideOperations = .{ .immediate = .or_rax, .register = .or_rax, .stack = .or_rax_rsp, .indirect = .or_rax_mem_rcx };
+        const wide_xor: WideOperations = .{ .immediate = .xor_rax, .register = .xor_rax, .stack = .xor_rax_rsp, .indirect = .xor_rax_mem_rcx };
+        const wide_compare: WideOperations = .{ .immediate = .cmp_rax, .register = .cmp_rax, .stack = .cmp_rax_rsp, .indirect = .cmp_rax_mem_rcx };
+
+        /// A 64-bit right operand that the accumulator forms can read in place:
+        /// a constant that fits a sign-extended immediate, or a register, stack slot or pointer.
+        fn wideOperand(self: *const Self, kind: structures.numeric.Type, value: structures.FunctionValueId) bool {
+            if (self.constantOperand(value)) |constant| {
+                const number = structures.numeric.asInteger(kind, constant.bits);
+                return number >= std.math.minInt(i32) and number <= std.math.maxInt(i32);
+            }
+            return switch (self.valueLocation(value)) {
+                .register, .stack, .incoming_argument, .indirect => true,
+                else => false,
+            };
+        }
+
+        /// Applies a 64-bit operation of rax with `wideOperand` already established.
+        fn emitWideOperand(self: *Self, kind: structures.numeric.Type, value: structures.FunctionValueId, operations: WideOperations) !void {
+            if (self.constantOperand(value)) |constant| {
+                return self.encoder.immediate(operations.immediate, @intCast(structures.numeric.asInteger(kind, constant.bits)));
+            }
+            switch (self.valueLocation(value)) {
+                .register => |selected| try self.encoder.register(operations.register, selected),
+                .stack, .incoming_argument => |offset| try self.encoder.offset(operations.stack, offset),
+                .indirect => |offset| {
+                    try self.encoder.offset(.mov_rcx_rsp, offset);
+                    try self.encoder.emit(operations.indirect);
+                },
+                else => unreachable,
+            }
+        }
+
+        /// 64-bit add, subtract, multiply and bitwise operations applied in place to the accumulator.
+        fn emitCompactWideBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !bool {
+            const kind = operation.type_id.numericType().?;
+            if (kind.width() != 64 or kind.isFloat() or operation.overflow == .saturating) return false;
+            const operations = switch (operation.operation) {
+                .add => wide_add,
+                .sub => wide_sub,
+                // Unsigned checked multiplication reads the high half instead of a flag.
+                .mul => if (!kind.isSigned() and operation.overflow != .wrapping) return false else wide_mul,
+                .bit_and => wide_and,
+                .bit_or => wide_or,
+                .bit_xor => wide_xor,
+                else => return false,
+            };
+            if (!self.wideOperand(kind, operation.operands.rhs)) return false;
+            try self.loadNumeric(operation.type_id, self.valueLocation(operation.operands.lhs));
+            try self.emitWideOperand(kind, operation.operands.rhs, operations);
+            switch (operation.operation) {
+                .bit_and, .bit_or, .bit_xor => {},
+                else => try self.numericArithmeticOverflow(kind, operation.operation, operation.overflow),
+            }
+            try self.storeNumeric(kind, destination, 0);
+            return true;
+        }
+
+        /// Sets the flags for an integer comparison of normalized operands.
+        fn emitIntegerComparison(self: *Self, operation: structures.NumericBinary) !void {
+            const kind = operation.type_id.numericType().?;
+            if (kind.width() == 64 and self.wideOperand(kind, operation.operands.rhs)) {
+                try self.loadNumeric(operation.type_id, self.valueLocation(operation.operands.lhs));
+                return self.emitWideOperand(kind, operation.operands.rhs, wide_compare);
+            }
+            if (kind.width() == 32) {
+                // A 32-bit compare orders the operands exactly as the type does.
+                try self.loadComponent(.dword, self.valueLocation(operation.operands.lhs), 0);
+                if (self.constantOperand(operation.operands.rhs)) |constant| {
+                    return self.encoder.immediate(.cmp_eax, @bitCast(@as(u32, @truncate(constant.bits))));
+                }
+                return self.encoder.compareEax(self.valueLocation(operation.operands.rhs));
+            }
+            if (self.constantOperand(operation.operands.rhs)) |constant| {
+                const value = structures.numeric.asInteger(kind, constant.bits);
+                if (value >= std.math.minInt(i32) and value <= std.math.maxInt(i32)) {
+                    try self.loadNumeric(operation.type_id, self.valueLocation(operation.operands.lhs));
+                    return self.encoder.immediate(.cmp_rax, @intCast(value));
+                }
+            }
+            try self.loadNumeric(operation.type_id, self.valueLocation(operation.operands.rhs));
+            try self.encoder.emit(.mov_rcx_rax);
+            try self.loadNumeric(operation.type_id, self.valueLocation(operation.operands.lhs));
+            try self.encoder.emit(.cmp_rax_rcx);
+        }
+
+        /// An integer comparison whose only use is the branch ending its block; the branch
+        /// then tests the flags instead of a materialized bool.
+        fn fusedBranchComparison(self: *const Self, block: structures.FunctionBlock) ?usize {
+            if (block.instruction_start == block.instruction_end or block.terminator != .predicate_branch) return null;
+            const predicate = block.terminator.predicate_branch;
+            if (predicate.operation != .eqb and predicate.operation != .neb) return null;
+            const index = block.instruction_end - 1;
+            const comparison = self.ssa.instructions[index];
+            if (comparison != .numeric_binary or !comparison.numeric_binary.operation.isComparison()) return null;
+            if (comparison.numeric_binary.type_id.numericType().?.isFloat()) {
+                switch (comparison.numeric_binary.operation) {
+                    .lt, .le, .gt, .ge => {},
+                    else => return null,
+                }
+            }
+            const value = self.ssa.instructionValue(index);
+            if (predicate.operands.lhs != value or self.plan.uses[@backingInt(value)] != .used) return null;
+            return if (self.boolConstant(predicate.operands.rhs) != null) index else null;
+        }
+
+        fn boolConstant(self: *const Self, value: structures.FunctionValueId) ?bool {
+            const index = @backingInt(value);
+            if (index < self.ssa.block_arguments.len) return null;
+            const instruction = self.ssa.instructions[index - self.ssa.block_arguments.len];
+            return if (instruction == .const_bool) instruction.const_bool else null;
+        }
+
+        fn emitFusedComparisonBranch(self: *Self, block: structures.FunctionBlock, index: usize, fallthrough: ?structures.FunctionBlockId) !void {
+            const predicate = block.terminator.predicate_branch;
+            const comparison = self.ssa.instructions[index].numeric_binary;
+            const kind = comparison.type_id.numericType().?;
+            const float_condition = if (kind.isFloat()) (try self.emitFloatCompare(comparison)).? else null;
+            if (!kind.isFloat()) try self.emitIntegerComparison(comparison);
+            try self.encoder.scratchDead();
+            // eqb against true, or neb against false, branches when the comparison holds.
+            const holds = (predicate.operation == .eqb) == self.boolConstant(predicate.operands.rhs).?;
+            const condition = float_condition orelse Condition.ofNumeric(comparison.operation, kind.isSigned());
+            try self.emitFlagBranch(predicate.then_branch, predicate.else_branch, if (holds) condition else condition.negated(), fallthrough);
+        }
+
+        /// A signed comparison followed by the select it controls: compare, then conditionally
+        /// move, without materializing the bool. Moves never change the flags.
+        fn emitFusedSelect(self: *Self, index: usize, end: usize) !bool {
+            if (index + 1 >= end) return false;
+            const selection = self.ssa.instructions[index + 1];
+            if (selection != .select) return false;
+            const condition = self.ssa.instructionValue(index);
+            const select = selection.select;
+            if (select.condition != condition or self.plan.uses[@backingInt(condition)] != .used) return false;
+            for ([_]structures.FunctionValueId{ select.then_value, select.else_value }) |operand| {
+                if (self.valueLocation(operand) == .eax or operand == condition) return false;
+            }
+            const size = (try self.types.layout(select.type_id)).byte_size;
+            if (size != 1 and size != 4) return false;
+            const comparison = self.ssa.instructions[index].compare;
+            const width = Width.ofBytes(size);
+            try self.emitPredicateComparison(comparison);
+            try self.encoder.scratchDead();
+            try self.loadComponent(width, self.valueLocation(select.else_value), 0);
+            try self.encoder.emit(.mov_ecx_eax);
+            try self.loadComponent(width, self.valueLocation(select.then_value), 0);
+            try self.encoder.emit(Condition.of(comparison.operation).negated().move());
+            try self.storeComponent(width, self.valueLocation(self.ssa.instructionValue(index + 1)), 0);
+            return true;
+        }
+
         fn emitNumericBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !void {
             const kind = operation.type_id.numericType().?;
             if (try self.emitCompactNumericBinary(operation, destination)) return;
+            if (try self.emitCompactWideBinary(operation, destination)) return;
+            if (!kind.isFloat() and operation.operation.isComparison()) {
+                try self.emitIntegerComparison(operation);
+                try self.encoder.emit(Condition.ofNumeric(operation.operation, kind.isSigned()).set());
+                try self.encoder.emit(.movzx_eax_al);
+                return self.storeComponent(.byte, destination, 0);
+            }
+            if (!kind.isFloat() and (operation.operation == .div or operation.operation == .rem)) {
+                if (self.constantOperand(operation.operands.rhs)) |constant| {
+                    if (try self.emitConstantDivision(operation, constant, destination)) return;
+                }
+            }
+            if (kind.isFloat() and operation.operation.isComparison()) return self.emitFloatComparison(operation, destination);
+            if (kind.isFloat() and try self.emitFloatFromMemory(operation, destination)) return;
             // The right operand is loaded first so loading an indirect operand
             // never destroys a live scratch register holding the other input.
             try self.loadNumericBinaryOperand(operation, self.valueLocation(operation.operands.rhs));
@@ -1193,11 +1562,6 @@ fn FunctionEmitter(comptime Types: type) type {
             if (kind.isFloat()) {
                 try self.encoder.emit(.movq_xmm0_rax);
                 return self.emitFloatBinary(operation, destination);
-            }
-            if (operation.operation.isComparison()) {
-                try self.encoder.emit(.cmp_rax_rcx);
-                try self.numericComparisonResult(operation.operation, kind.isSigned(), destination);
-                return;
             }
             switch (operation.operation) {
                 .add, .sub, .mul => try self.emitNumericArithmetic(kind, operation.operation, operation.overflow),
@@ -1222,19 +1586,24 @@ fn FunctionEmitter(comptime Types: type) type {
             const kind = operation.type_id.numericType().?;
             if (kind.width() != 32 or kind.isFloat() or operation.overflow == .saturating) return false;
             switch (operation.operation) {
-                .add, .sub => {},
+                .add, .sub, .bit_and, .bit_or, .bit_xor => {},
+                // Unsigned checked multiplication reads the high half instead of a flag.
                 .mul => if (!kind.isSigned() and operation.overflow != .wrapping) return false,
                 else => return false,
             }
+            const bitwise = operation.operation == .bit_and or operation.operation == .bit_or or operation.operation == .bit_xor;
             try self.loadComponent(.dword, self.valueLocation(operation.operands.lhs), 0);
             const right = self.valueLocation(operation.operands.rhs);
             switch (operation.operation) {
                 .add => try self.encoder.integerBinary(.addi, right),
                 .sub => try self.encoder.integerBinary(.subi, right),
                 .mul => try self.encoder.integerBinary(.muli, right),
+                .bit_and => try self.encoder.rhsOperation(right, .{ .immediate = .and_eax, .register = .and_eax, .stack = .and_eax_rsp, .indirect = .and_eax_rcx }),
+                .bit_or => try self.encoder.rhsOperation(right, .{ .immediate = .or_eax, .register = .or_eax, .stack = .or_eax_rsp, .indirect = .or_eax_rcx }),
+                .bit_xor => try self.encoder.rhsOperation(right, .{ .immediate = .xor_eax, .register = .xor_eax, .stack = .xor_eax_rsp, .indirect = .xor_eax_rcx }),
                 else => unreachable,
             }
-            try self.numericArithmeticOverflow(kind, operation.operation, operation.overflow);
+            if (!bitwise) try self.numericArithmeticOverflow(kind, operation.operation, operation.overflow);
             try self.storeNumeric(kind, destination, 0);
             return true;
         }
@@ -1312,22 +1681,81 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.encoder.patchHere(yes);
             try self.encoder.immediate(.mov_eax, 1);
             try self.encoder.patchHere(done);
-            try self.storeResult(destination);
+            try self.storeComponent(.byte, destination, 0);
+        }
+
+        /// Float operands that live in stack slots feed SSE instructions directly,
+        /// skipping the integer accumulator.
+        fn emitFloatFromMemory(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !bool {
+            const lhs = self.valueLocation(operation.operands.lhs);
+            const rhs = self.valueLocation(operation.operands.rhs);
+            if (lhs != .stack or rhs != .stack) return false;
+            const single = operation.type_id == .f32;
+            try self.encoder.offset(if (single) .movss_xmm0_rsp else .movsd_xmm0_rsp, lhs.stack);
+            try self.encoder.offset(switch (operation.operation) {
+                .add => if (single) .addss_xmm0_rsp else .addsd_xmm0_rsp,
+                .sub => if (single) .subss_xmm0_rsp else .subsd_xmm0_rsp,
+                .mul => if (single) .mulss_xmm0_rsp else .mulsd_xmm0_rsp,
+                .div => if (single) .divss_xmm0_rsp else .divsd_xmm0_rsp,
+                else => unreachable,
+            }, rhs.stack);
+            if (destination == .stack) {
+                try self.encoder.offset(if (single) .movss_rsp_xmm0 else .movsd_rsp_xmm0, destination.stack);
+            } else {
+                try self.encoder.emit(.movq_rax_xmm0);
+                try self.storeNumeric(operation.type_id.numericType().?, destination, 0);
+            }
+            return true;
+        }
+
+        /// Materializes a float comparison from the flags of an unordered compare.
+        fn emitFloatComparisonResult(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !void {
+            const unordered = try self.encoder.patchable(.jp);
+            try self.numericComparisonResult(operation.operation, false, destination);
+            const done = try self.encoder.patchable(.jmp);
+            try self.encoder.patchHere(unordered);
+            try self.encoder.immediate(.mov_eax, @intFromBool(operation.operation == .ne));
+            try self.storeComponent(.byte, destination, 0);
+            try self.encoder.patchHere(done);
+        }
+
+        /// Sets the flags for a float comparison. Greater-than and less-than forms compare
+        /// so that "above" holds and unordered operands fail it; they return that condition.
+        /// Equality forms return null and need the parity check of `emitFloatComparisonResult`.
+        fn emitFloatCompare(self: *Self, operation: structures.NumericBinary) !?Condition {
+            const single = operation.type_id == .f32;
+            const swap = operation.operation == .lt or operation.operation == .le;
+            const first = self.valueLocation(if (swap) operation.operands.rhs else operation.operands.lhs);
+            const second = self.valueLocation(if (swap) operation.operands.lhs else operation.operands.rhs);
+            if (first == .stack and second == .stack) {
+                try self.encoder.offset(if (single) .movss_xmm0_rsp else .movsd_xmm0_rsp, first.stack);
+                try self.encoder.offset(if (single) .ucomiss_xmm0_rsp else .ucomisd_xmm0_rsp, second.stack);
+            } else {
+                try self.loadNumeric(operation.type_id, second);
+                try self.encoder.emit(.movq_xmm1_rax);
+                try self.loadNumeric(operation.type_id, first);
+                try self.encoder.emit(.movq_xmm0_rax);
+                try self.encoder.emit(if (single) .ucomiss_xmm0_xmm1 else .ucomisd_xmm0_xmm1);
+            }
+            return switch (operation.operation) {
+                .gt, .lt => .above,
+                .ge, .le => .above_equal,
+                else => null,
+            };
+        }
+
+        fn emitFloatComparison(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !void {
+            if (try self.emitFloatCompare(operation)) |condition| {
+                try self.encoder.emit(condition.set());
+                try self.encoder.emit(.movzx_eax_al);
+                return self.storeComponent(.byte, destination, 0);
+            }
+            try self.emitFloatComparisonResult(operation, destination);
         }
 
         fn emitFloatBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !void {
             const single = operation.type_id == .f32;
-            if (operation.operation.isComparison()) {
-                try self.encoder.emit(if (single) .ucomiss_xmm0_xmm1 else .ucomisd_xmm0_xmm1);
-                const unordered = try self.encoder.patchable(.jp);
-                try self.numericComparisonResult(operation.operation, false, destination);
-                const done = try self.encoder.patchable(.jmp);
-                try self.encoder.patchHere(unordered);
-                try self.encoder.immediate(.mov_eax, @intFromBool(operation.operation == .ne));
-                try self.storeResult(destination);
-                try self.encoder.patchHere(done);
-                return;
-            }
+            std.debug.assert(!operation.operation.isComparison());
             try self.encoder.emit(switch (operation.operation) {
                 .add => if (single) .addss_xmm0_xmm1 else .addsd_xmm0_xmm1,
                 .sub => if (single) .subss_xmm0_xmm1 else .subsd_xmm0_xmm1,
@@ -1540,10 +1968,26 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.storeResult(destination);
         }
 
+        fn emitPredicateComparison(self: *Self, operation: structures.CompareOperation) !void {
+            const lhs = self.valueLocation(operation.operands.lhs);
+            const rhs = self.valueLocation(operation.operands.rhs);
+            if (operation.operation != .eqb and operation.operation != .neb) {
+                try self.loadComponent(.dword, lhs, 0);
+                return self.encoder.compareEax(rhs);
+            }
+            if (rhs == .immediate) {
+                try self.loadComponent(.byte, lhs, 0);
+                return self.encoder.compareEax(rhs);
+            }
+            try self.loadComponent(.byte, rhs, 0);
+            try self.encoder.emit(.mov_ecx_eax);
+            try self.loadComponent(.byte, lhs, 0);
+            try self.encoder.emit(.cmp_eax_ecx);
+        }
+
         fn emitCompare(self: *Self, operation: structures.CompareOperation, destination: ValueLocation) !void {
             if (destination == .discarded) return;
-            try self.loadComponent(.dword, self.valueLocation(operation.operands.lhs), 0);
-            try self.encoder.compareEax(self.valueLocation(operation.operands.rhs));
+            try self.emitPredicateComparison(operation);
             try self.encoder.scratchDead();
             try self.encoder.emit(switch (operation.operation) {
                 .lti => .setl_al,
@@ -1555,7 +1999,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 .eqt, .net => unreachable,
             });
             try self.encoder.emit(.movzx_eax_al);
-            try self.storeResult(destination);
+            try self.storeComponent(.byte, destination, 0);
         }
 
         fn emitSelect(self: *Self, operation: structures.SelectOperation, destination: ValueLocation) !void {
@@ -1565,7 +2009,7 @@ fn FunctionEmitter(comptime Types: type) type {
             const width = Width.ofBytes(size);
             try self.loadComponent(width, self.valueLocation(operation.else_value), 0);
             try self.encoder.emit(.mov_ecx_eax);
-            try self.loadComponent(.dword, self.valueLocation(operation.condition), 0);
+            try self.loadComponent(.byte, self.valueLocation(operation.condition), 0);
             try self.encoder.emit(.test_eax);
             try self.loadComponent(width, self.valueLocation(operation.then_value), 0);
             try self.encoder.emit(.cmove_eax_ecx);
@@ -1631,13 +2075,17 @@ fn FunctionEmitter(comptime Types: type) type {
         }
 
         fn emitPredicateBranch(self: *Self, predicate: @FieldType(structures.FunctionTerminator, "predicate_branch"), fallthrough: ?structures.FunctionBlockId) !void {
-            try self.loadComponent(.dword, self.valueLocation(predicate.operands.lhs), 0);
-            try self.encoder.compareEax(self.valueLocation(predicate.operands.rhs));
+            try self.emitPredicateComparison(.{ .operation = predicate.operation, .operands = predicate.operands });
             try self.encoder.scratchDead();
-            const final_is_then = fallthrough == predicate.then_branch.target or fallthrough != predicate.else_branch.target;
-            const final = if (final_is_then) predicate.then_branch else predicate.else_branch;
-            const early = if (final_is_then) predicate.else_branch else predicate.then_branch;
-            const operation = if (final_is_then) predicate.operation else predicate.operation.negated();
+            try self.emitFlagBranch(predicate.then_branch, predicate.else_branch, .of(predicate.operation), fallthrough);
+        }
+
+        /// Branches on already computed flags: to `then_branch` when the condition holds.
+        fn emitFlagBranch(self: *Self, then_branch: structures.FunctionBranch, else_branch: structures.FunctionBranch, condition: Condition, fallthrough: ?structures.FunctionBlockId) !void {
+            const final_is_then = fallthrough == then_branch.target or fallthrough != else_branch.target;
+            const final = if (final_is_then) then_branch else else_branch;
+            const early = if (final_is_then) else_branch else then_branch;
+            const operation = if (final_is_then) condition else condition.negated();
             if (early.arguments.start == early.arguments.end) {
                 try self.emitConditionalJump(operation.negated(), early.target);
             } else {
@@ -1689,7 +2137,7 @@ fn FunctionEmitter(comptime Types: type) type {
             for (arguments, parameters, destinations, 0..) |argument, parameter, destination, index| {
                 if (destination == .discarded) continue;
                 if (argument.coerce_to != null or destination == .indirect) return null;
-                if (parameter.type_id != .int and parameter.type_id != .bool and parameter.type_id != .byte) return null;
+                if (parameter.type_id.numericType() == null and parameter.type_id != .bool and parameter.type_id != .byte) return null;
                 const source = self.valueLocation(argument.value);
                 if (source == .indirect) return null;
                 if (std.meta.eql(source, destination)) continue;
@@ -1720,8 +2168,8 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.jump_patches.append(self.gpa, .{ .field_offset = try self.encoder.patchable(.jmp), .target = target });
         }
 
-        fn emitConditionalJump(self: *Self, operation: structures.PredicateOperation, target: structures.FunctionBlockId) !void {
-            try self.jump_patches.append(self.gpa, .{ .field_offset = try self.encoder.conditionalJump(operation), .target = target });
+        fn emitConditionalJump(self: *Self, condition: Condition, target: structures.FunctionBlockId) !void {
+            try self.jump_patches.append(self.gpa, .{ .field_offset = try self.encoder.conditionalJump(condition), .target = target });
         }
 
         fn emitReturn(self: *Self, returned: structures.FunctionValueUse) !void {
@@ -2314,7 +2762,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 .eax => std.debug.assert(component_offset == 0),
                 .register => |register| {
                     std.debug.assert(component_offset + width.bytes() <= 8);
-                    try self.encoder.register(if (width == .qword or component_offset != 0) .load_rax else .load_eax, register);
+                    try self.encoder.register(if (width == .qword or component_offset != 0) .load_rax else if (width == .byte) .load_byte else .load_eax, register);
                     if (component_offset != 0) try self.encoder.byteImmediate(.shr_rax, @intCast(component_offset * 8));
                 },
                 .stack, .incoming_argument, .return_buffer => |offset| try self.encoder.offset(width.select(&load_rsp), std.math.add(u32, offset, component_offset) catch return error.FunctionTooLarge),
@@ -2332,7 +2780,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 .eax => std.debug.assert(component_offset == 0),
                 .register => |register| {
                     std.debug.assert(component_offset == 0);
-                    try self.encoder.register(if (width == .qword) .store_rax else .store_eax, register);
+                    try self.encoder.register(if (width == .qword) .store_rax else if (width == .byte) .store_byte else .store_eax, register);
                 },
                 .discarded => {},
                 .immediate => unreachable,
@@ -2633,14 +3081,6 @@ pub fn compileExternalDeallocateHostStorage(gpa: std.mem.Allocator) !structures.
     try encoder.emit(.mov_esi_eax);
     try encoder.immediate(.mov_eax, linux_munmap_syscall);
     try encoder.emit(.syscall);
-    try encoder.emit(.ret);
-    return externalArtifact(&encoder);
-}
-
-pub fn compileExternalAllocationCount(gpa: std.mem.Allocator, count_offset: u32) !structures.CompiledFunction {
-    var encoder: Encoder = .{ .gpa = gpa };
-    defer encoder.deinit();
-    try encoder.offset(.mov_eax_rsp, count_offset + 8);
     try encoder.emit(.ret);
     return externalArtifact(&encoder);
 }
@@ -3018,16 +3458,8 @@ const Encoder = struct {
         try self.patch(try self.patchable(operation), target);
     }
 
-    fn conditionalJump(self: *Encoder, operation: structures.PredicateOperation) !u32 {
-        return self.patchable(switch (operation) {
-            .lti => .jl,
-            .gti => .jg,
-            .lei => .jle,
-            .gei => .jge,
-            .eqi, .eqb => .je,
-            .nei, .neb => .jne,
-            .eqt, .net => unreachable,
-        });
+    fn conditionalJump(self: *Encoder, condition: Condition) !u32 {
+        return self.patchable(condition.jump());
     }
 
     /// Adds a byte offset to rax; a zero offset emits nothing.
@@ -3086,9 +3518,31 @@ const Encoder = struct {
         try self.patchHere(done);
     }
 
+    /// Truncating signed division of eax by a constant without a divide instruction.
+    fn divideByMagic(self: *Encoder, magic: division.Int32, negative: bool) !void {
+        try self.emit(.movsxd_rax_eax);
+        try self.emit(.mov_rsi_rax);
+        if (magic.high) {
+            try self.immediate(.mov_ecx, @bitCast(magic.multiplier));
+            try self.emit(.imul_rax_rcx);
+            try self.byteImmediate(.sar_rax, 32);
+            try self.emit(.add_rax_rsi);
+            try self.byteImmediate(.sar_rax, magic.shift);
+        } else {
+            try self.immediate(.mov_ecx, @bitCast(magic.multiplier));
+            try self.emit(.imul_rax_rcx);
+            try self.byteImmediate(.sar_rax, @as(u8, 32) + magic.shift);
+        }
+        // Flooring a negative dividend rounds away from zero by one.
+        try self.byteImmediate(.shr_rsi, 63);
+        try self.emit(.add_rax_rsi);
+        if (negative) try self.emit(.neg_eax);
+    }
+
     fn divide(self: *Encoder, rhs: ValueLocation) !void {
         if (rhs == .immediate) {
             if (rhs.immediate == -1) return self.emit(.neg_eax);
+            if (division.Int32.of(rhs.immediate)) |magic| return self.divideByMagic(magic, rhs.immediate < 0);
             try self.immediate(.mov_ecx, rhs.immediate);
             try self.emit(.cdq);
             return self.emit(.idiv_ecx);

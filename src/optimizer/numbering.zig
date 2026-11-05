@@ -95,6 +95,8 @@ const AggregateLookup = struct {
 pub const Workspace = struct {
     pure: std.HashMapUnmanaged(Instruction, Candidates, Context, 80) = .empty,
     loads: std.HashMapUnmanaged(Instruction, ValueId, Context, 80) = .empty,
+    /// Snapshot copies made in the current block, by copy, with the storage each copied.
+    snapshots: std.AutoHashMapUnmanaged(ValueId, ValueId) = .empty,
     aggregates: std.HashMapUnmanaged(Aggregate, Candidates, AggregateContext, 80) = .empty,
     alternatives: std.ArrayList(Alternative) = .empty,
 };
@@ -107,6 +109,7 @@ pub fn number(function: *Function, workspace: *Workspace) !function_ir.Changes {
     const taken = roots.address_taken;
     const pure = &workspace.pure;
     const loads = &workspace.loads;
+    const snapshots = &workspace.snapshots;
     const aggregates = &workspace.aggregates;
     const alternatives = &workspace.alternatives;
     pure.clearRetainingCapacity();
@@ -115,14 +118,21 @@ pub fn number(function: *Function, workspace: *Workspace) !function_ir.Changes {
     var changes: function_ir.Changes = .{};
     for (graph.order) |block| {
         if (loads.count() != 0) loads.clearRetainingCapacity();
+        if (snapshots.count() != 0) snapshots.clearRetainingCapacity();
         for (function.blocks.items[block].instructions.items) |index| {
             if (function.removed.items[index]) continue;
             // Operands were resolved above; only this pass's own eliminations stale them.
             // Users follow their definitions, so resolving in place leaves nothing for a later sweep.
             if (changes.changed) function_ir.allOperands(function, &function.instructions.items[index], function, Function.resolveOperand);
-            const instruction = function.instructions.items[index];
+            var instruction = function.instructions.items[index];
             const result = function.results.items[index];
             const shareable = !taken[@backingInt(result)];
+            // A read of a snapshot reads the copied storage directly while nothing writes it.
+            if (snapshots.count() != 0) if (try forwardSnapshotRead(function, snapshots, index)) {
+                instruction = function.instructions.items[index];
+                changes.changed = true;
+                changes.storage = true;
+            };
             if (instruction == .aggregate) {
                 if (!shareable) continue;
                 const operation = instruction.aggregate;
@@ -153,9 +163,12 @@ pub fn number(function: *Function, workspace: *Workspace) !function_ir.Changes {
                     const entry = try loads.getOrPut(scratch, instruction);
                     if (entry.found_existing) {
                         eliminate(function, index, entry.value_ptr.*, &changes);
-                    } else entry.value_ptr.* = result;
+                    } else {
+                        entry.value_ptr.* = result;
+                        if (instruction == .value_copy and !function_ir.scalar(instruction.value_copy.type_id)) try snapshots.put(scratch, result, function.find(instruction.value_copy.source));
+                    }
                 },
-                .write => if (loads.count() != 0) invalidateLoads(loads, &roots, instruction),
+                .write => if (loads.count() != 0 or snapshots.count() != 0) invalidateLoads(loads, snapshots, &roots, instruction),
                 .none => {},
             }
         }
@@ -196,7 +209,19 @@ fn read(roots: *const effects.Roots, value: ValueId) Kind {
     return if (roots.root(value) == .immutable) .pure else .load;
 }
 
-fn invalidateLoads(loads: *std.HashMapUnmanaged(Instruction, ValueId, Context, 80), roots: *const effects.Roots, instruction: Instruction) void {
+/// Redirects a field or tag read of a snapshot copy to the storage it copied.
+fn forwardSnapshotRead(function: *Function, snapshots: *const std.AutoHashMapUnmanaged(ValueId, ValueId), index: u32) !bool {
+    const operand: *ValueId = switch (function.instructions.items[index]) {
+        .field_access => |*access| &access.operand,
+        .variant_tag => |*tagged| tagged,
+        else => return false,
+    };
+    const source = snapshots.get(function.find(operand.*)) orelse return false;
+    operand.* = source;
+    return true;
+}
+
+fn invalidateLoads(loads: *std.HashMapUnmanaged(Instruction, ValueId, Context, 80), snapshots: *std.AutoHashMapUnmanaged(ValueId, ValueId), roots: *const effects.Roots, instruction: Instruction) void {
     const written: effects.Resource = switch (instruction) {
         inline .value_copy, .variant_coerce, .variant_extract => |copy| roots.root(copy.destination.?),
         .borrow_write => |write| roots.referent(write.reference),
@@ -204,7 +229,14 @@ fn invalidateLoads(loads: *std.HashMapUnmanaged(Instruction, ValueId, Context, 8
         .move => |move| roots.root(move.destination),
         else => .unknown,
     };
-    if (written == .unknown) return loads.clearRetainingCapacity();
+    if (written == .unknown) {
+        snapshots.clearRetainingCapacity();
+        return loads.clearRetainingCapacity();
+    }
+    var copied = snapshots.iterator();
+    while (copied.next()) |entry| {
+        if (effects.Roots.overlaps(written, roots.root(entry.value_ptr.*))) _ = snapshots.remove(entry.key_ptr.*);
+    }
     var entries = loads.keyIterator();
     while (entries.next()) |key| {
         const resource: effects.Resource = switch (key.*) {

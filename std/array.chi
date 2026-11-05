@@ -44,6 +44,8 @@ pub struct Array(T: type, N: int)
         var view = self.span()
         return view.slice(bounds)
 
+    # No bounds check: `index` must satisfy 0 <= index < N. Violations are undefined behavior.
+    pub func unsafe_at(ref self: Array(T, N), index: int) ref T -> array_borrow(T, N, self, index)
     func get_at(ref self: Array(T, N), index: int) ref T | none
         if index < 0 or index >= N -> return none
         return array_borrow(T, N, self, index)

@@ -130,7 +130,7 @@ test "machine parameter loads disappear when the ABI home is retained" {
 test "machine wide parameter homes retain high bits and cannot supply narrow indices" {
     var function: test_sources.machine.Function = .{ .gpa = std.testing.allocator };
     defer function.deinit();
-    try function.instructions.append(std.testing.allocator, .{ .parameter = .{ .value = @fromBackingInt(0), .offset = 128, .wide = true } });
+    try function.instructions.append(std.testing.allocator, .{ .parameter = .{ .value = @fromBackingInt(0), .offset = 128, .width = .qword } });
     try function.register(.load_eax, @fromBackingInt(0), 0);
     try function.emit(.mov_ecx_eax);
     try function.offset(.lea_rax_rsp, 16);
@@ -1051,9 +1051,9 @@ const TestTypes = struct {
     }
 
     pub fn layout(_: @This(), type_id: structures.TypeId) !structures.TypeLayout {
-        if (type_id == .byte) return .{ .byte_size = 1, .byte_alignment = 1 };
+        if (type_id == .byte or type_id == .bool) return .{ .byte_size = 1, .byte_alignment = 1 };
         if (type_id == byte_reference_type) return .{ .byte_size = 8, .byte_alignment = 8 };
-        if (type_id == .int or type_id == .bool) return .{ .byte_size = 4, .byte_alignment = 4 };
+        if (type_id == .int) return .{ .byte_size = 4, .byte_alignment = 4 };
         if (type_id == .unit or type_id == .none or type_id == .never) return .{ .byte_size = 0, .byte_alignment = 1 };
         if (type_id == small_variant or type_id == wide_variant) return .{ .byte_size = 8, .byte_alignment = 4 };
         if (type_id == seven_byte_payload) return .{ .byte_size = 7, .byte_alignment = 1 };
@@ -2621,4 +2621,68 @@ test "checked i32 arithmetic uses native width without sign extension" {
         try std.testing.expect(std.mem.indexOf(u8, assembly, "movsxd") == null);
         try std.testing.expect(std.mem.indexOf(u8, assembly, "jo ") != null);
     }
+}
+
+test "byte register spills and parameter homes preserve adjacent bytes" {
+    const allocator = std.testing.allocator;
+    for ([_]?test_sources.x86_encoding.Register{ null, .r8, .r12 }) |selected| {
+        var function: test_sources.machine.Function = .{ .gpa = allocator };
+        defer function.deinit();
+        try function.instructions.append(allocator, .{ .parameter = .{ .value = @fromBackingInt(0), .offset = 17, .width = .byte } });
+        try function.register(.load_byte, @fromBackingInt(0), 0);
+        try function.register(.store_byte, @fromBackingInt(1), 0);
+        try function.register(.load_byte, @fromBackingInt(1), 0);
+        try function.emit(.ret);
+        var encoded = try function.encode(&.{ selected, null }, &.{ 17, 18 }, &.{});
+        defer encoded.deinit(allocator);
+        // The parameter at 17 and the spill at 18 must never read or overwrite each other.
+        const expected: []const u8 = if (selected == null)
+            &.{ 0x0f, 0xb6, 0x44, 0x24, 17, 0x88, 0x44, 0x24, 18, 0x0f, 0xb6, 0x44, 0x24, 18, 0xc3 }
+        else if (selected == .r8)
+            &.{ 0x44, 0x0f, 0xb6, 0x44, 0x24, 17, 0x44, 0x89, 0xc0, 0x88, 0x44, 0x24, 18, 0x0f, 0xb6, 0x44, 0x24, 18, 0xc3 }
+        else
+            &.{ 0x44, 0x0f, 0xb6, 0x64, 0x24, 17, 0x44, 0x89, 0xe0, 0x88, 0x44, 0x24, 18, 0x0f, 0xb6, 0x44, 0x24, 18, 0xc3 };
+        try std.testing.expectEqualSlices(u8, expected, encoded.code.items);
+    }
+}
+
+test "packed bool storage preserves fields arrays comparisons and outlined calls" {
+    const source =
+        \\struct Packed
+        \\    first: bool
+        \\    second: bool
+        \\    guard: byte
+        \\func assign(mut value: bool, replacement: bool) unit -> value = replacement
+        \\func compare(left: bool, right: bool) bool -> left == right
+        \\func integer(left: int, right: int) bool -> left < right
+        \\func floating(left: float, right: float) bool -> left == right
+        \\func optional(value: bool) bool | none -> value
+        \\func inspect(left: bool, right: bool, guard: byte) bool
+        \\    return left == right and not left and guard == 255 and right == false
+        \\func packed() Packed -> Packed{first = true, second = false, guard = 255}
+        \\func run() int
+        \\    var value = packed()
+        \\    assign(value.first, false)
+        \\    assign(value.second, true)
+        \\    if value.first or not value.second or value.guard <> 255 -> return 90
+        \\    var flags = [false, true, true, false, true]
+        \\    flags[1] = integer(2, 1)
+        \\    flags[2] = floating(2.0, 1.0)
+        \\    assign(flags[3], true)
+        \\    if flags[0] or flags[1] or flags[2] or not flags[3] or not flags[4] -> return 91
+        \\    if not compare(flags[1], flags[2]) -> return 92
+        \\    if not inspect(flags[1], flags[2], value.guard) -> return 93
+        \\    const tuple = (value.first, value.second, value.guard)
+        \\    if tuple.0 or not tuple.1 or tuple.2 <> 255 -> return 94
+        \\    match optional(flags[2])
+        \\        present and present is bool ->
+        \\            if present -> return 95
+        \\        _ -> return 96
+        \\    return 42
+    ;
+    try test_sources.SourceFixture.expectParity(source, 42);
+    const fixture = try test_sources.SourceFixture.init(source ++ "\nexit(run())");
+    defer fixture.deinit();
+    try fixture.db.addInput(test_sources.queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
 }

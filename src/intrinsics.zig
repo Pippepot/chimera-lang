@@ -59,7 +59,6 @@ pub fn hasTypedBody(symbol: standard_library.External) bool {
         .allocate_host_storage,
         .deallocate,
         .deallocate_host_storage,
-        .allocation_count,
         .io_read,
         .io_write,
         .exit,

@@ -7,13 +7,26 @@ const ValueId = structures.FunctionValueId;
 const Instruction = structures.FunctionInstruction;
 const Function = function_ir.Function;
 
+/// Memory regions are typed: an allocation holds elements of one type, and its
+/// block is never part of another object, so writes to a whole scalar element
+/// cannot touch a parameter object that has fields or another allocation type.
 pub const Resource = union(enum) {
     immutable,
     slot: ValueId,
     field: struct { slot: ValueId, index: u32 },
+    /// Caller storage whose type is a scalar or unknown.
     parameter,
-    heap,
+    /// Caller storage whose type is not a scalar.
+    parameter_object,
+    heap: Heap,
     unknown,
+
+    pub const Heap = struct {
+        /// Type of the allocation value, or null when the block is unknown.
+        allocation: ?structures.TypeId = null,
+        /// The resource is a whole element of a scalar type, not a projection.
+        scalar: bool = false,
+    };
 };
 
 /// Addressable snapshots may still be immutable when their addresses remain
@@ -72,29 +85,39 @@ pub const Roots = struct {
     pub fn root(self: *const Roots, value: ValueId) Resource {
         var current = value;
         var field: ?u32 = null;
+        var projected = false;
         for (0..64) |_| {
             switch (self.function.definitions.items[@backingInt(current)]) {
                 .argument => |argument| {
-                    if (argument.block == self.function.entry) return .parameter;
+                    if (argument.block == self.function.entry) return if (function_ir.scalar(argument.data.type_id)) .parameter else .parameter_object;
                     if (self.address_taken[@backingInt(current)]) return slotResource(current, field);
                     return if (self.function.directParameter(current)) .immutable else .unknown;
                 },
                 .instruction => |index| switch (self.function.instructions.items[index]) {
                     .local_storage => return slotResource(current, field),
                     .result_storage => return .parameter,
-                    .storage_projection => |projection| switch (projection.projection) {
-                        .field => |field_index| {
-                            field = field_index;
-                            current = projection.owner;
-                        },
-                        .variant => {
-                            field = null;
-                            current = projection.owner;
-                        },
-                        .allocation_array => return .heap,
+                    .storage_projection => |projection| {
+                        projected = true;
+                        switch (projection.projection) {
+                            .field => |field_index| {
+                                field = field_index;
+                                current = projection.owner;
+                            },
+                            .variant => {
+                                field = null;
+                                current = projection.owner;
+                            },
+                            .allocation_array => return .{ .heap = .{} },
+                        }
                     },
-                    .array_element => |element| current = element.array,
-                    .allocation_element => return .heap,
+                    .array_element => |element| {
+                        projected = true;
+                        current = element.array;
+                    },
+                    .allocation_element => |element| return .{ .heap = .{
+                        .allocation = self.function.valueType(element.allocation),
+                        .scalar = !projected and function_ir.scalar(element.type_id),
+                    } },
                     .cursor_element => return .unknown,
                     .borrow_read => |read| return self.referent(read.source),
                     else => return if (self.address_taken[@backingInt(current)]) slotResource(current, field) else if (self.function.plainValue(current)) .immutable else .unknown,
@@ -122,6 +145,13 @@ pub const Roots = struct {
             if (first_slot == null or second_slot == null or first_slot.? != second_slot.?) return false;
             return first != .field or second != .field or first.field.index == second.field.index;
         }
+        if (first == .heap and second == .heap) {
+            const first_block = first.heap.allocation orelse return true;
+            const second_block = second.heap.allocation orelse return true;
+            return first_block == second_block;
+        }
+        if (first == .heap and second == .parameter_object) return !first.heap.scalar;
+        if (first == .parameter_object and second == .heap) return !second.heap.scalar;
         return true;
     }
 
@@ -185,8 +215,13 @@ pub const Memory = struct {
 pub const Writes = struct {
     slots: std.AutoHashMapUnmanaged(ValueId, void) = .empty,
     fields: std.AutoHashMapUnmanaged(@FieldType(Resource, "field"), void) = .empty,
+    /// Allocation types with a write; a block is never part of another object.
+    blocks: std.AutoHashMapUnmanaged(structures.TypeId, void) = .empty,
     parameter: bool = false,
+    /// A write to an unknown heap block.
     heap: bool = false,
+    /// A heap write that is not a whole scalar element.
+    heap_object: bool = false,
     unknown: bool = false,
     call: bool = false,
 
@@ -195,8 +230,15 @@ pub const Writes = struct {
             .immutable => {},
             .slot => |slot| try self.slots.put(scratch, slot, {}),
             .field => |field| try self.fields.put(scratch, field, {}),
-            .parameter => self.parameter = true,
-            .heap => self.heap = true,
+            .parameter, .parameter_object => self.parameter = true,
+            .heap => |heap| {
+                const allocation = heap.allocation orelse {
+                    self.heap = true;
+                    return;
+                };
+                try self.blocks.put(scratch, allocation, {});
+                if (!heap.scalar) self.heap_object = true;
+            },
             .unknown => self.unknown = true,
         }
     }
@@ -219,8 +261,11 @@ pub const Writes = struct {
         return switch (resource) {
             .immutable => true,
             .slot, .field => self.preservesSlot(memory, resource),
-            .parameter, .heap => !(self.parameter or self.heap or self.unknown or self.call),
-            .unknown => !(self.parameter or self.heap or self.unknown or self.call) and self.slots.count() == 0 and self.fields.count() == 0,
+            .parameter => !(self.parameter or self.heap or self.blocks.count() != 0 or self.unknown or self.call),
+            .parameter_object => !(self.parameter or self.heap or self.heap_object or self.unknown or self.call),
+            .heap => |heap| !(self.parameter or self.heap or self.unknown or self.call) and
+                if (heap.allocation) |allocation| !self.blocks.contains(allocation) else self.blocks.count() == 0,
+            .unknown => !(self.parameter or self.heap or self.blocks.count() != 0 or self.unknown or self.call) and self.slots.count() == 0 and self.fields.count() == 0,
         };
     }
 

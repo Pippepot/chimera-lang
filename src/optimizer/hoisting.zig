@@ -105,7 +105,10 @@ const Motion = struct {
             .read => |resource| resource,
         };
         if (!self.writes.preserves(self.memory, resource)) return false;
-        return executes or resource == .slot or resource == .field or resource == .parameter or resource == .immutable;
+        return executes or switch (resource) {
+            .slot, .field, .parameter, .parameter_object, .immutable => true,
+            .heap, .unknown => false,
+        };
     }
 
     const Read = union(enum) { pure, read: effects.Resource };
@@ -113,7 +116,7 @@ const Motion = struct {
     fn classify(self: *Motion, instruction: Instruction) ?Read {
         const roots = &self.memory.roots;
         switch (instruction) {
-            .numeric_binary, .numeric_unary => return if (instruction.numericMayTrap()) null else .pure,
+            .numeric_binary, .numeric_unary => return if (function_ir.numericMayTrap(self.function, instruction)) null else .pure,
             .const_numeric, .numeric_convert, .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => return .pure,
             .divsi, .shli, .shrsi => |operands| return if (function_ir.validConstantRhs(self.function, instruction, operands.rhs)) .pure else null,
             .field_access => |operation| return .{ .read = roots.fieldResource(operation.operand, operation.field_index) },

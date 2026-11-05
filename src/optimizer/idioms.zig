@@ -334,7 +334,7 @@ const Escape = struct {
 
 fn pure(function: *const Function, instruction: Instruction) bool {
     return switch (instruction) {
-        .numeric_binary, .numeric_unary => !instruction.numericMayTrap(),
+        .numeric_binary, .numeric_unary => !function_ir.numericMayTrap(function, instruction),
         .const_numeric, .numeric_convert, .const_int, .const_bool, .const_byte, .const_unit, .const_none, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .variant_tag, .field_access, .borrow_address, .borrow_read, .storage_projection, .allocation_element, .array_element, .cursor_offset, .cursor_element, .function_ref => true,
         .divsi, .shli, .shrsi => |operands| function_ir.validConstantRhs(function, instruction, operands.rhs),
         inline .value_copy, .variant_extract, .variant_coerce => |operation| operation.destination == null,

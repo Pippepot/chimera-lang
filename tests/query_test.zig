@@ -3440,7 +3440,7 @@ test "host type layout reports size and alignment for variants" {
         (try db.get(queries.HostTypeLayout, .int)).*,
     );
     try testing.expectEqual(
-        structures.TypeLayout{ .byte_size = 4, .byte_alignment = 4 },
+        structures.TypeLayout{ .byte_size = 1, .byte_alignment = 1 },
         (try db.get(queries.HostTypeLayout, .bool)).*,
     );
     try testing.expectEqual(
@@ -10576,4 +10576,31 @@ test "nested generated structs discover each declaration under its own owner" {
     try testing.expectEqual(@as(?u32, 1), discovered.items[2].parent);
     const executable = (try db.get(queries.BuildExecutable, 1)).*.?;
     try test_sources.expectProgramExit(executable.bytes, @as(u8, 42));
+}
+
+test "bool host layouts pack fields tuples arrays and optional payloads into bytes" {
+    const fixture = try test_sources.SourceFixture.init(
+        \\static Packed = struct
+        \\    first: bool
+        \\    second: bool
+        \\    guard: byte
+        \\static Flags = Array(bool, 5)
+        \\static Nested = Array(Flags, 2)
+        \\static Tuple: type = (bool, bool, byte)
+        \\static Maybe: type = bool | none
+    );
+    defer fixture.deinit();
+    const db = fixture.db;
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    for ([_][]const u8{ "Packed", "Flags", "Nested", "Tuple", "Maybe" }, [_]u32{ 3, 5, 10, 3, 2 }) |name, size| {
+        const type_id = try resolvedStaticType(db, scope.resolveStatic(name).?);
+        try testing.expectEqual(structures.TypeLayout{ .byte_size = size, .byte_alignment = 1 }, (try db.get(queries.HostTypeLayout, type_id)).*);
+        if (std.mem.eql(u8, name, "Packed") or std.mem.eql(u8, name, "Tuple")) {
+            const layout = (try db.get(queries.StructLayout, type_id)).*.?;
+            try testing.expectEqualSlices(u32, &.{ 0, 1, 2 }, layout.field_offsets);
+        }
+        if (std.mem.eql(u8, name, "Maybe")) {
+            try testing.expectEqual(@as(u32, 1), (try db.get(queries.VariantLayout, type_id)).payload_offset);
+        }
+    }
 }

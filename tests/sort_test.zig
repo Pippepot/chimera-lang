@@ -2,6 +2,26 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const Fixture = test_sources.SourceFixture;
 
+const Scale = struct { name: []const u8, native: []const u8, interpreted: []const u8 };
+
+/// The compile-time interpreter is orders of magnitude slower than native code, so it
+/// evaluates the same program at a smaller size. `$name` placeholders select the size.
+fn expectScaledParity(template: []const u8, scales: []const Scale, status: u8) !void {
+    var native: []u8 = try std.testing.allocator.dupe(u8, template);
+    defer std.testing.allocator.free(native);
+    var interpreted: []u8 = try std.testing.allocator.dupe(u8, template);
+    defer std.testing.allocator.free(interpreted);
+    for (scales) |scale| {
+        const native_next = try std.mem.replaceOwned(u8, std.testing.allocator, native, scale.name, scale.native);
+        std.testing.allocator.free(native);
+        native = native_next;
+        const interpreted_next = try std.mem.replaceOwned(u8, std.testing.allocator, interpreted, scale.name, scale.interpreted);
+        std.testing.allocator.free(interpreted);
+        interpreted = interpreted_next;
+    }
+    try Fixture.expectEntryParity(native, interpreted, &.{}, status);
+}
+
 test "collection sort static comparators specialize Array List Span and sorted copies" {
     try Fixture.expectParity(
         \\func descending(imm left: int, imm right: int) bool -> left > right
@@ -424,21 +444,21 @@ test "reference-bearing List construction keeps captured authority" {
 }
 
 test "driftsort stably merges natural runs and unsorted regions" {
-    try Fixture.expectParity(
+    try expectScaledParity(
         \\struct Item
         \\    copy = none
         \\    pub key: int
         \\    pub sequence: int
         \\func before(imm left: Item, imm right: Item) bool -> left.key < right.key
         \\func run() int
-        \\    var values = List(Item).new(256)
+        \\    var values = List(Item).new($N)
         \\    if not (values is List(Item)) -> return 90
         \\    var index = 0
         \\    loop
-        \\        if index == 256 -> break
+        \\        if index == $N -> break
         \\        var key = (index * 37) % 127
-        \\        if index < 80 -> key = index * 2
-        \\        else if index < 160 -> key = 280 - index
+        \\        if index < $A -> key = index * 2
+        \\        else if index < $B -> key = $C - index
         \\        if not (values.append(Item{key = key, sequence = index}) is unit) -> return 91
         \\        index += 1
         \\    values.sort(before)
@@ -449,7 +469,12 @@ test "driftsort stably merges natural runs and unsorted regions" {
         \\        if values[index - 1].key == values[index].key and values[index - 1].sequence >= values[index].sequence -> return 94
         \\        index += 1
         \\    return 42
-    , 42);
+    , &.{
+        .{ .name = "$N", .native = "256", .interpreted = "96" },
+        .{ .name = "$A", .native = "80", .interpreted = "30" },
+        .{ .name = "$B", .native = "160", .interpreted = "60" },
+        .{ .name = "$C", .native = "280", .interpreted = "100" },
+    }, 42);
 }
 
 test "driftsort adapts to ordered inputs and repeated keys" {
@@ -463,20 +488,20 @@ test "driftsort adapts to ordered inputs and repeated keys" {
         \\    left.comparisons.value += 1
         \\    return left.key < right.key
         \\func check(pattern: int, mut comparisons: int) int
-        \\    var values = List(Item).new(256)
+        \\    var values = List(Item).new($N)
         \\    if not (values is List(Item)) -> return 90
         \\    var index = 0
         \\    loop
-        \\        if index == 256 -> break
+        \\        if index == $N -> break
         \\        var key = index
-        \\        if pattern == 1 -> key = 255 - index
+        \\        if pattern == 1 -> key = $M - index
         \\        if pattern == 2 -> key = (index * 37 + 7) % 3
         \\        if not (values.append(Item{key = key, sequence = index, comparisons = Ref.from(comparisons)}) is unit) -> return 91
         \\        index += 1
         \\    comparisons = 0
         \\    values.sort(before)
-        \\    if pattern < 2 and comparisons > 260 -> return 93
-        \\    if pattern == 2 and comparisons > 2048 -> return 94
+        \\    if pattern < 2 and comparisons > $O -> return 93
+        \\    if pattern == 2 and comparisons > $R -> return 94
         \\    index = 1
         \\    loop
         \\        if index == values.len() -> break
@@ -491,13 +516,18 @@ test "driftsort adapts to ordered inputs and repeated keys" {
         \\    if check(2, comparisons) <> 42 -> return 99
         \\    return 42
     ;
-    try Fixture.expectParity(source, 42);
+    try expectScaledParity(source, &.{
+        .{ .name = "$N", .native = "256", .interpreted = "64" },
+        .{ .name = "$M", .native = "255", .interpreted = "63" },
+        .{ .name = "$O", .native = "260", .interpreted = "68" },
+        .{ .name = "$R", .native = "2048", .interpreted = "512" },
+    }, 42);
 }
 
 test "driftsort preserves each value across lengths and distributions" {
-    try Fixture.expectParity(
+    try expectScaledParity(
         \\func run() int
-        \\    for length in [0, 1, 2, 19, 20, 21, 63, 64, 65, 127, 128]
+        \\    for length in [$LENGTHS]
         \\        var values = List(int).new(length)
         \\        if not (values is List(int)) -> return 90
         \\        var counts = Array(int, 17).filled(0)
@@ -518,7 +548,7 @@ test "driftsort preserves each value across lengths and distributions" {
         \\        for count in counts
         \\            if count <> 0 -> return 94
         \\    return 42
-    , 42);
+    , &.{.{ .name = "$LENGTHS", .native = "0, 1, 2, 19, 20, 21, 63, 64, 65, 127, 128", .interpreted = "0, 1, 2, 19, 20, 21, 64" }}, 42);
 }
 
 test "driftsort run scheduling handles integer boundaries" {

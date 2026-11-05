@@ -130,6 +130,8 @@ pub struct List(T: type)
         self.initialized += 1
         return unit
 
+    # No bounds check: `index` must satisfy 0 <= index < len. Violations are undefined behavior.
+    pub func unsafe_at(ref self: List(T), index: int) ref T -> unsafe_borrow(T, self.storage, index)
     func get_at(ref self: List(T), index: int) ref T | none
         if index < 0 or index >= self.initialized -> return none
         return unsafe_borrow(T, self.storage, index)
@@ -214,15 +216,16 @@ func append_collection_moved(static T: type, mut result: List(T), deinit item: T
 func append_collection_growing(static T: type, mut result: List(T), init item: T)
     if not (append_collection_optional(T, result, item) is unit) -> panic "List literal allocation failed"
 func reserve_collection_element(static T: type, mut result: List(T)) unit | none
-    const capacity = result.capacity()
-    if result.initialized == capacity
-        if capacity == 2147483647 -> return none
-        var next = 1
-        if capacity > 0
-            if capacity <= 1073741823 -> next = capacity * 2
-            else next = 2147483647
-        return result.reserve(next)
+    if result.initialized == result.capacity() -> return grow_collection(T, result)
     return unit
+func grow_collection(static T: type, mut result: List(T)) unit | none
+    const capacity = result.capacity()
+    if capacity == 2147483647 -> return none
+    var next = 1
+    if capacity > 0
+        if capacity <= 1073741823 -> next = capacity * 2
+        else next = 2147483647
+    return result.reserve(next)
 func append_collection_optional(static T: type, mut result: List(T), init item: T) unit | none
     if not (reserve_collection_element(T, result) is unit) -> return none
     initialize_collection_element(T, result.storage, result.initialized, item)
@@ -281,6 +284,8 @@ pub struct Span(T: type)
     func index_of_sequence_by(static Needle: type, imm self: Span(T), imm needle: Span(Needle), matches: func(imm T, imm Needle) bool) int | none -> std.search.index_of_sequence(self, needle, matches)
     pub overload index_of_sequence(index_of_sequence_equal, index_of_sequence_by)
     pub func iter(ref self: Span(T)) SpanIterator(T) -> SpanIterator(T){source = self, position = 0}
+    # No bounds check: `index` must satisfy 0 <= index < len. Violations are undefined behavior.
+    pub func unsafe_at(ref self: Span(T), index: int) ref T -> cursor_element(T, self.data, index)
     func get_at(ref self: Span(T), index: int) ref T | none
         if index < 0 or index >= self.size -> return none
         return cursor_element(T, self.data, index)

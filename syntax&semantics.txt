@@ -59,7 +59,7 @@
 # and signatures stay the same. Wrapping MIN / -1 yields MIN; saturation yields
 # MAX. Its remainder is zero in every mode. Division by zero always panics.
 # All concrete widths and policies apply equally during compile-time execution.
-# bool: true or false.
+# bool: true or false. On the host target, size and alignment are one byte.
 # type: the type of compile-time type values.
 # unit: single-valued type; its value is unit, also written ().
 # none: distinct single-valued type; its value is none.
@@ -1320,6 +1320,9 @@ func forward_initializer(static T: type, init item: T) T
 # Allocation methods use the same allocate, deallocate, unsafe_initialize,
 # unsafe_borrow, unsafe_take, and unsafe_destroy names as their free functions.
 # Their ordinary wrappers preserve initializer timing and ownership modes.
+# Array, List, and Span provide unsafe_at(ref self, index) ref T: indexing without
+# the bounds check, for callers that have proven 0 <= index < len. An index outside
+# that range is undefined behavior; the result borrows from the receiver like at.
 # An uninitialized Allocation(T) has no live T origins; unsafe operations with
 # reference-containing elements cannot return references to callee-local owners.
 # Known slots track captures separately: replacement, extraction, and destruction

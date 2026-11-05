@@ -48,10 +48,18 @@ fn addBytes(hasher: *Sha256, bytes: []const u8) void {
     hasher.update(bytes);
 }
 
+var image_digest: ?Key = null;
+var image_digest_mutex: std.Io.Mutex = .init;
+
 /// Tie cache entries to the linked compiler image, including any newly added
 /// source modules that a maintained list could miss.
 pub fn compilerDigest(io: std.Io) !Key {
     if (buildIdDigest()) |digest| return digest;
+    // Images without a build ID are hashed once per process: the image is fixed
+    // for the process lifetime and hashing a large test binary takes seconds.
+    try image_digest_mutex.lock(io);
+    defer image_digest_mutex.unlock(io);
+    if (image_digest) |digest| return digest;
     // /proc/self/exe refers to this process's original inode even if another
     // process replaces the binary on disk while this run is active.
     const compiler = try std.Io.Dir.cwd().openFile(io, "/proc/self/exe", .{});
@@ -61,7 +69,8 @@ pub fn compilerDigest(io: std.Io) !Key {
     var hashing: std.Io.Writer.Hashing(Sha256) = .init(&buffer);
     _ = try compiler_reader.interface.streamRemaining(&hashing.writer);
     try hashing.writer.flush();
-    return hashing.hasher.finalResult();
+    image_digest = hashing.hasher.finalResult();
+    return image_digest.?;
 }
 
 /// The executable result depends on all source and module inputs. Hash the

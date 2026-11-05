@@ -102,12 +102,13 @@ benchmarks for acceptance measurements.
 Routine checks:
 
 ```sh
-zig build test --seed=0 -Doptimize=safe -j1
+zig build test --seed=0 -Doptimize=safe
 zig fmt --check <modified-zig-files>
 git diff --check
 ```
 
-Use focused tests while editing; run the routine suite once for changes spanning
+The suite builds and runs its test binaries in parallel (about 2 minutes on 20 cores);
+keep the default job count. Use focused tests while editing; run the routine suite once for changes spanning
 stages or shared representations. Documentation-only changes need no compiler
 tests. Keep default caches and fixed `--seed=0`; add `--summary all` to distinguish
 executed checks from cached successful runs.

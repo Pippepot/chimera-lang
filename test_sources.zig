@@ -108,8 +108,29 @@ pub const SourceFixture = struct {
         return expectFilesParity(source, &.{}, status);
     }
 
+    /// The program's `run()` must exit with the same nonzero status when evaluated by the
+    /// compile-time interpreter, which has no native lowering to get wrong, and when run natively.
+    pub fn expectEnginesAgree(source: []const u8) !void {
+        const program = try std.testing.allocator.print("{s}\nexit(comptime -> run())", .{source});
+        defer std.testing.allocator.free(program);
+        const fixture = try init(program);
+        defer fixture.deinit();
+        const executable_bytes = (try fixture.executable(0)).bytes;
+        const status = try runStatus(executable_bytes);
+        // A program whose status is zero cannot detect a miscompilation.
+        try std.testing.expect(status != 0);
+        try expectParity(source, status);
+    }
+
     pub fn expectFilesParity(source: []const u8, files: []const modules.SourceFile, status: u8) !void {
+        try expectEntryParity(source, source, files, status);
+    }
+
+    /// Parity where the compile-time interpreter, which is far slower than native code,
+    /// evaluates a smaller variant of the native program.
+    pub fn expectEntryParity(native_source: []const u8, interpreted_source: []const u8, files: []const modules.SourceFile, status: u8) !void {
         for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
+            const source = if (std.mem.eql(u8, entry, "exit(run())")) native_source else interpreted_source;
             const program = try std.testing.allocator.print("{s}\n{s}", .{ source, entry });
             defer std.testing.allocator.free(program);
             const fixture = try initFiles(program, files);
@@ -170,6 +191,19 @@ pub const SourceFixture = struct {
         try std.testing.expect(diagnostics.len != 0);
     }
 };
+
+pub fn runStatus(bytes: []const u8) !u8 {
+    const io = std.testing.io;
+    defer std.Io.Dir.cwd().deleteFile(io, "prog") catch {};
+    try runtime.writeProgram(io, bytes);
+    const result = try std.process.run(std.testing.allocator, io, .{ .argv = &.{"./prog"} });
+    defer std.testing.allocator.free(result.stdout);
+    defer std.testing.allocator.free(result.stderr);
+    return switch (result.term) {
+        .exited => |status| status,
+        else => error.ProgramDidNotExit,
+    };
+}
 
 pub fn expectProgramExit(bytes: []const u8, status: u8) !void {
     const io = std.testing.io;
@@ -236,5 +270,6 @@ test {
     _ = @import("src/optimizer/sroa.zig");
     _ = @import("src/query/codec.zig");
     _ = @import("src/backend/disasm.zig");
+    _ = @import("src/backend/division.zig");
     _ = @import("src/backend/x86_encoding.zig");
 }
