@@ -101,6 +101,25 @@ test "integer conversion policies distinguish exact modular and clamped results"
     , 42);
 }
 
+test "conversions read borrowed heap elements before their owner ends" {
+    try Fixture.expectParity(
+        \\func read(index: int) int
+        \\    var values: List(byte) = []
+        \\    values.append(5)
+        \\    values.append(37)
+        \\    return wrap(i32, values[index])
+        \\func run() int
+        \\    var values: List(i64) = []
+        \\    values.append(-1)
+        \\    values.append(300)
+        \\    const saturated = saturate(u8, values[1])
+        \\    const checked_value = checked(i16, values[1])
+        \\    if not (checked_value is i16) -> return 90
+        \\    if saturated <> 255 or checked_value <> 300 -> return 91
+        \\    return read(1) + int(wrap(u8, values[0])) - 250
+    , 42);
+}
+
 test "float formats preserve direct literal rounding subnormals NaNs and signed zero" {
     try Fixture.expectParity(
         \\func calculate(value: f32, negative: f64) int

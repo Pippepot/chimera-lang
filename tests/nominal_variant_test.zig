@@ -361,3 +361,32 @@ test "nominal case diagnostics use qualified specialized names" {
     try sources.diagnostic_rendering.writeTypeInner(types, &writer.writer, try namedType(fixture.db, "Some"));
     try testing.expectEqualStrings("Cases.Value\nOptional(int).Some", writer.written());
 }
+
+test "wide nominal variants narrow and match without chained joins" {
+    var declaration: std.ArrayList(u8) = .empty;
+    defer declaration.deinit(testing.allocator);
+    try declaration.appendSlice(testing.allocator, "static Wide = .Case0: int");
+    for (1..300) |index| {
+        var buffer: [32]u8 = undefined;
+        try declaration.appendSlice(testing.allocator, try std.fmt.bufPrint(&buffer, " | .Case{d}: int", .{index}));
+    }
+    try declaration.appendSlice(testing.allocator,
+        \\
+        \\func classify(value: Wide) int
+        \\    if value is Wide.Case299
+        \\        const payload: int = value
+        \\        return payload
+        \\    if value is Wide.Case0 -> return 2
+        \\    return match value
+        \\        Wide.Case7 -> 3
+        \\        _ -> 4
+        \\func run() int
+        \\    const last: Wide = Wide.Case299{30}
+        \\    const first: Wide = Wide.Case0{1}
+        \\    const seventh: Wide = Wide.Case7{1}
+        \\    const other: Wide = Wide.Case8{1}
+        \\    return classify(last) + classify(first) + classify(seventh) + classify(other) + 3
+    );
+    const source = declaration.items;
+    try Fixture.expectParity(source, 42);
+}

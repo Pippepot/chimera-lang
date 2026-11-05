@@ -3084,3 +3084,37 @@ test "references stored by a replacing call expire after the next replacement" {
         \\    _ -> ()
     , .borrow_outlives_source);
 }
+
+test "borrows of a conditionally mutated list survive loops that leave it unchanged" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var values: List(int) = [1]
+        \\    const grow = 3
+        \\    if grow > 2 -> _ = values.append(40)
+        \\    ref first = values[0]
+        \\    var total = 0
+        \\    for _ in 0..3 -> total += first
+        \\    for value in values -> total += value
+        \\    return total - 2
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func run(grow: int) int
+        \\    var values: List(int) = [1]
+        \\    if grow > 2 -> _ = values.append(40)
+        \\    ref first = values[0]
+        \\    for _ in 0..3
+        \\        _ = values.append(1)
+        \\        if first == 1 -> return 1
+        \\    return 0
+        \\exit(run(1))
+    , .borrow_outlives_source);
+    try Fixture.expectSourceDiagnostic(
+        \\func run(grow: int) int
+        \\    var values: List(int) = [1]
+        \\    if grow > 2 -> _ = values.append(40)
+        \\    for value in values
+        \\        if value == 1 -> _ = values.append(1)
+        \\    return 0
+        \\exit(run(1))
+    , .borrow_outlives_source);
+}

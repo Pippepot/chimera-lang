@@ -1244,6 +1244,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn numericConversion(self: *Self, conversion: anytype, span: structures.SourceSpan) !Value {
             const source = try self.value(conversion.value);
             const result_type = try self.numericConversionType(source.type_id, conversion.target, conversion.policy, span);
+            // The operand is read where the conversion executes, so a borrowed
+            // source must stay alive through it rather than end at its producer.
+            try self.recordUse(source);
             return self.appendInstruction(.{ .numeric_convert = .{ .operand = source.id, .destination_type = conversion.target, .policy = conversion.policy, .result_type = result_type } });
         }
 
@@ -2088,13 +2091,14 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         /// Joins the members of `source` whose logical type does (`positive`) or does not widen to `target`.
         fn joinMatchingMembers(self: *Self, source: structures.TypeId, target: structures.TypeId, positive: bool) !structures.TypeId {
-            var result: structures.TypeId = .never;
+            var joined: TypeJoin = .{};
+            defer joined.deinit(self.gpa);
             for (try self.matchInputMembers(source)) |member| {
                 const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
                 if (try semantic.canWidenTo(self.analysis_context, logical, target) == positive)
-                    result = try joinTypes(self.analysis_context, result, member, self.gpa);
+                    try joined.add(self.gpa, member);
             }
-            return result;
+            return joined.finish(self.analysis_context, self.gpa);
         }
 
         fn copyFlowType(self: *Self, source: Value, local: semantic.UnresolvedBody.LocalId) !void {
@@ -2473,7 +2477,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             var current = identity;
             while (current == .join) {
                 const join = self.binding_joins.items[current.join];
-                if (!join.complete or join.alternatives.items.len != 0) break;
+                if (!join.complete) break;
+                // A loop whose backedges forward the header or entry identity
+                // never changes the binding.
+                for (join.alternatives.items) |alternative| {
+                    const forwarded = alternative == .join and alternative.join == current.join;
+                    if (!forwarded and !std.meta.eql(alternative, join.initial)) return current;
+                }
                 current = join.initial;
             }
             return current;
@@ -2611,16 +2621,17 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn returnedAlternatives(self: *Self, source: Value, use: structures.FunctionValueUse) !structures.TypeId {
             const targets = (try self.analysis_context.facts().variantMembers(self.return_type)) orelse return self.return_type;
             const possible = try self.matchInputMembers((try self.flowTypeView(source)).type_id);
-            var result: structures.TypeId = .never;
+            var joined: TypeJoin = .{};
+            defer joined.deinit(self.gpa);
             for (try self.matchInputMembers(source.type_id), 0..) |member, index| {
                 const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
                 for (possible) |candidate| {
                     if ((try self.analysis_context.facts().memberSpec(candidate)).type_id == logical) break;
                 } else continue;
                 const target = if (use.variant_tag_mapping) |mapping| targets[self.variant_coercion_tags.items[mapping.start + index]] else member;
-                result = try joinTypes(self.analysis_context, result, target, self.gpa);
+                try joined.add(self.gpa, target);
             }
-            return result;
+            return joined.finish(self.analysis_context, self.gpa);
         }
 
         fn validateEscapingBorrows(self: *Self, candidate: Value, span: structures.SourceSpan) !void {
@@ -5739,7 +5750,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                         const storage_depth = if (origin.stable and !origin.variant_guard) origin.storage_depth else null;
                         const expected = try self.resolveBindingIdentityAtDepth(origin.binding_identity, storage_depth);
                         const actual_identity = referenceIdentity(state.values.get(slot).?, origin);
-                        const same_identity = (origin.stable or origin.deferred_capture or origin.read != null) and std.meta.eql(origin.binding_identity, actual_identity);
+                        const same_identity = (origin.stable or origin.deferred_capture or origin.read != null) and std.meta.eql(self.unwrapBindingIdentity(origin.binding_identity), self.unwrapBindingIdentity(actual_identity));
                         const actual = if (same_identity) expected else try self.resolveBindingIdentityAtDepth(actual_identity, storage_depth);
                         if (expected.incomplete or actual.incomplete) {
                             incomplete.* = true;
@@ -8493,14 +8504,15 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn guardedResultAlternatives(self: *Self, head: ?u32, source: Value) anyerror!structures.TypeId {
             const place = source.result_place orelse return source.type_id;
-            var alternatives: structures.TypeId = .never;
+            var joined: TypeJoin = .{};
+            defer joined.deinit(self.gpa);
             for (try self.matchInputMembers(source.type_id)) |member| {
                 var memo: std.ArrayList(?bool) = .empty;
                 defer memo.deinit(self.gpa);
                 if (try self.resultGuardPossible(head, self.state.refinements, .{ .place = place, .type_id = member }, &memo))
-                    alternatives = try joinTypes(self.analysis_context, alternatives, member, self.gpa);
+                    try joined.add(self.gpa, member);
             }
-            return alternatives;
+            return joined.finish(self.analysis_context, self.gpa);
         }
 
         const ReferenceOriginSet = struct {
@@ -10125,15 +10137,17 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const source_type = try self.iteratorCarrierType(item.operand);
             const members = (try self.analysis_context.facts().variantMembers(source_type)).?;
             var all_reference = true;
-            var stored_type: structures.TypeId = .never;
+            var stored_join: TypeJoin = .{};
+            defer stored_join.deinit(self.gpa);
             var item_count: usize = 0;
             for (members) |member| {
                 const specification = try self.analysis_context.facts().memberSpec(member);
                 if (specification.type_id == item.end_type) continue;
                 if (specification.kind == .owned) all_reference = false;
-                stored_type = try joinTypes(self.analysis_context, stored_type, member, self.gpa);
+                try stored_join.add(self.gpa, member);
                 item_count += 1;
             }
+            const stored_type = try stored_join.finish(self.analysis_context, self.gpa);
             const whole_reference = self.locals.items(.reference)[@backingInt(item.carrier)];
             if (item.binding.mode == .inferred and !whole_reference and item_count > 1) {
                 const operand = try self.takeIteratorCarrier(item.carrier, item.operand.span);
@@ -10382,13 +10396,14 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (operand.borrowed_type != null)
                 return self.extractLogicalBinding(operand, operand.type_id, extraction.target_type, .reference, span);
             const members = (try self.analysis_context.facts().variantMembers(operand.type_id)).?;
-            var storage_type: structures.TypeId = .never;
+            var joined: TypeJoin = .{};
+            defer joined.deinit(self.gpa);
             for (members) |member| {
                 const specification = try self.analysis_context.facts().memberSpec(member);
                 if (try semantic.canWidenTo(self.analysis_context, specification.type_id, extraction.target_type))
-                    storage_type = try joinTypes(self.analysis_context, storage_type, member, self.gpa);
+                    try joined.add(self.gpa, member);
             }
-            return self.extractLogicalBinding(operand, operand.type_id, storage_type, .inferred, span);
+            return self.extractLogicalBinding(operand, operand.type_id, try joined.finish(self.analysis_context, self.gpa), .inferred, span);
         }
 
         fn extractOwnedVariant(self: *Self, operand: Value, target_type: structures.TypeId, span: structures.SourceSpan) !Value {
@@ -10935,12 +10950,14 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (pattern.shape == .any) return space;
             const members = try self.matchInputMembers(space.type_id);
             if (members.len > 1) std.debug.assert(space.shape == .any);
-            var selected: structures.TypeId = .never;
+            var joined: TypeJoin = .{};
+            defer joined.deinit(self.gpa);
             for (members) |candidate| {
                 if (containsType(pattern.members, candidate)) {
-                    selected = try joinTypes(self.analysis_context, selected, candidate, self.gpa);
+                    try joined.add(self.gpa, candidate);
                 } else try remainder.append(self.gpa, .{ .type_id = candidate, .shape = space.shape });
             }
+            const selected = try joined.finish(self.analysis_context, self.gpa);
             if (selected == .never) return null;
             const intersection: MatchSpace = .{ .type_id = selected, .shape = space.shape };
             switch (pattern.shape) {
@@ -11115,10 +11132,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             };
             const current = self.flow.?.facts.get(self.state.refinements, place);
             const possible = try self.matchInputMembers(current.type_id orelse source.type_id);
-            var selected: structures.TypeId = .never;
-            for (members) |member| if (containsType(possible, member)) {
-                selected = try joinTypes(self.analysis_context, selected, member, self.gpa);
-            };
+            var joined: TypeJoin = .{};
+            defer joined.deinit(self.gpa);
+            for (members) |member| if (containsType(possible, member)) try joined.add(self.gpa, member);
+            const selected = try joined.finish(self.analysis_context, self.gpa);
             try self.flow.?.facts.put(self.gpa, &self.state.refinements, place, .{ .version = current.version, .type_id = selected, .span = self.activeLifetimeSpan() });
             if (source.result_place) |result_place| try self.refineFlowPlace(result_place, self.flow.?.places.items[result_place].type_id, selected, true, self.activeLifetimeSpan());
             try self.refineFlowOwners();
@@ -11366,8 +11383,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn refineMatchFlow(self: *Self, prepared: PreparedMatchPattern, spaces: []const MatchSpace) anyerror!void {
             const source = self.unresolved.match_patterns[prepared.pattern.source];
             const operand = try self.readLocal(source.carrier, source.span);
-            var selected: structures.TypeId = .never;
-            for (spaces) |space| selected = try joinTypes(self.analysis_context, selected, space.type_id, self.gpa);
+            var joined: TypeJoin = .{};
+            defer joined.deinit(self.gpa);
+            for (spaces) |space| try joined.add(self.gpa, space.type_id);
+            const selected = try joined.finish(self.analysis_context, self.gpa);
             if (operand.result_place) |result_place| try self.refineFlowPlace(result_place, self.flow.?.places.items[result_place].type_id, selected, true, source.span);
             if (try self.flowPlace(operand, true)) |place| {
                 const current = self.flow.?.facts.get(self.state.refinements, place);
@@ -11536,16 +11555,22 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (self.current_block == null) return .{ .id = @fromBackingInt(0), .type_id = .never };
             const operand = try self.readLocal(source.carrier, source.operand.span);
             const members = try self.matchInputMembers(operand.type_id);
-            var errors: structures.TypeId = .never;
-            var successes: structures.TypeId = .never;
-            var error_types: structures.TypeId = .never;
+            var error_join: TypeJoin = .{};
+            defer error_join.deinit(self.gpa);
+            var success_join: TypeJoin = .{};
+            defer success_join.deinit(self.gpa);
+            var error_type_join: TypeJoin = .{};
+            defer error_type_join.deinit(self.gpa);
             for (members) |member| {
                 const specification = try self.analysis_context.facts().memberSpec(member);
                 if (try self.isErrorType(member)) {
-                    errors = try joinTypes(self.analysis_context, errors, member, self.gpa);
-                    error_types = try joinTypes(self.analysis_context, error_types, specification.type_id, self.gpa);
-                } else successes = try joinTypes(self.analysis_context, successes, member, self.gpa);
+                    try error_join.add(self.gpa, member);
+                    try error_type_join.add(self.gpa, specification.type_id);
+                } else try success_join.add(self.gpa, member);
             }
+            const errors = try error_join.finish(self.analysis_context, self.gpa);
+            const successes = try success_join.finish(self.analysis_context, self.gpa);
+            const error_types = try error_type_join.finish(self.analysis_context, self.gpa);
             if (source.annotation) |annotation| {
                 if (!try semantic.canWidenTo(self.analysis_context, error_types, annotation))
                     return self.reject(source.binding.?.span, .{ .local_type_mismatch = self.typeMismatch(annotation, error_types) });
@@ -13044,6 +13069,34 @@ fn normalizeValueReference(mapping: anytype, value: *structures.FunctionValueId)
     else
         raw - mapping.removed);
 }
+
+/// Joins many types with the result of folding `joinTypes` over them in order.
+/// Without tuples widening is member-set inclusion, so the fold is their union
+/// and one interning replaces a quadratic chain of growing intermediate variants.
+const TypeJoin = struct {
+    items: std.ArrayList(structures.TypeId) = .empty,
+
+    fn deinit(self: *TypeJoin, gpa: std.mem.Allocator) void {
+        self.items.deinit(gpa);
+    }
+
+    fn add(self: *TypeJoin, gpa: std.mem.Allocator, type_id: structures.TypeId) !void {
+        try self.items.append(gpa, type_id);
+    }
+
+    fn finish(self: *const TypeJoin, analysis_context: anytype, gpa: std.mem.Allocator) !structures.TypeId {
+        for (self.items.items) |item| {
+            for ((try analysis_context.facts().variantMembers(item)) orelse &.{item}) |member| {
+                if (try analysis_context.facts().tupleMembers(member) == null) continue;
+                var result: structures.TypeId = .never;
+                for (self.items.items) |next| result = try joinTypes(analysis_context, result, next, gpa);
+                return result;
+            }
+        }
+        if (self.items.items.len == 0) return .never;
+        return analysis_context.facts().internVariant(self.items.items);
+    }
+};
 
 fn joinTypes(analysis_context: anytype, left: structures.TypeId, right: structures.TypeId, gpa: std.mem.Allocator) !structures.TypeId {
     if (left == .never) return right;
