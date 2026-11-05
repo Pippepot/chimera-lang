@@ -2255,3 +2255,375 @@ test "for live list cursors reject backing relocation" {
         \\if (run() is unit) -> exit(0)
     , .borrow_outlives_source);
 }
+
+test "std algorithms compose map filter enumerate and zip" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{map, filter, enumerate, zip, Map, Filter, Enumerate}
+        \\import std.range.{RangeIterator}
+        \\func double(value: int) int -> value * 2
+        \\func even(value: int) bool -> value % 4 == 0
+        \\func run() int
+        \\    const mapped = map(RangeIterator, int, int, (1..=6).iter(), double)
+        \\    const selected = filter(Map(RangeIterator, int, int), int, false, mapped^, even)
+        \\    const numbered = enumerate(Filter(Map(RangeIterator, int, int), int, false), int, false, selected^)
+        \\    var paired = zip(Enumerate(Filter(Map(RangeIterator, int, int), int, false), int, false), RangeIterator, (int, int), int, false, false, numbered^, (5..=7).iter())
+        \\    var total = 0
+        \\    for pair in paired -> total += pair.0.0 + pair.0.1 + pair.1
+        \\    if not (paired.next() is End) -> return 90
+        \\    return total - 3
+    , 42);
+}
+
+test "std zip preserves every owned and borrowed tuple shape" {
+    inline for (.{ false, true }) |left_borrowed| {
+        inline for (.{ false, true }) |right_borrowed| {
+            const source = try test_sources.renderTemplate(std.testing.allocator,
+                \\import std.algorithms.{zip}
+                \\import std.memory.{SpanIterator}
+                \\import std.range.{RangeIterator}
+                \\func run() int
+                \\    var left = [10, 11]
+                \\    var right = [9, 10]
+                \\    var paired = zip($left_type, $right_type, int, int, $lb, $rb, $left, $right)
+                \\    var total = 0
+                \\    for pair in paired
+                \\        total += pair.0 + pair.1
+                \\        $write_left
+                \\        $write_right
+                \\    return total + 2
+            , .{
+                .left_type = if (left_borrowed) "SpanIterator(int)" else "RangeIterator",
+                .right_type = if (right_borrowed) "SpanIterator(int)" else "RangeIterator",
+                .lb = if (left_borrowed) "true" else "false",
+                .rb = if (right_borrowed) "true" else "false",
+                .left = if (left_borrowed) "left.iter()" else "(10..=11).iter()",
+                .right = if (right_borrowed) "right.iter()" else "(9..=10).iter()",
+                .write_left = if (left_borrowed) "pair.0 += 1" else "total += 0",
+                .write_right = if (right_borrowed) "pair.1 += 1" else "total += 0",
+            });
+            defer std.testing.allocator.free(source);
+            try Fixture.expectParity(source, 42);
+        }
+    }
+}
+
+test "std filter and enumerate preserve borrowed immovable elements" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{filter, enumerate, Filter}
+        \\import std.memory.{SpanIterator}
+        \\struct Item
+        \\    move = none
+        \\    copy = none
+        \\    value: int
+        \\func positive(item: Item) bool -> item.value > 0
+        \\func run() int
+        \\    var values = [Item{value = -1}, Item{value = 19}, Item{value = 21}]
+        \\    const selected = filter(SpanIterator(Item), Item, true, values.iter(), positive)
+        \\    var numbered = enumerate(Filter(SpanIterator(Item), Item, true), Item, true, selected^)
+        \\    for pair in numbered -> pair.1.value += 1
+        \\    return values[1].value + values[2].value
+    , 42);
+}
+
+test "std terminals short circuit resume cursors and handle empty inputs" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{find, any, all}
+        \\import std.range.{RangeIterator}
+        \\func even(value: int) bool -> value % 2 == 0
+        \\func below_four(value: int) bool -> value < 4
+        \\func run() int
+        \\    var first = (1..=6).iter()
+        \\    if not any(RangeIterator, int, first, even) -> return 90
+        \\    const after_any = first.next()
+        \\    if not (after_any is int) -> return 91
+        \\    if after_any <> 3 -> return 92
+        \\    if all(RangeIterator, int, first, below_four) -> return 93
+        \\    const found = find(RangeIterator, int, false, first, even)
+        \\    if not (found is int) -> return 94
+        \\    if found <> 6 -> return 95
+        \\    if not (find(RangeIterator, int, false, first, even) is none) -> return 96
+        \\    var empty = (0..0).iter()
+        \\    if any(RangeIterator, int, empty, even) -> return 97
+        \\    if not all(RangeIterator, int, empty, even) -> return 98
+        \\    return 42
+    , 42);
+}
+
+test "std find copies only the accepted borrowed element" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{find, any, all}
+        \\import std.memory.{SpanIterator}
+        \\struct Item
+        \\    value: int
+        \\    copies: Ref(int)
+        \\    copy = func(imm self: Item) Item
+        \\        self.copies.value += 1
+        \\        return Item{value = self.value, copies = self.copies}
+        \\func accept(item: Item) bool -> item.value == 23
+        \\func run() int
+        \\    var copies = 0
+        \\    const values = [Item{value = 19, copies = Ref.from(copies)}, Item{value = 23, copies = Ref.from(copies)}]
+        \\    var cursor = values.iter()
+        \\    const found = find(SpanIterator(Item), Item, true, cursor, accept)
+        \\    if not (found is Item) -> return 90
+        \\    if copies <> 1 -> return 91
+        \\    if any(SpanIterator(Item), Item, cursor, accept) -> return 92
+        \\    if not all(SpanIterator(Item), Item, cursor, accept) -> return 93
+        \\    return found.value + values[0].value
+    , 42);
+}
+
+test "std owned filtering and find transfer owners and drop rejected items" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{filter, find, Filter}
+        \\import std.memory.{ListIterator}
+        \\struct Item
+        \\    copy = none
+        \\    value: int
+        \\    drops: Ref(int)
+        \\    drop = func(deinit self: Item) -> self.drops.value += 1
+        \\func accept(item: Item) bool -> item.value % 2 == 0
+        \\func calculate(ref drops: int) int
+        \\    const values: List(Item) = [Item{value = 1, drops = Ref.from(drops)}, Item{value = 20, drops = Ref.from(drops)}, Item{value = 3, drops = Ref.from(drops)}, Item{value = 22, drops = Ref.from(drops)}]
+        \\    var selected = filter(ListIterator(Item), Item, false, values.consume_iter(), accept)
+        \\    const first = find(Filter(ListIterator(Item), Item, false), Item, false, selected, accept)
+        \\    if not (first is Item) -> return 90
+        \\    var total = first.value
+        \\    for item in selected -> total += item.value
+        \\    return total
+        \\func run() int
+        \\    var drops = 0
+        \\    const result = calculate(drops)
+        \\    if drops <> 4 -> return 91
+        \\    return result
+    , 42);
+}
+
+test "std map borrows immovable inputs and constructs immovable outputs" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{map}
+        \\import std.memory.{SpanIterator}
+        \\struct Item
+        \\    move = none
+        \\    copy = none
+        \\    value: int
+        \\func double(item: Item) Item -> Item{value = item.value * 2}
+        \\func run() int
+        \\    const values = [Item{value = 9}, Item{value = 12}]
+        \\    var mapped = map(SpanIterator(Item), Item, Item, values.iter(), double)
+        \\    var total = 0
+        \\    for item in mapped -> total += item.value
+        \\    return total
+    , 42);
+}
+
+test "std zip polls left first and drops unmatched owned values" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{zip}
+        \\struct Item
+        \\    copy = none
+        \\    value: int
+        \\    trace: Ref(int)
+        \\    drop = func(deinit self: Item) -> self.trace.value += 100
+        \\struct Left
+        \\    trace: Ref(int)
+        \\    ready: bool
+        \\    pub func next(mut self: Left) Item | End
+        \\        self.trace.value += 1
+        \\        if not self.ready -> return End{}
+        \\        self.ready = false
+        \\        return Item{value = 19, trace = self.trace}
+        \\struct Right
+        \\    trace: Ref(int)
+        \\    ready: bool
+        \\    pub func next(mut self: Right) int | End
+        \\        self.trace.value += 10
+        \\        if not self.ready -> return End{}
+        \\        self.ready = false
+        \\        return 23
+        \\func check(ref trace: int, left_ready: bool, right_ready: bool) int
+        \\    var paired = zip(Left, Right, Item, int, false, false, Left{trace = Ref.from(trace), ready = left_ready}, Right{trace = Ref.from(trace), ready = right_ready})
+        \\    const result = paired.next()
+        \\    if result is End -> return 0
+        \\    return result.0.value + result.1
+        \\func run() int
+        \\    var trace = 0
+        \\    if check(trace, false, true) <> 0 -> return 90
+        \\    if trace <> 1 -> return 91
+        \\    trace = 0
+        \\    if check(trace, true, false) <> 0 -> return 92
+        \\    if trace <> 111 -> return 93
+        \\    trace = 0
+        \\    const total = check(trace, true, true)
+        \\    if trace <> 111 -> return 94
+        \\    return total
+    , 42);
+}
+
+test "std algorithms retain contained references and release list borrows" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{map, filter, find}
+        \\import std.memory.{SpanIterator}
+        \\func identity(value: Ref(int)) Ref(int) -> value
+        \\func accept(value: Ref(int)) bool -> value.value == 19
+        \\func run() int
+        \\    var left = 19
+        \\    var right = 23
+        \\    var values: List(Ref(int)) = [Ref.from(left), Ref.from(right)]
+        \\    var mapped = map(SpanIterator(Ref(int)), Ref(int), Ref(int), values.iter(), identity)
+        \\    var cursor = values.iter()
+        \\    const found = find(SpanIterator(Ref(int)), Ref(int), true, cursor, accept)
+        \\    if not (found is Ref(int)) -> return 90
+        \\    var total = 0
+        \\    for item in mapped -> total += item.value
+        \\    if not (values.append(Ref.from(left)) is unit) -> return 91
+        \\    found.value += 1
+        \\    return total
+    , 42);
+}
+
+test "std algorithms recompute callback and standard library edits" {
+    const source =
+        \\import std.algorithms.{map}
+        \\import std.range.{RangeIterator}
+        \\func adjust(value: int) int -> value + 1
+        \\func run() int
+        \\    var mapped = map(RangeIterator, int, int, (41..=41).iter(), adjust)
+        \\    for value in mapped -> return value
+        \\    return 90
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const edited = try std.mem.replaceOwned(u8, std.testing.allocator, source, "value + 1", "value + 2");
+    defer std.testing.allocator.free(edited);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, edited);
+    try fixture.expectExit(0, 43);
+    const library = @import("standard_library");
+    const original = library.source("algorithms.chi");
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "return self.transform(result)", "return End{}");
+    defer std.testing.allocator.free(changed);
+    const file = (try fixture.db.input(test_sources.queries.StandardFile, @backingInt(library.File.algorithms))).*;
+    try fixture.db.setInput(test_sources.queries.SourceText, file, changed);
+    try fixture.expectExit(0, 90);
+}
+
+test "std algorithms treat optional producer results as items" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{map, filter, any, Filter}
+        \\struct Source
+        \\    index: int
+        \\    pub func next(mut self: Source) int | none | End
+        \\        self.index += 1
+        \\        if self.index == 1 -> return none
+        \\        if self.index == 2 -> return 41
+        \\        return End{}
+        \\func number(value: int | none) int
+        \\    if value is int -> return value
+        \\    return 1
+        \\func accept(value: int | none) bool -> true
+        \\func absent(value: int | none) bool -> value is none
+        \\func run() int
+        \\    var first = Source{index = 0}
+        \\    if not any(Source, int | none, first, absent) -> return 90
+        \\    const selected = filter(Source, int | none, false, Source{index = 0}, accept)
+        \\    var mapped = map(Filter(Source, int | none, false), int | none, int, selected^, number)
+        \\    var total = 0
+        \\    for value in mapped -> total += value
+        \\    return total
+    , 42);
+}
+
+test "std enumerate handles its final representable index and rejects overflow" {
+    const library = @import("standard_library");
+    const original = library.source("algorithms.chi");
+    const boundary = try std.mem.replaceOwned(u8, std.testing.allocator, original, "index = 0, overflow = false", "index = 2147483647, overflow = false");
+    defer std.testing.allocator.free(boundary);
+    inline for (.{ false, true }) |borrowed| {
+        for ([_]bool{ false, true }) |overflow| {
+            const declarations = try test_sources.renderTemplate(std.testing.allocator,
+                \\import std.algorithms.{enumerate}
+                \\import std.memory.{SpanIterator}
+                \\import std.range.{RangeIterator}
+                \\func run() int
+                \\    var values = $values
+                \\    var cursor = enumerate($source_type, int, $borrowed, $source)
+                \\    const first = cursor.next()
+                \\    if first is End -> return 90
+                \\    if first.0 <> 2147483647 -> return 91
+                \\    if not (cursor.next() is End) -> return 92
+                \\    return first.1 + 23
+            , .{
+                .source_type = if (borrowed) "SpanIterator(int)" else "RangeIterator",
+                .borrowed = if (borrowed) "true" else "false",
+                .values = if (overflow) "[19, 23]" else "[19]",
+                .source = if (borrowed)
+                    "values.iter()"
+                else
+                    (if (overflow) "(19..=20).iter()" else "(19..=19).iter()"),
+            });
+            defer std.testing.allocator.free(declarations);
+            for ([_]bool{ false, true }) |interpreted| {
+                const program = try std.fmt.allocPrint(std.testing.allocator, "{s}\nexit({s}run())", .{ declarations, if (interpreted) "comptime -> " else "" });
+                defer std.testing.allocator.free(program);
+                const fixture = try Fixture.init(program);
+                defer fixture.deinit();
+                const file = (try fixture.db.input(test_sources.queries.StandardFile, @backingInt(library.File.algorithms))).*;
+                try fixture.db.setInput(test_sources.queries.SourceText, file, boundary);
+                if (!overflow) {
+                    try fixture.expectExit(0, 42);
+                } else if (interpreted) {
+                    try fixture.expectDiagnostic(null, .compile_time_panic);
+                } else {
+                    const result = try fixture.runIo("");
+                    defer std.testing.allocator.free(result.stdout);
+                    defer std.testing.allocator.free(result.stderr);
+                    try std.testing.expectEqual(std.process.Child.Term{ .exited = 134 }, result.term);
+                    try std.testing.expect(std.mem.startsWith(u8, result.stderr, "panic: enumerate index overflow\n"));
+                }
+            }
+        }
+    }
+}
+
+test "std mapped cursors materialize through existing stable sorted collections" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{map}
+        \\import std.range.{RangeIterator}
+        \\func times_seven(value: int) int -> value * 7
+        \\func run() int
+        \\    var mapped = map(RangeIterator, int, int, (1..=3).reversed().iter(), times_seven)
+        \\    const values = List(int).collect([value for value in mapped])
+        \\    if not (values is List(int)) -> return 92
+        \\    const ordered = values.sorted()
+        \\    if not (ordered is List(int)) -> return 93
+        \\    if values[0] <> 21 -> return 90
+        \\    if ordered[0] <> 7 or ordered[2] <> 21 -> return 91
+        \\    return ordered[0] + ordered[1] + ordered[2]
+    , 42);
+}
+
+test "std terminal algorithms poll existing cursors without restarting iter" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{find, any, all}
+        \\struct Counter
+        \\    value: int
+        \\    pub func iter(self: Counter) Counter -> Counter{value = 0}
+        \\    pub func next(mut self: Counter) int | End
+        \\        if self.value == 6 -> return End{}
+        \\        self.value += 1
+        \\        return self.value
+        \\func accept(value: int) bool -> true
+        \\func reject(value: int) bool -> false
+        \\func run() int
+        \\    var cursor = Counter{value = 1}
+        \\    const found = find(Counter, int, false, cursor, accept)
+        \\    if not (found is int) -> return 90
+        \\    if found <> 2 -> return 91
+        \\    if not any(Counter, int, cursor, accept) -> return 92
+        \\    if all(Counter, int, cursor, reject) -> return 93
+        \\    if cursor.value <> 4 -> return 94
+        \\    return 42
+    , 42);
+}

@@ -81,6 +81,19 @@ const ParserState = struct {
         }
     }
 
+    /// Only a leading `|` claims indentation; an ordinary body keeps its indent.
+    fn atVariantSeparator(self: *@This()) bool {
+        switch (self.current().tag) {
+            .pipe => return true,
+            .indent => {
+                if (self.tokens[self.index + 1].tag != .pipe) return false;
+                self.skipContinuationIndent();
+                return true;
+            },
+            else => return false,
+        }
+    }
+
     pub fn matchingDedent(self: *@This(), indent_index: u32) u32 {
         std.debug.assert(self.tokens[indent_index].tag == .indent);
         var depth: usize = 1;
@@ -444,6 +457,7 @@ fn parseBinding(parser: *ParserState) !Node.Index {
     if (binding_keyword.tag != .keyword_static and (parser.current().tag == .l_paren or parser.current().tag == .l_bracket)) {
         const pattern = try parseBindingPattern(parser, binding_keyword.tag);
         _ = try parser.expect(.equal);
+        parser.skipContinuationIndent();
         const value = try parseRequiredExpression(parser);
         const binding = try parser.addNode(.{ .tag = .destructure_binding, .token_index = parser.nodes.items[pattern.index()].token_index, .data = .{ .node_node = .{ .a = pattern, .b = value } } });
         return parseBindingElse(parser, binding, parser.nodes.items[pattern.index()].token_index);
@@ -451,6 +465,7 @@ fn parseBinding(parser: *ParserState) !Node.Index {
     const name = try parseDeclarationName(parser, binding_keyword.tag == .keyword_static);
     const type_annotation = try parseTypeAnnotation(parser);
     _ = try parser.expect(.equal);
+    parser.skipContinuationIndent();
     const explicit_type_value = if (type_annotation.unwrap()) |annotation| blk: {
         const node = parser.nodes.items[annotation.index()];
         const token = parser.tokens[node.token_index];
@@ -557,6 +572,7 @@ fn parseImportAlias(parser: *ParserState, target: Node.Index) !Node.Index {
 fn parseAssign(parser: *ParserState, target: Node.Index, tag: Node.Tag) !Node.Index {
     const token_index = parser.index;
     parser.index += 1;
+    parser.skipContinuationIndent();
     const value = try parseRequiredExpression(parser);
     return try parser.addNode(.{ .tag = tag, .token_index = token_index, .data = .{ .node_node = .{ .a = target, .b = value } } });
 }
@@ -642,7 +658,8 @@ fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
     }
     const token_index = parser.index;
     const pattern = switch (parser.current().tag) {
-        .identifier, .keyword_func => try parseType(parser),
+        .period => try parseContextualMember(parser),
+        .identifier, .keyword_func => try parseTypePrimary(parser),
         .keyword_ref, .keyword_var => try parseMatchCapture(parser),
         .number_literal => try parseTokenNode(parser, .number_literal, .number_literal),
         .string_literal => try parseTokenNode(parser, .string_literal, .string_literal),
@@ -658,7 +675,7 @@ fn parseMatchPattern(parser: *ParserState) ParseError!Node.Index {
     };
     if (parser.current().tag != .pipe) return pattern;
     try matchPatternAsType(parser, pattern);
-    return parseVariantMembers(parser, token_index, pattern, true);
+    return parseVariantMembers(parser, token_index, pattern, .pattern);
 }
 
 fn matchRangeAhead(parser: *ParserState) bool {
@@ -775,19 +792,26 @@ fn parseTypeAnnotation(parser: *ParserState) !Node.Index {
 }
 
 fn parseType(parser: *ParserState) ParseError!Node.Index {
+    parser.skipContinuationIndent();
     const token_index = parser.index;
     const first = try parseTypePrimary(parser);
-    if (parser.current().tag != .pipe) return first;
-    return parseVariantMembers(parser, token_index, first, true);
+    if (!parser.atVariantSeparator()) return first;
+    return parseVariantMembers(parser, token_index, first, .type);
 }
 
 /// Parses the `|`-separated members that follow the first member of a variant.
-fn parseVariantMembers(parser: *ParserState, token_index: u32, first: Node.Index, comptime is_type: bool) ParseError!Node.Index {
+fn parseVariantMembers(parser: *ParserState, token_index: u32, first: Node.Index, comptime context: enum { type, expression, pattern }) ParseError!Node.Index {
     const stack_top = parser.scratch_stack.items.len;
     defer parser.scratch_stack.shrinkRetainingCapacity(stack_top);
     try parser.scratch_stack.append(parser.gpa, first);
-    while (parser.eat(.pipe) != null) {
-        const member = if (is_type) try parseTypePrimary(parser) else try parseExpressionPrecedence(parser, 1);
+    while (parser.atVariantSeparator()) {
+        _ = parser.eat(.pipe).?;
+        parser.skipContinuationIndent();
+        const member = switch (context) {
+            .type => try parseTypePrimary(parser),
+            .expression => try parseExpressionPrecedence(parser, 1),
+            .pattern => if (parser.current().tag == .period) try parseContextualMember(parser) else try parseTypePrimary(parser),
+        };
         try parser.scratch_stack.append(parser.gpa, member);
     }
     return addNodeList(parser, token_index, parser.scratch_stack.items[stack_top..], .type_variant);
@@ -886,7 +910,7 @@ fn parseExpressionPrecedence(parser: *ParserState, min_precedence: u8) ParseErro
         lhs = try parser.addNode(.{ .tag = op_info.tag, .token_index = operator_index, .data = .{ .node_node = .{ .a = lhs, .b = rhs } } });
     }
 
-    if (min_precedence == 0 and parser.current().tag == .pipe and !parser.atMatchArmBoundary()) return parseVariantMembers(parser, token_index, lhs, false);
+    if (min_precedence == 0 and parser.atVariantSeparator() and !parser.atMatchArmBoundary()) return parseVariantMembers(parser, token_index, lhs, .expression);
     if (min_precedence == 0 and parser.current().tag == .keyword_catch) return parseCatch(parser, lhs);
     return lhs;
 }
@@ -992,7 +1016,10 @@ fn parseCall(parser: *ParserState, callee: Node.Index) ParseError!Node.Index {
 
 fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
     return switch (parser.current().tag) {
-        .period => try parseNominalCase(parser),
+        .period => if (parser.tokens[parser.index + 1].tag == .identifier and parser.tokens[parser.index + 2].tag == .l_brace)
+            try parseContextualMember(parser)
+        else
+            try parseNominalCase(parser),
         .number_literal => try parseTokenNode(parser, .number_literal, .number_literal),
         .string_literal => try parseTokenNode(parser, .string_literal, .string_literal),
         .keyword_true => try parseTokenNode(parser, .keyword_true, .bool_literal),
@@ -1183,6 +1210,11 @@ fn parseStructInitializerItem(parser: *ParserState) ParseError!Node.Index {
     return parser.addNode(.{ .tag = .struct_init_positional, .token_index = token_index, .data = .{ .node = value } });
 }
 
+fn parseContextualMember(parser: *ParserState) ParseError!Node.Index {
+    _ = try parser.expect(.period);
+    return parseTokenNode(parser, .identifier, .contextual_member);
+}
+
 fn parseNominalCase(parser: *ParserState) ParseError!Node.Index {
     _ = try parser.expect(.period);
     const token_index = parser.index;
@@ -1217,6 +1249,7 @@ fn parseNamedValue(parser: *ParserState, tag: Node.Tag) ParseError!Node.Index {
     const identifier_index = parser.index;
     _ = try parser.expect(.identifier);
     _ = try parser.expect(.equal);
+    parser.skipContinuationIndent();
     const value = try parseRequiredExpression(parser);
     return try parser.addNode(.{ .tag = tag, .token_index = identifier_index, .data = .{ .node = value } });
 }
@@ -1308,7 +1341,7 @@ fn renderNode(gpa: std.mem.Allocator, node_index: Node.Index, ast: *const Ast, s
     const new_indent = if (at_root) "" else try std.mem.concat(gpa, u8, &.{ indent, if (is_last) "  " else "│ " });
     defer if (!at_root) gpa.free(new_indent);
     switch (node.tag) {
-        .bool_literal, .identifier, .none_literal, .type, .number_literal, .string_literal, .field_access, .struct_field, .struct_property, .struct_init_field, .param => {
+        .bool_literal, .identifier, .none_literal, .type, .number_literal, .string_literal, .field_access, .struct_field, .struct_property, .struct_init_field, .param, .contextual_member => {
             const loc = ast.tokens[node.token_index].loc;
             try writer.print(" : {s}", .{source[loc.start..loc.end]});
         },
@@ -1675,10 +1708,123 @@ test "parse static variant type value" {
     );
 }
 
+test "parse newline variant expressions with leading and trailing separators" {
+    const sources = [_][:0]const u8{
+        "static Color =\n    Red\n  | Blue\n  | Green\nstatic next = 0",
+        "static Color = Red\n  | Blue\n  | Green\nstatic next = 0",
+        "static Color = Red\n| Blue\n| Green\nstatic next = 0",
+        "static Color = Red |\n  Blue |\n  Green\nstatic next = 0",
+        "static Color =\n  Red |\n    Blue |\n  Green\nstatic next = 0",
+        "static Color =\n    Red\n  | Blue\n    | Green\nstatic next = 0",
+        "static Color =\r\n    Red\r\n  | Blue\r\n  | Green\r\nstatic next = 0",
+        "static Color = # first\n    Red\n\n  # second\n  | Blue # third\n  | Green\nstatic next = 0",
+    };
+    for (sources) |source| try testParsing(source,
+        \\static_binding
+        \\└─type_variant
+        \\  ├─identifier : Red
+        \\  ├─identifier : Blue
+        \\  └─identifier : Green
+        \\static_binding
+        \\└─number_literal : 0
+    );
+}
+
+test "parse newline variant annotations and preserve the following function body" {
+    const sources = [_][:0]const u8{
+        "func f(value:\n    int\n  | none) int\n  | none\n  return value",
+        "func f(value: int |\n  none) int |\n  none\n  return value",
+    };
+    for (sources) |source| try testParsing(source,
+        \\static_binding
+        \\└─func
+        \\  ├─signature
+        \\  │ ├─param_list
+        \\  │ │ └─param : value
+        \\  │ │   └─type_variant
+        \\  │ │     ├─type : int
+        \\  │ │     └─type : none
+        \\  │ └─type_variant
+        \\  │   ├─type : int
+        \\  │   └─type : none
+        \\  └─block
+        \\    └─return_expr
+        \\      └─identifier : value
+    );
+    try testParsing(
+        \\static Color: type =
+        \\    Red
+        \\  | ref Blue
+        \\  | (Green | none)
+    ,
+        \\static_binding
+        \\├─type : type
+        \\└─type_variant
+        \\  ├─type : Red
+        \\  ├─reference_type
+        \\  │ └─type : Blue
+        \\  └─type_variant
+        \\    ├─type : Green
+        \\    └─type : none
+    );
+}
+
+test "newline variant continuations preserve diagnostics and enclosing blocks" {
+    try testExpectDiagnosticTag("static Color = Red\n  Blue", .unexpected_indented_block);
+    try testExpectDiagnosticTag("static Color =\n  Red\n  |", .{ .invalid_expression = .eof });
+    try testExpectDiagnosticTag("const value: int |\n  = 1", .{ .invalid_expression = .equal });
+    try testParsing(
+        \\func f()
+        \\  static Color =
+        \\      Red
+        \\    | Blue
+        \\  use(Color)
+        \\after()
+    ,
+        \\static_binding
+        \\└─func
+        \\  ├─signature
+        \\  └─block
+        \\    ├─static_binding
+        \\    │ └─type_variant
+        \\    │   ├─identifier : Red
+        \\    │   └─identifier : Blue
+        \\    └─call
+        \\      ├─identifier : use
+        \\      └─call_arg_list
+        \\        └─identifier : Color
+        \\call
+        \\└─identifier : after
+    );
+}
+
+test "parse newline variants in nested lists and initializers" {
+    var report = try parseReport(std.testing.allocator, 0,
+        \\const (first, second) =
+        \\    (Red, Blue)
+        \\const value = Wrapper{
+        \\    kind =
+        \\        Red
+        \\      | Blue,
+        \\    other = choose(
+        \\        Red
+        \\          | Blue,
+        \\        Green |
+        \\            none),
+        \\}
+        \\after()
+    );
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    const parsed = &report.ast.?;
+    const statements = parsed.nodes[0].data.ref;
+    try std.testing.expectEqual(@as(u32, 3), statements.end - statements.start);
+}
+
 test "parse nominal declarations and positional construction in embedded and runtime sources" {
     const dense = comptime parseEmbedded("static Cases = .A: int | .B: int | .C: int | .D: int | .E: int | .F: int | .G: int | .H: int");
     try std.testing.expect(dense.nodes.len > dense.tokens.len * 2);
-    const source = "static Cases = .Empty | .Value: int\nconst value = Cases.Value{42}";
+    const source = "static Cases =\n    .Empty\n  | .Value: int\nconst value = Cases.Value{42}";
     const embedded = comptime parseEmbedded(source);
     var report = try parseReport(std.testing.allocator, 0, source);
     defer report.deinit(std.testing.allocator);
@@ -2876,6 +3022,7 @@ test "truncated multiline sources preserve parser error boundaries" {
         "static struct Container(T: type)\n  value: T\n  func get(self: Self) T -> self.value",
         "const value = call(\n  [1, 2,\n    3],\n  Item{\n    field = 4,\n  },\n)",
         "static Callback: type = func(imm int | none, init int) int",
+        "static Cases =\n    .Empty\n  | .Value: int\nconst value: int |\n  none = 42",
     };
     for (sources) |source| {
         for (0..source.len + 1) |length| {

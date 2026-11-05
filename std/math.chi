@@ -1,10 +1,14 @@
-pub func min(left: int, right: int) int
+pub func min(static T: type, imm left: T, imm right: T) T
     if left < right -> return left
     return right
 
-pub func max(left: int, right: int) int
+pub func max(static T: type, imm left: T, imm right: T) T
     if left > right -> return left
     return right
 
-pub func clamp(value: int, lower: int, upper: int) int
+pub func clamp(static T: type, imm value: T, imm lower: T, imm upper: T) T
     return max(min(value, upper), lower)
+
+# Keep the common int specializations in the precompiled standard library.
+func precompile_int_math() (func(int, int) int, func(int, int) int, func(int, int, int) int)
+    return (min, max, clamp)

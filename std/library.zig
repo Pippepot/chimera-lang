@@ -15,6 +15,7 @@ pub const File = enum(u32) {
     primitives,
     search,
     memory_sort,
+    algorithms,
 
     pub fn path(file: File) []const u8 {
         return switch (file) {
@@ -32,6 +33,7 @@ pub const File = enum(u32) {
             .primitives => "primitives.chi",
             .search => "search.chi",
             .memory_sort => "memory/sort.chi",
+            .algorithms => "algorithms.chi",
         };
     }
 

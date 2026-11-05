@@ -128,6 +128,12 @@ Inline variant cases reuse nominal struct identities with one anonymous payload
 component and ordinary aggregate storage. Their declaration-owned namespaces and
 generic specializations preserve identity through structural union composition;
 qualified case lookup can forward through aliases and composed unions.
+Construction preserves shorthand constructor and match-case names until typing
+supplies an expected type. Typing reuses qualified nominal-case lookup, including
+visibility and ambiguity checks, and owns initializer-shape validation after the
+target type is resolved.
+Item discovery tracks type-producing positions so bare runtime case values do
+not introduce declarations or collide with repeated references to the same case.
 Synthesized payload converters have ordinary callable identities and bodies;
 the backend has no case-specific instruction. Payload declarations validate
 copyability and public exposure before consumers see their definitions.

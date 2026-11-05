@@ -11,6 +11,37 @@ fn namedType(db: *sources.query.Database, name: []const u8) !structures.TypeId {
     return (try db.lookupInterned(queries.CompileTimeValues, value)).type;
 }
 
+test "newline variants compose ordinary and nominal alternatives with native interpreter parity" {
+    try Fixture.expectParity(
+        \\struct Red
+        \\struct Blue
+        \\struct Green
+        \\static Color =
+        \\    Red
+        \\  | Blue
+        \\  | Green
+        \\static Message =
+        \\    .Empty
+        \\  | .Value: int
+        \\  | Color
+        \\func color(c: Color) int
+        \\    match c
+        \\        Red -> return 20
+        \\        Blue -> return 1
+        \\        Green -> return 2
+        \\func run() int
+        \\    var message:
+        \\        Message
+        \\      | none = Message.Empty{}
+        \\    message =
+        \\        Message.Value{22}
+        \\    if message is Message.Value
+        \\        const payload: int = message
+        \\        return color(Red{}) + payload
+        \\    return 3
+    , 42);
+}
+
 test "nominal variants construct narrow and convert without changing the source" {
     try Fixture.expectParity(
         \\static Result = .Success: int | .Failure: int | .Empty
@@ -289,6 +320,12 @@ test "nominal payload edits refresh definitions converters layouts and executabl
     const requester = (try fixture.db.input(queries.FileModule, 0)).*;
     try fixture.expectExit(0, 42);
     try testing.expectEqual(@as(u32, 8), (try fixture.db.get(queries.HostTypeLayout, cases)).byte_size);
+    const multiline = try std.mem.replaceOwned(u8, testing.allocator, original, "Cases = .Value: Payload | .Empty", "Cases =\n    .Value: Payload\n  | .Empty");
+    defer testing.allocator.free(multiline);
+    try fixture.db.setInput(queries.SourceText, 0, multiline);
+    try testing.expectEqual(cases, try namedType(fixture.db, "Cases"));
+    try testing.expectEqual(case, try namedType(fixture.db, "Case"));
+    try fixture.expectExit(0, 42);
     const updated = try std.mem.replaceOwned(u8, testing.allocator, original, "Payload = int", "Payload = byte");
     defer testing.allocator.free(updated);
     try fixture.db.setInput(queries.SourceText, 0, updated);
@@ -320,7 +357,7 @@ test "nominal payload edits refresh definitions converters layouts and executabl
     try fixture.expectExit(0, 42);
 }
 
-test "nominal payload conversion copies once and drops both payload owners" {
+test "contextual nominal payload construction and conversion copy once and drop both payload owners" {
     try Fixture.expectParity(
         \\struct Payload
         \\    ref copies: int
@@ -334,7 +371,7 @@ test "nominal payload conversion copies once and drops both payload owners" {
         \\func run() int
         \\    var copies = 0
         \\    var drops = 0
-        \\    const wrapper = Cases.Value{Payload{copies = copies, drops = drops, value = 42}}
+        \\    const wrapper: Cases.Value = .Value{Payload{copies = copies, drops = drops, value = 42}}
         \\    const payload: Payload = wrapper
         \\    if not (wrapper is Cases.Value) -> return 1
         \\    const value = payload.value
@@ -389,4 +426,182 @@ test "wide nominal variants narrow and match without chained joins" {
     );
     const source = declaration.items;
     try Fixture.expectParity(source, 42);
+}
+
+test "contextual nominal constructors and match arms infer the original case namespace" {
+    try Fixture.expectParity(
+        \\static Color = .Red | .Blue | .Green
+        \\func color(c: Color) int
+        \\    match c
+        \\        .Red -> return 42
+        \\        Color.Blue | .Green -> return 1
+        \\func run() int -> color(.Red)
+    , 42);
+}
+
+test "contextual nominal cases flow through annotations returns fields tuples and arrays" {
+    try Fixture.expectParity(
+        \\static Cases = .Value: int | .Empty | .Absent: none
+        \\static Alias = Cases
+        \\struct Box
+        \\    value: Alias
+        \\func make() Alias -> if true -> .Value{20} else .Empty
+        \\func read(value: Alias) int
+        \\    match value
+        \\        .Value -> return int(value)
+        \\        .Empty | .Absent -> return 0
+        \\func sum(pair: (Alias, Alias)) int
+        \\    const (a, b) = pair
+        \\    match pair
+        \\        (.Value, .Value) -> return read(a) + read(b)
+        \\        _ -> return 1
+        \\func run() int
+        \\    var box = Box{value = .Empty}
+        \\    box.value = .Value{20}
+        \\    if read(box.value) <> read(make()) -> return 2
+        \\    var current: Alias = .Empty
+        \\    current = .Value{20}
+        \\    if read(current) <> 20 -> return 3
+        \\    const values: Array(Alias, 2) = [.Absent, .Value{22}]
+        \\    const narrow: Cases.Value = .Value{20}
+        \\    return sum((narrow, values[1]))
+    , 42);
+}
+
+test "contextual nominal cases retain imported composed and specialized identities" {
+    try Fixture.expectFilesParity(
+        \\import lib.{Optional}
+        \\static Integers = Optional(int)
+        \\static Bytes = Optional(byte)
+        \\static Extended = Integers | .Cancelled
+        \\func read(value: Extended) int
+        \\    match value
+        \\        .Some -> return int(value)
+        \\        .Empty | .Cancelled -> return 1
+        \\func run() int
+        \\    const other: Bytes = .Some{7}
+        \\    return read(.Some{42})
+    , &.{.{ .path = "lib/optional.chi", .module_path = "lib", .source =
+        \\pub func Optional(static T: type) type -> .Some: T | .Empty
+    }}, 42);
+}
+
+test "contextual nominal cases reject missing context missing names ambiguous names and invalid payloads" {
+    try Fixture.expectSourceDiagnostic("static Color = .Red | .Blue\nconst x = .Red{}", .nominal_case_requires_context);
+    try Fixture.expectSourceDiagnostic("static Color = .Red | .Blue\nconst x: Color = .Green{}", .unknown_nominal_case);
+    try Fixture.expectSourceDiagnostic("static Color = .Red | .Blue\nfunc f(c: Color) int\n    match c\n        .Green -> return 1\n        _ -> return 2\nexit(f(Color.Red{}))", .unknown_nominal_case);
+    try Fixture.expectSourceDiagnostic("static A = .Value: int | .Empty\nstatic B = .Value: int | .Empty\nconst x: A | B = .Value{42}", .ambiguous_nominal_case);
+    try Fixture.expectSourceDiagnostic("static A = .Value: int | .Empty\nstatic B = .Value: int | .Empty\nfunc f(x: A | B) int\n    match x\n        .Value -> return 1\n        _ -> return 2\nexit(f(A.Empty{}))", .ambiguous_nominal_case);
+    try Fixture.expectSourceDiagnostic("static Cases = .Value: int | .Empty\nconst x: Cases = .Value{}", .invalid_nominal_initializer);
+    try Fixture.expectSourceDiagnostic("static Cases = .Value: int | .Empty\nconst x: Cases = .Value", .invalid_nominal_initializer);
+    try Fixture.expectSourceDiagnostic("static Cases = .Value: int | .Empty\nconst x: Cases = .Value{1, 2}", .invalid_nominal_initializer);
+    try Fixture.expectSourceDiagnostic("struct Red\nconst x: Red = .Red{}", .unknown_nominal_case);
+}
+
+test "bare nominal values preserve declaration discovery and payloadless generic identity" {
+    try Fixture.expectParity(
+        \\static Color = .Red | .Blue
+        \\static Single = .Only
+        \\func Colors(static T: type) type -> .Red | .Blue
+        \\static Generated = Colors(int)
+        \\static saved: Color = .Red
+        \\func color(value: Color) int
+        \\    match value
+        \\        .Red -> return 20
+        \\        .Blue -> return 1
+        \\func run() int
+        \\    const first: Color = .Red
+        \\    const second: Color = .Red
+        \\    const single: Single = .Only
+        \\    const generated: Generated = .Red
+        \\    if not (generated is Generated.Red) -> return 1
+        \\    return color(first) + color(second) + color(saved) - 18
+    , 42);
+}
+
+test "contextual nominal lookup refreshes after case and parameter edits" {
+    const fixture = try Fixture.init(
+        \\static A = .Value: int | .Empty
+        \\static B = .Value: int | .Empty
+        \\func read(value: A) int
+        \\    match value
+        \\        .Value -> return int(value)
+        \\        .Empty -> return 1
+        \\exit(read(.Value{42}))
+    );
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    try fixture.db.setInput(queries.SourceText, 0,
+        \\static A = .Value: int | .Empty
+        \\static B = .Value: int | .Empty
+        \\func read(value: B) int
+        \\    match value
+        \\        .Value -> return int(value)
+        \\        .Empty -> return 1
+        \\exit(read(.Value{43}))
+    );
+    try fixture.expectExit(0, 43);
+    try fixture.db.setInput(queries.SourceText, 0,
+        \\static A = .Value: int | .Empty
+        \\static B = .Changed: int | .Empty
+        \\func read(value: B) int
+        \\    match value
+        \\        .Changed -> return int(value)
+        \\        .Empty -> return 1
+        \\exit(read(.Value{43}))
+    );
+    try fixture.expectDiagnostic(0, .unknown_nominal_case);
+}
+
+test "contextual nominal overload arguments use each candidate parameter without executing payloads" {
+    try Fixture.expectParity(
+        \\static A = .Value: int | .Empty
+        \\static B = .Other: int | .Empty
+        \\func first(value: A) int
+        \\    match value
+        \\        .Value -> return int(value)
+        \\        .Empty -> return 1
+        \\func second(value: B) int -> 2
+        \\overload choose(second, first)
+        \\func next(mut calls: int) int
+        \\    calls += 1
+        \\    return 40
+        \\func run() int
+        \\    var calls = 0
+        \\    const result = choose(.Value{next(calls)})
+        \\    return result + calls + 1
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\static A = .Value: int | .Empty
+        \\static B = .Value: int | .Empty
+        \\func first(value: A) int -> 1
+        \\func second(value: B) int -> 2
+        \\overload choose(first, second)
+        \\exit(choose(.Value{42}))
+    , .ambiguous_overload);
+}
+
+test "contextual nominal static initializers retain expected types" {
+    try Fixture.expectParity(
+        \\static Cases = .Value: int | .Empty
+        \\static saved: Cases = .Value{42}
+        \\func read(value: Cases) int
+        \\    match value
+        \\        .Value -> return int(value)
+        \\        .Empty -> return 1
+        \\func run() int -> read(saved)
+    , 42);
+}
+
+test "contextual nominal cases retain private visibility" {
+    const fixture = try Fixture.initFiles(
+        \\import lib
+        \\static Cases = lib.cases()
+        \\const forged: Cases = .Value{7}
+    , &.{.{ .path = "lib/private.chi", .module_path = "lib", .source =
+        \\static Hidden = .Value: int | .Empty
+        \\pub func cases() type -> Hidden
+    }});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .private_access);
 }

@@ -660,7 +660,7 @@ pub const UnresolvedBody = struct {
     pub const PatternBinding = struct { pattern: u32, value: ValueId, span: structures.SourceSpan };
     pub const MatchInterval = struct { first: i64, last: i64 };
     pub const MatchPattern = struct {
-        shape: union(enum) { any, type: structures.TypeId, literal: ValueUse, range: MatchInterval, tuple: structures.FunctionValueRange },
+        shape: union(enum) { any, type: structures.TypeId, case_name: []const u8, alternatives: structures.FunctionValueRange, literal: ValueUse, range: MatchInterval, tuple: structures.FunctionValueRange },
         binding: ?Capture = null,
         carrier: LocalId,
         read: ValueId,
@@ -695,7 +695,7 @@ pub const UnresolvedBody = struct {
         };
     };
     pub const MemberCall = struct { receiver: ValueUse, name: []const u8 };
-    pub const StructInitTarget = union(enum) { concrete: structures.TypeId, inferred: structures.InstanceId };
+    pub const StructInitTarget = union(enum) { concrete: structures.TypeId, inferred: structures.InstanceId, contextual: []const u8 };
     pub const Expression = struct {
         operation: Operation,
         span: structures.SourceSpan,
@@ -1346,7 +1346,14 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .none_literal => return self.appendExpression(index, if (result_is_type) .{ .type_value = .none } else .none),
                 .type, .implicit_type, .type_func, .type_tuple, .reference_type => return self.appendTypeValue(index),
                 .type_variant => return self.appendPipe(index),
-                .nominal_case => return self.appendTypeValue(index),
+                .nominal_case => return if (result_is_type or self.ast.tokens[node.token_index + 1].tag == .colon)
+                    self.appendTypeValue(index)
+                else
+                    self.appendExpression(index, .{ .struct_init = .{
+                        .target = .{ .contextual = tokenText(self.ast, self.source, node.token_index) },
+                        .type_span = nodeFocusSpan(self.ast, index),
+                        .fields = .{ .start = 0, .end = 0 },
+                    } }),
                 .nominal_payload => return self.appendNominalPayload(index),
                 .comptime_expr => return self.appendComptime(index),
                 .call => return self.appendCall(index),
@@ -1476,31 +1483,20 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             const node = self.ast.nodes[index.index()];
             const parts = self.ast.node_refs[node.data.ref.start..node.data.ref.end];
             std.debug.assert(parts.len >= 1);
-            if (runtimeReference(self.ast, self.source, parts[0], self)) |reference| return self.reject(reference, .value_used_as_type);
-            const reference = try self.namedExpression(parts[0]);
-            const generic = reference != null and reference.? == .declaration and try self.analysis_context.isGenericStruct(reference.?.declaration.item);
-            const target: UnresolvedBody.StructInitTarget = if (generic)
-                .{ .inferred = reference.?.declaration }
-            else
-                .{ .concrete = try self.analyzeTypeOrReject(parts[0], .local_type_not_supported) };
-            const positional = parts.len == 1 or self.ast.nodes[parts[1].index()].tag == .struct_init_positional;
-            const definition = if (target == .concrete and positional)
-                try self.analysis_context.facts().structDefinition(target.concrete)
-            else
-                null;
-            const anonymous_payload = if (definition) |shape| shape.anonymousPayload() else null;
-            if (anonymous_payload) |payload| {
-                if (parts.len > 2 or (parts.len == 2 and self.ast.nodes[parts[1].index()].tag != .struct_init_positional))
-                    return self.reject(index, .invalid_nominal_initializer);
-                if (parts.len == 1 and payload != .unit and payload != .none)
-                    return self.reject(index, .invalid_nominal_initializer);
-            }
+            const type_node = self.ast.nodes[parts[0].index()];
+            const target: UnresolvedBody.StructInitTarget = if (type_node.tag == .contextual_member)
+                .{ .contextual = tokenText(self.ast, self.source, type_node.token_index) }
+            else target: {
+                if (runtimeReference(self.ast, self.source, parts[0], self)) |reference| return self.reject(reference, .value_used_as_type);
+                const reference = try self.namedExpression(parts[0]);
+                if (reference != null and reference.? == .declaration and try self.analysis_context.isGenericStruct(reference.?.declaration.item))
+                    break :target .{ .inferred = reference.?.declaration };
+                break :target .{ .concrete = try self.analyzeTypeOrReject(parts[0], .local_type_not_supported) };
+            };
             const scratch_start = self.scratch.items.len;
             defer self.scratch.shrinkRetainingCapacity(scratch_start);
             for (parts[1..]) |field_index| {
                 const field = self.ast.nodes[field_index.index()];
-                if (field.tag == .struct_init_positional and anonymous_payload == null)
-                    return self.reject(field_index, .positional_initializer_not_nominal);
                 std.debug.assert(field.tag == .struct_init_field or field.tag == .struct_init_positional);
                 try self.scratch.append(self.gpa, try self.appendUse(field.data.node, false));
             }
@@ -1510,13 +1506,6 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 const name = if (self.ast.nodes[field_index.index()].tag == .struct_init_positional) "" else self.source[name_span.start..name_span.end];
                 try self.struct_field_values.append(self.gpa, .{ .name = name, .name_span = name_span, .value = value });
             }
-            if (anonymous_payload) |payload| if (parts.len == 1) {
-                try self.struct_field_values.append(self.gpa, .{
-                    .name = "",
-                    .name_span = nodeFocusSpan(self.ast, index),
-                    .value = .{ .value = try self.appendExpression(index, if (payload == .unit) .unit else .none), .span = nodeFocusSpan(self.ast, index) },
-                });
-            };
             return self.appendExpression(index, .{ .struct_init = .{
                 .target = target,
                 .type_span = nodeFocusSpan(self.ast, parts[0]),
@@ -1954,7 +1943,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                     pattern_index = header.data.node_node.a;
                     condition_index = header.data.node_node.b;
                 }
-                const pattern = try self.buildMatchPattern(pattern_index);
+                const pattern = try self.buildMatchPattern(pattern_index, false);
                 try self.declareMatchCaptures(pattern);
                 const condition = if (condition_index) |guard| try self.appendUse(guard, false) else null;
                 const body = try self.buildBranch(arm.data.node_node.b, result_is_type);
@@ -1965,7 +1954,7 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
             return self.appendExpression(index, .{ .match = .{ .subject = subject, .carrier = carrier, .read = read, .arms = arm_range } });
         }
 
-        fn buildMatchPattern(self: *Self, index: structures.Node.Index) anyerror!u32 {
+        fn buildMatchPattern(self: *Self, index: structures.Node.Index, comptime type_only: bool) anyerror!u32 {
             const node = self.ast.nodes[index.index()];
             const carrier = self.newLocal();
             var pattern: UnresolvedBody.MatchPattern = .{
@@ -1974,7 +1963,9 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 .read = try self.appendExpression(index, .{ .local_read = carrier }),
                 .span = nodeFocusSpan(self.ast, index),
             };
-            switch (node.tag) {
+            if (type_only and node.tag != .contextual_member and node.tag != .type_variant) {
+                pattern.shape = .{ .type = try self.bindingType(index) };
+            } else switch (node.tag) {
                 .type => if (try self.matchNameIsType(index)) {
                     pattern.shape = .{ .type = try self.bindingType(index) };
                 } else self.buildMatchCapture(index, &pattern),
@@ -1982,9 +1973,11 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                     self.buildMatchCapture(index, &pattern);
                     std.debug.assert(node.data.parameter.annotation == .null);
                 },
-                .field_access, .call, .type_variant, .type_func => pattern.shape = .{ .type = try self.bindingType(index) },
+                .field_access, .call, .type_func => pattern.shape = .{ .type = try self.bindingType(index) },
+                .contextual_member => pattern.shape = .{ .case_name = tokenText(self.ast, self.source, node.token_index) },
+                .type_variant => pattern.shape = .{ .alternatives = try self.buildMatchChildren(index, true) },
                 .range, .range_inclusive => pattern.shape = .{ .range = try self.buildMatchRange(index) },
-                .match_tuple => pattern.shape = .{ .tuple = try self.buildMatchTuple(index) },
+                .match_tuple => pattern.shape = .{ .tuple = try self.buildMatchChildren(index, false) },
                 else => pattern.shape = .{ .literal = try self.appendUse(index, false) },
             }
             const result: u32 = @intCast(self.match_patterns.items.len);
@@ -2067,10 +2060,10 @@ fn ExpressionBuilder(comptime AnalysisServices: type) type {
                 try self.declareMatchCaptures(child);
         }
 
-        fn buildMatchTuple(self: *Self, index: structures.Node.Index) anyerror!structures.FunctionValueRange {
+        fn buildMatchChildren(self: *Self, index: structures.Node.Index, comptime type_only: bool) anyerror!structures.FunctionValueRange {
             var children: std.ArrayList(u32) = .empty;
             defer children.deinit(self.gpa);
-            for (self.ast.nodeList(index)) |child| try children.append(self.gpa, try self.buildMatchPattern(child));
+            for (self.ast.nodeList(index)) |child| try children.append(self.gpa, try self.buildMatchPattern(child, type_only));
             return self.appendTableRange(&self.match_pattern_children, children.items);
         }
 
@@ -2949,6 +2942,48 @@ const ItemDiscovery = struct {
     module: structures.ModuleId,
     items: std.ArrayList(structures.DiscoveredItem) = .empty,
 
+    const DiscoveryContext = struct {
+        type_result: bool = false,
+        returns_type: bool = false,
+        breaks_type: bool = false,
+    };
+
+    fn childDiscoveryContext(self: *const ItemDiscovery, node: structures.Node, position: usize, count: usize, context: DiscoveryContext) DiscoveryContext {
+        var child = context;
+        child.type_result = false;
+        switch (node.tag) {
+            .static_binding => {
+                const annotation = node.data.node_node.a;
+                child.type_result = position == 0 or (if (annotation != .null)
+                    isMetaTypeAnnotation(self.ast, self.source, annotation)
+                else
+                    containsNominalCases(self.ast, node.data.node_node.b));
+            },
+            .func => {
+                const signature = self.ast.nodes[node.data.node_node.a.index()].data.signature;
+                child.returns_type = signature.return_type != .null and isMetaTypeAnnotation(self.ast, self.source, signature.return_type);
+                child.breaks_type = false;
+                child.type_result = position == 1 and child.returns_type;
+            },
+            .signature => child.type_result = position == 1,
+            .param, .struct_field, .reference_type, .type_tuple => child.type_result = true,
+            .const_binding, .var_binding, .ref_binding => child.type_result = position == 0,
+            .binding_annotation => child.type_result = position == 1,
+            .type_variant, .tuple_literal, .comptime_expr => child.type_result = context.type_result,
+            .block => child.type_result = position + 1 == count and context.type_result,
+            .return_expr => child.type_result = context.returns_type,
+            .break_expr => child.type_result = context.breaks_type,
+            .loop => {
+                child.type_result = context.type_result;
+                child.breaks_type = context.type_result;
+            },
+            .@"if", .if_else, .match_expr, .match_arm => child.type_result = position != 0 and context.type_result,
+            .catch_expr => child.type_result = position + 1 == count and context.type_result,
+            else => {},
+        }
+        return child;
+    }
+
     /// Discovers the items owned by `declaration`, whose value is `value`.
     fn discoverValue(self: *ItemDiscovery, declaration: structures.Node.Index, value: structures.Node.Index, parent: u32) anyerror!void {
         if (itemKind(self.ast, value) == .structure)
@@ -2960,15 +2995,20 @@ const ItemDiscovery = struct {
     fn discoverGeneratedStructs(self: *ItemDiscovery, declaration: structures.Node.Index, parent: u32) anyerror!void {
         // Traverse only this declaration, stopping at structs whose member
         // declarations establish their own owners and source-relative sites.
-        var pending: std.ArrayList(structures.Node.Index) = .empty;
+        const Pending = struct { index: structures.Node.Index, context: DiscoveryContext = .{} };
+        var pending: std.ArrayList(Pending) = .empty;
         defer pending.deinit(self.gpa);
-        try pending.append(self.gpa, declaration);
-        while (pending.pop()) |index| {
+        try pending.append(self.gpa, .{ .index = declaration });
+        while (pending.pop()) |work| {
+            const index = work.index;
             const node = self.ast.nodes[index.index()];
             // Other declarations have their own discovery roots. In particular,
             // entry traversal must not claim members inside module declarations.
             if (index != declaration and node.tag == .static_binding) continue;
             if (node.tag == .nominal_case) {
+                // Bare case syntax declares a type only in a type-producing
+                // position. Runtime shorthand must not create namespace items.
+                if (!work.context.type_result and self.ast.tokens[node.token_index + 1].tag != .colon) continue;
                 const parts = self.ast.nodeList(index);
                 const child = try self.appendItem(.structure, .{ .identifier = tokenText(self.ast, self.source, node.token_index) }, index.index(), self.items.items[parent].is_public, parent, null);
                 self.items.items[child].loc.is_nominal_case = true;
@@ -2976,7 +3016,7 @@ const ItemDiscovery = struct {
                     _ = try self.appendItem(.function, .{ .identifier = "$payload" }, parts[1].index(), self.items.items[parent].is_public, child, null);
                     _ = try self.appendItem(.function, .{ .identifier = "$static_payload" }, parts[2].index(), self.items.items[parent].is_public, child, null);
                 }
-                try pending.append(self.gpa, parts[0]);
+                try pending.append(self.gpa, .{ .index = parts[0], .context = .{ .type_result = true } });
                 continue;
             }
             if (node.tag == .@"struct") {
@@ -2989,7 +3029,10 @@ const ItemDiscovery = struct {
             var end = nodes.len;
             while (end > 0) {
                 end -= 1;
-                if (nodes[end].unwrap()) |child| try pending.append(self.gpa, child);
+                if (nodes[end].unwrap()) |child| try pending.append(self.gpa, .{
+                    .index = child,
+                    .context = self.childDiscoveryContext(node, end, nodes.len, work.context),
+                });
             }
         }
     }

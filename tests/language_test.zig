@@ -476,8 +476,8 @@ test "integer min max callable values evaluate arguments once from left to right
         \\    trace = trace * 10 + value
         \\    return value
         \\func run() int
-        \\    const lower = std.math.min
-        \\    const upper = std.math.max
+        \\    const lower: func(int, int) int = std.math.min
+        \\    const upper: func(int, int) int = std.math.max
         \\    var trace = 0
         \\    if lower(argument(trace, 3), argument(trace, 1)) <> 1 -> return 90
         \\    if trace <> 31 -> return 91

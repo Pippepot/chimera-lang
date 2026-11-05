@@ -1,0 +1,154 @@
+import std.iteration.{End}
+
+# Adapters own their cursors. Transfer a named noncopyable cursor with ^.
+# Item types include every non-End alternative produced by the input cursor.
+pub struct Map(S: type, A: type, B: type)
+    source: S
+    transform: func(imm A) B
+    pub func next(mut self: Map(S, A, B)) B | End
+        const result = self.source.next()
+        if result is End -> return End{}
+        return self.transform(result)
+
+pub func map(static S: type, static A: type, static B: type, var source: S, transform: func(imm A) B) Map(S, A, B)
+    return Map(S, A, B){source = source^, transform = transform}
+
+# Borrowed delivery forwards the original reference; owned delivery moves the
+# accepted item and automatically drops rejected items.
+pub func Filter(static S: type, static T: type, static borrowed: bool) type
+    if borrowed
+        return struct
+            source: S
+            predicate: func(imm T) bool
+            pub func next(mut self: Filter(S, T, borrowed)) ref T | End
+                loop
+                    const result = self.source.next()
+                    if result is End -> return End{}
+                    ref item = result
+                    if self.predicate(item) -> return item
+            func find(mut source: S, predicate: func(imm T) bool) T | none
+                loop
+                    const result = source.next()
+                    if result is End -> return none
+                    ref item = result
+                    if predicate(item) -> return item
+    return struct
+        source: S
+        predicate: func(imm T) bool
+        pub func next(mut self: Filter(S, T, borrowed)) T | End
+            loop
+                const result = self.source.next()
+                if result is End -> return End{}
+                if self.predicate(result) -> return result^
+        func find(mut source: S, predicate: func(imm T) bool) T | none
+            loop
+                const result = source.next()
+                if result is End -> return none
+                if predicate(result) -> return result^
+
+pub func filter(static S: type, static T: type, static borrowed: bool, var source: S, predicate: func(imm T) bool) Filter(S, T, borrowed)
+    return Filter(S, T, borrowed){source = source^, predicate = predicate}
+
+# Terminal algorithms resume the caller's cursor and stop at the first result.
+# find copies a borrowed match and moves an owned match.
+pub func find(static S: type, static T: type, static borrowed: bool, mut source: S, predicate: func(imm T) bool) T | none
+    return Filter(S, T, borrowed).find(source, predicate)
+
+pub func any(static S: type, static T: type, mut source: S, predicate: func(imm T) bool) bool
+    loop
+        const result = source.next()
+        if result is End -> return false
+        if predicate(result) -> return true
+
+pub func all(static S: type, static T: type, mut source: S, predicate: func(imm T) bool) bool
+    loop
+        const result = source.next()
+        if result is End -> return true
+        if not predicate(result) -> return false
+
+# Each delivery combination has an exact tuple type, so references never become
+# copies and owned items never become references into a temporary poll carrier.
+pub func Zip(static L: type, static R: type, static A: type, static B: type, static left_borrowed: bool, static right_borrowed: bool) type
+    if left_borrowed and right_borrowed
+        return struct
+            left: L
+            right: R
+            pub func next(mut self: Zip(L, R, A, B, left_borrowed, right_borrowed)) (ref A, ref B) | End
+                const left_result = self.left.next()
+                if left_result is End -> return End{}
+                const right_result = self.right.next()
+                if right_result is End -> return End{}
+                ref left_item = left_result
+                ref right_item = right_result
+                const pair: (ref A, ref B) = (left_item, right_item)
+                return pair^
+    if left_borrowed
+        return struct
+            left: L
+            right: R
+            pub func next(mut self: Zip(L, R, A, B, left_borrowed, right_borrowed)) (ref A, B) | End
+                const left_result = self.left.next()
+                if left_result is End -> return End{}
+                const right_result = self.right.next()
+                if right_result is End -> return End{}
+                ref left_item = left_result
+                const pair: (ref A, B) = (left_item, right_result^)
+                return pair^
+    if right_borrowed
+        return struct
+            left: L
+            right: R
+            pub func next(mut self: Zip(L, R, A, B, left_borrowed, right_borrowed)) (A, ref B) | End
+                const left_result = self.left.next()
+                if left_result is End -> return End{}
+                const right_result = self.right.next()
+                if right_result is End -> return End{}
+                ref right_item = right_result
+                const pair: (A, ref B) = (left_result^, right_item)
+                return pair^
+    return struct
+        left: L
+        right: R
+        pub func next(mut self: Zip(L, R, A, B, left_borrowed, right_borrowed)) (A, B) | End
+            const left_result = self.left.next()
+            if left_result is End -> return End{}
+            const right_result = self.right.next()
+            if right_result is End -> return End{}
+            const pair: (A, B) = (left_result^, right_result^)
+            return pair^
+
+pub func zip(static L: type, static R: type, static A: type, static B: type, static left_borrowed: bool, static right_borrowed: bool, var left: L, var right: R) Zip(L, R, A, B, left_borrowed, right_borrowed)
+    return Zip(L, R, A, B, left_borrowed, right_borrowed){left = left^, right = right^}
+
+pub func Enumerate(static S: type, static T: type, static borrowed: bool) type
+    if borrowed
+        return struct
+            source: S
+            index: int
+            overflow: bool
+            pub func next(mut self: Enumerate(S, T, borrowed)) (int, ref T) | End
+                const result = self.source.next()
+                if result is End -> return End{}
+                if self.overflow -> panic "enumerate index overflow"
+                const index = self.index
+                if index == 2147483647 -> self.overflow = true
+                else self.index += 1
+                ref item = result
+                const pair: (int, ref T) = (index, item)
+                return pair^
+    return struct
+        source: S
+        index: int
+        overflow: bool
+        pub func next(mut self: Enumerate(S, T, borrowed)) (int, T) | End
+            const result = self.source.next()
+            if result is End -> return End{}
+            if self.overflow -> panic "enumerate index overflow"
+            const index = self.index
+            if index == 2147483647 -> self.overflow = true
+            else self.index += 1
+            const pair: (int, T) = (index, result^)
+            return pair^
+
+pub func enumerate(static S: type, static T: type, static borrowed: bool, var source: S) Enumerate(S, T, borrowed)
+    return Enumerate(S, T, borrowed){source = source^, index = 0, overflow = false}

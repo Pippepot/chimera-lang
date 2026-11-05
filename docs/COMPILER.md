@@ -24,9 +24,6 @@ Chimera code. There is no independent backend option.
 
 The std precompiler always builds in `debug` mode with the self-hosted backend
 to minimize rebuild time, independently of compiler and test optimization modes.
-When rebuilding the std bundle, it reports `Precompiled std in ... ms` on stderr.
-This measures bundle creation and writing, not compilation of the precompiler
-executable. Cached builds do not repeat the report.
 
 ```sh
 zig build run -Doptimize=fast -- --debug=timing example.chi

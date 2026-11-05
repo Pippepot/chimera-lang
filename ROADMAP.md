@@ -11,9 +11,11 @@ diagnostics, execution, ownership, and incremental/cache behavior.
 
 ### Basic collection algorithms
 
-- Build pull-iterator utilities in the standard library: `zip` and `enumerate`;
-  algorithms `map`, `filter`, `find`, `any`, `all`, and `sorted`; make numerical
-  helpers `min`, `max`, and `clamp` generic. Use `T | none` for `find`.
+- Eliminate cold-compilation regressions, including bundled scalar printing and
+  source-mode workloads; finish qualifying collection algorithms and generic
+  numerical helpers. Verify matched-baseline cold and leaf-edit compilation on
+  million-line workloads with zero and eight workers, and qualify runtime across
+  representative workloads.
 
 ### Collections
 
@@ -46,7 +48,8 @@ diagnostics, execution, ownership, and incremental/cache behavior.
 - Finish result-correlated mutation provenance performance qualification: remove
   cold-compilation regressions while retaining incremental typing reuse and
   forwarding, saved-result, later-write, loop-join, and cached-contract behavior.
-- Contextual enum shorthand (`.Red`); define name resolution and inference.
+- Expected-type shorthand for struct namespace members and omitted-type struct
+  initializers; define member eligibility, syntax, and ambiguity beyond nominal cases.
 - Generator suspension/yield syntax only if ordinary cursor composition proves
   insufficient; preserve item ownership, lending lifetimes, and failure effects.
 - Buffered iterator adapters `pairwise`, `windows`, and `chunks`: settle retained

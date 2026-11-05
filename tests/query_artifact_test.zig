@@ -124,9 +124,10 @@ test "bundled std reuses native functions on a fresh project without disk cachin
     // Only the project's entry needs code generation; it inlines clamp, min,
     // and max from bundled bodies, and exit already has a native artifact.
     try std.testing.expectEqual(@as(usize, 1), after.get(.codegen).runs - before.get(.codegen).runs);
+    try std.testing.expectEqual(@as(usize, 1), after.get(.body_typing).runs - before.get(.body_typing).runs);
     const math = try db.intern(queries.ModulePaths, .{ .path = "std.math" });
     const scope = (try db.get(queries.ModuleDeclarations, math)).*.?;
-    const instance: structures.InstanceId = .{ .item = scope.resolve("clamp").? };
+    const instance = try integerClamp(db, scope.resolve("clamp").?);
     const loaded = loader.stats().bodies;
     try std.testing.expect(loaded != 0);
     const body = try db.get(queries.AnalyzeFunctionInstance, instance);
@@ -151,7 +152,7 @@ test "bundled std restores optimizer bodies and call components without running 
     const loader = try bundle.install(db, sources.standard_bundle);
     const math = try db.intern(queries.ModulePaths, .{ .path = "std.math" });
     const scope = (try db.get(queries.ModuleDeclarations, math)).*.?;
-    const clamp: structures.InstanceId = .{ .item = scope.resolve("clamp").? };
+    const clamp = try integerClamp(db, scope.resolve("clamp").?);
     const prepared = try db.get(queries.PrepareFunctionInstance, clamp);
     const component = try db.get(queries.CallComponent, clamp);
     const optimized = try db.get(queries.OptimizeFunctionInstance, clamp);
@@ -182,7 +183,7 @@ test "bundled std tracks inline policy for optimized bodies and native functions
     const loader = try bundle.install(db, sources.standard_bundle);
     const math = try db.intern(queries.ModulePaths, .{ .path = "std.math" });
     const scope = (try db.get(queries.ModuleDeclarations, math)).*.?;
-    const clamp: structures.InstanceId = .{ .item = scope.resolve("clamp").? };
+    const clamp = try integerClamp(db, scope.resolve("clamp").?);
     const prepared = try db.get(queries.PrepareFunctionInstance, clamp);
     const optimized = (try db.get(queries.OptimizeFunctionInstance, clamp)).*.?;
     try std.testing.expectEqual(@as(usize, 0), directCalls(optimized));
@@ -338,7 +339,7 @@ test "portable snapshots remap the shared std validation boundary" {
     _ = try bundle.install(original.db, sources.standard_bundle);
     const module = try original.db.intern(queries.ModulePaths, .{ .path = "std.math" });
     const scope = (try original.db.get(queries.ModuleDeclarations, module)).*.?;
-    const clamp: structures.InstanceId = .{ .item = scope.resolve("clamp").? };
+    const clamp = try integerClamp(original.db, scope.resolve("clamp").?);
     // Demand both memo shapes so the snapshot exercises the shared boundary.
     _ = try original.db.get(queries.AnalyzeFunctionInstance, clamp);
     _ = try original.db.get(queries.CompileFunction, clamp);
@@ -482,4 +483,10 @@ test "truncated portable artifacts release partially decoded records" {
     try std.testing.expectError(error.InvalidCache, artifact.restore(db, bytes[0 .. bytes.len - 1], &registry));
     const fixture: sources.SourceFixture = .{ .db = db };
     try fixture.expectExit(0, 42);
+}
+
+fn integerClamp(db: *query.Database, item: structures.ItemId) !structures.InstanceId {
+    const argument = try db.intern(queries.CompileTimeValues, structures.CompileTimeValue{ .type = .int });
+    const specialization = try db.intern(queries.CompileTimeValueTuples, .{ .values = &.{argument} });
+    return .{ .item = item, .specialization = specialization };
 }

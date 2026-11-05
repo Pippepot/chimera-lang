@@ -222,6 +222,7 @@ pub const Node = struct {
         struct_init_field,
         struct_init_positional,
         nominal_case,
+        contextual_member,
         nominal_self,
         nominal_payload,
         type,
@@ -263,7 +264,7 @@ pub const Node = struct {
 
     pub fn dataTag(self: Node) ?std.meta.FieldEnum(Data) {
         return switch (self.tag) {
-            .break_nothing, .continue_expr, .return_nothing, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type, .nominal_self, .nominal_payload => .none,
+            .break_nothing, .continue_expr, .return_nothing, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type, .nominal_self, .nominal_payload, .contextual_member => .none,
             .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .bit_not, .from_end, .reference_type, .move_expr, .propagate_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .struct_init_positional, .@"pub", .collection_spread => .node,
             .add, .sub, .mul, .div, .rem, .bit_and, .bit_xor, .shift_left, .shift_right, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .membership, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .bit_and_assign, .bit_or_assign, .bit_xor_assign, .shift_left_assign, .shift_right_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .binding_else, .func, .type_func, .@"if", .collection_if, .match_arm, .match_guard => .node_node,
             .param => .parameter,
@@ -1912,6 +1913,8 @@ pub const Diagnostic = struct {
         .duplicate_struct_member = Message{ .text = "struct member is already declared", .source_label = true },
         .duplicate_nominal_case = Message{ .text = "nominal case is already declared", .source_label = true },
         .ambiguous_nominal_case = Message{ .text = "nominal case name is ambiguous; qualify its original variant", .source_label = true },
+        .nominal_case_requires_context = "a shorthand case constructor requires an expected type",
+        .unknown_nominal_case = Message{ .text = "expected type has no nominal case with this name", .source_label = true },
         .nominal_case_requires_declaration = "a nominal case requires an enclosing named declaration",
         .nominal_payload_not_copyable = TypeMessage{ .prefix = "nominal case payload must support copy; found " },
         .public_variant_private_type = "a public variant cannot expose private alternatives or payload types",

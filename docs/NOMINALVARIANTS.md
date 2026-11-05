@@ -47,6 +47,35 @@ const failure = Result.Failure{7}
 - Ordinary struct field initialization continues to use `Foo{name = value}`.
 - Construction preserves nominal identity.
 
+When an expected type is available, `.Name{payload}` or `.Name{}` selects its
+unique nominal case with that name:
+
+```chi
+func color(c: Color) int
+    match c
+        .Red -> return 1
+        .Blue | .Green -> return 2
+
+const red: Color = .Red
+const success: Result = .Success{42}
+color(.Red)
+```
+
+Annotations, parameters, returns, assignments, and aggregate members supply the
+expected type. Match arms use the subject type; tuple subpatterns use their
+element types. Aliases, composed variants, specialized generic variants, and
+singleton case types all retain their original case identities. Missing context,
+missing names, and distinct cases sharing a name are errors. Payload types do not
+break name ties. Visibility and constructor validation match qualified lookup.
+For cases with a `unit` or `none` payload, bare `.Name` in an expression is a
+value, equivalent to `.Name{}`. Other payloads require braces and an initializer.
+Type declarations and match patterns retain their type meanings; runtime
+shorthand never declares a new case.
+
+This currently applies to nominal cases. The same expected-type principle could
+support struct namespace members or omitted-type struct initializers, but those
+extensions need their own eligibility and ambiguity rules.
+
 ## Conversion
 
 - The compiler synthesizes a converter from `.Name: T` to `T` when `T` is

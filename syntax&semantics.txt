@@ -11,6 +11,12 @@
 # span lines. Indented bodies introduced by if, loop, struct, or a function
 # retain their block meaning inside delimiters. A comma or closing delimiter
 # may end such an expression body before its physical dedent.
+# Binding initializers, assignment values, and type annotations may begin on an
+# indented next line.
+# Variant expressions and type annotations may break before or after |;
+# indentation at these continuations is whitespace, including when the first
+# member is farther indented than the following | lines. Ordinary bodies retain
+# their block meaning. A continuation contains one expression, not a block.
 
 
 # Types and evaluation
@@ -1827,6 +1833,10 @@ pub struct Interval
 # never contributes no member. A singleton union is its member, and a union
 # containing only never is never. Overlapping aliases compose without error.
 static int_or_float = int | float
+static multiline_scalar =
+    int
+  | bool
+  | none
 static number_or_bool = int_or_float | bool # same as bool | float | int
 static scalar = int | bool
 static nullable_scalar = scalar | (bool | none) # same as int | bool | none
@@ -1861,6 +1871,21 @@ reassigned = int_or_float_value
 static Message = .Empty | .Text: StaticString | CustomMessageType
 const empty = Message.Empty{}
 const text = Message.Text{"hello"}
+const inferred_text: Message = .Text{"hello"}
+# In a brace constructor, .Name resolves an existing nominal case by name within
+# the expected type, supplied by a parameter, return type, annotation, assignment,
+# or aggregate member. A singleton case type also supplies this context. Aliases,
+# compositions, and generic specializations preserve the selected case identity.
+# No context, no matching case, or multiple distinct matching cases is an error;
+# no surrounding/global namespace search or payload-based tie breaking occurs.
+# Constructors retain their narrow case type before ordinary widening.
+# A match arm .Name resolves against its subject type; tuple subpatterns use the
+# corresponding element type. Shorthand and qualified types may be joined with |.
+# Bare .Name in an expression constructs the selected case when its payload is
+# unit or none; other payload types require brace construction with a payload.
+# Bare .Name in a type declaration still declares a case. Runtime shorthand does
+# not introduce a new declaration. This shorthand does not yet select arbitrary
+# struct namespace members or infer an omitted struct initializer type.
 static ExtendedMessage = Message | .Cancelled
 # ExtendedMessage.Text and Message.Text denote the same case type.
 # Brace construction takes exactly one positional payload initializer; {} is

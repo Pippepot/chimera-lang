@@ -1,6 +1,13 @@
-func foo(static T: type, bar: func(T) T) func(T) T
-  return bar
 
-func id(static T: type, x: T) T
-  return x + 10
-exit(foo(int, id)(20))
+static Color =
+    .Red
+  | .Blue
+  | .Green
+
+func print_color(c: Color)
+  match c
+    .Red -> print("Red")
+    .Blue -> print("Blue")
+    .Green -> print("Green")
+
+print_color(.Red)

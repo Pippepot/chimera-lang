@@ -1881,9 +1881,15 @@ pub fn AnalysisContext(comptime Context: type) type {
         }
 
         fn nominalCaseMember(self: @This(), type_id: structures.TypeId, name: []const u8, span: structures.SourceSpan) !?structures.NameReference {
+            const member = (try self.nominalCaseTypeByName(type_id, name, span)) orelse return null;
+            return .{ .constant = try self.ctx.intern(CompileTimeValues, .{ .type = member }) };
+        }
+
+        pub fn nominalCaseTypeByName(self: @This(), type_id: structures.TypeId, name: []const u8, span: structures.SourceSpan) !?structures.TypeId {
             const members = (try self.facts().variantMembers(type_id)) orelse &.{type_id};
             var selected: ?structures.TypeId = null;
-            for (members) |member| {
+            for (members) |storage_member| {
+                const member = (try self.facts().memberSpec(storage_member)).type_id;
                 const identity = (try nominalCaseIdentity(self.ctx, member)) orelse continue;
                 const item = structOwnerItem(identity);
                 const location = try self.ctx.lookupInterned(ItemLocations, item);
@@ -1895,7 +1901,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             }
             const member = selected orelse return null;
             _ = (try self.facts().structDefinition(member)) orelse return error.Unavailable; // Validate a selected case's payload.
-            return .{ .constant = try self.ctx.intern(CompileTimeValues, .{ .type = member }) };
+            return member;
         }
 
         const ConversionMember = union(enum) {
@@ -4345,6 +4351,7 @@ fn typeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!
         const type_id = switch (expression.operation) {
             .struct_init => |initialization| switch (initialization.target) {
                 .concrete => |type_id| type_id,
+                .contextual => return null,
                 .inferred => |target| switch ((try ctx.lookupInterned(CompileTimeValues, (try ctx.get(ResolveStaticInstance, target)).* orelse return null)).*) {
                     .type => |type_id| type_id,
                     .runtime => return null,

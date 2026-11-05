@@ -662,3 +662,27 @@ fn minimumLiteral(kind: []const u8) []const u8 {
 fn oddLiteral(kind: []const u8) []const u8 {
     return if (kind.len == 2 and kind[1] == '8') "77" else "12345";
 }
+
+test "std numeric helpers preserve widths bounds and floating comparison behavior" {
+    try Fixture.expectParity(
+        \\import std.math.{min, max, clamp}
+        \\func run() int
+        \\    const lo: i64 = -5000000000
+        \\    const hi: i64 = 5000000000
+        \\    if min(lo, hi) <> lo -> return 90
+        \\    if max(lo, hi) <> hi -> return 91
+        \\    if clamp(hi, lo, i64(42)) <> i64(42) -> return 92
+        \\    const low: byte = 19
+        \\    const high: byte = 23
+        \\    if min(low, high) <> low -> return 93
+        \\    if max(low, high) <> high -> return 94
+        \\    if clamp(byte(42), low, high) <> high -> return 95
+        \\    const small: f32 = 1.5
+        \\    const large: f32 = 2.5
+        \\    if min(small, large) <> small -> return 96
+        \\    if max(small, large) <> large -> return 97
+        \\    if clamp(f32(9.5), small, large) <> large -> return 98
+        \\    if clamp(0, 23, 19) <> 23 -> return 99
+        \\    return min(50, 42)
+    , 42);
+}

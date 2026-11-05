@@ -592,6 +592,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         options: BodyOptions = .{},
         type_check_only: bool = false,
+        skip_expected_variant_capture: ?semantic.UnresolvedBody.ValueId = null,
         numeric_overflow: structures.numeric.Overflow = .checked,
         values: flow_snapshot.Buffer(?Value, null) = .{},
         state: State = .{},
@@ -2878,7 +2879,16 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             for (members) |member| {
                 if ((try self.analysis_context.facts().memberSpec(member)).kind == .reference) break;
             } else return null;
-            const source_type = (try self.unevaluatedType(id, target)) orelse return null;
+            // Discover the logical value before deciding whether to capture a
+            // reference. Keeping reference storage in this context would ask
+            // inference to perform this same capture recursively.
+            var logical_members: std.ArrayList(structures.MemberSpec) = .empty;
+            for (members) |member| {
+                const specification = try self.analysis_context.facts().memberSpec(member);
+                try logical_members.append(self.gpa, .{ .type_id = specification.type_id });
+            }
+            const logical_target = try self.analysis_context.facts().internVariantMembers(logical_members.items);
+            const source_type = (try self.unevaluatedType(id, logical_target)) orelse return null;
             if (source_type == target or source_type == .never) return null;
             var reference_member: ?structures.TypeId = null;
             for (members) |member| {
@@ -2925,7 +2935,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (operation.* == .annotation) context.expected_type = operation.annotation.type_id;
                 if (operation.* == .string_literal and context.allow_converters) context.expected_type = try self.analysis_context.stringType();
             };
-            if (try self.captureExpectedVariant(id, context)) |captured| return captured;
+            if (self.skip_expected_variant_capture != id)
+                if (try self.captureExpectedVariant(id, context)) |captured| return captured;
             const contextual_collection = source_operation != null and source_operation.?.* == .collection_literal;
             if (context.allow_converters and !contextual_collection) if (try self.prepareConversion(id, context)) |converted| {
                 try self.rememberCleanupOrigins(converted);
@@ -3003,7 +3014,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     try self.constructAnnotated(annotation, destination)
                 else
                     try self.annotate(annotation, context),
-                .struct_init => try self.constructStruct(expression, try self.temporaryDestination(request.destination, context, fresh)),
+                .struct_init => try self.constructStruct(expression, expected_type, try self.temporaryDestination(request.destination, context, fresh)),
                 .array_init => |initializer| try self.constructArrayElements(expression, initializer.type_id, initializer.elements, request.destination orelse .{
                     .storage = context.fresh_destination orelse try self.localStorage(initializer.type_id),
                     .site = .local,
@@ -3648,8 +3659,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             return result;
         }
 
-        fn constructStruct(self: *Self, expression: Expression, destination: ?Destination) !Value {
-            const type_id = switch (try self.structInitType(expression.operation.struct_init)) {
+        fn constructStruct(self: *Self, expression: Expression, expected_type: ?structures.TypeId, destination: ?Destination) !Value {
+            const type_id = switch (try self.structInitType(expression.operation.struct_init, expected_type)) {
                 .diverged => |diverged| return diverged,
                 .type_id => |resolved| resolved,
             };
@@ -3666,6 +3677,15 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
             @memset(seen, false);
             var parts: AggregateParts = .{};
+            if (initializer.fields.start == initializer.fields.end) if (definition.anonymousPayload()) |payload| {
+                std.debug.assert(definition.fields.len == 1);
+                std.debug.assert(payload == .unit or payload == .none);
+                const field_storage = try self.projectStorage(storage, payload, .{ .field = 0 });
+                const value_to_place = try self.appendInstruction(if (payload == .unit) .const_unit else .const_none);
+                const field_value = try self.placeValue(value_to_place, expression.span, .{ .storage = field_storage, .site = .field });
+                try parts.completed.append(self.gpa, field_value);
+                seen[0] = true;
+            };
             for (self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end]) |source_field| {
                 const field = definition.resolveField(source_field.name).?;
                 if (seen[field.index]) return self.reject(source_field.name_span, .duplicate_struct_initializer_field);
@@ -4397,8 +4417,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (Item == Body.MatchArm) {
                     try self.visit(self.parent.unresolved.match_patterns[item.pattern]);
                 }
-                if (Item == Body.MatchPattern and item.shape == .tuple) {
-                    const children = item.shape.tuple;
+                if (Item == Body.MatchPattern and (item.shape == .tuple or item.shape == .alternatives)) {
+                    const children = if (item.shape == .tuple) item.shape.tuple else item.shape.alternatives;
                     for (self.parent.unresolved.match_pattern_children[children.start..children.end]) |index|
                         try self.visit(self.parent.unresolved.match_patterns[index]);
                 }
@@ -4612,6 +4632,12 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (!initializer_boundary) region.options.result_mode = self.options.result_mode;
             region.options.allow_type_values = self.options.allow_type_values;
             region.type_check_only = true;
+            // Control-flow inference applies the expected type to its exits;
+            // capturing the root would re-enter its own type query.
+            if (self.expressionOperation(raw.value)) |operation| switch (operation.*) {
+                .if_else, .match, .error_handler, .loop, .scope, .iterator, .iterator_item => region.skip_expected_variant_capture = raw.value,
+                else => {},
+            };
             try self.bindInferenceCaptures(&region, raw.value);
             region.current_boundary = try region.newBoundary(raw.span);
             // Type the whole expression for inference without publishing or
@@ -5962,7 +5988,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn inPlaceStructFieldType(self: *Self, id: semantic.UnresolvedBody.ValueId, expected_type: ?structures.TypeId) anyerror!StructTypeResult {
             if (self.expressionOperation(id)) |operation| if (operation.* == .struct_init) {
                 const initializer = operation.struct_init;
-                const type_id = switch (try self.structInitType(initializer)) {
+                const type_id = switch (try self.structInitType(initializer, expected_type)) {
                     .diverged => |diverged| return .{ .diverged = diverged },
                     .type_id => |resolved| resolved,
                 };
@@ -5970,7 +5996,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 // A struct that cannot move directly is typed field by field instead of evaluated.
                 if (!capabilities.isDirectlyMovable()) {
                     const definition = try self.structInitializerDefinition(initializer, type_id);
-                    if (initializer.target == .concrete) for (self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end]) |field| {
+                    if (initializer.target != .inferred) for (self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end]) |field| {
                         const field_result = try self.inPlaceStructFieldType(field.value.value, definition.resolveField(field.name).?.type_id);
                         if (field_result == .diverged) return field_result;
                     };
@@ -6033,6 +6059,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .struct_init => |initializer| switch (initializer.target) {
                     .concrete => |type_id| type_id,
                     .inferred => |factory| if (try self.inferStructType(factory, initializer, false)) |result| result.type_id else null,
+                    .contextual => |name| if (expected_type) |expected| try self.analysis_context.nominalCaseTypeByName(expected, name, initializer.type_span) else null,
                 },
                 .call => |call| try self.unevaluatedCallType(call),
                 .sequence => |operands| try self.unevaluatedType(operands.rhs.value, expected_type),
@@ -6040,16 +6067,16 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     var found = false;
                     if (expected_type != null and try self.stringLiteralBranch(branches.then_block, &found) and
                         try self.stringLiteralBranch(branches.else_block, &found) and found) break :blk .string_literal;
-                    break :blk try self.inferArgumentType(.{ .value = id, .span = self.valueSpan(id) });
+                    break :blk try self.inferExpressionType(.{ .value = id, .span = self.valueSpan(id) }, expected_type, false);
                 },
                 .match => |selection| blk: {
                     var found = false;
                     if (expected_type != null) for (self.unresolved.match_arms[selection.arms.start..selection.arms.end]) |arm| {
                         if (!try self.stringLiteralBranch(arm.body, &found)) break;
                     } else if (found) break :blk .string_literal;
-                    break :blk try self.inferArgumentType(.{ .value = id, .span = self.valueSpan(id) });
+                    break :blk try self.inferExpressionType(.{ .value = id, .span = self.valueSpan(id) }, expected_type, false);
                 },
-                .loop, .scope, .iterator, .iterator_item, .error_handler => try self.inferArgumentType(.{ .value = id, .span = self.valueSpan(id) }),
+                .loop, .scope, .iterator, .iterator_item, .error_handler => try self.inferExpressionType(.{ .value = id, .span = self.valueSpan(id) }, expected_type, false),
                 .type_value => .type,
             };
         }
@@ -6249,6 +6276,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     }
                     return expected;
                 },
+                .struct_init => |initializer| if (initializer.target == .contextual)
+                    return self.unevaluatedType(argument.value, expected_type),
                 else => {},
             };
             if (discovered_type) |known| if (known.*) |type_id| return type_id;
@@ -6446,10 +6475,15 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             };
         }
 
-        fn structInitType(self: *Self, initializer: @FieldType(Expression.Operation, "struct_init")) !StructTypeResult {
+        fn structInitType(self: *Self, initializer: @FieldType(Expression.Operation, "struct_init"), expected_type: ?structures.TypeId) !StructTypeResult {
             return switch (initializer.target) {
                 .concrete => |concrete| .{ .type_id = concrete },
                 .inferred => |factory| (try self.inferStructType(factory, initializer, false)) orelse (try self.inferStructType(factory, initializer, true)).?,
+                .contextual => |name| .{ .type_id = (try self.analysis_context.nominalCaseTypeByName(
+                    expected_type orelse return self.reject(initializer.type_span, .nominal_case_requires_context),
+                    name,
+                    initializer.type_span,
+                )) orelse return self.reject(initializer.type_span, .unknown_nominal_case) },
             };
         }
 
@@ -7009,6 +7043,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn structInitializerDefinition(self: *Self, initializer: @FieldType(Expression.Operation, "struct_init"), type_id: structures.TypeId) !*const structures.StructDefinition {
             const definition = (try self.analysis_context.facts().structDefinition(type_id)) orelse
                 return self.reject(initializer.type_span, .{ .struct_initializer_not_struct = type_id });
+            const fields = self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end];
+            if (definition.anonymousPayload()) |payload| {
+                if (fields.len > 1 or (fields.len == 0 and payload != .unit and payload != .none))
+                    return self.reject(initializer.type_span, .invalid_nominal_initializer);
+            } else for (fields) |field| {
+                if (field.name.len == 0) return self.reject(field.name_span, .positional_initializer_not_nominal);
+            }
             const private_access = initializer.canonical or try self.analysis_context.canAccessPrivateFields(type_id);
             for (self.unresolved.struct_field_values[initializer.fields.start..initializer.fields.end]) |source_field| {
                 const field = definition.resolveField(source_field.name) orelse return self.reject(source_field.name_span, .unknown_struct_field);
@@ -10878,13 +10919,30 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 try patterns.append(self.gpa, .{ .source = id, .input_type = type_id, .members = try self.gpa.dupe(structures.TypeId, &.{member}), .shape = shape });
         }
 
+        fn resolveMatchType(self: *Self, id: u32, type_id: structures.TypeId) anyerror!structures.TypeId {
+            const source = self.unresolved.match_patterns[id];
+            switch (source.shape) {
+                .type => |target| return target,
+                .case_name => |name| return (try self.analysis_context.nominalCaseTypeByName(type_id, name, source.span)) orelse
+                    self.reject(source.span, .unknown_nominal_case),
+                .alternatives => |range| {
+                    var alternatives: std.ArrayList(structures.MemberSpec) = .empty;
+                    for (self.unresolved.match_pattern_children[range.start..range.end]) |child|
+                        try alternatives.append(self.gpa, try self.analysis_context.facts().memberSpec(try self.resolveMatchType(child, type_id)));
+                    return self.analysis_context.facts().internVariantMembers(alternatives.items);
+                },
+                else => unreachable,
+            }
+        }
+
         fn resolveMatchPatterns(self: *Self, id: u32, type_id: structures.TypeId) anyerror![]const MatchPattern {
             const source = self.unresolved.match_patterns[id];
             const members = try self.matchInputMembers(type_id);
             var patterns: std.ArrayList(MatchPattern) = .empty;
             switch (source.shape) {
                 .any => try patterns.append(self.gpa, .{ .source = id, .input_type = type_id, .members = members, .shape = .any }),
-                .type => |target| {
+                .type, .case_name, .alternatives => {
+                    const target = try self.resolveMatchType(id, type_id);
                     var selected: std.ArrayList(structures.TypeId) = .empty;
                     for (members) |member| {
                         const logical = (try self.analysis_context.facts().memberSpec(member)).type_id;
