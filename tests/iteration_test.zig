@@ -2538,7 +2538,7 @@ test "std algorithms treat optional producer results as items" {
 test "std enumerate handles its final representable index and rejects overflow" {
     const library = @import("standard_library");
     const original = library.source("algorithms.chi");
-    const boundary = try std.mem.replaceOwned(u8, std.testing.allocator, original, "index = 0, overflow = false", "index = 2147483647, overflow = false");
+    const boundary = try std.mem.replaceOwned(u8, std.testing.allocator, original, "last = -1", "last = 2147483646");
     defer std.testing.allocator.free(boundary);
     inline for (.{ false, true }) |borrowed| {
         for ([_]bool{ false, true }) |overflow| {

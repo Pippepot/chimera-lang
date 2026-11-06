@@ -678,6 +678,10 @@ fn boundsChecks(function: *Function, analysis: *const loops.Analysis, loop: Loop
 fn boundsForCounter(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32, counter: loops.InductionExit, test_result: loops.ExitTest) bool {
     var changed = false;
     const limit = counter.comparison.other;
+    // A stay block reachable around the test (a bottom-tested loop's header) runs
+    // its first iteration before the counter is tested, so the range holds only
+    // for terminal counters, whose proof does not assume the test passed.
+    if (counter.induction.terminal_bound == null and analysis.graph.incoming[test_result.stay].items.len != 1) return false;
     for (loop.blocks) |block| {
         if (!analysis.graph.dominates(test_result.stay, block)) continue;
         const range = analysis.iterationRange(block, counter, 16) orelse continue;

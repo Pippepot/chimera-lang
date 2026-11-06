@@ -160,11 +160,11 @@ initializer regions, without observing their results. Ordinary inliner reads own
 dependencies and runtime validation. Temporary hint edges settle on success or
 failure; existing optimized bodies retain lazy validation after edits.
 
-Directly passed aggregate arguments make primitive constants free in callee cost
-because they expose scalar-replacement opportunities. Caller growth still counts
-every inserted instruction. No std identity or speculative specialization is
-needed. One optimization reuses callee resolution and eligibility facts across
-inlining rounds and loop analysis.
+Callee cost excludes constants, which inlining shares once in the caller's entry
+block, and diverging blocks, which run at most once (panic message construction).
+Caller growth still counts every inserted instruction. No std identity or
+speculative specialization is needed. One optimization reuses callee resolution
+and eligibility facts across inlining rounds and loop analysis.
 Inlining revisits remaining calls after local simplification frees growth
 capacity. Every round retains the original caller's budget; pruning cannot
 repeatedly multiply its permitted size.
@@ -278,7 +278,9 @@ use runtime guards with the original loop as fallback. Checked carried updates
 remain until their overflow has been ruled out by range analysis.
 
 Integer exits may follow a flag test inside the loop body when their staying
-edge dominates the latch and the proof site. Counter matching follows
+edge dominates the latch and the proof site. A non-terminal counter's range
+assumes its exit test passed, so its staying block must have the test as its only
+entry; a loop tested after its first iteration yields no range. Counter matching follows
 identity-only acyclic joins; range derivation unions concrete incoming values
 through unchanged cyclic joins. Successful write guards therefore constrain a
 carried count after its checked increment, including across nested generation

@@ -120,35 +120,30 @@ pub func Zip(static L: type, static R: type, static A: type, static B: type, sta
 pub func zip(static L: type, static R: type, static A: type, static B: type, static left_borrowed: bool, static right_borrowed: bool, var left: L, var right: R) Zip(L, R, A, B, left_borrowed, right_borrowed)
     return Zip(L, R, A, B, left_borrowed, right_borrowed){left = left^, right = right^}
 
+# The last delivered index starts at -1, so one comparison guards each increment.
 pub func Enumerate(static S: type, static T: type, static borrowed: bool) type
     if borrowed
         return struct
             source: S
-            index: int
-            overflow: bool
+            last: int
             pub func next(mut self: Enumerate(S, T, borrowed)) (int, ref T) | End
                 const result = self.source.next()
                 if result is End -> return End{}
-                if self.overflow -> panic "enumerate index overflow"
-                const index = self.index
-                if index == 2147483647 -> self.overflow = true
-                else self.index += 1
+                if self.last == 2147483647 -> panic "enumerate index overflow"
+                self.last += 1
                 ref item = result
-                const pair: (int, ref T) = (index, item)
+                const pair: (int, ref T) = (self.last, item)
                 return pair^
     return struct
         source: S
-        index: int
-        overflow: bool
+        last: int
         pub func next(mut self: Enumerate(S, T, borrowed)) (int, T) | End
             const result = self.source.next()
             if result is End -> return End{}
-            if self.overflow -> panic "enumerate index overflow"
-            const index = self.index
-            if index == 2147483647 -> self.overflow = true
-            else self.index += 1
-            const pair: (int, T) = (index, result^)
+            if self.last == 2147483647 -> panic "enumerate index overflow"
+            self.last += 1
+            const pair: (int, T) = (self.last, result^)
             return pair^
 
 pub func enumerate(static S: type, static T: type, static borrowed: bool, var source: S) Enumerate(S, T, borrowed)
-    return Enumerate(S, T, borrowed){source = source^, index = 0, overflow = false}
+    return Enumerate(S, T, borrowed){source = source^, last = -1}

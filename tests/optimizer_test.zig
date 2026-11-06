@@ -783,6 +783,72 @@ test "ordinary user cursor construction and polling simplify across loop joins" 
     try testing.expectEqual(@as(usize, 0), count(body, &.{ .aggregate, .subi, .variant_coerce, .variant_extract, .variant_tag, .select }));
 }
 
+test "bounds proofs ignore the untested first iteration of a bottom-tested counter" {
+    try Fixture.expectParity(
+        \\struct Cursor
+        \\    value: int
+        \\    last: int
+        \\    step: int
+        \\    finished: bool
+        \\    func next(mut self: Cursor) int | End
+        \\        if self.finished -> return End{}
+        \\        const value = self.value
+        \\        if value == self.last -> self.finished = true
+        \\        else self.value = wrapping(value + self.step)
+        \\        return value
+        \\struct Positive
+        \\    source: Cursor
+        \\    func next(mut self: Positive) int | End
+        \\        loop
+        \\            const result = self.source.next()
+        \\            match result^
+        \\                item and item is int -> if item > 0 -> return item^
+        \\                _ -> return End{}
+        \\func run() int
+        \\    var positive = Positive{source = Cursor{value = 1, last = 2, step = 1, finished = false}}
+        \\    var total = 0
+        \\    loop
+        \\        const result = positive.next()
+        \\        match result
+        \\            int -> total += result
+        \\            _ -> break
+        \\    return total * 14
+    , 42);
+}
+
+test "standard zip and enumerate over range and span cursors inline" {
+    const program =
+        \\import std.algorithms.{zip, enumerate}
+        \\import std.memory.{SpanIterator}
+        \\import std.range.{RangeIterator}
+        \\func zipped() int
+        \\    var left: Array(int, 3) = [10, 11, 12]
+        \\    var right: Array(int, 3) = [1, 2, 3]
+        \\    var sum = 0
+        \\    for pair in zip(SpanIterator(int), SpanIterator(int), int, int, true, true, left.iter(), right.iter()) -> sum += pair.0 + pair.1
+        \\    return sum
+        \\func numbered() int
+        \\    var values: Array(int, 3) = [10, 11, 12]
+        \\    var sum = 0
+        \\    for pair in enumerate(SpanIterator(int), int, true, values.iter()) -> sum += pair.0 * pair.1
+        \\    return sum
+        \\func ranged() int
+        \\    var values: Array(int, 3) = [10, 11, 12]
+        \\    var sum = 0
+        \\    for pair in zip(RangeIterator, SpanIterator(int), int, int, false, true, (0..3).iter(), values.iter()) -> sum += pair.0 + pair.1
+        \\    for pair in enumerate(RangeIterator, int, false, (5..8).iter()) -> sum += pair.0 * pair.1
+        \\    return sum
+        \\func run() int -> zipped() + numbered() + ranged() - 88
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try testing.expectEqual(@as(usize, 0), countCalls((try optimizedBody(fixture, "zipped")).*.?));
+    // The only remaining call is the unreachable index overflow panic.
+    try testing.expectEqual(@as(usize, 1), countCalls((try optimizedBody(fixture, "numbered")).*.?));
+    try testing.expectEqual(@as(usize, 1), countCalls((try optimizedBody(fixture, "ranged")).*.?));
+}
+
 test "constant incoming predicates bypass only exits independent of join parameters" {
     try Fixture.expectParity(
         \\func pick(flag: bool, number: int) int | none

@@ -64,13 +64,12 @@ pub struct RangeSequence
     empty: bool
 
     pub func iter(self: RangeSequence) RangeIterator
-        return RangeIterator{
-            value = self.first,
-            last = self.last,
-            stride = self.stride,
-            descending = self.descending,
-            finished = self.empty,
-        }
+        # A zero stride is a single jump from first to last. Every step lands on
+        # last exactly, so wrapping addition never leaves the sequence.
+        var step = self.stride
+        if self.stride == 0 -> step = wrapping(self.last - self.first)
+        else if self.descending -> step = -self.stride
+        return RangeIterator{value = self.first, last = self.last, step = step, finished = self.empty}
 
     pub func reversed(self: RangeSequence) RangeSequence
         return RangeSequence{
@@ -102,17 +101,14 @@ pub struct RangeIterator
     copy = trivial
     value: int
     last: int
-    stride: int
-    descending: bool
+    step: int
     finished: bool
 
     pub func next(mut self: RangeIterator) int | End
         if self.finished -> return End{}
         const value = self.value
         if value == self.last -> self.finished = true
-        else if self.stride == 0 -> self.value = self.last
-        else if self.descending -> self.value -= self.stride
-        else self.value += self.stride
+        else self.value = wrapping(value + self.step)
         return value
 
 pub func exclusive(first: int | FromEnd | none, limit: int | FromEnd | none) Range

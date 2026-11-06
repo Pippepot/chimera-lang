@@ -323,7 +323,8 @@ pub struct SpanIterator(T: type)
         if self.position >= self.source.len() -> return End{}
         const position = self.position
         self.position += 1
-        return self.source[position]
+        # The private position starts at zero and stays below the immutable length.
+        return self.source.unsafe_at(position)
 
 extern func empty_cursor(static T: type) StorageCursor(T)
 extern func array_cursor(static T: type, static N: int, ref array: Array(T, N)) StorageCursor(T)

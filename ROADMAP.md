@@ -11,11 +11,14 @@ diagnostics, execution, ownership, and incremental/cache behavior.
 
 ### Basic collection algorithms
 
-- Eliminate cold-compilation regressions, including bundled scalar printing and
-  source-mode workloads; finish qualifying collection algorithms and generic
-  numerical helpers. Verify matched-baseline cold and leaf-edit compilation on
-  million-line workloads with zero and eight workers, and qualify runtime across
-  representative workloads.
+- Qualify the existing collection algorithms and numerical helpers against
+  representative workloads. Adapter pipelines over span and range cursors match
+  equivalent index loops within about 25% (nested chains up to 1.6x); extend that
+  check to owned List cursors, `collect`, mixed adapter chains, floating-point
+  helpers, and nested chains whose callee bodies approach the inline limit. Keep
+  matched-baseline cold and leaf-edit compilation on million-line workloads, with
+  zero and eight workers, and bundled/source standard-library compilation from
+  regressing.
 
 ### Collections
 

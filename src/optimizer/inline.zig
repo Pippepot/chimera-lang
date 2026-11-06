@@ -177,13 +177,19 @@ fn liveInstructions(function: *const Function) usize {
     return count;
 }
 
+/// Size charged against the inline limit. Inlined constants are shared in the
+/// caller's entry block and a diverging block runs at most once, so neither counts.
 pub fn cost(body: *const Body) usize {
-    var total = body.blocks.len;
-    for (body.instructions) |instruction| {
-        total += switch (instruction) {
-            .const_numeric, .const_int, .const_bool, .const_byte, .const_unit, .const_none => 0,
-            else => @as(usize, 1),
-        };
+    var total: usize = 0;
+    for (body.blocks) |block| {
+        if (block.terminator == .diverge) continue;
+        total += 1;
+        for (body.instructions[block.instruction_start..block.instruction_end]) |instruction| {
+            total += switch (instruction) {
+                .const_numeric, .const_int, .const_bool, .const_byte, .const_unit, .const_none => 0,
+                else => 1,
+            };
+        }
     }
     return total;
 }
@@ -210,14 +216,7 @@ fn candidate(function: *Function, context: anytype, cache: *Cache, call: structu
     };
     const body = callee.body;
     if (cache.limit == null) cache.limit = try context.inlineLimit();
-    if (body.instructions.len + body.blocks.len > cache.limit.?) {
-        for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
-            if (argument != .prepared) continue;
-            const type_id = function.valueType(function.find(argument.valueId()));
-            if (!type_id.isPrimitive() and function.direct(type_id)) break;
-        } else return null;
-        if (cost(body) > cache.limit.?) return null;
-    }
+    if (body.instructions.len + body.blocks.len > cache.limit.? and cost(body) > cache.limit.?) return null;
     const facts = if (@hasDecl(@TypeOf(context), "inlineFacts") and !callee.region)
         (try cache.instanceFacts(function.scratch, context, callee.instance)) orelse return null
     else
