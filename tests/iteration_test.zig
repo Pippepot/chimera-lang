@@ -2587,6 +2587,64 @@ test "std enumerate handles its final representable index and rejects overflow" 
     }
 }
 
+test "std adapter chains carrying references analyze their lifetimes in bounded memory" {
+    // Each stage rewrites a nested cursor field. Nine mixed stages used to exhaust memory
+    // during lifetime analysis.
+    try Fixture.expectParity(
+        \\import std.algorithms.{map, filter, enumerate, Map, Filter, Enumerate}
+        \\import std.memory.{SpanIterator}
+        \\func triple(value: int) int -> value % 100 + 1
+        \\func sum2(pair: (int, int)) int -> pair.0 + pair.1
+        \\func sumref(pair: (int, ref int)) int -> pair.0 + pair.1
+        \\func odd(value: int) bool -> value % 3 <> 0
+        \\func run() int
+        \\    var values: Array(int, 16) = [3, 8, 1, 9, 4, 7, 2, 6, 5, 11, 13, 17, 19, 23, 29, 31]
+        \\    const e0 = enumerate(SpanIterator(int), int, true, values.iter())
+        \\    const t0 = map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, e0^, sumref)
+        \\    const s1 = filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false, t0^, odd)
+        \\    const e2 = enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false, s1^)
+        \\    const t2 = map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int, e2^, sum2)
+        \\    const s3 = map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int, t2^, triple)
+        \\    const s4 = filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false, s3^, odd)
+        \\    const e5 = enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false, s4^)
+        \\    const t5 = map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int, e5^, sum2)
+        \\    const s6 = map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int), int, int, t5^, triple)
+        \\    const s7 = filter(Map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int), int, int), int, false, s6^, odd)
+        \\    const e8 = enumerate(Filter(Map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int), int, int), int, false), int, false, s7^)
+        \\    const t8 = map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int, e8^, sum2)
+        \\    var total = 0
+        \\    for value in t8^ -> total += value
+        \\    return total % 251
+    , 28);
+}
+
+test "nested filters over a reference-carrying cursor analyze their lifetimes in bounded memory" {
+    // Every filter excludes and re-selects its source field, which once multiplied the
+    // reference origins of the loop with each stage; eight stages exhausted memory.
+    try Fixture.expectParity(
+        \\import std.algorithms.{map, filter, enumerate, Map, Filter, Enumerate}
+        \\import std.memory.{SpanIterator}
+        \\func triple(value: int) int -> value % 100 + 1
+        \\func sumref(pair: (int, ref int)) int -> pair.0 + pair.1
+        \\func odd(value: int) bool -> value % 3 <> 0
+        \\func run() int
+        \\    var values: Array(int, 16) = [3, 8, 1, 9, 4, 7, 2, 6, 5, 11, 13, 17, 19, 23, 29, 31]
+        \\    const e0 = enumerate(SpanIterator(int), int, true, values.iter())
+        \\    const t0 = map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, e0^, sumref)
+        \\    const f1 = filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false, t0^, odd)
+        \\    const f2 = filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false, f1^, odd)
+        \\    const f3 = filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false, f2^, odd)
+        \\    const f4 = filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false), int, false, f3^, odd)
+        \\    const f5 = filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false), int, false), int, false, f4^, odd)
+        \\    const f6 = filter(Filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false), int, false), int, false), int, false, f5^, odd)
+        \\    const f7 = filter(Filter(Filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false), int, false), int, false), int, false), int, false, f6^, odd)
+        \\    const f8 = filter(Filter(Filter(Filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false), int, false), int, false), int, false), int, false), int, false, f7^, odd)
+        \\    var total = 0
+        \\    for v in f8^ -> total += v
+        \\    return total % 251
+    , 233);
+}
+
 test "std mapped cursors materialize through existing stable sorted collections" {
     try Fixture.expectParity(
         \\import std.algorithms.{map}

@@ -162,7 +162,14 @@ failure; existing optimized bodies retain lazy validation after edits.
 
 Callee cost excludes constants, which inlining shares once in the caller's entry
 block, and diverging blocks, which run at most once (panic message construction).
-Caller growth still counts every inserted instruction. No std identity or
+A call that passes a local aggregate by reference may exceed the limit by sixteen:
+the state lives in registers once inlined, and function values stored in it become
+direct calls. Calls inside a callee pass fields of its parameter, not a local, so
+they keep the plain limit and stay out of line there; the caller then inlines
+level by level, which makes composed iterator adapters inline at any depth with
+callee cost independent of depth. Charging every by-reference state argument
+instead accumulates inner bodies into the outer callee and reintroduces a depth
+cliff. Caller growth still counts every inserted instruction. No std identity or
 speculative specialization is needed. One optimization reuses callee resolution
 and eligibility facts across inlining rounds and loop analysis.
 Inlining revisits remaining calls after local simplification frees growth
@@ -190,7 +197,8 @@ does allocation contents alias a stack slot. Private slots cannot be modified
 through escaped references. Address-taken results and block parameters remain
 mutable roots even when their producing instruction is a plain value.
 Independent top-level fields of a private slot have separate write resources;
-whole-slot writes overlap every field. Variant payload projections discard
+whole-slot writes overlap every field. A borrowed field of a slot occupies that
+field's resource, so reads through the borrow cannot be hoisted past writes to it. Variant payload projections discard
 field separation. Memory is typed: an allocation block holds elements of one
 type and is never part of another object. Heap resources therefore carry their
 allocation type, so writes to different allocation types are disjoint, and a

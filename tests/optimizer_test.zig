@@ -843,10 +843,64 @@ test "standard zip and enumerate over range and span cursors inline" {
     try Fixture.expectParity(program, 42);
     const fixture = try Fixture.init(program);
     defer fixture.deinit();
-    try testing.expectEqual(@as(usize, 0), countCalls((try optimizedBody(fixture, "zipped")).*.?));
-    // The only remaining call is the unreachable index overflow panic.
-    try testing.expectEqual(@as(usize, 1), countCalls((try optimizedBody(fixture, "numbered")).*.?));
-    try testing.expectEqual(@as(usize, 1), countCalls((try optimizedBody(fixture, "ranged")).*.?));
+    for ([_][]const u8{ "zipped", "numbered", "ranged" }) |name| {
+        try testing.expectEqual(@as(usize, 0), countReturningCalls((try optimizedBody(fixture, name)).*.?));
+    }
+}
+
+test "composed standard adapters inline their cursor state" {
+    const program =
+        \\import std.algorithms.{map, filter, enumerate, zip, Map, Filter, Enumerate}
+        \\import std.memory.{SpanIterator}
+        \\import std.range.{RangeIterator}
+        \\func triple(value: int) int -> value * 3 + 1
+        \\func odd(value: int) bool -> value % 2 == 1
+        \\func total(ref values: Array(int, 4)) int
+        \\    const mapped = map(SpanIterator(int), int, int, values.iter(), triple)
+        \\    const selected = filter(Map(SpanIterator(int), int, int), int, false, mapped^, odd)
+        \\    const numbered = enumerate(Filter(Map(SpanIterator(int), int, int), int, false), int, false, selected^)
+        \\    var sum = 0
+        \\    for pair in zip(Enumerate(Filter(Map(SpanIterator(int), int, int), int, false), int, false), RangeIterator, (int, int), int, false, false, numbered^, (5..8).iter()) -> sum += pair.0.0 + pair.0.1 + pair.1
+        \\    return sum
+        \\func run() int
+        \\    var values: Array(int, 4) = [1, 2, 3, 4]
+        \\    return total(values) + 10
+    ;
+    try Fixture.expectParity(program, 42);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try testing.expectEqual(@as(usize, 0), countReturningCalls((try optimizedBody(fixture, "run")).*.?));
+}
+
+test "deep standard adapter chains inline at every depth" {
+    const program =
+        \\import std.algorithms.{map, filter, enumerate, zip, Map, Filter, Enumerate, Zip}
+        \\import std.range.{RangeIterator}
+        \\func triple(value: int) int -> value % 100 + 1
+        \\func sum2(pair: (int, int)) int -> pair.0 + pair.1
+        \\func odd(value: int) bool -> value % 3 <> 0
+        \\func total(limit: int) int
+        \\    const e0 = enumerate(RangeIterator, int, false, (0..limit).iter())
+        \\    const t0 = map(Enumerate(RangeIterator, int, false), (int, int), int, e0^, sum2)
+        \\    const s1 = filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false, t0^, odd)
+        \\    const z2 = zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false, s1^, (2..limit).iter())
+        \\    const t2 = map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int, z2^, sum2)
+        \\    const s3 = map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int, t2^, triple)
+        \\    const e4 = enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false, s3^)
+        \\    const t4 = map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false), (int, int), int, e4^, sum2)
+        \\    const s5 = filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false), (int, int), int), int, false, t4^, odd)
+        \\    const z6 = zip(Filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false), (int, int), int), int, false), RangeIterator, int, int, false, false, s5^, (6..limit).iter())
+        \\    const t6 = map(Zip(Filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int, z6^, sum2)
+        \\    const s7 = map(Map(Zip(Filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int, t6^, triple)
+        \\    var sum = 0
+        \\    for value in s7^ -> sum += value % 1000
+        \\    return sum
+        \\func run() int -> total(64) % 251
+    ;
+    try Fixture.expectParity(program, 25);
+    const fixture = try Fixture.init(program);
+    defer fixture.deinit();
+    try testing.expectEqual(@as(usize, 0), countReturningCalls((try optimizedBody(fixture, "total")).*.?));
 }
 
 test "constant incoming predicates bypass only exits independent of join parameters" {
@@ -1760,6 +1814,15 @@ test "inlining exposes callee bodies to scalar replacement selects and loop idio
     const spin = (try optimizedBody(fixture, "spin")).*.?;
     // An arbitrary negative start eventually overflows its checked decrement.
     try testing.expectEqual(@as(usize, 1), countPredicates(spin));
+}
+
+/// Calls that can return; panic paths end in never-returning calls.
+fn countReturningCalls(body: structures.FunctionBodyAnalysis) usize {
+    var total: usize = 0;
+    for (body.instructions) |instruction| {
+        if (instruction == .call and instruction.call.return_type != .never) total += 1;
+    }
+    return total;
 }
 
 fn countCallsTo(body: structures.FunctionBodyAnalysis, name: []const u8, fixture: Fixture) !usize {

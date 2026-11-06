@@ -3,6 +3,9 @@ const std = @import("std");
 pub fn Store(comptime Origin: type, comptime Projection: type, comptime Transform: type) type {
     return struct {
         origins: std.ArrayList(Origin) = .empty,
+        /// Origin sets can grow combinatorially with the nesting of a program's types;
+        /// beyond this many entries the analysis fails instead of exhausting memory.
+        maximum: usize = std.math.maxInt(u32),
         projections: std.AutoArrayHashMapUnmanaged(Projection, void) = .empty,
         transforms: std.AutoArrayHashMapUnmanaged(Transform, void) = .empty,
 
@@ -26,6 +29,7 @@ pub fn Store(comptime Origin: type, comptime Projection: type, comptime Transfor
 
         /// The caller has established that this origin is absent from the set.
         pub inline fn prependAssumeUnique(self: *@This(), allocator: std.mem.Allocator, head: ?u32, origin: Origin) !u32 {
+            if (self.origins.items.len >= self.maximum) return error.AnalysisTooLarge;
             const index: u32 = @intCast(self.origins.items.len);
             var added = origin;
             added.next = head;
@@ -75,5 +79,17 @@ test "reference paths have canonical identities and origin sets ignore list link
     const first = try store.add(allocator, null, origin);
     const second = try store.add(allocator, first, .{ .projection = tail });
     try std.testing.expectEqual(second, try store.add(allocator, second, origin));
+    try std.testing.expectEqual(@as(usize, 2), store.origins.items.len);
+}
+
+test "an origin store refuses to grow past its maximum" {
+    const Origin = struct { value: u32 = 0, next: ?u32 = null };
+    var store: Store(Origin, struct { step: u32, next: ?u32 }, struct { operation: u32, previous: ?u32 }) = .{ .maximum = 2 };
+    const allocator = std.testing.allocator;
+    defer store.origins.deinit(allocator);
+    const first = try store.add(allocator, null, .{ .value = 1 });
+    const second = try store.add(allocator, first, .{ .value = 2 });
+    try std.testing.expectEqual(first, try store.add(allocator, first, .{ .value = 1 }));
+    try std.testing.expectError(error.AnalysisTooLarge, store.add(allocator, second, .{ .value = 3 }));
     try std.testing.expectEqual(@as(usize, 2), store.origins.items.len);
 }

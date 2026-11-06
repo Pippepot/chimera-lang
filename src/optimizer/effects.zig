@@ -163,10 +163,20 @@ pub const Roots = struct {
         };
     }
 
+    /// A borrowed field of a slot occupies that field alone. Reading fields of the
+    /// borrowed value must not be mistaken for fields of the slot.
+    fn borrowedRoot(self: *const Roots, address: structures.BorrowAddressOperation) Resource {
+        const resource = self.root(address.source);
+        if (resource != .slot) return resource;
+        const path = self.function.borrow_fields.items[address.fields.start..address.fields.end];
+        if (path.len == 0 or path[0] != .field) return resource;
+        return .{ .field = .{ .slot = resource.slot, .index = path[0].field } };
+    }
+
     pub fn referent(self: *const Roots, reference: ValueId) Resource {
         const definition = self.function.definition(reference) orelse return .unknown;
         return switch (definition) {
-            .borrow_address => |address| if (address.base_is_reference) self.referent(address.source) else self.root(address.source),
+            .borrow_address => |address| if (address.base_is_reference) self.referent(address.source) else self.borrowedRoot(address),
             else => .unknown,
         };
     }

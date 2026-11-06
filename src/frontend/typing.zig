@@ -6,6 +6,10 @@ const semantic = @import("semantic.zig");
 const lifetime = @import("lifetime.zig");
 const body_graph = @import("body_graph.zig");
 const origin_storage = @import("reference_origins.zig");
+
+/// Ordinary bodies keep under a few hundred thousand reference origins. A body whose
+/// origin sets multiply past this limit fails analysis rather than exhausting memory.
+const max_reference_origins = 2_000_000;
 const flow_snapshot = @import("flow_snapshot.zig");
 const flow_types = @import("flow_types.zig");
 const cleanup_shape = @import("cleanup_shape.zig");
@@ -632,7 +636,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         block_argument_generations: std.ArrayList(?GenerationId) = .empty,
         variant_coercion_tags: std.ArrayList(u32) = .empty,
         borrow_fields: std.ArrayList(structures.BorrowProjection) = .empty,
-        reference_storage: origin_storage.Store(ReferenceOrigin, ReferenceProjection, ReferenceTransform) = .{},
+        reference_storage: origin_storage.Store(ReferenceOrigin, ReferenceProjection, ReferenceTransform) = .{ .maximum = max_reference_origins },
         flow: ?*FlowData = null,
         flow_parent: ?*Self = null,
         flow_captures: []const Value = &.{},
@@ -8730,7 +8734,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     } else {
                         // Unprojected and descendant origins retain the selection as an ownership restriction.
                         if (origin.readonly_owned) |type_id| try self.restrictOwnedOrigin(origin, (try self.referencePathStepType(type_id, step)) orelse unreachable);
-                        if (projection == null and origin.parameter != null and origin.root == null) try self.appendOriginSourcePath(origin, step);
+                        if (projection == null and origin.parameter != null and origin.root == null) {
+                            if (self.sourcePathExcludes(origin.source_path, step)) return false;
+                            try self.appendOriginSourcePath(origin, step);
+                        }
                     }
                 },
                 .exclude => |step| if (!try self.excludeReferenceOrigin(origin, step)) return false,
@@ -9417,6 +9424,22 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn appendSourcePath(self: *Self, origins: ?u32, step: structures.ReferencePathStep) !?u32 {
             return self.transformReferenceOrigins(origins, .{ .source_path = step });
+        }
+
+        /// Whether the exclusions ending a source path already rule out `step`: selecting a
+        /// part after excluding that same part leaves nothing.
+        fn sourcePathExcludes(self: *Self, source_path: ?u32, step: structures.ReferencePathStep) bool {
+            var cursor = source_path;
+            while (cursor) |index| {
+                const projection = self.reference_storage.projections.keys()[index];
+                switch (projection.step) {
+                    .without_field => |field| if (step == .field and step.field == field) return true,
+                    .without_variant => |member| if (step == .variant and step.variant == member) return true,
+                    else => if (!projection.step.isExclusion()) return false,
+                }
+                cursor = projection.next;
+            }
+            return false;
         }
 
         fn appendOriginSourcePath(self: *Self, origin: *ReferenceOrigin, step: structures.ReferencePathStep) !void {

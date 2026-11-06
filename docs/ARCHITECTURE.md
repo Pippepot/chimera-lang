@@ -354,6 +354,13 @@ nominal-hook captures are collected once per value, generation, type, and resolv
 origins only when substitution is snapshot-only. Partial shapes, content loads,
 and read-version captures remain conservative. Empty places that cannot
 store borrows and own no resource require no deferred content reads.
+A contents origin records the selections and exclusions applied to a parameter as its
+source path, and callers replay that path against their own origins. Selecting a part
+that the path's trailing exclusions already removed leaves nothing, so the origin is
+dropped when the selection is made; keeping it multiplied the origins of nested cursor
+adapters with every stage, since each adapter excludes and re-selects its source field.
+A body whose store passes two million origins, far above ordinary bodies, fails
+analysis with `AnalysisTooLarge` instead of exhausting memory.
 Reference-bearing slots retain initial captures and ordered ordinary writes,
 including writes before cleanup discovery. A hook's captured-slot dereferences
 resolve at its scheduled cursor rather than the already-unbound live state.

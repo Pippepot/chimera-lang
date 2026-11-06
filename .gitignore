@@ -4,6 +4,7 @@ chimera.asm
 chimera.o
 zig-out/
 .venv
+.vscode
 .zig-cache
 .chimera-cache/
 .chimera-run-*

@@ -292,6 +292,33 @@ external store avoids artifact expiration. Dedicated runners are preferable for
 performance; hosted runners are too variable for small timing differences.
 No automatic hook or workflow is installed.
 
+## Runtime History
+
+[runtime_history.py](runtime_history.py) records every runtime benchmark (the 88M sieve,
+the five-face key search, and the array sort in all five distributions with static and
+runtime comparators) across commits, in `.history/runtime/`, and renders a standalone
+report to `.history/runtime.html`. It shares nothing with the compilation history's
+records or report.
+
+```sh
+python3 benchmarks/runtime_history.py record --cpu 4 --since e61767a
+python3 benchmarks/runtime_history.py record --cpu 4 --worktree
+python3 benchmarks/runtime_history.py render
+python3 -m unittest discover -s benchmarks -p runtime_history_test.py -v
+```
+
+Each commit's compiler builds from `git archive` in Debug mode, which cannot change the
+generated machine code, then compiles the current benchmark programs unchanged, so a
+point differs from its neighbours only by the compiler. A commit whose language cannot
+compile a program records that failure. The sieve program is read from
+[history_benchmark.zig](history_benchmark.zig) rather than copied. Only generated programs are timed,
+pinned to `--cpu`, with the same correctness checks and adaptive sampling as the
+standalone drivers (sort: seven rotated samples). Clang C and C++ references are
+measured once per recording session, so ratios hold for that machine and session;
+delete `.history/runtime/references.json` to measure them again. Records carry a suite
+hash and are skipped while it matches; `--force` re-measures. Do not run it alongside
+other timed work.
+
 ## Frontend attribution
 
 The compilation driver can profile one cold build and one fresh leaf edit with

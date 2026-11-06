@@ -194,6 +194,20 @@ pub fn cost(body: *const Body) usize {
     return total;
 }
 
+/// Extra callee cost accepted for a call that passes a local aggregate by reference:
+/// its state lives in registers once inlined, and function values stored in it
+/// become direct calls. Composed iterator adapters depend on this headroom.
+const state_allowance = 16;
+
+fn allowance(function: *const Function, call: structures.FunctionCall) u32 {
+    for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
+        if (argument != .borrowed) continue;
+        const definition = function.definition(function.find(argument.borrowed)) orelse continue;
+        if (definition == .local_storage) return state_allowance;
+    }
+    return 0;
+}
+
 fn candidate(function: *Function, context: anytype, cache: *Cache, call: structures.FunctionCall) !?Callee {
     var callee: Callee = switch (call.target) {
         .direct => |instance| .{ .instance = instance, .body = (try cache.body(function.scratch, context, instance)) orelse return null },
@@ -216,7 +230,7 @@ fn candidate(function: *Function, context: anytype, cache: *Cache, call: structu
     };
     const body = callee.body;
     if (cache.limit == null) cache.limit = try context.inlineLimit();
-    if (body.instructions.len + body.blocks.len > cache.limit.? and cost(body) > cache.limit.?) return null;
+    if (body.instructions.len + body.blocks.len > cache.limit.? and cost(body) > cache.limit.? + allowance(function, call)) return null;
     const facts = if (@hasDecl(@TypeOf(context), "inlineFacts") and !callee.region)
         (try cache.instanceFacts(function.scratch, context, callee.instance)) orelse return null
     else
