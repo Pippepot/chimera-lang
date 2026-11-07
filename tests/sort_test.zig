@@ -70,13 +70,13 @@ test "collection sort static comparator preserves stability captured authority a
         \\    left.comparisons.value += 1
         \\    return left.key < right.key
         \\func check(mut comparisons: int, mut drops: int) int
-        \\    var values = List(Item).new(64)
+        \\    var values = List(Item).new(192)
         \\    if not (values is List(Item)) -> return 90
-        \\    for index in 0..64
+        \\    for index in 0..192
         \\        if not (values.append(Item{key = (index * 37) % 7, sequence = index, comparisons = Ref.from(comparisons), drops = Ref.from(drops)}) is unit) -> return 91
         \\    values.sort(Item, before)
         \\    if comparisons == 0 or drops <> 0 -> return 92
-        \\    for index in 1..64
+        \\    for index in 1..192
         \\        if values[index - 1].key > values[index].key -> return 93
         \\        if values[index - 1].key == values[index].key and values[index - 1].sequence > values[index].sequence -> return 94
         \\    return 42
@@ -84,7 +84,7 @@ test "collection sort static comparator preserves stability captured authority a
         \\    var comparisons = 0
         \\    var drops = 0
         \\    if check(comparisons, drops) <> 42 -> return 95
-        \\    if drops <> 64 -> return 96
+        \\    if drops <> 192 -> return 96
         \\    return 42
     , 42);
 }
@@ -548,7 +548,7 @@ test "driftsort preserves each value across lengths and distributions" {
         \\        for count in counts
         \\            if count <> 0 -> return 94
         \\    return 42
-    , &.{.{ .name = "$LENGTHS", .native = "0, 1, 2, 19, 20, 21, 63, 64, 65, 127, 128", .interpreted = "0, 1, 2, 19, 20, 21, 64" }}, 42);
+    , &.{.{ .name = "$LENGTHS", .native = "0, 1, 2, 19, 20, 21, 63, 64, 65, 127, 128, 129, 257, 4097", .interpreted = "0, 1, 2, 19, 20, 21, 64" }}, 42);
 }
 
 test "driftsort run scheduling handles integer boundaries" {
@@ -594,9 +594,9 @@ test "driftsort stable fallback sorts a forced depth-limited region" {
     ;
     const standard_library = @import("standard_library");
     const original = standard_library.source("memory/sort.chi");
-    const call = "drift_quicksort(T, Order, source, order, scratch, 0, length, drift_depth(length), before)";
+    const call = "drift_quicksort(T, Order, source, order, scratch, 0, length, drift_depth(length), -1, before)";
     try std.testing.expect(std.mem.indexOf(u8, original, call) != null);
-    const forced = try std.mem.replaceOwned(u8, std.testing.allocator, original, call, "drift_quicksort(T, Order, source, order, scratch, 0, length, 0, before)");
+    const forced = try std.mem.replaceOwned(u8, std.testing.allocator, original, call, "drift_quicksort(T, Order, source, order, scratch, 0, length, 0, -1, before)");
     defer std.testing.allocator.free(forced);
     for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
         const program = try std.fmt.allocPrint(std.testing.allocator, "{s}\n{s}", .{ source, entry });
@@ -607,6 +607,72 @@ test "driftsort stable fallback sorts a forced depth-limited region" {
         try fixture.db.setInput(test_sources.queries.SourceText, file, forced);
         try fixture.expectExit(0, 42);
     }
+}
+
+test "driftsort merges asymmetric overlapping and disjoint runs stably" {
+    const program =
+        \\import std.memory.{test_drift_merge}
+        \\struct Item
+        \\    copy = none
+        \\    pub key: int
+        \\    pub sequence: int
+        \\    comparisons: Ref(int)
+        \\func ascending(imm left: Item, imm right: Item) bool
+        \\    left.comparisons.value += 1
+        \\    return left.key < right.key
+        \\func descending(imm left: Item, imm right: Item) bool
+        \\    left.comparisons.value += 1
+        \\    return left.key > right.key
+        \\func check(middle: int, pattern: int, reverse: bool, mut comparisons: int) int
+        \\    var values = List(Item).new($N)
+        \\    if not (values is List(Item)) -> return 90
+        \\    for index in 0..$N
+        \\        var local = index
+        \\        if index >= middle -> local -= middle
+        \\        var key = local / 3
+        \\        if pattern == 1 and index < middle -> key += 100
+        \\        if pattern == 2 and index >= middle -> key += 100
+        \\        if reverse -> key = 256 - key
+        \\        if not (values.append(Item{key = key, sequence = index, comparisons = Ref.from(comparisons)}) is unit) -> return 91
+        \\    var before = ascending
+        \\    if reverse -> before = descending
+        \\    comparisons = 0
+        \\    var view = values.span()
+        \\    test_drift_merge(Item, view, middle, before)
+        \\    if pattern > 0 and comparisons > 2 -> return 92
+        \\    for index in 1..$N
+        \\        if before(values[index], values[index - 1]) -> return 93
+        \\        if values[index - 1].key == values[index].key and values[index - 1].sequence >= values[index].sequence -> return 94
+        \\    return 42
+        \\func run() int
+        \\    var comparisons = 0
+        \\    for middle in [$SPLITS]
+        \\        for pattern in 0..3
+        \\            if check(middle, pattern, false, comparisons) <> 42 -> return 95
+        \\            if check(middle, pattern, true, comparisons) <> 42 -> return 96
+        \\    return 42
+    ;
+    const native = try test_sources.renderTemplate(std.testing.allocator, program, .{ .N = "96", .SPLITS = "1, 20, 65" });
+    defer std.testing.allocator.free(native);
+    const interpreted = try test_sources.renderTemplate(std.testing.allocator, program, .{ .N = "32", .SPLITS = "1, 8, 23" });
+    defer std.testing.allocator.free(interpreted);
+    try Fixture.expectEntryParity(native, interpreted, &.{.{
+        .path = "drift_merge_test.chi",
+        .module_path = "std.memory",
+        .source =
+        \\pub func test_drift_merge(static T: type, mut source: Span(T), middle: int, before: func(imm T, imm T) bool)
+        \\    const length = source.len()
+        \\    var order = List(int).filled(0, length)
+        \\    if not (order is List(int)) -> panic "test allocation failed"
+        \\    var scratch = List(int).filled(0, length)
+        \\    if not (scratch is List(int)) -> panic "test allocation failed"
+        \\    for index in 0..length -> order.unsafe_at(index) = index
+        \\    var indices = order.span()
+        \\    var buffer = scratch.span()
+        \\    drift_merge(T, RuntimeSortOrder(T), source, indices, buffer, 0, middle, length, RuntimeSortOrder(T){before = before})
+        \\    apply_sort_order(T, source.data, indices)
+        ,
+    }}, 42);
 }
 
 test "driftsort terminates and preserves elements with inconsistent comparisons" {
@@ -623,6 +689,30 @@ test "driftsort terminates and preserves elements with inconsistent comparisons"
         \\    for count in counts
         \\        if count <> 1 -> return 92
         \\    return 42
+    , 42);
+}
+
+test "driftsort bounds partition work when comparisons change during sorting" {
+    try Fixture.expectParity(
+        \\struct Item
+        \\    pub value: int
+        \\    calls: Ref(int)
+        \\func changing(imm left: Item, imm right: Item) bool
+        \\    left.calls.value += 1
+        \\    return left.calls.value % 3 == 0
+        \\func check(mut calls: int) int
+        \\    var values = [Item{value = index, calls = Ref.from(calls)} static for index in 0..64]
+        \\    var counts = Array(int, 64).filled(0)
+        \\    values.sort(changing)
+        \\    for item in values
+        \\        if item.value < 0 or item.value >= 64 -> return 90
+        \\        counts[item.value] += 1
+        \\    for count in counts
+        \\        if count <> 1 -> return 91
+        \\    return 42
+        \\func run() int
+        \\    var calls = 0
+        \\    return check(calls)
     , 42);
 }
 
@@ -672,8 +762,8 @@ test "collection sorting panics when either scratch allocation fails" {
     const standard_library = @import("standard_library");
     const original = standard_library.source("memory/sort.chi");
     for ([_]struct { original: []const u8, failed: []const u8 }{
-        .{ .original = "var order = List(int).filled(0, length)", .failed = "var order = List(int).filled(0, -1)" },
-        .{ .original = "var scratch = List(int).filled(0, length)", .failed = "var scratch = List(int).filled(0, -1)" },
+        .{ .original = "var order_storage = allocate(int, length)", .failed = "var order_storage = allocate(int, -1)" },
+        .{ .original = "var scratch_storage = allocate(int, length)", .failed = "var scratch_storage = allocate(int, -1)" },
     }) |allocation| {
         try std.testing.expect(std.mem.indexOf(u8, original, allocation.original) != null);
         const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, allocation.original, allocation.failed);
@@ -723,7 +813,7 @@ test "collection sort fast paths do not need scratch allocations" {
     ;
     const standard_library = @import("standard_library");
     const original = standard_library.source("memory/sort.chi");
-    const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "List(int).filled(0, length)", "List(int).filled(0, -1)");
+    const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "allocate(int, length)", "allocate(int, -1)");
     defer std.testing.allocator.free(failed);
     for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
         const program = try std.fmt.allocPrint(std.testing.allocator, "{s}\n{s}", .{ source, entry });

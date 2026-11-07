@@ -1,12 +1,20 @@
-# Static and runtime sort comparators
+# Stable sorting with static and runtime comparators
 
 The [benchmark runner](../../array-sort/README.md) compares matching static and
-runtime callback interfaces in Chimera and C++. All timings below are whole-process
-wall time, including generation, sorting, scratch allocation, verification,
-startup, and cleanup. They do not isolate sorting-kernel time.
+runtime callback interfaces in Chimera and C++. Timings are whole-process wall
+time, including generation, sorting, scratch allocation, verification, startup,
+and cleanup. They do not isolate sorting-kernel time.
+
+## Matched before and after measurements
+
+The [baseline](optimization-before.json) and [optimized run](optimization-after.json)
+use the same checkout revision, workload, compiler source, machine, toolchain, and
+CPU affinity. The standard-library sort source changes between runs; both raw
+records retain source hashes and the compiler executable hash. The compiler was
+already built and supplied with `--compiler` in each run.
 
 ```sh
-python3 benchmarks/array-sort/run.py --cpu 4 --output benchmarks/results/array-sort/static-samples.json
+python3 benchmarks/array-sort/run.py --cpu 4 --compiler /path/to/chimera --output /tmp/array-sort.json
 ```
 
 Machine: AMD Ryzen 9 3900X, Linux x86-64, Zig 0.17.0; Clang 22.1.8 with
@@ -16,64 +24,65 @@ one discarded full warm-up per lane/distribution, then nine samples with
 rotating lane order, pinned to CPU 4. Each distribution also passes independent
 correctness probes with seeds 0, 42, and 65,535.
 
+Median milliseconds per batch of eight sorts (lower is faster):
+
+| Input | Static before | Static after | Runtime before | Runtime after |
+| --- | ---: | ---: | ---: | ---: |
+| random | 58.316 | 50.013 | 96.973 | 66.919 |
+| sorted | 4.904 | 5.066 | 5.689 | 5.630 |
+| reversed | 5.493 | 5.761 | 6.272 | 6.404 |
+| duplicates | 21.463 | 22.311 | 30.348 | 27.921 |
+| runs | 20.011 | 14.819 | 27.199 | 15.518 |
+
+Random input improves by 1.17x with a static comparator and 1.45x with a runtime
+comparator. Reversed runs improve by 1.35x and 1.75x respectively. Ordered inputs
+retain their scan/reverse fast paths; their small timing differences, and the
+static duplicate-heavy result, do not demonstrate an improvement. C++ reference
+medians also varied between sessions, so small differences need caution.
+
 Chimera static calls `values.sort(int, before)`; runtime calls
 `values.sort(before)`. C++ static lanes use the default comparator; runtime lanes
 pass a function pointer into a separately compiled translation unit without LTO.
-Both C++ interfaces support ordinary runtime functions. Chimera is stable in
-both modes; C++ `std::stable_sort` matches that ordering guarantee.
+Chimera remains stable in both modes; C++ `std::stable_sort` matches that guarantee.
+In the optimized run, static random input takes 2.20x C++ `std::stable_sort` time,
+and static runs take 1.18x. The runtime runs lane takes 0.94x C++'s matching runtime
+`std::stable_sort` time. The full six-lane samples and ranges are in the raw records.
 
-Median milliseconds per batch of eight sorts (lower is faster):
+## Implementation
 
-| Input | Chimera static | C++ sort | C++ stable_sort | Chimera runtime | C++ sort runtime | C++ stable_sort runtime |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| random | 140.624 | 27.677 | 21.859 | 153.799 | 34.736 | 28.064 |
-| sorted | 6.727 | 7.207 | 12.051 | 7.117 | 17.556 | 15.780 |
-| reversed | 7.515 | 6.376 | 12.976 | 7.864 | 13.730 | 15.486 |
-| duplicates | 41.042 | 11.898 | 18.764 | 44.325 | 18.627 | 25.790 |
-| runs | 43.941 | 8.398 | 12.325 | 48.239 | 16.965 | 16.152 |
+- Quicksort partitions equal keys only when an ancestor bound or an empty less-than
+  partition establishes the need. It recurses into the smaller region and loops
+  over the larger one; every iteration consumes depth, preserving the stable
+  worst-case fallback even for inconsistent comparisons.
+- Large partitions choose a pivot from three medians of three samples.
+- Merging buffers the shorter run and writes into the index array in the safe
+  direction. Ordered adjacent runs need no movement; strictly reversed disjoint
+  ranges move as blocks after two boundary comparisons.
+- Index storage is allocated without zero filling. The permutation and each
+  scratch range are initialized before any read. Hot loops use private span
+  descriptors and copies with offsets established before entering the loop.
+- The final permutation trusts the index bounds established by the sorting
+  algorithms. Source elements remain stationary during comparison and retain
+  their ordinary ownership transfers when the permutation is applied.
 
-On random input, specializing the comparator reduces Chimera's process time by
-8.6% (1.09× speedup). The static lane still takes
-5.08× the C++ default `std::sort` time; the runtime lane takes
-4.43× the C++ runtime `std::sort` time. Eliminating indirect comparisons therefore
-explains only part of the difference. The languages still use different sorting
-implementations, bounds checks, and generated machine code.
-
-The duplicate-heavy measurements include visible outliers; consult minima,
-maxima, and all nine samples in the [raw record](static-samples.json). The raw
-record also retains source and compiler binary hashes, versions, affinity, and
-executable sizes. The [earlier runtime-only comparison](samples.json) is retained
-as a separate snapshot and was not overwritten.
-
-## Code generation and size
-
-Named assembly was inspected with the measured compiler, using `--debug=asm`
-on the same source with the runtime mode selected or discarded at compile time.
-Both the explicit static overload and default `sort()` have zero indirect call
-sites in their sort helpers, and the comparison/adaptor functions are inlined.
-The runtime overload retains 14 indirect comparison call sites. There are 12
-emitted sort-helper bodies in each mode; specialization preserves the shared
-algorithm rather than forcing recursive helper inlining.
-
-- Chimera static executable: 93,452 bytes.
-- Chimera runtime executable: 95,621 bytes.
-
-These are separate programs using one comparator each. They do not measure code
-growth in a program that retains multiple static comparator specializations.
-The C++ executable contains all four C++ lanes and is not a per-lane size baseline.
+The public API, stable ordering, custom copy/move/drop behavior, reference
+permissions, and two-index-buffer allocation policy are preserved. The optimized
+static executable is 51,722 bytes, compared with 48,790 bytes before; runtime is
+60,411 bytes, compared with 51,751 bytes. C++'s 31,016-byte executable contains all
+four C++ lanes, so its size is not a per-lane comparison.
 
 ## Verification
 
 Every measured output passed ascending-order and order-sensitive checksum checks
-against Python's independently sorted input. Additional smoke runs at 20 and 257
-elements passed all five distributions and all six lanes, covering the insertion
-threshold and a partial natural run; their one-sample timings are not included
-as performance measurements.
+against Python's independently sorted input. The sort suite also covers native
+and interpreter execution, stability for noncopyable owners, comparator effects,
+custom moves and drops, backing references, explicit drop duties, forced stable
+fallback, allocation failures, asymmetric and overlapping merges, and changing
+inconsistent comparisons. Distribution/length coverage crosses the insertion,
+pivot-sampling, and natural-run thresholds.
 
-The routine safe suite passed 2,418 tests with 24 skipped; its only failure was a
-source-edit cache fixture still matching the old callback-call syntax. After
-updating that fixture, all 71 disk-cache tests passed. The two affected static-sort
-tests also passed on the final exact-element-type constraint. The checks together
-cover 2,419 passing tests and 24 skipped, including incremental comparator edits,
-cache restoration, ownership, stability, and native/interpreter parity. Formatting
-checks and `git diff --check` passed.
+`zig build test --seed=0 -Doptimize=safe --summary all` passed 2,516 tests with
+24 skipped. Zig formatting checks and `git diff --check` passed.
+
+Earlier comparator-specialization measurements remain available in
+[static-samples.json](static-samples.json) and [samples.json](samples.json).

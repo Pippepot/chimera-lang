@@ -37,14 +37,22 @@ func sort_span(static T: type, static Order: type, mut source: Span(T), imm befo
         if descending -> source.reverse()
         return unit
 
-    var order = List(int).filled(0, length)
-    if not (order is List(int)) -> panic "sort scratch allocation failed"
-    var scratch = List(int).filled(0, length)
-    if not (scratch is List(int)) -> panic "sort scratch allocation failed"
+    var order_storage = allocate(int, length)
+    if not (order_storage is Allocation(int)) -> panic "sort scratch allocation failed"
+    var scratch_storage = allocate(int, length)
+    if not (scratch_storage is Allocation(int))
+        deallocate(int, order_storage^)
+        panic "sort scratch allocation failed"
+    var order = Span(int){data = allocation_cursor(int, order_storage), size = length}
+    var scratch = Span(int){data = allocation_cursor(int, scratch_storage), size = length}
+    # The permutation is fully initialized here; each algorithm initializes the
+    # scratch range it will read. Neither buffer needs a preliminary zero fill.
     for index in 0..length
         order.unsafe_at(index) = index
     drift_indices(T, Order, source, order, scratch, before)
     apply_sort_order(T, source.data, order)
+    deallocate(int, scratch_storage^)
+    deallocate(int, order_storage^)
     return unit
 
 func insertion_sort_slots(static T: type, static Order: type, mut source: Span(T), imm before: Order)
@@ -65,7 +73,7 @@ func sorted_span(static T: type, static Order: type, ref source: Span(T), imm be
     sort_span(T, Order, view, before)
     return result^
 
-func drift_indices(static T: type, static Order: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), imm before: Order)
+func drift_indices(static T: type, static Order: type, ref source: Span(T), mut order: Span(int), mut scratch: Span(int), imm before: Order)
     const length = source.len()
     const threshold = drift_run_threshold(length)
     var runs = Array(DriftRun, 64).filled(DriftRun{first = 0, limit = 0, sorted = false, power = 0})
@@ -91,7 +99,7 @@ func drift_indices(static T: type, static Order: type, ref source: Span(T), mut 
         drift_merge_runs(T, Order, source, order, scratch, runs, count - 2, before)
         count -= 1
     if not runs[0].sorted
-        drift_quicksort(T, Order, source, order, scratch, 0, length, drift_depth(length), before)
+        drift_quicksort(T, Order, source, order, scratch, 0, length, drift_depth(length), -1, before)
 
 func drift_run_threshold(length: int) int
     if length <= 4096
@@ -106,7 +114,7 @@ func drift_run_threshold(length: int) int
         estimate *= 2
     return (estimate + length / estimate) / 2
 
-func drift_next_run(static T: type, static Order: type, ref source: Span(T), mut order: List(int), first: int, threshold: int, imm before: Order) DriftRun
+func drift_next_run(static T: type, static Order: type, ref source: Span(T), mut order: Span(int), first: int, threshold: int, imm before: Order) DriftRun
     const remaining = source.len() - first
     if remaining >= threshold
         const descending = before.less(source.unsafe_at(order.unsafe_at(first + 1)), source.unsafe_at(order.unsafe_at(first)))
@@ -122,7 +130,7 @@ func drift_next_run(static T: type, static Order: type, ref source: Span(T), mut
     if remaining > threshold -> limit = first + threshold
     return DriftRun{first = first, limit = limit, sorted = false, power = 0}
 
-func reverse_order(mut order: List(int), first: int, limit: int)
+func reverse_order(mut order: Span(int), first: int, limit: int)
     for offset in 0..((limit - first) / 2)
         const left = first + offset
         const right = limit - 1 - offset
@@ -146,15 +154,15 @@ func drift_node_power(length: int, first: int, middle: int, limit: int) int
             left -= denominator
             right -= denominator
 
-func drift_merge_runs(static T: type, static Order: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), mut runs: Array(DriftRun, 64), index: int, imm before: Order)
+func drift_merge_runs(static T: type, static Order: type, ref source: Span(T), mut order: Span(int), mut scratch: Span(int), mut runs: Array(DriftRun, 64), index: int, imm before: Order)
     const left = runs[index]
     const right = runs[index + 1]
     var sorted = false
     if left.sorted or right.sorted
         if not left.sorted
-            drift_quicksort(T, Order, source, order, scratch, left.first, left.limit, drift_depth(left.limit - left.first), before)
+            drift_quicksort(T, Order, source, order, scratch, left.first, left.limit, drift_depth(left.limit - left.first), -1, before)
         if not right.sorted
-            drift_quicksort(T, Order, source, order, scratch, right.first, right.limit, drift_depth(right.limit - right.first), before)
+            drift_quicksort(T, Order, source, order, scratch, right.first, right.limit, drift_depth(right.limit - right.first), -1, before)
         drift_merge(T, Order, source, order, scratch, left.first, left.limit, right.limit, before)
         sorted = true
     runs[index] = DriftRun{first = left.first, limit = right.limit, sorted = sorted, power = right.power}
@@ -168,24 +176,56 @@ func drift_depth(length: int) int
         depth += 2
     return depth
 
-func drift_quicksort(static T: type, static Order: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), first: int, limit: int, depth: int, imm before: Order)
-    const length = limit - first
-    if length <= 20
-        insertion_sort_order(T, Order, source, order, first, limit, before)
-        return
-    if depth == 0
-        drift_merge_sort(T, Order, source, order, scratch, first, limit, before)
-        return
-    const pivot = drift_pivot(T, Order, source, order, first, limit, before)
-    const middle = drift_partition(T, Order, source, order, scratch, first, limit, pivot, false, before)
-    const greater = drift_partition(T, Order, source, order, scratch, middle, limit, pivot, true, before)
-    drift_quicksort(T, Order, source, order, scratch, first, middle, depth - 1, before)
-    drift_quicksort(T, Order, source, order, scratch, greater, limit, depth - 1, before)
+func drift_quicksort(static T: type, static Order: type, ref source: Span(T), mut order: Span(int), mut scratch: Span(int), first: int, limit: int, depth: int, ancestor: int, imm before: Order)
+    var start = first
+    var end = limit
+    # Every iteration consumes depth, including non-splitting inconsistent comparisons.
+    var remaining = depth
+    var lower = ancestor
+    loop
+        const length = end - start
+        if length <= 20
+            insertion_sort_order(T, Order, source, order, start, end, before)
+            return
+        if remaining == 0
+            drift_merge_sort(T, Order, source, order, scratch, start, end, before)
+            return
+        remaining -= 1
+        const pivot = drift_pivot(T, Order, source, order, start, end, before)
+        # The right partition's ancestor is a lower bound. Equal pivots need only
+        # an equality partition; ordinary distinct pivots need only a less-than one.
+        var equal = false
+        if lower >= 0 -> equal = not before.less(source.unsafe_at(lower), source.unsafe_at(pivot))
+        var middle = start
+        if not equal
+            middle = drift_partition(T, Order, source, order, scratch, start, end, pivot, false, before)
+            equal = middle == start
+        if equal
+            start = drift_partition(T, Order, source, order, scratch, start, end, pivot, true, before)
+            lower = -1
+        else if middle - start < end - middle
+            drift_quicksort(T, Order, source, order, scratch, start, middle, remaining, lower, before)
+            start = middle
+            lower = pivot
+        else
+            drift_quicksort(T, Order, source, order, scratch, middle, end, remaining, pivot, before)
+            end = middle
 
-func drift_pivot(static T: type, static Order: type, ref source: Span(T), imm order: List(int), first: int, limit: int, imm before: Order) int
-    const a = order.unsafe_at(first)
-    const b = order.unsafe_at(first + (limit - first) / 2)
-    const c = order.unsafe_at(limit - 1)
+func drift_pivot(static T: type, static Order: type, ref source: Span(T), mut order: Span(int), first: int, limit: int, imm before: Order) int
+    const length = limit - first
+    const middle = first + length / 2
+    const last = limit - 1
+    var a = order.unsafe_at(first)
+    var b = order.unsafe_at(middle)
+    var c = order.unsafe_at(last)
+    if length >= 128
+        const step = length / 8
+        a = drift_median(T, Order, source, a, order.unsafe_at(first + step), order.unsafe_at(first + step * 2), before)
+        b = drift_median(T, Order, source, order.unsafe_at(middle - step), b, order.unsafe_at(middle + step), before)
+        c = drift_median(T, Order, source, order.unsafe_at(last - step * 2), order.unsafe_at(last - step), c, before)
+    return drift_median(T, Order, source, a, b, c, before)
+
+func drift_median(static T: type, static Order: type, ref source: Span(T), a: int, b: int, c: int, imm before: Order) int
     if before.less(source.unsafe_at(a), source.unsafe_at(b))
         if before.less(source.unsafe_at(b), source.unsafe_at(c)) -> return b
         if before.less(source.unsafe_at(a), source.unsafe_at(c)) -> return c
@@ -194,14 +234,16 @@ func drift_pivot(static T: type, static Order: type, ref source: Span(T), imm or
     if before.less(source.unsafe_at(b), source.unsafe_at(c)) -> return c
     return b
 
-func drift_partition(static T: type, static Order: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), first: int, limit: int, pivot: int, equal: bool, imm before: Order) int
+func drift_partition(static T: type, static Order: type, ref input: Span(T), mut indices: Span(int), mut buffer: Span(int), first: int, limit: int, pivot: int, equal: bool, imm before: Order) int
+    var source = input
+    var order = indices
+    var scratch = buffer
     var left = first
     var right = limit
     for position in first..limit
         const item = order.unsafe_at(position)
         if equal
-            var selected = item == pivot
-            if not selected -> selected = not before.less(source.unsafe_at(pivot), source.unsafe_at(item))
+            const selected = not before.less(source.unsafe_at(pivot), source.unsafe_at(item))
             if selected
                 scratch.unsafe_at(left) = item
                 left += 1
@@ -213,19 +255,20 @@ func drift_partition(static T: type, static Order: type, ref source: Span(T), mu
             # the unpredictable comparison needs no branch. The slot before `right`
             # is only claimed by a later write, and the slots coincide for the last item.
             var claimed = 0
-            if item <> pivot and before.less(source.unsafe_at(item), source.unsafe_at(pivot)) -> claimed = 1
+            if before.less(source.unsafe_at(item), source.unsafe_at(pivot)) -> claimed = 1
             scratch.unsafe_at(left) = item
             scratch.unsafe_at(right - 1) = item
             left += claimed
             right -= 1 - claimed
-    for position in first..left
-        order.unsafe_at(position) = scratch.unsafe_at(position)
+    var partitioned = cursor_offset(int, scratch.data, first)
+    var destination = cursor_offset(int, order.data, first)
+    copy_sort_indices(partitioned, destination, left - first)
     for position in left..limit
         const reversed = limit - 1 - (position - left)
         order.unsafe_at(position) = scratch.unsafe_at(reversed)
     return left
 
-func insertion_sort_order(static T: type, static Order: type, ref source: Span(T), mut order: List(int), first: int, limit: int, imm before: Order)
+func insertion_sort_order(static T: type, static Order: type, ref source: Span(T), mut order: Span(int), first: int, limit: int, imm before: Order)
     if first >= limit -> return
     for position in (first + 1)..limit
         const item = order.unsafe_at(position)
@@ -238,7 +281,7 @@ func insertion_sort_order(static T: type, static Order: type, ref source: Span(T
             destination -= 1
         order.unsafe_at(destination) = item
 
-func drift_merge_sort(static T: type, static Order: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), first: int, limit: int, imm before: Order)
+func drift_merge_sort(static T: type, static Order: type, ref source: Span(T), mut order: Span(int), mut scratch: Span(int), first: int, limit: int, imm before: Order)
     const length = limit - first
     var width = 1
     loop
@@ -255,42 +298,104 @@ func drift_merge_sort(static T: type, static Order: type, ref source: Span(T), m
         if width > length / 2 -> break
         width *= 2
 
-func drift_merge(static T: type, static Order: type, ref source: Span(T), mut order: List(int), mut scratch: List(int), first: int, middle: int, limit: int, imm before: Order)
-    var left = first
+func drift_merge(static T: type, static Order: type, ref source: Span(T), mut order: Span(int), mut scratch: Span(int), first: int, middle: int, limit: int, imm before: Order)
+    if not before.less(source.unsafe_at(order.unsafe_at(middle)), source.unsafe_at(order.unsafe_at(middle - 1))) -> return
+    const reversed = before.less(source.unsafe_at(order.unsafe_at(limit - 1)), source.unsafe_at(order.unsafe_at(first)))
+    if middle - first <= limit - middle
+        drift_merge_forward(T, Order, source, order, scratch, first, middle, limit, reversed, before)
+    else
+        drift_merge_backward(T, Order, source, order, scratch, first, middle, limit, reversed, before)
+
+func drift_merge_forward(static T: type, static Order: type, ref input: Span(T), mut indices: Span(int), mut buffer: Span(int), first: int, middle: int, limit: int, reversed: bool, imm before: Order)
+    var source = input
+    var order = indices
+    var scratch = buffer
+    const length = middle - first
+    var from = cursor_offset(int, order.data, first)
+    var to = scratch.data
+    copy_sort_indices(from, to, length)
+    var left = 0
     var right = middle
     var position = first
-    loop
-        if left == middle or right == limit -> break
-        const from_right = order.unsafe_at(right)
-        const from_left = order.unsafe_at(left)
-        if before.less(source.unsafe_at(from_right), source.unsafe_at(from_left))
-            scratch.unsafe_at(position) = from_right
-            right += 1
-        else
-            scratch.unsafe_at(position) = from_left
-            left += 1
-        position += 1
-    loop
-        if left == middle -> break
-        scratch.unsafe_at(position) = order.unsafe_at(left)
-        left += 1
-        position += 1
-    loop
-        if right == limit -> break
-        scratch.unsafe_at(position) = order.unsafe_at(right)
-        right += 1
-        position += 1
-    for index in first..limit
-        order.unsafe_at(index) = scratch.unsafe_at(index)
+    if reversed
+        var from_right = cursor_offset(int, order.data, middle)
+        var to_first = cursor_offset(int, order.data, first)
+        copy_sort_indices(from_right, to_first, limit - middle)
+        position += limit - middle
+    else
+        loop
+            if left == length or right == limit -> break
+            const from_left = scratch.unsafe_at(left)
+            const from_right = order.unsafe_at(right)
+            if before.less(source.unsafe_at(from_right), source.unsafe_at(from_left))
+                order.unsafe_at(position) = from_right
+                right += 1
+            else
+                order.unsafe_at(position) = from_left
+                left += 1
+            position += 1
+    var remaining = cursor_offset(int, scratch.data, left)
+    var destination = cursor_offset(int, order.data, position)
+    copy_sort_indices(remaining, destination, length - left)
 
-func apply_sort_order(static T: type, mut cursor: StorageCursor(T), mut order: List(int))
+func drift_merge_backward(static T: type, static Order: type, ref input: Span(T), mut indices: Span(int), mut buffer: Span(int), first: int, middle: int, limit: int, reversed: bool, imm before: Order)
+    var source = input
+    var order = indices
+    var scratch = buffer
+    const length = limit - middle
+    var from = cursor_offset(int, order.data, middle)
+    var to = scratch.data
+    copy_sort_indices(from, to, length)
+    var left = middle
+    var right = length
+    var position = limit
+    if reversed
+        var from_left = cursor_offset(int, order.data, first)
+        var to_last = cursor_offset(int, order.data, first + length)
+        copy_sort_indices_backward(from_left, to_last, middle - first)
+        position = first + length
+    else
+        loop
+            if left == first or right == 0 -> break
+            const from_left = order.unsafe_at(left - 1)
+            const from_right = scratch.unsafe_at(right - 1)
+            position -= 1
+            # Equal values from the right run go last, preserving stability.
+            if before.less(source.unsafe_at(from_right), source.unsafe_at(from_left))
+                order.unsafe_at(position) = from_left
+                left -= 1
+            else
+                order.unsafe_at(position) = from_right
+                right -= 1
+    var remaining = scratch.data
+    var destination = cursor_offset(int, order.data, position - right)
+    copy_sort_indices(remaining, destination, right)
+
+# Callers choose the direction so overlapping copies read each index before replacing it.
+func copy_sort_indices(ref source: StorageCursor(int), mut destination: StorageCursor(int), length: int)
+    var index = 0
+    loop
+        if index == length -> break
+        cursor_element(int, destination, index) = cursor_element(int, source, index)
+        index += 1
+
+func copy_sort_indices_backward(ref source: StorageCursor(int), mut destination: StorageCursor(int), length: int)
+    var index = length
+    loop
+        if index == 0 -> break
+        index -= 1
+        cursor_element(int, destination, index) = cursor_element(int, source, index)
+
+func apply_sort_order(static T: type, mut source: StorageCursor(T), mut indices: Span(int))
+    var cursor = source
+    var order = indices
     for start in 0..order.len()
-        if order[start] <> start
+        if order.unsafe_at(start) <> start
             const saved = cursor_take(T, cursor, start)
             var destination = start
             loop
-                const next = order[destination]
-                order[destination] = destination
+                const next = order.unsafe_at(destination)
+                order.unsafe_at(destination) = destination
                 if next == start
                     cursor_initialize(T, cursor, destination, saved^)
                     break

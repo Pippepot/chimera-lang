@@ -5,10 +5,11 @@ Each commit's compiler builds from `git archive` (or the working tree) and compi
 current benchmark programs unchanged, so a point differs from its neighbours only by the
 compiler. Only generated programs are timed. The compiler's own optimization mode cannot
 change generated machine code, so historical compilers build in Debug mode.
+Commits run newest first, stopping at an existing entry or the first build,
+compilation, or execution failure. The report is rendered when recording stops.
 
-    python3 benchmarks/runtime_history.py record --cpu 4 --since e61767a
-    python3 benchmarks/runtime_history.py record --cpu 4 --worktree
-    python3 benchmarks/runtime_history.py render
+    python3 benchmarks/runtime_history.py --cpu 4
+    python3 benchmarks/runtime_history.py --cpu 4 --worktree
 
 Records live in `.history/runtime/` and the report is `.history/runtime.html`. Neither
 touches the compilation history's records or report.
@@ -208,7 +209,7 @@ def compile_program(compiler: Path, workers: bool, source_text: str, probe: byte
     command = [str(compiler)] + (["--workers=0"] if workers else []) + ["main.chi"]
     compiled = subprocess.run(command, cwd=directory, input=probe, capture_output=True, timeout=300)
     produced = directory / "prog"
-    if not produced.exists():
+    if compiled.returncode != 0 or not produced.exists():
         first = (compiled.stdout + compiled.stderr).decode(errors="replace").strip().splitlines()
         raise RuntimeError("compilation failed: " + (first[0][:200] if first else f"status {compiled.returncode}"))
     target = work / f"{name}-exe"
@@ -225,12 +226,6 @@ def record_commit(source: Path, work: Path) -> dict:
     compiler = build_compiler(source, work / "compiler")
     workers = compiler_takes_workers(compiler)
     results: dict = {}
-
-    def attempt(label: str, action) -> None:
-        try:
-            results.update(action())
-        except Exception as error:  # A failing benchmark is a recorded fact, not an abort.
-            results[label] = {"status": "failed", "reason": str(error)[:300]}
 
     def sieve() -> dict:
         exe = compile_program(compiler, workers, sieve_source(), struct.pack("<I", 10), work, "sieve")
@@ -251,7 +246,11 @@ def record_commit(source: Path, work: Path) -> dict:
         return timed(measure_sort, programs)
 
     for label, action in (("sieve", sieve), ("key-gen", keygen), ("sort", sort)):
-        attempt(label, action)
+        try:
+            results.update(action())
+        except Exception as error:
+            results[label] = {"status": "failed", "reason": str(error)[:300]}
+            break
     return results
 
 
@@ -261,10 +260,10 @@ def commit_info(rev: str) -> dict:
 
 
 def first_parent(since: str | None) -> list[str]:
-    revs = subprocess.check_output(["git", "rev-list", "--first-parent", "--reverse", "HEAD"], cwd=ROOT, text=True).split()
+    revs = subprocess.check_output(["git", "rev-list", "--first-parent", "HEAD"], cwd=ROOT, text=True).split()
     if since:
         full = subprocess.check_output(["git", "rev-parse", since], cwd=ROOT, text=True).strip()
-        revs = revs[revs.index(full):]
+        revs = revs[:revs.index(full) + 1]
     return revs
 
 
@@ -335,22 +334,23 @@ def archive_worktree(destination: Path) -> None:
         shutil.copy2(path, target, follow_symlinks=False)
 
 
-def record(arguments: argparse.Namespace) -> None:
+def record(arguments: argparse.Namespace) -> str | None:
     if arguments.cpu is not None and arguments.cpu not in ORIGINAL_AFFINITY:
         sys.exit("--cpu must be in the allowed CPU set")
     global TIMED_CPU
     TIMED_CPU = arguments.cpu
     DATA.mkdir(parents=True, exist_ok=True)
     suite = suite_hash()
-    targets = [("worktree", None)] if arguments.worktree else [(rev, rev) for rev in first_parent(arguments.since)]
-    if not arguments.skip_references and not (DATA / "references.json").exists():
-        print("measuring C/C++ references", flush=True)
-        record_references()
-    for label, rev in targets:
+    targets = [None] if arguments.worktree else first_parent(arguments.since)
+    for rev in targets:
         stem = "worktree" if rev is None else rev[:12]
         path = DATA / f"{stem}.json"
-        if path.exists() and not arguments.force and json.loads(path.read_text()).get("suite") == suite:
-            continue
+        if path.exists():
+            print(f"{stem}: entry already exists; stopping", flush=True)
+            break
+        if not arguments.skip_references and not (DATA / "references.json").exists():
+            print("measuring C/C++ references", flush=True)
+            record_references()
         info = {"commit": "worktree", "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "subject": "working tree (uncommitted)"} if rev is None else commit_info(rev)
         print(f"{stem}: {info['subject'][:60]}", flush=True)
@@ -374,6 +374,10 @@ def record(arguments: argparse.Namespace) -> None:
         shown = {key: (f"{value['median']:.4g}s" if "median" in value else value["status"])
                  for key, value in results.items() if key in ("sieve", "key-gen", "build") or key.startswith("sort random")}
         print("  " + ", ".join(f"{key}={value}" for key, value in shown.items()), flush=True)
+        for name, result in results.items():
+            if result.get("status") == "failed":
+                return f"{stem}: stopping at failed {name}: {result['reason']}"
+    return None
 
 
 # ---- Rendering ------------------------------------------------------------------------
@@ -395,7 +399,7 @@ def format_seconds(value: float) -> str:
     return f"{value * 1000:.2f} ms" if value < 1 else f"{value:.3f} s"
 
 
-LEFT, RIGHT, TOP, BOTTOM = 62, 14, 14, 44
+LEFT, RIGHT, TOP, BOTTOM = 62, 14, 14, 28
 
 
 def nice_ceiling(value: float) -> tuple[float, float]:
@@ -410,16 +414,19 @@ def nice_ceiling(value: float) -> tuple[float, float]:
 
 def chart(title: str, series: list[dict], records: list[dict], references: list[dict], note: str = "", wide: bool = False) -> str:
     """One line chart: series are Chimera lanes over commits, references are flat lines."""
+    measured_indices = sorted({index for line in series for index in line["points"]})
+    positions = {index: position for position, index in enumerate(measured_indices)}
     values = [point["median"] for line in series for point in line["points"].values()]
     values += [reference["median"] for reference in references]
     if not values:
         return f'<figure><figcaption>{html.escape(title)}</figcaption><p class="muted">No successful measurement.</p></figure>'
     W, H = (1100, 300) if wide else (520, 250)
     top, step_size = nice_ceiling(max(values) * 1.06)
-    count = max(len(records) - 1, 1)
+    count = max(len(measured_indices) - 1, 1)
 
     def x(index: int) -> float:
-        return LEFT + (W - LEFT - RIGHT) * index / count
+        position = positions[index] if len(measured_indices) > 1 else 0.5
+        return LEFT + (W - LEFT - RIGHT) * position / count
 
     def y(value: float) -> float:
         return TOP + (H - TOP - BOTTOM) * (1 - value / top)
@@ -429,13 +436,11 @@ def chart(title: str, series: list[dict], records: list[dict], references: list[
         value = step_size * step
         parts.append(f'<line class="grid" x1="{LEFT}" x2="{W - RIGHT}" y1="{y(value):.1f}" y2="{y(value):.1f}"/>')
         parts.append(f'<text class="axis" x="{LEFT - 6}" y="{y(value) + 4:.1f}" text-anchor="end">{html.escape(format_seconds(value))}</text>')
-    stride = max(1, math.ceil(len(records) / ((W - LEFT - RIGHT) / 64)))
-    last = len(records) - 1
-    for index, record in enumerate(records):
-        if index == last or (index % stride == 0 and last - index >= stride):
-            label = "tree" if record["commit"] == "worktree" else record["commit"][:7]
-            parts.append(f'<text class="axis" x="{x(index):.1f}" y="{H - BOTTOM + 16}" text-anchor="middle">{label}</text>')
-            parts.append(f'<text class="axis dim" x="{x(index):.1f}" y="{H - BOTTOM + 29}" text-anchor="middle">{record["date"][5:10]}</text>')
+    stride = max(1, math.ceil(len(measured_indices) / ((W - LEFT - RIGHT) / 64)))
+    last = len(measured_indices) - 1
+    for position, index in enumerate(measured_indices):
+        if position == last or (position % stride == 0 and last - position >= stride):
+            parts.append(f'<text class="axis" x="{x(index):.1f}" y="{H - BOTTOM + 16}" text-anchor="middle">{records[index]["date"][5:10]}</text>')
     for number, reference in enumerate(references):
         parts.append(f'<line class="ref ref{number % 3}" x1="{LEFT}" x2="{W - RIGHT}" y1="{y(reference["median"]):.1f}" y2="{y(reference["median"]):.1f}"/>')
         parts.append(f'<text class="axis ref{number % 3}t" x="{W - RIGHT}" y="{y(reference["median"]) - 4:.1f}" text-anchor="end">{html.escape(reference["label"])} {html.escape(format_seconds(reference["median"]))}</text>')
@@ -484,7 +489,7 @@ th{color:var(--muted);font-weight:600}.good{color:var(--r2)}.bad{color:#d1483f}
 .grid-charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(480px,1fr));gap:14px}
 figure{margin:0;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px}
 figcaption{font-weight:600;margin-bottom:4px}svg{width:100%;height:auto;display:block}
-.grid{stroke:var(--grid);stroke-width:1}.axis{fill:var(--muted);font-size:10.5px}svg.wide .axis{font-size:12px}.axis.ref0t,.axis.ref1t,.axis.ref2t{paint-order:stroke;stroke:var(--card);stroke-width:3px}svg.wide{max-height:340px}.dim{opacity:.75}
+.grid{stroke:var(--grid);stroke-width:1}.axis{fill:var(--muted);font-size:10.5px}svg.wide .axis{font-size:12px}.axis.ref0t,.axis.ref1t,.axis.ref2t{paint-order:stroke;stroke:var(--card);stroke-width:3px}svg.wide{max-height:340px}
 .line{fill:none;stroke-width:2}.dot{stroke:var(--card);stroke-width:1.2}
 .s0{stroke:var(--s0)}.s1{stroke:var(--s1)}circle.s0{fill:var(--s0)}circle.s1{fill:var(--s1)}
 .ref{stroke-width:1.2;stroke-dasharray:5 4}.ref0{stroke:var(--r0)}.ref1{stroke:var(--r1)}.ref2{stroke:var(--r2)}
@@ -495,11 +500,11 @@ figcaption{font-weight:600;margin-bottom:4px}svg{width:100%;height:auto;display:
 """
 
 
-def render(_: argparse.Namespace) -> None:
+def render() -> None:
     records = load_records()
     references = load_references()
     if not records:
-        sys.exit(f"no records in {DATA}; run `record` first")
+        sys.exit(f"no records in {DATA}")
     sections = []
     rows = []
 
@@ -561,18 +566,15 @@ def render(_: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    commands = parser.add_subparsers(dest="command", required=True)
-    recording = commands.add_parser("record", help="build and measure commits")
-    recording.add_argument("--since", help="oldest commit to include (default: every first-parent commit)")
-    recording.add_argument("--worktree", action="store_true", help="measure the working tree instead of commits")
-    recording.add_argument("--cpu", type=int, help="pin timed runs to this CPU")
-    recording.add_argument("--force", action="store_true", help="re-measure existing records")
-    recording.add_argument("--skip-references", action="store_true")
-    recording.set_defaults(handler=record)
-    rendering = commands.add_parser("render", help="write the HTML report")
-    rendering.set_defaults(handler=render)
+    parser.add_argument("--since", help="oldest commit to include (default: every first-parent commit)")
+    parser.add_argument("--worktree", action="store_true", help="measure the working tree instead of commits")
+    parser.add_argument("--cpu", type=int, help="pin timed runs to this CPU")
+    parser.add_argument("--skip-references", action="store_true")
     arguments = parser.parse_args()
-    arguments.handler(arguments)
+    failure = record(arguments)
+    render()
+    if failure:
+        sys.exit(failure)
 
 
 if __name__ == "__main__":

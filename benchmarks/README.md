@@ -301,23 +301,31 @@ report to `.history/runtime.html`. It shares nothing with the compilation histor
 records or report.
 
 ```sh
-python3 benchmarks/runtime_history.py record --cpu 4 --since e61767a
-python3 benchmarks/runtime_history.py record --cpu 4 --worktree
-python3 benchmarks/runtime_history.py render
+python3 benchmarks/runtime_history.py --cpu 4
+python3 benchmarks/runtime_history.py --cpu 4 --worktree
 python3 -m unittest discover -s benchmarks -p runtime_history_test.py -v
 ```
 
 Each commit's compiler builds from `git archive` in Debug mode, which cannot change the
 generated machine code, then compiles the current benchmark programs unchanged, so a
-point differs from its neighbours only by the compiler. A commit whose language cannot
-compile a program records that failure. The sieve program is read from
+point differs from its neighbours only by the compiler. Recording starts at HEAD and
+walks first-parent commits newest to oldest until it reaches an existing entry or a
+compiler build, benchmark compilation, or execution/correctness failure. It saves
+each commit immediately, retaining completed benchmarks from a failed commit, and
+renders the report when it stops. A new failure exits nonzero after rendering.
+Existing entries stop the walk regardless of their suite hash or status. The optional
+`--since` sets an inclusive oldest commit. The sieve program is read from
 [history_benchmark.zig](history_benchmark.zig) rather than copied. Only generated programs are timed,
 pinned to `--cpu`, with the same correctness checks and adaptive sampling as the
 standalone drivers (sort: seven rotated samples). Clang C and C++ references are
-measured once per recording session, so ratios hold for that machine and session;
-delete `.history/runtime/references.json` to measure them again. Records carry a suite
-hash and are skipped while it matches; `--force` re-measures. Do not run it alongside
-other timed work.
+cached in `.history/runtime/references.json`; delete it to measure them again.
+References are measured only when a new entry is needed, and ratios apply to the
+machine and session that produced those references. Records carry a suite hash for
+provenance. Do not run it alongside other timed work.
+
+Each chart's x-axis includes only commits with a successful measurement in one of
+its displayed Chimera lanes. Ticks show dates; commit hashes remain in point hover
+details.
 
 ## Frontend attribution
 
