@@ -36,7 +36,8 @@ static Integers = Optional(int)
 ## Construction
 
 ```chi
-const red = Color.Red{}
+const red = Color.Red
+const explicit_red = Color.Red{}
 const success = Result.Success{42}
 const failure = Result.Failure{7}
 ```
@@ -71,6 +72,27 @@ For cases with a `unit` or `none` payload, bare `.Name` in an expression is a
 value, equivalent to `.Name{}`. Other payloads require braces and an initializer.
 Type declarations and match patterns retain their type meanings; runtime
 shorthand never declares a new case.
+
+Qualified references to cases with `unit` or `none` payloads also construct
+values in value contexts. An unannotated `const` or `var` infers the narrow case
+type; annotations, arguments, returns, assignments, and aggregate elements can
+widen that value as usual. Static aliases of the case type follow the same rule.
+Type annotations, static type arguments, type-returning functions, patterns,
+constructor targets, compile-time type comparisons, and union type composition
+continue to select the type.
+Unannotated static initializers select values too, matching `unit` and `none`.
+A static type alias supplies a `type` annotation:
+
+```chi
+static Red: type = Color.Red
+static red = Color.Red
+static saved: Color = Color.Red
+const narrow = Red
+const wide: Color = Color.Red
+```
+
+Cases with other payloads still require braces and an initializer. This rule
+does not implicitly construct ordinary structs.
 
 This currently applies to nominal cases. The same expected-type principle could
 support struct namespace members or omitted-type struct initializers, but those

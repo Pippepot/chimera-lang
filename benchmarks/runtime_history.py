@@ -10,6 +10,7 @@ compilation, or execution failure. The report is rendered when recording stops.
 
     python3 benchmarks/runtime_history.py --cpu 4
     python3 benchmarks/runtime_history.py --cpu 4 --worktree
+    python3 benchmarks/runtime_history.py --cpu 4 --sort-pattern 'adjacent swap' --sort-pattern 'minimum last'
 
 Records live in `.history/runtime/` and the report is `.history/runtime.html`. Neither
 touches the compilation history's records or report.
@@ -43,7 +44,7 @@ SIEVE_LIMIT = 88_000_000
 SIEVE_ANSWER = b"5107832\n"
 KEYS = (0, 1, 5, 22, 94, 312, 992, 2422, 5624, 12522, 19998, 43258, 79415)
 KEY_LAST = 10
-PATTERNS = ("random", "sorted", "reversed", "duplicates", "runs")
+PATTERNS = ("random", "sorted", "reversed", "duplicates", "runs", "adjacent swap", "minimum last")
 SORT_SIZE = 65536
 SORT_ROUNDS = 8
 SORT_SAMPLES = 7
@@ -98,6 +99,16 @@ def sort_expected(pattern: int, rounds: int, seed: int) -> bytes:
                 value = state % 16
             elif pattern == 4:
                 value = ((SORT_SIZE - 1) // 256 - index // 256) * 256 + index % 256
+            elif pattern == 5:
+                value = index
+                if SORT_SIZE > 1:
+                    middle = (SORT_SIZE - 1) // 2
+                    if index == middle:
+                        value += 1
+                    elif index == middle + 1:
+                        value -= 1
+            elif pattern == 6:
+                value = index + 1 if index < SORT_SIZE - 1 else 0
             values.append(value)
         for value in sorted(values):
             checksum = (checksum * 31 + value) % 1000003
@@ -163,23 +174,30 @@ def sort_input(pattern: int, rounds: int, seed: int) -> bytes:
     return struct.pack("<BHH", pattern, rounds, seed)
 
 
-def measure_sort(programs: dict[str, Program]) -> dict:
+def measure_sort(programs: dict[str, Program], patterns: list[str] | None = None,
+                 existing: dict | None = None) -> dict:
     result: dict = {}
     for pattern, name in enumerate(PATTERNS):
+        if patterns is not None and name not in patterns:
+            continue
+        selected = {lane: program for lane, program in programs.items()
+                    if f"sort {name} / {lane}" not in (existing or {})}
+        if not selected:
+            continue
         for seed in (0, 42):
             answer = sort_expected(pattern, 1, seed)
-            for program in programs.values():
+            for program in selected.values():
                 program.run(sort_input(pattern, 1, seed), answer)
         data = sort_input(pattern, SORT_ROUNDS, 0)
         answer = sort_expected(pattern, SORT_ROUNDS, 0)
-        for program in programs.values():
+        for program in selected.values():
             program.run(data, answer)
-        samples = {lane: [] for lane in programs}
-        lanes = list(programs)
+        samples = {lane: [] for lane in selected}
+        lanes = list(selected)
         for index in range(SORT_SAMPLES):
             for offset in range(len(lanes)):  # Rotate order against drift.
                 lane = lanes[(index + offset) % len(lanes)]
-                samples[lane].append(programs[lane].run(data, answer))
+                samples[lane].append(selected[lane].run(data, answer))
         for lane, times in samples.items():
             result[f"sort {name} / {lane}"] = summary(times)
     return result
@@ -222,7 +240,8 @@ def compiler_takes_workers(compiler: Path) -> bool:
     return "--workers" in help_text.stdout + help_text.stderr
 
 
-def record_commit(source: Path, work: Path) -> dict:
+def record_commit(source: Path, work: Path, patterns: list[str] | None = None,
+                  existing: dict | None = None) -> dict:
     compiler = build_compiler(source, work / "compiler")
     workers = compiler_takes_workers(compiler)
     results: dict = {}
@@ -240,16 +259,25 @@ def record_commit(source: Path, work: Path) -> dict:
         base = (ROOT / "benchmarks/array-sort/main.chi").read_text().replace("static SIZE = 65536", f"static SIZE = {SORT_SIZE}")
         programs = {}
         for mode in ("static", "runtime"):
+            if patterns is not None and all(f"sort {name} / Chimera {mode}" in (existing or {}) for name in patterns):
+                continue
             text = base.replace("static RUNTIME_COMPARATOR = false", f"static RUNTIME_COMPARATOR = {str(mode == 'runtime').lower()}")
             exe = compile_program(compiler, workers, text, sort_input_probe(), work, f"sort-{mode}")
             programs[f"Chimera {mode}"] = Program([str(exe)], 0)
-        return timed(measure_sort, programs)
+        if patterns is None:
+            return timed(measure_sort, programs)
+        return timed(measure_sort, programs, patterns, existing)
 
-    for label, action in (("sieve", sieve), ("key-gen", keygen), ("sort", sort)):
+    actions = (("sieve", sieve), ("key-gen", keygen), ("sort", sort)) if patterns is None else (("sort", sort),)
+    for label, action in actions:
         try:
             results.update(action())
         except Exception as error:
-            results[label] = {"status": "failed", "reason": str(error)[:300]}
+            failure = {"status": "failed", "reason": str(error)[:300]}
+            if patterns is None:
+                results[label] = failure
+            else:
+                results.update({key: failure for key in sort_keys(patterns) if key not in (existing or {})})
             break
     return results
 
@@ -271,6 +299,7 @@ def environment() -> dict:
     cpu = next((line.split(":", 1)[1].strip() for line in Path("/proc/cpuinfo").read_text().splitlines()
                 if line.startswith("model name")), "unknown")
     return {"machine": platform.platform(), "cpu": cpu,
+            "cpu_affinity": [TIMED_CPU] if TIMED_CPU is not None else sorted(ORIGINAL_AFFINITY),
             "zig": subprocess.check_output(["zig", "version"], text=True).strip()}
 
 
@@ -334,6 +363,10 @@ def archive_worktree(destination: Path) -> None:
         shutil.copy2(path, target, follow_symlinks=False)
 
 
+def sort_keys(patterns: list[str]) -> list[str]:
+    return [f"sort {pattern} / {lane}" for pattern in patterns for lane in SORT_LANES]
+
+
 def record(arguments: argparse.Namespace) -> str | None:
     if arguments.cpu is not None and arguments.cpu not in ORIGINAL_AFFINITY:
         sys.exit("--cpu must be in the allowed CPU set")
@@ -345,10 +378,13 @@ def record(arguments: argparse.Namespace) -> str | None:
     for rev in targets:
         stem = "worktree" if rev is None else rev[:12]
         path = DATA / f"{stem}.json"
-        if path.exists():
+        previous = json.loads(path.read_text()) if path.exists() else None
+        existing = previous["results"] if previous else {}
+        patterns = arguments.sort_pattern
+        if previous is not None and (patterns is None or all(key in existing for key in sort_keys(patterns))):
             print(f"{stem}: entry already exists; stopping", flush=True)
             break
-        if not arguments.skip_references and not (DATA / "references.json").exists():
+        if not arguments.skip_references and not references_complete():
             print("measuring C/C++ references", flush=True)
             record_references()
         info = {"commit": "worktree", "date": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -365,14 +401,25 @@ def record(arguments: argparse.Namespace) -> str | None:
                 subprocess.run(["tar", "-x", "-C", str(source)], stdin=archived.stdout, check=True)
                 archived.wait()
             try:
-                results = record_commit(source, work)
+                if patterns is None:
+                    results = record_commit(source, work)
+                else:
+                    results = record_commit(source, work, patterns, existing)
             except Exception as error:
-                results = {"build": {"status": "failed", "reason": str(error)[:300]}}
-        path.write_text(json.dumps({"schema": 1, "suite": suite, **info, "recorded_at":
-                                    datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                                    "environment": environment(), "results": results}, indent=1) + "\n")
+                failure = {"status": "failed", "reason": str(error)[:300]}
+                results = ({"build": failure} if patterns is None else
+                           {key: failure for key in sort_keys(patterns) if key not in existing})
+        measured = {"suite": suite, "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "environment": environment()}
+        if previous is None:
+            entry = {"schema": 1, **info, **measured, "results": results}
+        else:
+            entry = previous
+            entry["results"].update(results)
+            entry.setdefault("backfills", []).append({**measured, "keys": list(results)})
+        path.write_text(json.dumps(entry, indent=1) + "\n")
         shown = {key: (f"{value['median']:.4g}s" if "median" in value else value["status"])
-                 for key, value in results.items() if key in ("sieve", "key-gen", "build") or key.startswith("sort random")}
+                 for key, value in results.items() if patterns is not None or key in ("sieve", "key-gen", "build") or key.startswith("sort random")}
         print("  " + ", ".join(f"{key}={value}" for key, value in shown.items()), flush=True)
         for name, result in results.items():
             if result.get("status") == "failed":
@@ -393,6 +440,13 @@ def load_records() -> list[dict]:
 def load_references() -> dict:
     path = DATA / "references.json"
     return json.loads(path.read_text()) if path.exists() else {"results": {}}
+
+
+def references_complete() -> bool:
+    results = load_references()["results"]
+    expected = {f"{name} C {optimization}" for name in ("sieve", "key-gen") for optimization in ("-O0", "-O3")}
+    expected.update(f"sort {pattern} / {lane}" for pattern in PATTERNS for lane in SORT_REFERENCES)
+    return expected <= results.keys()
 
 
 def format_seconds(value: float) -> str:
@@ -457,13 +511,25 @@ def chart(title: str, series: list[dict], records: list[dict], references: list[
             parts.append(f'<circle class="dot s{number}" cx="{x(i):.1f}" cy="{y(point["median"]):.1f}" r="3.4"><title>{html.escape(tip)}</title></circle>')
     parts.append("</svg>")
     legend = "".join(f'<span class="key k{n}">{html.escape(line["label"])}</span>' for n, line in enumerate(series))
-    return f'<figure><figcaption>{html.escape(title)}</figcaption>{"".join(parts)}<div class="legend">{legend}</div>{f"<p class=muted>{html.escape(note)}</p>" if note else ""}</figure>'
+    commits = [records[index] for index in measured_indices if records[index]["commit"] != "worktree"]
+    coverage = f"Measured {len(commits)} commits"
+    if len(commits) != len(measured_indices):
+        coverage += " + working tree"
+    if commits:
+        coverage += f" ({commits[0]['date'][:10]} to {commits[-1]['date'][:10]})"
+    failures = sorted({index for line in series for index in line.get("failures", {})})
+    if failures:
+        boundary = records[failures[-1]]
+        coverage += f". Unavailable at {boundary['commit'][:10]}: {boundary['subject']}"
+    return f'<figure><figcaption>{html.escape(title)}</figcaption>{"".join(parts)}<div class="legend">{legend}</div><p class="muted">{html.escape(coverage)}.</p>{f"<p class=muted>{html.escape(note)}</p>" if note else ""}</figure>'
 
 
 def series_for(records: list[dict], key: str, label: str) -> dict:
     points = {index: record["results"][key] for index, record in enumerate(records)
               if "median" in record["results"].get(key, {})}
-    return {"label": label, "points": points}
+    failures = {index: record["results"][key] for index, record in enumerate(records)
+                if record["results"].get(key, {}).get("status") == "failed"}
+    return {"label": label, "points": points, "failures": failures}
 
 
 def reference_list(references: dict, keys: list[tuple[str, str]]) -> list[dict]:
@@ -568,6 +634,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--since", help="oldest commit to include (default: every first-parent commit)")
     parser.add_argument("--worktree", action="store_true", help="measure the working tree instead of commits")
+    parser.add_argument("--sort-pattern", action="append", choices=PATTERNS,
+                        help="backfill only this sort input (repeatable), preserving existing results; stop when all selected entries exist")
     parser.add_argument("--cpu", type=int, help="pin timed runs to this CPU")
     parser.add_argument("--skip-references", action="store_true")
     arguments = parser.parse_args()

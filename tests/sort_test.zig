@@ -669,7 +669,7 @@ test "driftsort merges asymmetric overlapping and disjoint runs stably" {
         \\    for index in 0..length -> order.unsafe_at(index) = index
         \\    var indices = order.span()
         \\    var buffer = scratch.span()
-        \\    drift_merge(T, RuntimeSortOrder(T), source, indices, buffer, 0, middle, length, RuntimeSortOrder(T){before = before})
+        \\    drift_merge(source, indices, buffer, 0, middle, length, RuntimeSortOrder{before = before})
         \\    apply_sort_order(T, source.data, indices)
         ,
     }}, 42);

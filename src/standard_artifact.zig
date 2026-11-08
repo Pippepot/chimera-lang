@@ -42,6 +42,13 @@ pub fn build(allocator: std.mem.Allocator) ![]u8 {
             return error.InvalidStandardLibrary;
         };
         for (compiled.referenced_instances) |referenced| try instances.put(allocator, referenced, {});
+        const location = try db.lookupInterned(queries.ItemLocations, instance.item);
+        if (location.adapter) |adapter| if (adapter != .function_reference) {
+            // Descriptor invocations can inline their targets, but the bundle must retain both.
+            var target = instance;
+            target.item = location.owner.?;
+            try instances.put(allocator, target, {});
+        };
     }
     return bundle.encode(db, allocator);
 }

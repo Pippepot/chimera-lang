@@ -1,0 +1,41 @@
+import std.memory.{Allocation, AllocationError, allocate_layout_with, root_allocator, type_layout, AllocationLayout, deallocate, unsafe_initialize, unsafe_destroy}
+import std.context as context
+
+pub extern func erase(static Signature: type, init callback: Signature) Signature | AllocationError
+pub extern func clone(static Signature: type, imm callback: Signature) Signature | AllocationError
+extern func copy_callable(static Signature: type, imm callback: Signature) Signature
+extern func drop_callable(static Signature: type, deinit callback: Signature) unit
+
+func copy_or_panic(static Signature: type, imm callback: Signature) Signature
+    const copied = clone(Signature, callback)
+    if copied is AllocationError -> panic "Callable environment allocation failed"
+    return copied^
+
+struct EnvironmentReservation(Environment: type)
+    allocation: Allocation(Environment)
+    drop = func(deinit self: EnvironmentReservation(Environment))
+        deallocate(Environment, self.allocation^)
+
+func reserve_environment(static Environment: type) EnvironmentReservation(Environment) | AllocationError
+    const environment = type_layout(Environment)
+    const owner = type_layout(Allocation(Environment))
+    const trailer = ((environment.byte_size + owner.alignment - 1) / owner.alignment) * owner.alignment
+    const layout = AllocationLayout{byte_size = trailer + owner.byte_size, alignment = if environment.alignment > owner.alignment -> environment.alignment else owner.alignment}
+    const storage = allocate_layout_with(Environment, context.allocator, 1, layout)
+    if storage is AllocationError -> return storage^
+    return EnvironmentReservation(Environment){allocation = storage^}
+
+func reserve_environment_or_panic(static Environment: type) EnvironmentReservation(Environment)
+    const storage = reserve_environment(Environment)
+    if storage is AllocationError -> panic "Callable environment allocation failed"
+    return storage^
+
+func copy_environment(static Environment: type, imm source: Environment) EnvironmentReservation(Environment) | AllocationError
+    var storage = reserve_environment(Environment)?
+    unsafe_initialize(Environment, storage.allocation, 0, source)
+    return storage^
+
+func drop_environment(static Environment: type, deinit storage: Allocation(Environment))
+    var owner = storage^
+    unsafe_destroy(Environment, owner, 0)
+    deallocate(Environment, owner^)

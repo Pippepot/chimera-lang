@@ -4,7 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from xml.etree import ElementTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -22,6 +22,12 @@ def record(commit: str, day: int, scale: float) -> dict:
         results[f"sort {pattern} / Chimera runtime"] = summary(0.04 * scale)
     return {"schema": 1, "suite": "x", "commit": commit, "date": f"2026-11-{day:02d}T00:00:00+00:00",
             "subject": f"commit {commit}", "results": results, "environment": {"cpu": "test", "zig": "0"}}
+
+
+def reference_results() -> dict:
+    results = {f"{name} C {optimization}": summary(1) for name in ("sieve", "key-gen") for optimization in ("-O0", "-O3")}
+    results.update({f"sort {pattern} / {lane}": summary(1) for pattern in history.PATTERNS for lane in history.SORT_REFERENCES})
+    return results
 
 
 class RuntimeHistoryTest(unittest.TestCase):
@@ -86,7 +92,7 @@ class RuntimeHistoryTest(unittest.TestCase):
                     measured = RuntimeError("unsupported") if failed_name == "build" else results
 
                     def references():
-                        (data / "references.json").write_text("{}")
+                        (data / "references.json").write_text(json.dumps({"results": reference_results()}))
 
                     with patch.object(history.sys, "argv", ["runtime_history.py"]), \
                             patch.object(history, "DATA", data), \
@@ -132,6 +138,77 @@ class RuntimeHistoryTest(unittest.TestCase):
             references.assert_not_called()
             measure.assert_not_called()
             render.assert_called_once_with()
+
+    def test_sort_backfill_preserves_old_results_and_stops_at_failure(self) -> None:
+        revisions = ["a" * 40, "b" * 40, "c" * 40]
+        patterns = ["adjacent swap", "minimum last"]
+        added = {key: summary(0.01) for key in history.sort_keys(patterns)}
+        failed = {key: {"status": "failed", "reason": "unsupported sort API"} for key in added}
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            previous = []
+            for day, revision in enumerate(revisions, 1):
+                entry = record(revision, day, 1)
+                entry["results"] = {"sieve": summary(1), "sort": {"status": "failed", "reason": "old failure"}}
+                previous.append(entry)
+                (data / f"{revision[:12]}.json").write_text(json.dumps(entry))
+            arguments = ["runtime_history.py", "--skip-references", "--sort-pattern", patterns[0], "--sort-pattern", patterns[1]]
+            with patch.object(history.sys, "argv", arguments), \
+                    patch.object(history, "DATA", data), \
+                    patch.object(history, "suite_hash", return_value="new suite"), \
+                    patch.object(history, "first_parent", return_value=revisions), \
+                    patch.object(history, "commit_info", side_effect=lambda rev: {"commit": rev, "subject": "test"}), \
+                    patch.object(history, "environment", return_value={"cpu_affinity": [4]}), \
+                    patch.object(history.subprocess, "Popen"), \
+                    patch.object(history.subprocess, "run"), \
+                    patch.object(history, "record_commit", side_effect=[added, failed]) as measure, \
+                    patch.object(history, "render") as render:
+                with self.assertRaisesRegex(SystemExit, "stopping at failed sort adjacent swap.*unsupported sort API"):
+                    history.main()
+                self.assertEqual(measure.call_count, 2)
+                render.assert_called_once_with()
+                for revision, original, additions in zip(revisions, previous, (added, failed, {})):
+                    entry = json.loads((data / f"{revision[:12]}.json").read_text())
+                    self.assertEqual(entry["results"], {**original["results"], **additions})
+                    self.assertEqual(entry["suite"], original["suite"])
+                    if additions:
+                        self.assertEqual(entry["backfills"][0]["keys"], list(additions))
+                        self.assertEqual(entry["backfills"][0]["suite"], "new suite")
+                        self.assertEqual(entry["backfills"][0]["environment"], {"cpu_affinity": [4]})
+                    else:
+                        self.assertEqual(entry, original)
+                measure.reset_mock()
+                history.main()  # All requested entries at HEAD now exist.
+                measure.assert_not_called()
+
+    def test_sort_backfill_measures_only_missing_cases_and_lanes(self) -> None:
+        programs = {lane: Mock() for lane in history.SORT_LANES}
+        for program in programs.values():
+            program.run.return_value = 0.01
+        existing = {key: summary(1) for key in history.sort_keys(["adjacent swap", "minimum last"])}
+        del existing["sort minimum last / Chimera runtime"]
+        with patch.object(history, "sort_expected", return_value=b"answer"), \
+                patch.object(history, "SORT_SAMPLES", 2):
+            results = history.measure_sort(programs, ["adjacent swap", "minimum last"], existing)
+        self.assertEqual(list(results), ["sort minimum last / Chimera runtime"])
+        programs["Chimera static"].run.assert_not_called()
+        self.assertEqual(programs["Chimera runtime"].run.call_count, 5)
+        self.assertTrue(all(call.args[0][0] == 6 for call in programs["Chimera runtime"].run.call_args_list))
+
+    def test_sort_backfill_skips_other_benchmarks_and_records_compile_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            existing = {"sort adjacent swap / Chimera static": summary(1)}
+            with patch.object(history, "build_compiler", return_value=work / "compiler"), \
+                    patch.object(history, "compiler_takes_workers", return_value=True), \
+                    patch.object(history, "compile_program", side_effect=RuntimeError("unsupported")) as compile_program, \
+                    patch.object(history, "measure_sieve") as sieve, \
+                    patch.object(history, "measure_keygen") as keygen:
+                results = history.record_commit(work, work, ["adjacent swap"], existing)
+            self.assertEqual(results, {"sort adjacent swap / Chimera runtime": {"status": "failed", "reason": "unsupported"}})
+            self.assertEqual(compile_program.call_args.args[-1], "sort-runtime")
+            sieve.assert_not_called()
+            keygen.assert_not_called()
 
     def test_command_renders_after_measuring_all_targets(self) -> None:
         for worktree in (False, True):
@@ -203,6 +280,23 @@ class RuntimeHistoryTest(unittest.TestCase):
         # Repeated rounds fold more values into the checksum.
         self.assertNotEqual(history.sort_expected(1, 2, 0), history.sort_expected(1, 1, 0))
 
+    def test_nearly_sorted_oracles_preserve_the_sorted_values(self) -> None:
+        for pattern in (5, 6):
+            with self.subTest(pattern=pattern):
+                self.assertEqual(history.sort_expected(pattern, 1, 0), history.sort_expected(1, 1, 0))
+                self.assertEqual(history.sort_expected(pattern, 2, 42), history.sort_expected(1, 2, 42))
+
+    def test_reference_cache_refreshes_when_a_workload_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch.object(history, "DATA", Path(directory)):
+            self.assertFalse(history.references_complete())
+            results = reference_results()
+            path = history.DATA / "references.json"
+            path.write_text(json.dumps({"results": results}))
+            self.assertTrue(history.references_complete())
+            del results[f"sort {history.PATTERNS[-1]} / {history.SORT_REFERENCES[0]}"]
+            path.write_text(json.dumps({"results": results}))
+            self.assertFalse(history.references_complete())
+
     def test_stability_requires_two_close_samples(self) -> None:
         self.assertFalse(history.stable([1.0]))
         self.assertTrue(history.stable([1.0, 1.01]))
@@ -252,6 +346,20 @@ class RuntimeHistoryTest(unittest.TestCase):
             "Sieve", [history.series_for(records, "sieve", "Chimera")], records, references))
         self.assertEqual(figure.findall(".//text[@text-anchor='middle']"), [])
         self.assertEqual(figure.findall(".//circle"), [])
+
+    def test_chart_reports_historical_coverage_and_failure_boundary(self) -> None:
+        records = [record(letter * 40, day, 1) for day, letter in enumerate("abc", 1)]
+        records.append(record("worktree", 4, 1))
+        key = "sort adjacent swap / Chimera static"
+        records[0]["results"] = {key: {"status": "failed", "reason": "unsupported"}}
+        figure = ElementTree.fromstring(history.chart(
+            "Sort", [history.series_for(records, key, "static")], records, []))
+        self.assertEqual(len(figure.findall(".//circle")), 3)
+        coverage = figure.find("p").text
+        self.assertIn("Measured 2 commits + working tree (2026-11-02 to 2026-11-03)", coverage)
+        self.assertIn("Unavailable at aaaaaaaaaa: commit", coverage)
+        self.assertEqual([tick.text for tick in figure.findall(".//text[@text-anchor='middle']")],
+                         ["11-02", "11-03", "11-04"])
 
     def test_render_reports_every_benchmark_and_skips_failures(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -11,6 +11,816 @@ const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 
 const Fixture = test_sources.SourceFixture;
 
+test "erased callable effects follow recursive receiver reference graphs" {
+    try Fixture.expectParity(
+        \\struct Node
+        \\  value: int
+        \\  next: Ref(Node) | none
+        \\  func add(mut self: Node, value: int) -> self.value += value
+        \\func factory(mut node: Node) func(int) unit -> node.add
+        \\func invoke(callback: func(int) unit, value: int) -> callback(value)
+        \\func update(mut node: Node) -> invoke(factory(node), 40)
+        \\func run() int
+        \\  var node = Node{value = 1, next = none}
+        \\  node.next = Ref.from(node)
+        \\  update(node)
+        \\  return node.value + 1
+    , 42);
+}
+
+test "bound methods and erased callable descriptors retain original receivers" {
+    try Fixture.expectParity(
+        \\struct Tracker
+        \\    value: int
+        \\    func record(mut self: Tracker, value: int) -> self.value += value
+        \\    func read(imm self: Tracker) int -> self.value
+        \\func recorder(mut tracker: Tracker) func(int) unit -> tracker.record
+        \\func run() int
+        \\    var tracker = Tracker{value = 1}
+        \\    const concrete = tracker.record
+        \\    concrete(2)
+        \\    const erased = recorder(tracker)
+        \\    const copied = erased
+        \\    copied(39)
+        \\    const read: func() int = tracker.read
+        \\    return read()
+    , 42);
+}
+
+test "bound methods and erased callable descriptors erase named and noncapturing functions" {
+    try Fixture.expectParity(
+        \\func add(value: int) int -> value + 2
+        \\func named() func(int) int -> add
+        \\func anonymous() func(int) int -> (value) => value * 2
+        \\func run() int
+        \\    const first = named()
+        \\    const second = anonymous()
+        \\    return first(second(20))
+    , 42);
+}
+
+test "bound methods and erased callable descriptors preserve opaque receiver effects fields and joins" {
+    try Fixture.expectParity(
+        \\struct Tracker
+        \\    value: int
+        \\    func add(mut self: Tracker, value: int) -> self.value += value
+        \\    func read(imm self: Tracker) int -> self.value
+        \\struct Service
+        \\    update: func(int) unit
+        \\func forward(callback: func(int) unit) func(int) unit -> callback
+        \\func invoke(callback: func(int) unit, value: int) -> callback(value)
+        \\func read(callback: func() int) int -> callback()
+        \\func choose(first: func(int) unit, second: func(int) unit, flag: bool) func(int) unit
+        \\    return if flag -> first else second
+        \\func run() int
+        \\    var first = Tracker{value = 1}
+        \\    var second = Tracker{value = 0}
+        \\    const update: func(int) unit = first.add
+        \\    const other: func(int) unit = second.add
+        \\    const service = Service{update = forward(choose(update, other, true))}
+        \\    service.update(20)
+        \\    invoke(service.update, 21)
+        \\    const reader: func() int = first.read
+        \\    return read(reader)
+    , 42);
+}
+
+test "bound methods and erased callable descriptors never copy or destroy providers" {
+    try Fixture.expectParity(
+        \\struct Counts
+        \\    copies: int
+        \\    drops: int
+        \\struct Tracker
+        \\    move = none
+        \\    ref counts: Counts
+        \\    value: int
+        \\    copy = func(imm self: Tracker) Tracker
+        \\        self.counts.copies += 1
+        \\        return Tracker{counts = self.counts, value = self.value}
+        \\    drop = func(deinit self: Tracker) -> self.counts.drops += 1
+        \\    func add(mut self: Tracker, value: int) -> self.value += value
+        \\func factory(mut tracker: Tracker) func(int) unit -> tracker.add
+        \\func work(mut counts: Counts) int
+        \\    var tracker = Tracker{counts = counts, value = 1}
+        \\    const concrete = tracker.add
+        \\    const erased = factory(tracker)
+        \\    const copied = erased
+        \\    concrete(10)
+        \\    copied(30)
+        \\    return tracker.value
+        \\func run() int
+        \\    var counts = Counts{copies = 0, drops = 0}
+        \\    const result = work(counts)
+        \\    return result + counts.drops + 10 * counts.copies
+    , 42);
+}
+
+test "bound methods and erased callable descriptors preserve result reference dependencies" {
+    try Fixture.expectParity(
+        \\struct Tracker
+        \\    value: int
+        \\    func borrow(ref self: Tracker) ref int -> self.value
+        \\func factory(ref tracker: Tracker) func() ref int -> tracker.borrow
+        \\func opaque(callback: func() ref int) ref int -> callback()
+        \\func run() int
+        \\    var tracker = Tracker{value = 42}
+        \\    const callback = factory(tracker)
+        \\    ref result = opaque(callback)
+        \\    return result
+    , 42);
+}
+
+test "bound methods and erased callable descriptors specialize generic references and bound overloads" {
+    try Fixture.expectParity(
+        \\func identity(static T: type, value: T) T -> value
+        \\struct Tracker
+        \\    value: int
+        \\    func add(imm self: Tracker, static T: type, value: T) T -> value + T(self.value)
+        \\func apply(callback: func(int) int, value: int) int -> callback(value)
+        \\func run() int
+        \\    const tracker = Tracker{value = 2}
+        \\    const first: func(int) int = identity
+        \\    const second: func(int) int = tracker.add
+        \\    const fixed: func(func(int) int, int) int = apply
+        \\    return fixed(second, first(40))
+    , 42);
+}
+
+test "bound methods and erased callable descriptors erase opaque thin references" {
+    try Fixture.expectParity(
+        \\func increment(value: int) int -> value + 2
+        \\func erase(callback: func(int) int) func(int) int -> callback
+        \\func opaque(callback: func(int) int, value: int) int -> callback(value)
+        \\func run() int
+        \\    const callback = erase(increment)
+        \\    return opaque(callback, 40)
+    , 42);
+}
+
+test "bound methods and erased callable descriptors reject invalid receiver formation and escape" {
+    try Fixture.expectSourceDiagnostic(
+        \\struct Tracker
+        \\    value: int
+        \\    func add(mut self: Tracker, value: int) -> self.value += value
+        \\const tracker = Tracker{value = 0}
+        \\const callback = tracker.add
+        \\callback(42)
+    , .mutable_argument_requires_mutable_place);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Tracker
+        \\    value: int
+        \\    func read(imm self: Tracker) int -> self.value
+        \\const callback = Tracker{value = 42}.read
+        \\exit(callback())
+    , .bound_method_requires_receiver_place);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Tracker
+        \\    value: int
+        \\    func consume(var self: Tracker) int -> self.value
+        \\var tracker = Tracker{value = 42}
+        \\const callback = tracker.consume
+        \\exit(callback())
+    , .bound_method_consuming_receiver);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Tracker
+        \\    value: int
+        \\    func read(imm self: Tracker) int -> self.value
+        \\func invalid() func() int
+        \\    const tracker = Tracker{value = 42}
+        \\    return tracker.read
+        \\exit(invalid()())
+    , .borrow_outlives_source);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Tracker
+        \\    value: int
+        \\    func change(ref self: Tracker) -> self.value += 1
+        \\const tracker = Tracker{value = 41}
+        \\const callback = tracker.change
+        \\exit(42)
+    , .reference_not_writable);
+}
+
+test "bound methods and erased callable descriptors select overloads and preserve unbound methods" {
+    try Fixture.expectParity(
+        \\struct Tracker
+        \\    value: int
+        \\    func number(imm self: Tracker, value: int) int -> self.value + value
+        \\    func boolean(imm self: Tracker, value: bool) bool -> value
+        \\    overload add(number, boolean)
+        \\func run() int
+        \\    const tracker = Tracker{value = 2}
+        \\    const bound: func(int) int = tracker.add
+        \\    const unbound: func(Tracker, int) int = Tracker.number
+        \\    return bound(20) + unbound(tracker, 18)
+    , 42);
+}
+
+test "bound methods and erased callable descriptors retain receivers in arrays and reference fields" {
+    try Fixture.expectParity(
+        \\struct Tracker
+        \\    ref value: int
+        \\    func read(imm self: Tracker) ref int -> self.value
+        \\func apply(callback: func() ref int) int -> callback()
+        \\func run() int
+        \\    var first = 20
+        \\    var second = 22
+        \\    const one = Tracker{value = first}
+        \\    const two = Tracker{value = second}
+        \\    const callbacks: Array(func() ref int, 2) = [one.read, two.read]
+        \\    return apply(callbacks[0]) + apply(callbacks[1])
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Tracker
+        \\    ref value: int
+        \\    func read(imm self: Tracker) ref int -> self.value
+        \\func invalid() ref int
+        \\    var value = 42
+        \\    const tracker = Tracker{value = value}
+        \\    const callback: func() ref int = tracker.read
+        \\    return callback()
+        \\exit(invalid())
+    , .borrow_outlives_source);
+}
+
+test "bound methods and erased callable descriptors invalidate opaque referenced provider storage" {
+    try Fixture.expectSourceDiagnostic(
+        \\struct Provider
+        \\    ref owner: String
+        \\    func grow(imm self: Provider)
+        \\        if not (self.owner.append("x") is unit) -> return
+        \\func invoke(callback: func() unit) -> callback()
+        \\func run() int
+        \\    var owner: String = "abc"
+        \\    const view = owner.view()
+        \\    const provider = Provider{owner = owner}
+        \\    const callback: func() unit = provider.grow
+        \\    invoke(callback)
+        \\    return view.byte_length() + 39
+        \\exit(run())
+    , .borrow_outlives_source);
+}
+
+test "bound methods and erased callable descriptors match signatures without changing concrete storage" {
+    try Fixture.expectParity(
+        \\import std.ownership.{copyable, movable}
+        \\func answer() int -> 42
+        \\func wrong(value: bool) int -> 0
+        \\func run() int
+        \\    const callback = answer
+        \\    if not (callback is func() int) -> return 1
+        \\    if wrong is func() int -> return 2
+        \\    if not copyable(int) -> return 3
+        \\    if not movable(int) -> return 4
+        \\    return callback()
+    , 42);
+}
+
+test "bound methods and erased callable descriptors support optional erased storage and contextual closures" {
+    try Fixture.expectParity(
+        \\func callback() (func(int) int) | none -> (value) => value + 2
+        \\func run() int
+        \\    const selected = callback()
+        \\    match selected
+        \\        operation and operation is func(int) int -> return operation(40)
+        \\        _ -> return 1
+    , 42);
+}
+
+test "callable adapter results infer declared arguments independent reordered slots and aliases" {
+    try Fixture.expectParity(
+        \\static Callback: type = func(int) int
+        \\struct Adapter(T: type, First: type, Second: type)
+        \\    second: Second
+        \\    value: T
+        \\    first: First
+        \\func make(static T: type, first: Callback, init second: Callback, value: T) Adapter(T, Callback, Callback)
+        \\    return Adapter{second = second, value = value, first = first}
+        \\func forward(static T: type, static F: type, static G: type, var adapter: Adapter(T, F, G)) Adapter(T, Callback, Callback)
+        \\    return adapter^
+        \\func run() int
+        \\    const offset = 2
+        \\    const first = (value: int) => value + offset
+        \\    const adapter = forward(make(int, first, (value) => value * offset, 10))
+        \\    return adapter.first(adapter.value) + adapter.second(15)
+    , 42);
+}
+
+test "callable adapter results construct deferred copyable immovable callbacks once" {
+    try Fixture.expectParity(
+        \\struct Pinned
+        \\    move = none
+        \\    ref copies: int
+        \\    value: int
+        \\    copy = func(imm self: Pinned) Pinned
+        \\        self.copies += 1
+        \\        return Pinned{copies = self.copies, value = self.value}
+        \\struct Adapter(T: type, F: type)
+        \\    value: T
+        \\    callback: F
+        \\func make(static T: type, value: T, init callback: func(T) T) Adapter(T, func(T) T)
+        \\    return Adapter{value = value, callback = callback}
+        \\func ignore(init callback: func(int) int) int -> 0
+        \\func run() int
+        \\    var copies = 0
+        \\    const pinned = Pinned{copies = copies, value = 40}
+        \\    ignore((value) => value + pinned.value)
+        \\    if copies <> 0 -> return 90
+        \\    const adapter = make(1, (value: int) => value + pinned.value)
+        \\    return adapter.callback(adapter.value) + copies
+    , 42);
+    try Fixture.expectParity(
+        \\struct Pinned
+        \\    move = none
+        \\    copy = func(imm self: Pinned) Pinned -> Pinned{value = self.value}
+        \\    value: int
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func make(init callback: func() int) Adapter(func() int) -> Adapter{callback = callback}
+        \\func run() int
+        \\    const pinned = Pinned{value = 42}
+        \\    const callback = () => pinned.value
+        \\    const adapter = make(callback)
+        \\    return adapter.callback()
+    , 42);
+}
+
+test "callable adapter results resolve whole result aliases and agreeing conditional returns" {
+    try Fixture.expectParity(
+        \\struct Adapter(T: type, F: type)
+        \\    value: T
+        \\    callback: F
+        \\static Result: type = Adapter(int, func(int) int)
+        \\func choose(static F: type, callback: F, flag: bool) Result
+        \\    if flag -> return Adapter{value = 20, callback = callback}
+        \\    const adapter = Adapter(int, F){value = 20, callback = callback}
+        \\    return adapter^
+        \\func run() int
+        \\    const extra = 1
+        \\    const callback = (value: int) => value + extra
+        \\    const first = choose(callback, true)
+        \\    const second = choose(callback, false)
+        \\    return first.callback(first.value) + second.callback(second.value)
+    , 42);
+    try Fixture.expectParity(
+        \\struct Outer(T: type)
+        \\    struct Adapter(F: type)
+        \\        value: T
+        \\        callback: F
+        \\    func make(init callback: func(T) T, value: T) Adapter(func(T) T)
+        \\        return Adapter{callback = callback, value = value}
+        \\func run() int
+        \\    const extra = 2
+        \\    const adapter = Outer(int).make((value) => value + extra, 40)
+        \\    return adapter.callback(adapter.value)
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Adapter(T: type, F: type)
+        \\    value: T
+        \\    callback: F
+        \\func make() Adapter(int, func() int) -> Adapter{value = 42}
+        \\const adapter = make()
+    , .static_argument_cannot_be_inferred);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func make(init callback: func() int) Adapter(func() int) -> Adapter{callback = callback}
+        \\const fixed: Adapter(func() int) = make(() => 42)
+    , .local_type_mismatch);
+}
+
+test "callable adapter results reject conflicting slots fixed arguments and inference cycles" {
+    try Fixture.expectSourceDiagnostic(
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func make(flag: bool) Adapter(func() int)
+        \\    if flag -> return Adapter{callback = () => 42}
+        \\    return Adapter{callback = () => 43}
+        \\const adapter = make(true)
+        \\exit(adapter.callback())
+    , .callable_result_inference_conflict);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Adapter(T: type, F: type)
+        \\    value: T
+        \\    callback: F
+        \\func make() Adapter(int, func() int)
+        \\    return Adapter(bool, func() int){value = true, callback = answer}
+        \\func answer() int -> 42
+        \\const adapter = make()
+    , .return_type_mismatch);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func make() Adapter(func() int) -> make()
+        \\const adapter = make()
+    , .callable_result_inference_cycle);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func make() Adapter(func() int) -> panic "no result"
+        \\const adapter = make()
+    , .callable_result_cannot_be_inferred);
+}
+
+test "callable adapter results preserve capture lifetimes modes and owning copy effects" {
+    try Fixture.expectParity(
+        \\struct Capture
+        \\    ref copies: int
+        \\    ref drops: int
+        \\    value: int
+        \\    copy = func(imm self: Capture) Capture
+        \\        self.copies += 1
+        \\        return Capture{copies = self.copies, drops = self.drops, value = self.value}
+        \\    drop = func(deinit self: Capture) -> self.drops += 1
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func make(init callback: func() int) Adapter(func() int) -> Adapter{callback = callback}
+        \\func scope(mut copies: int, mut drops: int) int
+        \\    const capture = Capture{copies = copies, drops = drops, value = 38}
+        \\    const callback = () => capture.value
+        \\    const adapter = make(callback)
+        \\    return adapter.callback()
+        \\func run() int
+        \\    var copies = 0
+        \\    var drops = 0
+        \\    const result = scope(copies, drops)
+        \\    return result + copies + drops - 1
+    , 42);
+    try Fixture.expectParity(
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func make(init callback: func() ref int) Adapter(func() ref int) -> Adapter{callback = callback}
+        \\func run() int
+        \\    var value = 41
+        \\    ref live = value
+        \\    const adapter = make(() => live)
+        \\    ref selected = adapter.callback()
+        \\    selected += 1
+        \\    return value
+    , 42);
+    try Fixture.expectRejected(
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func make(init callback: func() ref int) Adapter(func() ref int) -> Adapter{callback = callback}
+        \\func invalid() Adapter(func() ref int)
+        \\    var value = 42
+        \\    ref live = value
+        \\    return make(() => live)
+        \\const adapter = invalid()
+        \\exit(adapter.callback())
+    );
+}
+
+test "concrete closures capture scoped bindings and nested expression dependencies" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    const (first, second) = (10, 11)
+        \\    const sum = () => first + second
+        \\    var total = sum()
+        \\    for item in 1..=3
+        \\        const current = () => item
+        \\        total += current()
+        \\    const choose = (value: int | none) => match value
+        \\        number and number is int -> (() => number + second)()
+        \\        _ -> first
+        \\    return total + choose(4)
+    , 42);
+    try Fixture.expectParity(
+        \\struct Failure
+        \\    error = true
+        \\    code: int
+        \\    copy = fieldwise
+        \\func fail() int | Failure -> Failure{code = 20}
+        \\func run() int
+        \\    const extra = 2
+        \\    const recover = () => fail() catch error -> (() => error.code + extra)()
+        \\    var value = 20
+        \\    match value
+        \\        ref selected ->
+        \\                const update = () => selected += extra
+        \\                update()
+        \\    return recover() + value - 2
+    , 42);
+    try Fixture.expectParity(
+        \\func run() int
+        \\    const extra = 2
+        \\    const collect = () => if extra > 0
+        \\        const source: Array(int, 2) = [0, 1]
+        \\        const values = [(() => item + extra)() for item in source]
+        \\        values[0] + values[1]
+        \\    else 0
+        \\    return collect() + 37
+    , 42);
+}
+
+test "concrete closures receive overload contexts without rejected candidate diagnostics or effects" {
+    try Fixture.expectParity(
+        \\func wrong(callback: func(bool) int, value: bool) int -> callback(value)
+        \\func right(callback: func(int) int, value: int) int -> callback(value)
+        \\overload apply(wrong, right)
+        \\struct Capture
+        \\    ref copies: int
+        \\    value: int
+        \\    copy = func(imm self: Capture) Capture
+        \\        self.copies += 1
+        \\        return Capture{copies = self.copies, value = self.value}
+        \\func run() int
+        \\    var copies = 0
+        \\    const capture = Capture{copies = copies, value = 2}
+        \\    const result = apply((item) => item + capture.value, 39)
+        \\    return result + copies
+    , 42);
+    try Fixture.expectParity(
+        \\func wrong(callback: func(bool) int) int -> callback(true)
+        \\func right(callback: func(int) int) int -> callback(40)
+        \\overload apply(wrong, right)
+        \\func run() int
+        \\    const callback = (item: int) => item + 2
+        \\    return apply(callback)
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func first(callback: func(int) int) int -> callback(42)
+        \\func second(callback: func(int) int) int -> callback(42)
+        \\overload apply(first, second)
+        \\exit(apply((item) => item))
+    , .ambiguous_overload);
+}
+
+test "concrete closures invoke generated iteration protocol fields" {
+    try Fixture.expectParity(
+        \\struct Cursor(F: type)
+        \\    next: F
+        \\struct Source(F: type)
+        \\    iter: F
+        \\    consume_iter: F
+        \\func poll(mut position: int) int | End
+        \\    if position >= 3 -> return End{}
+        \\    const result = position
+        \\    position += 1
+        \\    return result
+        \\func run() int
+        \\    var position = 0
+        \\    ref live = position
+        \\    const next = () => poll(live)
+        \\    const iter = () => Cursor{next = next}
+        \\    const source = Source{iter = iter, consume_iter = iter}
+        \\    var total = 0
+        \\    for item in source -> total += item
+        \\    position = 0
+        \\    for item in source^ -> total += item
+        \\    return total + position + 33
+    , 42);
+}
+
+test "concrete closures snapshot owned bindings and preserve reference aliases" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var offset = 5
+        \\    const snapshot = (value: int) => value + offset
+        \\    ref live = offset
+        \\    const current = (value: int) => value + live
+        \\    offset = 10
+        \\    return snapshot(1) + current(26)
+    , 42);
+}
+
+test "concrete closures specialize independent callable parameters and aliases" {
+    try Fixture.expectParity(
+        \\static Callback: type = func(int) int
+        \\func apply(callback: Callback, value: int) int -> callback(value)
+        \\func combine(first: Callback, second: Callback, value: int) int
+        \\    return apply(first, value) + apply(second, value)
+        \\func double(value: int) int -> value * 2
+        \\func run() int
+        \\    const offset = 2
+        \\    const plus = (value: int) => value + offset
+        \\    return combine(plus, double, 10) + apply((value) => value + offset, 8)
+    , 42);
+    try Fixture.expectParity(
+        \\static Callback: type = func(int) int
+        \\func combine(prefix: int, first: Callback, middle: int, init second: Callback, tail: int) int
+        \\    const current = second
+        \\    return first(prefix) + current(middle) + tail
+        \\func run() int
+        \\    const offset = 2
+        \\    return combine(10, (value) => value + offset, 20, (value) => value + offset, 8)
+    , 42);
+    try Fixture.expectParity(
+        \\static Callback: type = func(int) int
+        \\func right(prefix: int, first: Callback, middle: int, init second: Callback, tail: int) int
+        \\    const current = second
+        \\    return first(prefix) + current(middle) + tail
+        \\func wrong(prefix: int, first: func(bool) int, middle: int, init second: func(bool) int, tail: int) int
+        \\    const current = second
+        \\    return first(true) + current(false) + tail
+        \\overload combine(wrong, right)
+        \\func run() int
+        \\    const offset = 2
+        \\    return combine(10, (value) => value + offset, 20, (value) => value + offset, 8)
+    , 42);
+}
+
+test "concrete closures infer noncapturing expression results" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    const answer = () => 42
+        \\    return answer()
+    , 42);
+}
+
+test "concrete closures copy captures in lexical order and copy owned callbacks" {
+    try Fixture.expectParity(
+        \\struct Capture
+        \\    ref trace: int
+        \\    digit: int
+        \\    copy = func(imm self: Capture) Capture
+        \\        self.trace = self.trace * 10 + self.digit
+        \\        return Capture{trace = self.trace, digit = self.digit}
+        \\func take(var callback: func() int) int -> callback()
+        \\func run() int
+        \\    var trace = 0
+        \\    const first = Capture{trace = trace, digit = 1}
+        \\    const second = Capture{trace = trace, digit = 2}
+        \\    const callback = () => second.digit + first.digit + second.digit
+        \\    if trace <> 21 -> return 90
+        \\    const copy = callback
+        \\    if trace <> 2121 -> return 91
+        \\    const result = take(copy)
+        \\    if trace <> 212121 -> return 92
+        \\    return result + callback() + 32
+    , 42);
+}
+
+test "concrete closures defer capture construction until init consumption" {
+    try Fixture.expectParity(
+        \\struct Capture
+        \\    ref copies: int
+        \\    value: int
+        \\    copy = func(imm self: Capture) Capture
+        \\        self.copies += 1
+        \\        return Capture{copies = self.copies, value = self.value}
+        \\func ignore(init callback: func() int) int -> 1
+        \\func use(init callback: func() int) int
+        \\    const concrete = callback
+        \\    return concrete()
+        \\func run() int
+        \\    var copies = 0
+        \\    const capture = Capture{copies = copies, value = 40}
+        \\    const ignored = ignore(() => capture.value)
+        \\    if copies <> 0 -> return 90
+        \\    const result = use(() => capture.value)
+        \\    return result + ignored + copies
+    , 42);
+}
+
+test "concrete closures construct nested captures and call inline struct fields" {
+    try Fixture.expectParity(
+        \\struct Holder(F: type)
+        \\    callback: F
+        \\func apply(callback: func(int) int, value: int) int -> callback(value)
+        \\func run() int
+        \\    const offset = 2
+        \\    const outer = (value: int) => apply((inner) => inner + offset, value)
+        \\    const holder = Holder{callback = outer}
+        \\    return holder.callback(40)
+    , 42);
+}
+
+test "concrete closures preserve writable and readonly captured reference authority" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var count = 40
+        \\    ref live = count
+        \\    const callback = () => live += 1
+        \\    callback()
+        \\    callback()
+        \\    return count
+    , 42);
+    try Fixture.expectSourceDiagnostic(
+        \\func invalid(value: int) int
+        \\    ref live = value
+        \\    const callback = () => live += 1
+        \\    callback()
+        \\    return value
+        \\exit(invalid(41))
+    , .reference_not_writable);
+}
+
+test "concrete closures contextualize parameter modes and reference results" {
+    try Fixture.expectParity(
+        \\func change(callback: func(mut int) int, mut value: int) int -> callback(value)
+        \\func borrow(callback: func() ref int) ref int -> return callback()
+        \\func run() int
+        \\    var value = 40
+        \\    change((item) => item += 1, value)
+        \\    ref live = value
+        \\    ref selected = borrow(() => live)
+        \\    selected += 1
+        \\    return value
+    , 42);
+}
+
+test "concrete closures reject unsupported ownership and uncontextualized parameters" {
+    try Fixture.expectSourceDiagnostic(
+        \\const callback = (value) => value + 1
+        \\exit(callback(41))
+    , .parameter_type_missing);
+    try Fixture.expectSourceDiagnostic(
+        \\struct Resource
+        \\    value: int
+        \\const resource = Resource{value = 42}
+        \\const callback = () => resource.value
+        \\exit(callback())
+    , .type_not_copyable);
+    try Fixture.expectSourceDiagnostic(
+        \\func apply(init callback: func() int) int
+        \\    const nested = () => callback()
+        \\    return nested()
+        \\exit(apply(() => 42))
+    , .closure_capture_initializer);
+    try Fixture.expectSourceExit(
+        \\const offset = 1
+        \\const callback: func(int) int = (value) => value + offset
+        \\exit(callback(41))
+    , 42);
+}
+
+test "concrete closures preserve explicit and inferred static arguments" {
+    try Fixture.expectParity(
+        \\func apply(static T: type, callback: func(T) T, value: T) T -> callback(value)
+        \\func invoke(static T: type, callback: func() T) T -> callback()
+        \\func run() int
+        \\    const offset = 2
+        \\    return apply(int, (value) => value + offset, 20) + invoke(() => 20)
+    , 42);
+}
+
+test "concrete closures construct copyable immovable environments in final storage" {
+    try Fixture.expectParity(
+        \\struct Pinned
+        \\    move = none
+        \\    copy = func(imm self: Pinned) Pinned -> Pinned{value = self.value}
+        \\    value: int
+        \\struct Holder(F: type)
+        \\    callback: F
+        \\func run() int
+        \\    const pinned = Pinned{value = 42}
+        \\    const holder = Holder{callback = () => pinned.value}
+        \\    return holder.callback()
+    , 42);
+}
+
+test "concrete closures run fieldwise destruction and retain Ref provenance" {
+    try Fixture.expectParity(
+        \\import std.memory
+        \\struct Tracked
+        \\    ref drops: int
+        \\    value: int
+        \\    copy = fieldwise
+        \\    drop = func(deinit self: Tracked) -> self.drops += 1
+        \\func scope(mut drops: int) int
+        \\    const item = Tracked{drops = drops, value = 40}
+        \\    const callback = () => item.value
+        \\    return callback()
+        \\func run() int
+        \\    var drops = 0
+        \\    const answer = scope(drops)
+        \\    var value = answer
+        \\    const reference = Ref.from(value)
+        \\    const callback = () => reference.value
+        \\    value += drops
+        \\    return callback()
+    , 42);
+}
+
+test "concrete closures reject capture consumption and borrowed result escape" {
+    try Fixture.expectSourceDiagnostic(
+        \\struct Item
+        \\    copy = fieldwise
+        \\    value: int
+        \\const item = Item{value = 42}
+        \\const callback = () => item^
+    , .ownership_transfer_requires_owned_place);
+    try Fixture.expectRejected(
+        \\import std.memory
+        \\func invoke(callback: func() Ref(int)) Ref(int) -> callback()
+        \\func invalid() Ref(int)
+        \\    var value = 42
+        \\    const reference = Ref.from(value)
+        \\    return invoke(() => reference)
+        \\const escaped = invalid()
+        \\exit(escaped.value)
+    );
+    try Fixture.expectSourceDiagnostic(
+        \\struct Explicit
+        \\    copy = fieldwise
+        \\    drop = explicit
+        \\    value: int
+        \\const owner = Explicit{value = 42}
+        \\const callback = () => owner.value
+        \\owner^.drop()
+    , .closure_capture_explicit_drop);
+}
+
 test "error handlers recover and propagate ordinary marked alternatives" {
     try Fixture.expectParity(
         \\struct Failure
@@ -27,6 +837,47 @@ test "error handlers recover and propagate ordinary marked alternatives" {
         \\    const second = doubled(true) catch err -> err.code - 5
         \\    return first + second
     , 42);
+}
+
+test "error handlers permit omitted captures and evaluate the operand once" {
+    try Fixture.expectParity(
+        \\struct Failure
+        \\    error = true
+        \\func attempt(mut calls: int, fail: bool) int | Failure
+        \\    calls += 1
+        \\    if fail -> return Failure{}
+        \\    return 20
+        \\func recover(static T: type, value: T) int -> value catch -> 22
+        \\func run() int
+        \\    var calls = 0
+        \\    const first = attempt(calls, false) catch -> panic
+        \\    const second = attempt(calls, true) catch ->
+        \\        22
+        \\    if calls <> 2 -> return 91
+        \\    if recover(20) <> 20 -> return 92
+        \\    if recover(Failure{}) <> 22 -> return 93
+        \\    const nested = Failure{} catch -> Failure{} catch -> 42
+        \\    if nested <> 42 -> return 94
+        \\    return first + second
+    , 42);
+}
+
+test "error handlers recompute when captures are added or omitted" {
+    const source =
+        \\struct Failure
+        \\    error = true
+        \\func attempt() int | Failure -> Failure{}
+        \\exit(attempt() catch err -> 42)
+    ;
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    for ([_][]const u8{ "catch ->", "catch _ ->", "catch err ->" }) |handler| {
+        const changed = try std.mem.replaceOwned(u8, testing.allocator, source, "catch err ->", handler);
+        defer testing.allocator.free(changed);
+        try fixture.db.setInput(queries.SourceText, 0, changed);
+        try fixture.expectExit(0, 42);
+    }
 }
 
 test "error handlers require acknowledgment and complete annotations" {
@@ -253,7 +1104,7 @@ test "error handlers preserve mixed owned reference and multiple owned successes
         \\    return value.value
         \\func run() int
         \\    var original = 7
-        \\    var borrowed = forward(original, 1) catch err -> return 90
+        \\    var borrowed = forward(original, 1) catch -> return 90
         \\    match borrowed
         \\        int ->
         \\            ref alias = borrowed
@@ -312,28 +1163,32 @@ test "error handlers retain tag dependencies and validate error properties" {
 }
 
 test "error handlers destroy multiple owned error alternatives exactly once" {
-    try Fixture.expectParity(
-        \\struct First
-        \\    error = true
-        \\    ref count: int
-        \\    drop = func(deinit self: First) -> self.count += 1
-        \\struct Second
-        \\    error = true
-        \\    ref count: int
-        \\    drop = func(deinit self: Second) -> self.count += 10
-        \\static Errors = First | Second | First
-        \\func attempt(mut count: int, mode: int) int | Errors
-        \\    if mode == 0 -> return 0
-        \\    if mode == 1 -> return First{count = count}
-        \\    return Second{count = count}
-        \\func recover(mut count: int, mode: int) int -> attempt(count, mode) catch err: Errors -> 0
-        \\func run() int
-        \\    var count = 0
-        \\    _ = recover(count, 0)
-        \\    _ = recover(count, 1)
-        \\    _ = recover(count, 2)
-        \\    return count + 31
-    , 42);
+    for ([_][]const u8{ "", "_", "err: Errors" }) |capture| {
+        const source = try test_sources.renderTemplate(testing.allocator,
+            \\struct First
+            \\    error = true
+            \\    ref count: int
+            \\    drop = func(deinit self: First) -> self.count += 1
+            \\struct Second
+            \\    error = true
+            \\    ref count: int
+            \\    drop = func(deinit self: Second) -> self.count += 10
+            \\static Errors = First | Second | First
+            \\func attempt(mut count: int, mode: int) int | Errors
+            \\    if mode == 0 -> return 0
+            \\    if mode == 1 -> return First{count = count}
+            \\    return Second{count = count}
+            \\func recover(mut count: int, mode: int) int -> attempt(count, mode) catch $capture -> 0
+            \\func run() int
+            \\    var count = 0
+            \\    _ = recover(count, 0)
+            \\    _ = recover(count, 1)
+            \\    _ = recover(count, 2)
+            \\    return count + 31
+        , .{ .capture = capture });
+        defer testing.allocator.free(source);
+        try Fixture.expectParity(source, 42);
+    }
 }
 
 test "error handlers preserve errors while converting ordinary success alternatives" {
@@ -3155,10 +4010,13 @@ test "an indexed comparison operand snapshots before a nested allocation transfe
 
 test "a callable field cannot outlive an argument transferring its owner" {
     try Fixture.expectSourceDiagnostic(
+        \\import std.memory.{take}
         \\struct Handler
         \\  callback: func(int) int
         \\func answer(value: int) int -> 42
-        \\func dispose(deinit owner: Box(Handler)) int -> 0
+        \\func dispose(deinit owner: Box(Handler)) int
+        \\  const removed = take(Handler, owner^)
+        \\  return 0
         \\func run() int | none
         \\  const owner = Box.new(Handler{callback = answer})
         \\  if not (owner is Box(Handler)) -> return none

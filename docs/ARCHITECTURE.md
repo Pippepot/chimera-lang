@@ -132,6 +132,12 @@ Construction preserves shorthand constructor and match-case names until typing
 supplies an expected type. Typing reuses qualified nominal-case lookup, including
 visibility and ambiguity checks, and owns initializer-shape validation after the
 target type is resolved.
+Semantic construction uses the same type/value context for unit, none, and
+qualified payload-free case references. It emits a type value in type contexts
+and an ordinary empty constructor for a case in value contexts. Typing and
+argument discovery trust that distinction without reinterpreting type values.
+Compile-time and runtime expressions use the same defaults; a static alias of a
+payload-free case supplies an explicit type annotation.
 Item discovery tracks type-producing positions so bare runtime case values do
 not introduce declarations or collide with repeated references to the same case.
 Synthesized payload converters have ordinary callable identities and bodies;
@@ -277,6 +283,217 @@ nor interpretation has an error-only instruction or second return channel.
 Entry forwarding cleans owners before invoking the ordinary unhandled-error
 reporter.
 
+## Closures and Bound Methods
+
+Concrete runtime captures, implicit runtime-callable specialization, and generic
+struct result patterns, bound methods, and owning lexical-environment erasure
+implement callable v1 (slices 1 through 4).
+Inferred function references remain thin; fixed `func(...)` values use the
+descriptor/payload ABI below. The rules belong to
+[syntax&semantics.txt](../syntax&semantics.txt); [CLOSURES.md](CLOSURES.md) develops
+their design. This section specifies the required compiler boundaries rather
+than promising that every described behavior is implemented.
+
+The concrete implementation discovers synthetic invocation items at
+closure expression sites. Interned lexical environments retain static bindings
+and type-only capture/parameter metadata, never runtime capture contents.
+Generated structs provide inline storage and fieldwise copying, inheriting
+ordinary movement and cleanup capabilities. `AnalyzeClosureBody` validates and
+publishes receiver-based invocation with an inferred or contextual result;
+ordinary direct-call IR borrows the actual environment with an internal `ref`
+receiver. Closure-body typing marks that receiver readonly, without attenuating
+writable captured referents. This preserves references into small environments
+that would otherwise be passed by value under `imm`.
+Runtime callable parameter types are recorded independently in the instance's
+interned environment, without adding positional static arguments. Call discovery
+allocates an argument-type buffer only when a resolved parameter requires a
+callable signature; ordinary calls and overload candidates need none.
+Specialization reuses the discovered candidate signature and sparse argument
+types, with null entries for non-callable parameters. `FunctionCallSignature`
+caches dispatch classification and validated signatures for fixed targets;
+callable targets defer validation until their concrete specialization is selected.
+Type-only discovery and actual calls share that query rather than repeatedly
+demanding candidate and validated signatures. Query snapshot
+format changes invalidate older snapshots when this metadata shape changes.
+
+Overload matching supplies callable contexts to closure expressions without
+executing capture construction or publishing rejected candidates' diagnostics.
+Closure analysis caches source rejection as data; selected formation publishes
+those diagnostics. Environment identities normalize inferred and contextual
+signatures and distinguish capture types without depending on capture contents.
+Ordinary and generated member calls project a concrete callable field once and
+borrow its actual storage as the invocation receiver. Reference fields forward
+their existing reference rather than taking its address again. Captured lexical
+locals are installed before inference regions evaluate their static expressions.
+
+Semantic construction identifies closure expressions, lexical free bindings,
+capture order, and method-value expressions. Generated environment and invocation
+identities include the expression site and enclosing specialization. Concrete
+bound-method types identify the selected method and receiver type. Canonical
+specialization keys include inferred callable types, never runtime capture values
+or receiver addresses. Concrete environments use ordinary struct construction,
+copy/move capabilities, cleanup, and receiver-based invocation.
+
+Typing distinguishes a declaration's callable requirement from a concrete stored
+`func(...)` type. Runtime callable parameters infer hidden concrete types without
+adding positional static arguments. Ownership modes remain independent of that
+inference. Generic struct result patterns combine fixed declared arguments with
+callable types inferred from returned values and field initializers. Inference
+observes an `init` operand's eventual logical type without forcing construction.
+Each callable result slot resolves independently; conflicting or unresolved
+returns are source errors. This extends nominal struct inference, not inversion
+of arbitrary type-valued functions or general function return inference.
+
+Candidate discovery remains independent of selected bodies. `ResolveCallableResultType`
+types the selected instance's returns without constructing their values, using
+the cached semantic body and type-only initializer discovery. Declared generic
+struct identity and noncallable arguments constrain field inference; callable
+arguments are independent slots checked against their required signatures.
+`FunctionInstanceSignature` publishes the settled concrete result before actual
+typing chooses its destination and layout. `ConstructFunctionBody` needs only
+candidate parameter types, avoiding a dependency back to the unresolved result.
+An erased temporary cannot stand in for a concrete result. Ordinary declaration,
+initializer-type, and body dependencies drive recomputation; conflicting returns
+and unresolved inference cycles are source diagnostics. Missing or stale query
+state remains unavailable and must not masquerade as a semantic inference failure.
+
+Std Map and Filter fields retain concrete callbacks through `init` parameters.
+Filter keeps borrowed and owned delivery in separate selected helper bodies,
+preserving reference forwarding and ownership transfer. Runtime sorting uses a
+concrete reference-field holder at the caller, never a copied callback or a
+factory-local wrapper. Type-valued union results preserve reference member kinds
+during semantic construction.
+
+Stored `func(...)` values have one common native descriptor/payload representation:
+
+| Construction | Payload | Copy and cleanup |
+| --- | --- | --- |
+| Named function or noncapturing closure | Unused; descriptor selects code | Representation copy; no allocation or owned cleanup |
+| Borrowed-receiver bound method | Checked reference to the original receiver | Reference copy; no allocation or receiver ownership hooks |
+| Capturing lexical closure | Pointer to an owned concrete environment | Allocate/copy captures; destroy captures and release storage |
+
+Descriptors provide ordinary invocation, copy, and cleanup code. Track the
+payload's storage form separately from invocation-target identity: a merged or
+opaque target can still be known to require no environment allocation. Method
+binding validates member selection, receiver identity, and required permissions
+at the frontend boundary. Its erased receiver reference is independent of any
+temporary bound-value wrapper. Borrowing the receiver never transfers ownership
+of the provider or upgrades its authority. Ordinary `ref` still aliases callable
+storage; it is not an erased callable view.
+
+Compiler-owned adapter items retain their construction form independently of
+the target recovered at a use site: named code, noncapturing closure, borrowed
+receiver, or an opaque thin function reference. Concrete bound types identify
+the selected method and store one original receiver reference. Erasure extracts
+that reference, never an address of the temporary bound wrapper. Signature
+membership and overload matching are separate from representation widening.
+Binding checks receiver requirements without executing invocation effects.
+Immutable storage identities survive lexical scope exit so cleanup retains
+descriptor facts. Invocation recovery follows direct destination construction,
+immutable copies, fields, variants, and unambiguous helper returns. A separate
+construction proof joins all alternatives without requiring one invocation
+target. Returned proofs are derived from analyzed IR and may depend on immutable
+input parameters and owned struct-field paths. Unexposed mutable local storage
+can retain this proof across assignments; opaque storage exposure or any owning
+alternative prevents it. These derived facts use ordinary query dependencies,
+not additional serialized metadata.
+
+Callee evaluation and runtime argument evaluation have separate ownership
+boundaries. Callee liveness follows storage paths through argument control flow,
+including loop generation remapping. Reading an allocated payload snapshots its
+environment identity; later handle replacement invalidates dependent borrows.
+Owned definitions are anchored immediately, before nested construction can
+consume them. Computed bound methods are values, not argument storage places.
+
+On x86-64, thin references and concrete bound values occupy eight bytes; erased
+handles occupy sixteen bytes, aligned to eight. Adapter artifacts prepend a
+24-byte invoke/copy/drop descriptor and publish an executable `entry_offset`.
+Function relocations target that entry; descriptor relocations target its prefix.
+Invocation passes the payload as a hidden pointer-sized stack argument, with
+known adapters retaining the receiver's logical type. Recovering a descriptor
+target during optimization explicitly repacks its hidden argument when needed;
+physical pointer equivalence never substitutes for logical type agreement.
+Native debug rendering separates named descriptor entries from executable code.
+The std precompiler retains original adapter targets even when their invocation
+has been inlined, preserving reusable ordinary function specializations.
+Copy and drop entries receive the whole handle; invocation receives its payload.
+Ownership entries are separately compiled functions, without descriptor prefixes.
+Indirect destruction consumes a snapshot of the handle bits, not a copy of its
+environment. This keeps handle addressability separate from environment identity
+and permits proven nonowning descriptor entries to inline.
+Erased handles are opaque ownership units: consuming parameters and replacement
+destroy remaining handles through descriptors, never through synthetic fields.
+Numbering invalidates payload, invocation, and allocation reads when handle
+storage changes.
+Nonowning construction facts permit representation copies and no-op cleanup;
+the stored callable type itself has custom copy/drop and trivial move capabilities.
+The evaluator uses dedicated erased-handle cells, preserving receiver aliases
+across copies and snapshots. Opaque pointer carriers do not weaken ordinary
+borrow type assertions. Owned payloads retain typed evaluation allocations and
+borrow their initialized environment element for invocation. Snapshots preserve
+allocation identity. Only receiver-free handles become canonical static
+constants. Query snapshots, portable artifacts, and std bundles version these
+identities, values, and ABI together.
+
+Contract inference needs distinct sources for owned environment storage, receiver
+references, captured referents, retained allocation providers, and registered
+ambient inputs. Extend borrow containment, projections, joins, copy/move/drop,
+and indirect-call substitution together. A returned reference into an owned
+environment depends on that owner; a returned captured reference keeps its
+original referent dependency. Copies of bound methods retain receivers, while
+copies of allocated environments establish fresh ownership and apply ordinary
+capture-copy contracts. Unknown callables conservatively account for possible
+captures, writes, returned dependencies, allocation, and cleanup hooks. Contract
+demand cannot depend only on explicit reference arguments or reference results:
+scalar-returning callbacks and implicit hooks can use captured or ambient state.
+Opaque receiver writes are an explicit contract dimension, not a fabricated
+written type. Copy/drop effects select owned-environment provenance; borrowed
+receiver payloads have no ownership-hook effects even after opaque forwarding.
+An unknown environment type uses a wildcard environment path, while invocation
+still follows receiver authority and referenced contents conservatively.
+Scheduled implicit cleanup contributes symbolic writes before contract
+publication without adding ownership uses after lifetime solving. Even
+scalar-returning erased factories therefore require receiver-effect contracts
+during analysis.
+
+Standard service factories construct private callable fields only from direct
+bound methods or permanent named functions. Validate their nonallocating
+construction, storage/release authority, and message-nonretention requirements
+at that boundary. Preserve construction facts through factory returns, handle
+copies, and opaque invocation. A stored `func(...)` type alone does not promise
+nonallocating copying; service handles use ordinary fieldwise callable copies
+under their stronger construction invariant. Incompatible protocols are source
+errors; missing contracts require recomputation rather than an assumed safe
+fallback. General borrowed erased lexical-closure views remain deferred.
+
+Allocating erasure uses existing typed allocation and destination construction.
+An unpublished reservation owns raw storage without destroying an uninitialized
+environment. Ordinary aggregate construction tracks completed captures; publishing
+the handle consumes both the completed environment and its reservation.
+`callable_allocation` reconstructs a borrowed typed allocation view from an owned
+payload, and logical `.environment` reference paths distinguish environment
+ownership from captured referents. Opaque traversal deduplicates actual origin
+sets and does not treat readonly owner storage as a referent mutation.
+Reserve storage before forcing fresh capture initializers or running copy hooks;
+ordinary partial-initialization cleanup owns unpublished storage. Capture hooks
+remain infallible. Implicit reservation failure panics, while explicit fallible
+erasure/cloning returns the shared `std.memory.AllocationError` through the existing
+result channel. `std.callables.erase` specializes its concrete deferred initializer;
+other compiler-owned external declarations retain fixed result shapes.
+With scoped services, each environment retains its original release
+provider in a nonallocating handle. A new copy selects a provider for its new
+allocation. Invocation and implicit hooks use the context active when they run;
+only an explicitly captured service handle preserves an earlier selection.
+
+Interpreter values retain symbolic descriptor identities and checked receiver or
+evaluation-heap references, never host-native descriptor pointers. Published
+results may contain only representable symbolic values; actual evaluation-local
+captures remain transient and cannot enter canonical arguments or caches.
+Reachability follows descriptor invocation, copy, destruction, and release code.
+The ABI, interned callable identities, bundled bodies, and persistent snapshots
+invalidate incompatible representations through their versioned formats.
+Native and interpreter execution must preserve the same effects and lifetimes.
+
 ## References, Construction, and Cleanup
 
 Places retain typed projections and storage identity rather than byte offsets.
@@ -402,16 +619,79 @@ checks actual contents before interning results, static arguments, conversions,
 or copy-back. Transient handles never enter canonical values or disk snapshots;
 representable extracted data can publish normally.
 
+Context-sensitive calls also execute transiently. Each executor owns separate
+allocator/logger bindings and an active-service stack; neither uses host TLS.
+Recursion snapshots include the current bindings. Root allocation belongs to
+the evaluation heap; the root logger is disabled and performs no host output.
+
+## Scoped Context
+
+Physical alias origins participate in flow invalidation without creating lifetime
+loans into provider-object storage. Retention origins keep issued storage and its
+release authority alive without claiming that counter writes alias element bytes.
+Both properties survive contract publication and caller substitution.
+
+Canonical registered declarations identify the independent allocator and logger
+entries. Semantic construction preserves declaration identity through aliases and
+reexports. Reading an entry snapshots a handle; only scoped replacement writes its
+storage. Ordinary assignment, writable aliases, and moving out of an entry are
+source errors.
+
+Typing tracks each ambient entry as a symbolic input alongside ordinary parameters.
+A scoped replacement evaluates its right-hand side under the previous bindings,
+retains its installed dependencies and saved handle, and restores the saved binding
+on ordinary exits after body cleanup. Returned allocations and saved service handles
+retain their providers or backends, rather than temporary binding storage.
+
+Reference contracts carry independent contextual reads, writes, source identities,
+and mutation outputs. Service payload origins also retain symbolic invocation
+metadata. Deferred service-mutation records preserve backend retention requirements
+through opaque wrappers and are resolved against the installed receiver at callers.
+Each record carries the allocator/logger origins active at its invocation site.
+Internal overrides therefore survive contract forwarding; an expired callee-local
+provider remains an explicit expired dependency when a backend retains new storage.
+These are analysis facts and introduce no hidden runtime call arguments.
+Storage construction and copy/drop qualification remain independent of invocation
+identity. Allocator results retain both release dependencies and physical cursor
+provenance, so adopted typed storage cannot acquire independent alias proofs from
+its raw backing.
+
+Deferred initializer inputs retain explicitly captured snapshots. Contextual result
+dependencies instead use the forcing site's bindings and are conditional on the
+actual initializer's returned contextual dependencies. Context reads performed by
+cleanup or other effects do not alone attach a provider to the result.
+A nonallocating literal initializer does
+not introduce an allocator dependency merely because its result type can own
+storage. Opaque initializer invocation conservatively includes context effects;
+compiler-generated calls, converters, and ownership hooks also contribute them.
+
+Native execution uses private GS thread state with lazily initialized roots. Each
+synchronous frame caches its thread-state address after its first context operation;
+subsequent reads still read the current individual handle. A new or foreign-origin
+thread validates its thread ID and attaches fresh root state. Checked service
+adapters push canonical factory/receiver pairs and remove them on every ordinary
+return; repeated active pairs terminate with a service-cycle diagnostic. Cached CFGs
+must balance that stack on ordinary returns and agree on depth at joins/backedges.
+
+The evaluator owns independent bindings and a service stack for each evaluation.
+Context-sensitive calls execute transiently, with binding state included in cycle
+snapshots. The root allocator uses evaluation-local storage; the root logger is off
+and performs no host output. Custom service state and allocated identities cannot be
+published into canonical static values. Optimizer contextual resources remain
+separate from ordinary memory, with reads invalidated by relevant writes and calls.
+
 ## Storage, Text, and Native Execution
 
 Arrays store elements inline; Lists own an allocation and initialized prefix;
 Allocation owns deallocation facts rather than element initialization state.
 Box, Ref, Span, and text wrappers use ordinary declarations over validated storage
 primitives. Construction and relocation use typed destinations, hooks, and cleanup.
-Recoverable APIs return ordinary optional values. Explicit allocation and owned
-storage growth can return allocation refusal; internal auxiliary allocations in
-library algorithms panic on failure without adding optional results. Implicit
-allocation failure also panics. Zero-byte host allocations reserve a distinct
+Recoverable allocation and owned-storage growth return marked `AllocationError`
+alternatives. Allocation retains its raw storage token, logical count, and
+original allocator; growth and release use that provider. Infallible converters,
+literal construction, and implicit callable erasure panic on refusal. Sorting
+scratch uses an explicit root provider and exposes marked failures through its
+recoverable implementation. Zero-byte host allocations reserve a distinct
 stable address without changing logical count or layout.
 
 Span holds a typed cursor and length. Checked views retain permissions and
@@ -430,7 +710,7 @@ The internal ABI is derived centrally, not assumed to be a platform ABI.
 Linking trusts validated artifact metadata and treats an incomplete reachable
 closure as an invariant violation; size and displacement limits remain recoverable
 backend errors. Immutable data is deduplicated into the read-only ELF segment.
-Native I/O retries EINTR and returns ordinary optional failures. Panic prints a
+Native I/O retries EINTR and returns marked `IoError` with cause and progress. Panic prints a
 source trace from read-only call-site metadata, exits 134, and does not unwind;
 successful calls need no tracing instructions.
 

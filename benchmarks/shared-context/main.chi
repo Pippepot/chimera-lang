@@ -1,0 +1,117 @@
+import std.memory.{Allocator, AllocationLayout, AllocationError, RawBlock, root_allocator, type_layout, Allocation}
+import std.logging.{Logger, LogLevel, log}
+import std.logging as logging
+import std.io.{stdin, read_bytes, IoError}
+
+static MODE = 0
+static DEPTH = 0
+struct Forwarder
+    upstream: Allocator
+    pub func allocate(imm self: Forwarder, layout: AllocationLayout) RawBlock | AllocationError -> self.upstream.allocate(layout)
+    pub func deallocate(imm self: Forwarder, deinit block: RawBlock) unit -> self.upstream.deallocate(block^)
+struct Backend
+    calls: int
+    pub func emit(mut self: Backend, level: LogLevel, imm message: StringView) unit -> self.calls += 1
+
+struct NoopBackend
+    pub func emit(imm self: NoopBackend, level: LogLevel, imm message: StringView) unit -> unit
+struct LogForwarder
+    upstream: Logger
+    pub func emit(imm self: LogForwarder, level: LogLevel, imm message: StringView) unit | AllocationError | IoError -> logging.emit(self.upstream, level, message)
+
+func destroy(var values: List(List(int))) int
+    var checksum = 0
+    loop
+        if values.len() == 0 -> break
+        const item = values.remove(values.len() - 1)
+        if item is none -> panic "missing destruction item"
+        checksum = wrapping(checksum + item[0])
+    return checksum
+
+func destruction(rounds: int) int | AllocationError
+    var values = List(List(int)).new_with(root_allocator(), rounds)?
+    for index in 0..rounds
+        var item = if MODE == 7 -> List(int).new_with(root_allocator(), 1)? else List(int).new(1)?
+        _ = item.append(index)?
+        _ = values.append(item^)?
+    var signal = List(byte).new_with(root_allocator(), 1)?
+    print("ready")
+    const received = read_bytes(stdin, signal, 1)
+    if not (received is int) or received <> 1 -> panic "missing destruction signal"
+    return destroy(values^)
+
+func workload(rounds: int) int | AllocationError
+    if MODE >= 7 -> return destruction(rounds)
+    var checksum = 0
+    if MODE == 0 or MODE == 1
+        for index in 0..rounds
+            var values = if MODE == 0 -> List(int).new_with(root_allocator(), 1)? else List(int).new(1)?
+            _ = values.append(index)?
+            checksum = wrapping(checksum + values[0])
+    else if MODE == 2
+        var values = List(int).new_with(root_allocator(), rounds)?
+        for index in 0..rounds
+            _ = values.append(index)?
+        checksum = values.len()
+    else if MODE == 3
+        var values = List(int).new(0)?
+        for index in 0..rounds
+            _ = values.append(index)?
+        checksum = values.len()
+    else
+        for index in 0..rounds
+            _ = log(LogLevel.info, "event")
+        checksum = rounds
+    return checksum
+
+func nested(rounds: int) int | AllocationError
+    if MODE >= 4 and MODE <= 6
+        var first_log = LogForwarder{upstream = context.logger}
+        const one_log = Logger.from(LogForwarder, first_log, if MODE == 4 -> LogLevel.off else LogLevel.info)
+        var second_log = LogForwarder{upstream = one_log}
+        const two_log = Logger.from(LogForwarder, second_log, if MODE == 4 -> LogLevel.off else LogLevel.info)
+        var third_log = LogForwarder{upstream = two_log}
+        const three_log = Logger.from(LogForwarder, third_log, if MODE == 4 -> LogLevel.off else LogLevel.info)
+        var fourth_log = LogForwarder{upstream = three_log}
+        if DEPTH == 0 -> return workload(rounds)
+        if DEPTH == 1
+            with context.logger = one_log
+                return workload(rounds)
+        with context.logger = Logger.from(LogForwarder, fourth_log, if MODE == 4 -> LogLevel.off else LogLevel.info)
+            return workload(rounds)
+    var first = Forwarder{upstream = root_allocator()}
+    const one = Allocator.from(Forwarder, first)
+    var second = Forwarder{upstream = one}
+    const two = Allocator.from(Forwarder, second)
+    var third = Forwarder{upstream = two}
+    const three = Allocator.from(Forwarder, third)
+    var fourth = Forwarder{upstream = three}
+    if DEPTH == 0 -> return workload(rounds)
+    if DEPTH == 1
+        with context.allocator = one
+            return workload(rounds)
+    with context.allocator = Allocator.from(Forwarder, fourth)
+        return workload(rounds)
+
+var input: List(byte) = []
+loop
+    if input.len() == 4 -> break
+    const received = read_bytes(stdin, input, 4 - input.len())
+    if not (received is int) or received == 0 -> exit(1)
+const rounds = int(input[0]) + int(input[1]) * 256 + int(input[2]) * 65536
+if rounds == 0 -> exit(1)
+if input[3] == 1
+    print(type_layout(func(int) int).byte_size)
+    print(type_layout(Allocator).byte_size)
+    print(type_layout(Logger).byte_size)
+    print(type_layout(Allocation(int)).byte_size)
+    print(type_layout(List(int)).byte_size)
+    exit(0)
+var backend = Backend{calls = 0}
+var noop = NoopBackend{}
+const selected = if MODE == 6 -> Logger.from(NoopBackend, noop, LogLevel.info) else Logger.from(Backend, backend, if MODE == 4 -> LogLevel.off else LogLevel.info)
+with context.logger = selected
+    const result = nested(rounds)
+    if result is AllocationError -> exit(2)
+    print(result)
+if MODE >= 4 and MODE <= 6 -> print(backend.calls)

@@ -2,6 +2,54 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const Fixture = test_sources.SourceFixture;
 
+test "callable adapter results retain concrete std callbacks and borrow terminal comparators" {
+    try Fixture.expectParity(
+        \\import std.algorithms.{map, filter, any}
+        \\import std.range.{RangeIterator}
+        \\func run() int
+        \\    const offset = 2
+        \\    const mapped = map(RangeIterator, int, int, (1..=3).iter(), (value) => value + offset)
+        \\    var selected = filter(mapped^, (value: int) => value > offset)
+        \\    var total = 0
+        \\    for item in selected -> total += item
+        \\    var values = [3, 1, 2]
+        \\    values.sort((left: int, right: int) => left + offset < right + offset)
+        \\    var source = (1..=3).iter()
+        \\    if not any(source, (value: int) => value == offset) -> return 90
+        \\    return total + values[0] + values[2] + 26
+    , 42);
+    try Fixture.expectParity(
+        \\import std.algorithms.{filter}
+        \\struct Item
+        \\    move = none
+        \\    copy = none
+        \\    value: int
+        \\func run() int
+        \\    var values = [Item{value = 19}, Item{value = 21}]
+        \\    const threshold = 0
+        \\    var selected = filter(values.iter(), (item: Item) => item.value > threshold)
+        \\    for ref item in selected -> item.value += 1
+        \\    return values[0].value + values[1].value
+    , 42);
+    try Fixture.expectParity(
+        \\struct Capture
+        \\    ref copies: int
+        \\    value: int
+        \\    copy = func(imm self: Capture) Capture
+        \\        self.copies += 1
+        \\        return Capture{copies = self.copies, value = self.value}
+        \\func run() int
+        \\    var copies = 0
+        \\    const capture = Capture{copies = copies, value = 1}
+        \\    const before = (left: int, right: int) => left + capture.value < right + capture.value
+        \\    var values = [21, 19]
+        \\    values.sort(before)
+        \\    const result = values.sorted(before)
+        \\    if not (result is List(int)) -> return 90
+        \\    return result[0] + result[1] + copies * 2
+    , 42);
+}
+
 test "pull standard cursors deliver items and End directly" {
     try Fixture.expectParity(
         \\func calculate() int | none
@@ -486,7 +534,7 @@ test "adapter feasibility type factories select owned or borrowed delivery" {
     }
 }
 
-test "adapter feasibility structural type construction and callable inference limits" {
+test "adapter feasibility structural type construction and callable type inference" {
     try Fixture.expectParity(
         \\func Pair(static A: type, static B: type) type -> (A, B)
         \\func run() int
@@ -523,7 +571,7 @@ test "adapter feasibility structural type construction and callable inference li
         \\        _ -> ()
         \\    return 90
     , 42);
-    try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
+    try Fixture.expectParity(declarations ++ "\n" ++
         \\func run() int
         \\    var source = Source{value = 42}
         \\    const result: NextType(Source.next) = source.next()
@@ -533,8 +581,7 @@ test "adapter feasibility structural type construction and callable inference li
         \\            return item
         \\        _ -> ()
         \\    return 90
-        \\_ = run()
-    , .static_argument_cannot_be_inferred);
+    , 42);
 }
 
 test "adapter feasibility logical matching cannot preserve a mixed physical carrier" {
@@ -2260,13 +2307,15 @@ test "std algorithms compose map filter enumerate and zip" {
     try Fixture.expectParity(
         \\import std.algorithms.{map, filter, enumerate, zip, Map, Filter, Enumerate}
         \\import std.range.{RangeIterator}
-        \\func double(value: int) int -> value * 2
-        \\func even(value: int) bool -> value % 4 == 0
+        \\func double_impl(value: int) int -> value * 2
+        \\func even_impl(value: int) bool -> value % 4 == 0
+        \\static double: func(int) int = double_impl
+        \\static even: func(int) bool = even_impl
         \\func run() int
         \\    const mapped = map(RangeIterator, int, int, (1..=6).iter(), double)
-        \\    const selected = filter(Map(RangeIterator, int, int), int, false, mapped^, even)
-        \\    const numbered = enumerate(Filter(Map(RangeIterator, int, int), int, false), int, false, selected^)
-        \\    var paired = zip(Enumerate(Filter(Map(RangeIterator, int, int), int, false), int, false), RangeIterator, (int, int), int, false, false, numbered^, (5..=7).iter())
+        \\    const selected = filter(Map(RangeIterator, int, int, func(imm int) int), int, false, mapped^, even)
+        \\    const numbered = enumerate(Filter(Map(RangeIterator, int, int, func(imm int) int), int, false, func(imm int) bool), int, false, selected^)
+        \\    var paired = zip(Enumerate(Filter(Map(RangeIterator, int, int, func(imm int) int), int, false, func(imm int) bool), int, false), RangeIterator, (int, int), int, false, false, numbered^, (5..=7).iter())
         \\    var total = 0
         \\    for pair in paired -> total += pair.0.0 + pair.0.1 + pair.1
         \\    if not (paired.next() is End) -> return 90
@@ -2315,11 +2364,12 @@ test "std filter and enumerate preserve borrowed immovable elements" {
         \\    move = none
         \\    copy = none
         \\    value: int
-        \\func positive(item: Item) bool -> item.value > 0
+        \\func positive_impl(item: Item) bool -> item.value > 0
+        \\static positive: func(Item) bool = positive_impl
         \\func run() int
         \\    var values = [Item{value = -1}, Item{value = 19}, Item{value = 21}]
         \\    const selected = filter(SpanIterator(Item), Item, true, values.iter(), positive)
-        \\    var numbered = enumerate(Filter(SpanIterator(Item), Item, true), Item, true, selected^)
+        \\    var numbered = enumerate(Filter(SpanIterator(Item), Item, true, func(imm Item) bool), Item, true, selected^)
         \\    for pair in numbered -> pair.1.value += 1
         \\    return values[1].value + values[2].value
     , 42);
@@ -2382,11 +2432,12 @@ test "std owned filtering and find transfer owners and drop rejected items" {
         \\    value: int
         \\    drops: Ref(int)
         \\    drop = func(deinit self: Item) -> self.drops.value += 1
-        \\func accept(item: Item) bool -> item.value % 2 == 0
+        \\func accept_impl(item: Item) bool -> item.value % 2 == 0
+        \\static accept: func(Item) bool = accept_impl
         \\func calculate(ref drops: int) int
         \\    const values: List(Item) = [Item{value = 1, drops = Ref.from(drops)}, Item{value = 20, drops = Ref.from(drops)}, Item{value = 3, drops = Ref.from(drops)}, Item{value = 22, drops = Ref.from(drops)}]
         \\    var selected = filter(ListIterator(Item), Item, false, values.consume_iter(), accept)
-        \\    const first = find(Filter(ListIterator(Item), Item, false), Item, false, selected, accept)
+        \\    const first = find(Filter(ListIterator(Item), Item, false, func(imm Item) bool), Item, false, selected, accept)
         \\    if not (first is Item) -> return 90
         \\    var total = first.value
         \\    for item in selected -> total += item.value
@@ -2522,13 +2573,14 @@ test "std algorithms treat optional producer results as items" {
         \\func number(value: int | none) int
         \\    if value is int -> return value
         \\    return 1
-        \\func accept(value: int | none) bool -> true
+        \\func accept_impl(value: int | none) bool -> true
+        \\static accept: func(int | none) bool = accept_impl
         \\func absent(value: int | none) bool -> value is none
         \\func run() int
         \\    var first = Source{index = 0}
         \\    if not any(Source, int | none, first, absent) -> return 90
         \\    const selected = filter(Source, int | none, false, Source{index = 0}, accept)
-        \\    var mapped = map(Filter(Source, int | none, false), int | none, int, selected^, number)
+        \\    var mapped = map(Filter(Source, int | none, false, func(imm int | none) bool), int | none, int, selected^, number)
         \\    var total = 0
         \\    for value in mapped -> total += value
         \\    return total
@@ -2593,25 +2645,29 @@ test "std adapter chains carrying references analyze their lifetimes in bounded 
     try Fixture.expectParity(
         \\import std.algorithms.{map, filter, enumerate, Map, Filter, Enumerate}
         \\import std.memory.{SpanIterator}
-        \\func triple(value: int) int -> value % 100 + 1
-        \\func sum2(pair: (int, int)) int -> pair.0 + pair.1
-        \\func sumref(pair: (int, ref int)) int -> pair.0 + pair.1
-        \\func odd(value: int) bool -> value % 3 <> 0
+        \\func triple_impl(value: int) int -> value % 100 + 1
+        \\func sum2_impl(pair: (int, int)) int -> pair.0 + pair.1
+        \\func sumref_impl(pair: (int, ref int)) int -> pair.0 + pair.1
+        \\func odd_impl(value: int) bool -> value % 3 <> 0
+        \\static triple: func(int) int = triple_impl
+        \\static sum2: func((int, int)) int = sum2_impl
+        \\static sumref: func((int, ref int)) int = sumref_impl
+        \\static odd: func(int) bool = odd_impl
         \\func run() int
         \\    var values: Array(int, 16) = [3, 8, 1, 9, 4, 7, 2, 6, 5, 11, 13, 17, 19, 23, 29, 31]
         \\    const e0 = enumerate(SpanIterator(int), int, true, values.iter())
         \\    const t0 = map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, e0^, sumref)
-        \\    const s1 = filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false, t0^, odd)
-        \\    const e2 = enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false, s1^)
-        \\    const t2 = map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int, e2^, sum2)
-        \\    const s3 = map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int, t2^, triple)
-        \\    const s4 = filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false, s3^, odd)
-        \\    const e5 = enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false, s4^)
-        \\    const t5 = map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int, e5^, sum2)
-        \\    const s6 = map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int), int, int, t5^, triple)
-        \\    const s7 = filter(Map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int), int, int), int, false, s6^, odd)
-        \\    const e8 = enumerate(Filter(Map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int), int, int), int, false), int, false, s7^)
-        \\    const t8 = map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int), int, int), int, false), int, false), (int, int), int, e8^, sum2)
+        \\    const s1 = filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, t0^, odd)
+        \\    const e2 = enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false, s1^)
+        \\    const t2 = map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false), (int, int), int, e2^, sum2)
+        \\    const s3 = map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, t2^, triple)
+        \\    const s4 = filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, s3^, odd)
+        \\    const e5 = enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, func(imm int) bool), int, false, s4^)
+        \\    const t5 = map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, func(imm int) bool), int, false), (int, int), int, e5^, sum2)
+        \\    const s6 = map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, t5^, triple)
+        \\    const s7 = filter(Map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, s6^, odd)
+        \\    const e8 = enumerate(Filter(Map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, func(imm int) bool), int, false, s7^)
+        \\    const t8 = map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Map(Enumerate(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, func(imm int) bool), int, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, func(imm int) bool), int, false), (int, int), int, e8^, sum2)
         \\    var total = 0
         \\    for value in t8^ -> total += value
         \\    return total % 251
@@ -2625,20 +2681,22 @@ test "nested filters over a reference-carrying cursor analyze their lifetimes in
         \\import std.algorithms.{map, filter, enumerate, Map, Filter, Enumerate}
         \\import std.memory.{SpanIterator}
         \\func triple(value: int) int -> value % 100 + 1
-        \\func sumref(pair: (int, ref int)) int -> pair.0 + pair.1
-        \\func odd(value: int) bool -> value % 3 <> 0
+        \\func sumref_impl(pair: (int, ref int)) int -> pair.0 + pair.1
+        \\func odd_impl(value: int) bool -> value % 3 <> 0
+        \\static sumref: func((int, ref int)) int = sumref_impl
+        \\static odd: func(int) bool = odd_impl
         \\func run() int
         \\    var values: Array(int, 16) = [3, 8, 1, 9, 4, 7, 2, 6, 5, 11, 13, 17, 19, 23, 29, 31]
         \\    const e0 = enumerate(SpanIterator(int), int, true, values.iter())
         \\    const t0 = map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, e0^, sumref)
-        \\    const f1 = filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false, t0^, odd)
-        \\    const f2 = filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false, f1^, odd)
-        \\    const f3 = filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false, f2^, odd)
-        \\    const f4 = filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false), int, false, f3^, odd)
-        \\    const f5 = filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false), int, false), int, false, f4^, odd)
-        \\    const f6 = filter(Filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false), int, false), int, false), int, false, f5^, odd)
-        \\    const f7 = filter(Filter(Filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false), int, false), int, false), int, false), int, false, f6^, odd)
-        \\    const f8 = filter(Filter(Filter(Filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int), int, false), int, false), int, false), int, false), int, false), int, false), int, false), int, false, f7^, odd)
+        \\    const f1 = filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, t0^, odd)
+        \\    const f2 = filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false, f1^, odd)
+        \\    const f3 = filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, f2^, odd)
+        \\    const f4 = filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, f3^, odd)
+        \\    const f5 = filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, f4^, odd)
+        \\    const f6 = filter(Filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, f5^, odd)
+        \\    const f7 = filter(Filter(Filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, f6^, odd)
+        \\    const f8 = filter(Filter(Filter(Filter(Filter(Filter(Filter(Filter(Map(Enumerate(SpanIterator(int), int, true), (int, ref int), int, func(imm (int, ref int)) int), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, func(imm int) bool), int, false, f7^, odd)
         \\    var total = 0
         \\    for v in f8^ -> total += v
         \\    return total % 251

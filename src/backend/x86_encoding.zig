@@ -22,6 +22,8 @@ pub const Encoding = struct {
 };
 
 const instructions = .{
+    .and_eax_ecx = Encoding{ .prefix = &.{ 0x21, 0xc8 }, .asm_prefix = "and eax, ecx" },
+    .sub_ecx = Encoding{ .prefix = &.{ 0x81, 0xE9 }, .operand = .i32, .compact = .{ .immediate = &.{ 0x83, 0xE9 } }, .asm_prefix = "sub ecx, " },
     .add_eax_ecx = Encoding{ .prefix = &.{ 0x01, 0xc8 }, .asm_prefix = "add eax, ecx" },
     .sub_eax_ecx = Encoding{ .prefix = &.{ 0x29, 0xc8 }, .asm_prefix = "sub eax, ecx" },
     .imul_eax_ecx = Encoding{ .prefix = &.{ 0x0f, 0xaf, 0xc1 }, .asm_prefix = "imul eax, ecx" },

@@ -10,4 +10,12 @@ func print_color(c: Color)
     .Blue -> print("Blue")
     .Green -> print("Green")
 
-print_color(.Red)
+func foo (x: func(Color) unit, y: Color) -> x(y)
+
+const clos = (x: Color) => print_color(x)
+
+foo(clos, .Blue)
+
+const col = Color.Red
+const cl = () => print_color(col)
+cl()

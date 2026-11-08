@@ -347,6 +347,7 @@ fn parseExpression(parser: *ParserState) ParseError!Node.Index {
         .keyword_overload => try parseOverload(parser),
         .keyword_return, .keyword_break => try parseReturnOrBreak(parser),
         .keyword_panic => try parsePanic(parser),
+        .keyword_with => try parseWith(parser),
         .keyword_continue => try parseTokenNode(parser, .keyword_continue, .continue_expr),
         else => |tag| {
             if (std.mem.indexOfScalar(Token.Tag, &statement_expression_starts, tag) == null) return .null;
@@ -362,6 +363,14 @@ const statement_expression_starts = [_]Token.Tag{
     .keyword_loop,   .keyword_for,    .keyword_sizeof, .keyword_struct, .identifier,   .l_paren,    .l_bracket,
     .ellipsis2,      .keyword_not,    .minus,          .caret,          .tilde,        .period,
 };
+
+fn parseWith(parser: *ParserState) !Node.Index {
+    const token_index = parser.index;
+    _ = try parser.expect(.keyword_with);
+    const header = try parseRequiredExpression(parser);
+    const body = try parseBody(parser, token_index);
+    return parser.addNode(.{ .tag = .with_scope, .token_index = token_index, .data = .{ .node_node = .{ .a = header, .b = body } } });
+}
 
 fn parsePanic(parser: *ParserState) !Node.Index {
     const token_index = parser.index;
@@ -918,10 +927,13 @@ fn parseExpressionPrecedence(parser: *ParserState, min_precedence: u8) ParseErro
 fn parseCatch(parser: *ParserState, operand: Node.Index) ParseError!Node.Index {
     const token_index = parser.index;
     _ = try parser.expect(.keyword_catch);
-    const name_index = parser.index;
-    _ = try parser.expect(.identifier);
-    const annotation = try parseTypeAnnotation(parser);
-    const binding = try parser.addNode(.{ .tag = .param, .token_index = name_index, .data = .{ .parameter = .{ .annotation = annotation } } });
+    var binding: Node.Index = .null;
+    if (parser.current().tag != .arrow) {
+        const name_index = parser.index;
+        _ = try parser.expect(.identifier);
+        const annotation = try parseTypeAnnotation(parser);
+        binding = try parser.addNode(.{ .tag = .param, .token_index = name_index, .data = .{ .parameter = .{ .annotation = annotation } } });
+    }
     _ = try parser.expect(.arrow);
     const body = try parseMatchArmBody(parser, token_index);
     return parser.addNode(.{ .tag = .catch_expr, .token_index = token_index, .data = try parser.listToSpan(&.{ operand, binding, body }) });
@@ -1038,9 +1050,38 @@ fn parsePrimary(parser: *ParserState) ParseError!Node.Index {
         .keyword_static => try parseStruct(parser),
         .identifier => try parseTokenNode(parser, .identifier, .identifier),
         .l_bracket => try parseCollectionLiteral(parser),
-        .l_paren => try parseParenthesizedItems(parser, .tuple_literal, parseExpressionPrecedence, .{@as(u8, 0)}),
+        .l_paren => if (parser.tokens[matchingParen(parser)].tag == .equal_angle_bracket_right)
+            try parseClosure(parser)
+        else
+            try parseParenthesizedItems(parser, .tuple_literal, parseExpressionPrecedence, .{@as(u8, 0)}),
         else => return parser.fail(.{ .invalid_expression = parser.current().tag }),
     };
+}
+
+fn matchingParen(parser: *ParserState) u32 {
+    var depth: usize = 0;
+    var index = parser.index;
+    while (index < parser.tokens.len) : (index += 1) {
+        switch (parser.tokens[index].tag) {
+            .l_paren => depth += 1,
+            .r_paren => {
+                depth -= 1;
+                if (depth == 0) return index + 1;
+            },
+            .eof => return index,
+            else => {},
+        }
+    }
+    return @intCast(parser.tokens.len - 1);
+}
+
+fn parseClosure(parser: *ParserState) ParseError!Node.Index {
+    const token_index = parser.index;
+    const parameters = try parseParenthesizedList(parser, .param_list, parseParameter, .{false});
+    _ = try parser.expect(.equal_angle_bracket_right);
+    var body = try parseExpressionPrecedence(parser, 0);
+    if (assignmentTag(parser.current().tag)) |assignment| body = try parseAssign(parser, body, assignment);
+    return parser.addNode(.{ .tag = .closure, .token_index = token_index, .data = .{ .node_node = .{ .a = parameters, .b = body } } });
 }
 
 fn parseCollectionLiteral(parser: *ParserState) ParseError!Node.Index {
@@ -2045,6 +2086,27 @@ test "parse catch annotations and postfix propagation" {
     }
     try std.testing.expectEqual(@as(usize, 3), propagation_count);
     try std.testing.expectEqual(@as(usize, 1), handler_count);
+}
+
+test "parse catch without a capture with inline and indented bodies" {
+    var report = try parseReport(std.testing.allocator, 0,
+        \\const first = attempt() catch -> panic
+        \\const second = attempt() catch ->
+        \\    42
+    );
+    defer report.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), report.diagnostics.len);
+    const ast = report.ast.?;
+    var handler_count: usize = 0;
+    for (ast.nodes) |node| {
+        if (node.tag != .catch_expr) continue;
+        handler_count += 1;
+        const parts = ast.node_refs[node.data.ref.start..node.data.ref.end];
+        try std.testing.expectEqual(@as(usize, 3), parts.len);
+        try std.testing.expectEqual(Node.Index.null, parts[1]);
+        try std.testing.expect(parts[2] != .null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), handler_count);
 }
 
 test "parse struct properties" {

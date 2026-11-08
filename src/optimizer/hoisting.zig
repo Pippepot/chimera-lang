@@ -107,7 +107,7 @@ const Motion = struct {
         if (!self.writes.preserves(self.memory, resource)) return false;
         return executes or switch (resource) {
             .slot, .field, .parameter, .parameter_object, .immutable => true,
-            .heap, .unknown => false,
+            .heap, .unknown, .contextual => false,
         };
     }
 

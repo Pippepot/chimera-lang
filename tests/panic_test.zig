@@ -50,6 +50,15 @@ test "bare panic and message panic report their source location" {
     try SourceFixture.expectSourceDiagnostic("panic 42", .call_argument_type_mismatch);
 }
 
+test "catch without a capture can panic on error" {
+    try expectPanic(
+        \\struct Failure
+        \\    error = true
+        \\func attempt() int | Failure -> Failure{}
+        \\attempt() catch -> panic
+    , "", &.{"<entry> (main.chi:4:20)"});
+}
+
 test "checked marking retains negative upper-bound and wrapping index panics" {
     for ([_]i32{ -1, 16, std.math.maxInt(i32) }) |first| {
         const source = try std.fmt.allocPrint(std.testing.allocator,
@@ -259,7 +268,7 @@ test "function names render static values types callables and aggregates" {
         .{ .source = "static selected: int | none = 7\nfunc show(static value: int | none) never -> panic\nshow(selected)", .name = "show(7 as int)" },
         .{ .source = "func show(static T: type) never -> panic\nshow(int | none)", .name = "show(int | none)" },
         .{ .source = "struct Item(T: type)\n  value: T\nfunc show(static T: type) never -> panic\nshow(Item(int))", .name = "show(Item(int))" },
-        .{ .source = "struct Item(T: type)\n  pub func callback(value: T) T -> unknown\nstruct Callback\n  copy = trivial\n  operation: func(int) int\nfunc show(static value: Callback) never -> panic\nshow(Callback{operation = Item(int).callback})", .name = "show(Callback{operation = Item(int).callback})" },
+        .{ .source = "struct Item(T: type)\n  pub func callback(value: T) T -> unknown\nstruct Callback\n  copy = fieldwise\n  operation: func(int) int\nfunc show(static value: Callback) never -> panic\nshow(Callback{operation = Item(int).callback})", .name = "show(Callback{operation = Item(int).callback})" },
         .{ .source = "struct Item\n  copy = trivial\n  value: int\nfunc show(static value: Item) never -> panic\nshow(Item{value = 7})", .name = "show(Item{value = 7})" },
         .{ .source = "func show(static value: Array(int, 2)) never -> panic\nshow([1, 2])", .name = "show([1, 2])" },
         .{ .source = "func show(static value: (int, bool)) never -> panic\nshow((7, true))", .name = "show((7, true))" },

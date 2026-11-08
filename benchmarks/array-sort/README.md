@@ -34,8 +34,9 @@ sorts it eight times by default. Size, round count, distribution, and seed match
 between languages. The round count, distribution, and seed arrive on stdin.
 Distributions are a deterministic 16-bit pseudorandom sequence, ascending values,
 descending values, 16 distinct keys, and ascending runs of 256 elements arranged
-in reverse order. Each round regenerates the unsorted input. Random rounds use
-successive seeds; the 16-bit generator repeats after 65,536 values.
+in reverse order. Two nearly sorted cases swap the middle adjacent pair, or move
+the smallest element to the end. Each round regenerates the unsorted input.
+Random rounds use successive seeds; the 16-bit generator repeats after 65,536 values.
 
 Every round checks ascending order and folds every output value into an
 order-sensitive checksum. Python independently sorts the input and verifies the

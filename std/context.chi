@@ -1,0 +1,5 @@
+import std.memory.{root_allocator}
+import std.logging.{root_logger}
+
+pub static allocator = root_allocator()
+pub static logger = root_logger()

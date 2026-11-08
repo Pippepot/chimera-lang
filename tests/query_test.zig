@@ -14,6 +14,312 @@ const testing = std.testing;
 const allocation_failure_allocator = test_sources.allocation_failure_allocator;
 const DiagnosticKind = std.meta.Tag(structures.Diagnostic.Kind);
 
+test "owning callable descriptors retain separate ownership entries across capture edits" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    const source =
+        \\func make(value: int) func(int) int -> (amount) => amount + value
+        \\const callback = make(20)
+        \\const copied = callback
+        \\exit(copied(22))
+    ;
+    try addSource(db, 1, source);
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const make: structures.InstanceId = .{ .item = scope.resolve("make").? };
+    const body = (try db.get(queries.AnalyzeFunctionInstance, make)).*.?;
+    const signature = (try db.get(queries.FunctionInstanceSignature, make)).*.?;
+    try testing.expectEqual(@as(u32, 16), (try db.get(queries.HostTypeLayout, signature.return_type)).byte_size);
+    var descriptor: ?structures.InstanceId = null;
+    for (body.instructions) |instruction| if (instruction == .erased_callable) {
+        try testing.expect(instruction.erased_callable.owns_environment);
+        descriptor = instruction.erased_callable.invocation;
+    };
+    const adapter = (try db.get(queries.CompileFunction, descriptor.?)).*.?;
+    try testing.expectEqual(@as(u32, 24), adapter.entry_offset);
+    const analysis: queries.AnalysisContext(*Database) = .{ .ctx = db };
+    const copy = try analysis.callableAdapter(descriptor.?, .{ .copy = signature.return_type });
+    const drop = try analysis.callableAdapter(descriptor.?, .{ .drop = signature.return_type });
+    try testing.expectEqual(@as(u32, 0), (try db.get(queries.CompileFunction, copy)).*.?.entry_offset);
+    try testing.expectEqual(@as(u32, 0), (try db.get(queries.CompileFunction, drop)).*.?.entry_offset);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+    const changed = try std.mem.replaceOwned(u8, testing.allocator, source, "amount + value", "amount + value + 1");
+    defer testing.allocator.free(changed);
+    try setSource(db, 1, changed);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 43);
+    const incompatible = try std.mem.replaceOwned(u8, testing.allocator, source, "amount + value", "amount > value");
+    defer testing.allocator.free(incompatible);
+    try setSource(db, 1, incompatible);
+    try testing.expect((try db.get(queries.BuildExecutable, 1)).* == null);
+    try setSource(db, 1, source);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+}
+
+test "bound methods and erased callable descriptors preserve layouts effects and incremental identity" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    const source =
+        \\struct Tracker
+        \\    value: int
+        \\    func update(mut self: Tracker) -> self.value += 41
+        \\func factory(mut tracker: Tracker) func() unit -> tracker.update
+        \\func invoke(callback: func() unit) -> callback()
+        \\func run() int
+        \\    var tracker = Tracker{value = 1}
+        \\    const concrete = tracker.update
+        \\    const callback = factory(tracker)
+        \\    invoke(callback)
+        \\    return tracker.value
+        \\exit(run())
+    ;
+    try addSource(db, 1, source);
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const factory: structures.InstanceId = .{ .item = scope.resolve("factory").? };
+    const facts: queries.TypeFacts(*Database) = .{ .ctx = db };
+    const signature = (try db.get(queries.FunctionInstanceSignature, factory)).*.?;
+    try testing.expect(try facts.callable(signature.return_type) != null);
+    try testing.expectEqual(@as(u32, 16), (try db.get(queries.HostTypeLayout, signature.return_type)).byte_size);
+    const body = (try db.get(queries.AnalyzeFunctionInstance, factory)).*.?;
+    var descriptor: ?structures.InstanceId = null;
+    for (body.instructions) |instruction| {
+        if (instruction == .erased_callable) {
+            descriptor = instruction.erased_callable.invocation;
+            try testing.expect(instruction.erased_callable.payload != null);
+            try testing.expect((try facts.itemLocation(descriptor.?.item)).adapter.? == .bound_method);
+        }
+        if (try facts.boundMethod(instruction.resultType()) != null)
+            try testing.expectEqual(@as(u32, 8), (try db.get(queries.HostTypeLayout, instruction.resultType())).byte_size);
+    }
+    const artifact = try db.get(queries.CompileFunction, factory);
+    const adapter = (try db.get(queries.CompileFunction, descriptor.?)).*.?;
+    try testing.expectEqual(@as(u32, 24), adapter.entry_offset);
+    const reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
+    var found_opaque_effect = false;
+    for (reachable.instances) |instance| {
+        if (instance.item != scope.resolve("invoke").?) continue;
+        const contract = (try db.get(queries.InferReferenceContract, instance)).*.?;
+        for (contract.requirements) |requirement| {
+            if (requirement.opaque_write) found_opaque_effect = true;
+        }
+    }
+    try testing.expect(found_opaque_effect);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+    const runtime_edit = try std.mem.replaceOwned(u8, testing.allocator, source, "value = 1", "value = 2");
+    defer testing.allocator.free(runtime_edit);
+    try setSource(db, 1, runtime_edit);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 43);
+    try testing.expectEqual(artifact, try db.get(queries.CompileFunction, factory));
+    const body_edit = try std.mem.replaceOwned(u8, testing.allocator, source, "self.value += 41", "self.value += 42");
+    defer testing.allocator.free(body_edit);
+    try setSource(db, 1, body_edit);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 43);
+    const signature_edit = try std.mem.replaceOwned(u8, testing.allocator, source, "func update(mut self: Tracker) -> self.value += 41", "func update(mut self: Tracker) int -> self.value");
+    defer testing.allocator.free(signature_edit);
+    try setSource(db, 1, signature_edit);
+    try testing.expect((try db.get(queries.BuildExecutable, 1)).* == null);
+    try setSource(db, 1, source);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+}
+
+test "callable adapter results separate candidate discovery and invalidate inferred layouts" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    const source =
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func make(init callback: func() int) Adapter(func() int)
+        \\    return Adapter{callback = callback}
+        \\func compute(offset: int) int
+        \\    const adapter = make(() => match offset
+        \\        number and number is int -> number + 1
+        \\        _ -> 1)
+        \\    return adapter.callback()
+        \\exit(compute(20) + compute(20))
+    ;
+    try addSource(db, 1, source);
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const make = scope.resolve("make").?;
+    const candidate = (try db.get(queries.FunctionCandidateSignature, .{ .item = make })).*.?;
+    const facts: queries.TypeFacts(*Database) = .{ .ctx = db };
+    const candidate_fields = (try facts.structDefinition(candidate.return_type)).?.fields;
+    try testing.expect(try facts.callable(candidate_fields[0].type_id) != null);
+    const reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
+    const instances = try reachableInstancesForItem(reachable.instances, make);
+    defer testing.allocator.free(instances);
+    try testing.expectEqual(@as(usize, 1), instances.len);
+    const concrete = (try db.get(queries.ResolveCallableResultType, instances[0])).*.?;
+    try testing.expect(concrete != candidate.return_type);
+    try testing.expectEqual(concrete, (try db.get(queries.FunctionInstanceSignature, instances[0])).*.?.return_type);
+    try testing.expectEqual(@as(u32, 4), (try db.get(queries.HostTypeLayout, concrete)).byte_size);
+    const artifact = try db.get(queries.CompileFunction, instances[0]);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+    const runtime_edit = try std.mem.replaceOwned(u8, testing.allocator, source, "compute(20) + compute(20)", "compute(20) + compute(21)");
+    defer testing.allocator.free(runtime_edit);
+    try setSource(db, 1, runtime_edit);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 43);
+    try testing.expectEqual(artifact, try db.get(queries.CompileFunction, instances[0]));
+    const type_edit = try std.mem.replaceOwned(u8, testing.allocator, source, "offset: int", "offset: int | none");
+    defer testing.allocator.free(type_edit);
+    try setSource(db, 1, type_edit);
+    const changed_reachable = (try db.get(queries.CollectReachableInstances, 1)).* orelse {
+        try (test_sources.SourceFixture{ .db = db }).printDiagnostics(1);
+        return error.TestUnexpectedResult;
+    };
+    const changed_instances = try reachableInstancesForItem(changed_reachable.instances, make);
+    defer testing.allocator.free(changed_instances);
+    try testing.expectEqual(@as(usize, 1), changed_instances.len);
+    const changed = (try db.get(queries.ResolveCallableResultType, changed_instances[0])).*.?;
+    try testing.expect(changed != concrete);
+    try testing.expectEqual(@as(u32, 8), (try db.get(queries.HostTypeLayout, changed)).byte_size);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+    try setSource(db, 1, source);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+}
+
+test "callable adapter results leave unselected bodies unanalyzed" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func invalid(value: bool) Adapter(func() int) -> missing
+        \\func valid(value: int) int -> value
+        \\overload choose(invalid, valid)
+        \\exit(choose(42))
+    );
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const invalid: structures.InstanceId = .{ .item = scope.resolve("invalid").? };
+    try testing.expect((try db.get(queries.FunctionCandidateSignature, invalid)).* != null);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+    try testing.expect((try db.get(queries.ResolveCallableResultType, invalid)).* == null);
+    try setSource(db, 1,
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func invalid(value: bool) Adapter(func() int) -> Adapter{callback = () => 42}
+        \\func valid(value: int) int -> value
+        \\overload choose(invalid, valid)
+        \\exit(choose(42))
+    );
+    try testing.expect((try db.get(queries.ResolveCallableResultType, invalid)).* != null);
+}
+
+const ClosureTypeIdentity = struct {
+    pub const Input = structures.TypeId;
+    pub const Output = bool;
+
+    pub fn run(ctx: *Context, closure_type: Input) anyerror!Output {
+        const analysis: queries.AnalysisContext(*Context) = .{ .ctx = ctx, .file_id = 1 };
+        const invocation = (try analysis.concreteClosureInvocation(closure_type)).?;
+        const environment = (try ctx.lookupInterned(queries.CompileTimeBindings, invocation.environment.?)).*;
+        var formation = invocation;
+        formation.environment = try ctx.intern(queries.CompileTimeBindings, .{ .bindings = environment.bindings });
+        const captures = environment.closure.?.captures;
+        const callable = (try analysis.callableSignature(closure_type)).?;
+        const requirement = try analysis.facts().internCallable(callable);
+        const inferred = try analysis.concreteClosureType(formation, captures, null);
+        const contextual = try analysis.concreteClosureType(formation, captures, requirement);
+        const concrete_context = try analysis.concreteClosureType(formation, captures, closure_type);
+        var different_capture = captures[0];
+        different_capture.type_id = .bool;
+        const different_type = try analysis.concreteClosureType(formation, &.{different_capture}, null);
+        const different_matches = try analysis.probeConcreteClosureType(formation, &.{different_capture}, closure_type);
+        return inferred == closure_type and contextual == closure_type and concrete_context == closure_type and
+            different_type != closure_type and different_matches == null;
+    }
+};
+
+test "callable dispatch signatures defer constraints until specialization is selected" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    try addSource(db, 1,
+        \\func apply(callback: func() int) int where false -> callback()
+        \\exit(apply(() => 42))
+    );
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const instance: structures.InstanceId = .{ .item = scope.resolve("apply").? };
+    try testing.expect((try db.get(queries.FunctionCallSignature, instance)).*.?.requires_callable_specialization);
+    const header_diagnostics = try db.transitiveAccumulatorValues(queries.FunctionCallSignature, instance, structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(header_diagnostics);
+    try testing.expectEqual(@as(usize, 0), header_diagnostics.len);
+    try testing.expect((try db.get(queries.BuildExecutable, 1)).* == null);
+    const diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, @as(structures.FileId, 1), structures.Diagnostic, testing.allocator);
+    defer freeDiagnostics(diagnostics);
+    var constraint_failed = false;
+    for (diagnostics) |diagnostic| if (diagnostic.kind == .where_condition_failed) {
+        constraint_failed = true;
+    };
+    try testing.expect(constraint_failed);
+    try setSource(db, 1,
+        \\func apply(value: int) int where false -> value
+        \\exit(apply(42))
+    );
+    try testing.expect((try db.get(queries.FunctionCallSignature, instance)).* == null);
+}
+
+test "callable dispatch signatures invalidate when parameter requirements change" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    const callable_source =
+        \\func apply(callback: func() int) int -> callback()
+        \\exit(apply(() => 42))
+    ;
+    try addSource(db, 1, callable_source);
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const instance: structures.InstanceId = .{ .item = scope.resolve("apply").? };
+    try testing.expect((try db.get(queries.FunctionCallSignature, instance)).*.?.requires_callable_specialization);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+    try setSource(db, 1,
+        \\func apply(value: int) int -> value
+        \\exit(apply(43))
+    );
+    const fixed = (try db.get(queries.FunctionCallSignature, instance)).*.?;
+    try testing.expect(!fixed.requires_callable_specialization);
+    try testing.expectEqual(structures.TypeId.int, fixed.signature.parameters[0].type_id);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 43);
+    try setSource(db, 1, callable_source);
+    try testing.expect((try db.get(queries.FunctionCallSignature, instance)).*.?.requires_callable_specialization);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+}
+
+test "concrete closures reuse type specializations across runtime captures and recompute body edits" {
+    const db = try testDatabase(2);
+    defer db.deinit();
+    const source =
+        \\func apply(callback: func() int) int -> callback()
+        \\func compute(offset: int) int
+        \\    const callback = () => offset
+        \\    return apply(callback)
+        \\exit(compute(20) + compute(22))
+    ;
+    try addSource(db, 1, source);
+    const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+    const apply = scope.resolve("apply").?;
+    const reachable = (try db.get(queries.CollectReachableInstances, 1)).*.?;
+    const instances = try reachableInstancesForItem(reachable.instances, apply);
+    defer testing.allocator.free(instances);
+    try testing.expectEqual(@as(usize, 1), instances.len);
+    try testing.expect(instances[0].specialization == null);
+    const environment = (try db.lookupInterned(queries.CompileTimeBindings, instances[0].environment.?)).*;
+    const closure_type = environment.callable_parameters[0].?;
+    try testing.expect((try db.get(ClosureTypeIdentity, closure_type)).*);
+    const layout = (try db.get(queries.HostTypeLayout, closure_type)).*;
+    try testing.expectEqual(@as(u32, 4), layout.byte_size);
+    const signature = (try db.get(queries.FunctionInstanceSignature, instances[0])).*.?;
+    try testing.expectEqual(closure_type, signature.parameters[0].type_id);
+    const artifact = try db.get(queries.CompileFunction, instances[0]);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+    const runtime_edit = try std.mem.replaceOwned(u8, testing.allocator, source, "compute(22)", "compute(23)");
+    defer testing.allocator.free(runtime_edit);
+    try setSource(db, 1, runtime_edit);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 43);
+    try testing.expectEqual(artifact, try db.get(queries.CompileFunction, instances[0]));
+    const body_edit = try std.mem.replaceOwned(u8, testing.allocator, source, "=> offset", "=> offset + 1");
+    defer testing.allocator.free(body_edit);
+    try setSource(db, 1, body_edit);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 44);
+    try setSource(db, 1, source);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+}
+
 fn flowSnapshotLoopSource(allocator: std.mem.Allocator, owning: bool, threshold: u32) ![]u8 {
     var source: std.ArrayList(u8) = .empty;
     errdefer source.deinit(allocator);
@@ -131,11 +437,35 @@ fn testDatabaseWithPrelude(worker_count: usize, enable_prelude: bool) !*Database
         try db.addInput(queries.StandardFile, @backingInt(source.file), file_id);
         if (source.file == .prelude and enable_prelude) try db.addInput(queries.StandardPreludeModule, {}, module);
     }
-    try db.addInput(queries.ModuleCatalog, {}, &.{
+    var catalog: std.ArrayList(structures.ModuleId) = .empty;
+    defer catalog.deinit(testing.allocator);
+    try catalog.appendSlice(testing.allocator, &.{
         try db.intern(queries.ModulePaths, .{ .path = "std.exit" }),
         try db.intern(queries.ModulePaths, .{ .path = "std.prelude" }),
         try db.intern(queries.ModulePaths, .{ .path = "std.primitives" }),
     });
+    for (test_sources.modules.standard_sources, 0..) |source, index| {
+        const standard_file: standard_library.File = @fromBackingInt(@intCast(index));
+        if (standard_file == .exit or standard_file == .prelude or standard_file == .primitives) continue;
+        const file_id: structures.FileId = 100_003 + index;
+        const module = try db.intern(queries.ModulePaths, .{ .path = source.module_path });
+        try db.addInput(queries.FileModule, file_id, module);
+        try db.addInput(queries.SourceText, file_id, source.source);
+        try db.addInput(queries.SourcePath, file_id, source.display_path);
+        try db.addInput(queries.StandardFile, @backingInt(standard_file), file_id);
+        if (std.mem.indexOfScalar(structures.ModuleId, catalog.items, module) == null) {
+            try catalog.append(testing.allocator, module);
+            try db.addInput(queries.ModuleMembers, module, &.{file_id});
+        } else {
+            const previous = (try db.input(queries.ModuleMembers, module)).*;
+            const members = try testing.allocator.alloc(structures.FileId, previous.len + 1);
+            defer testing.allocator.free(members);
+            @memcpy(members[0..previous.len], previous);
+            members[previous.len] = file_id;
+            try db.setInput(queries.ModuleMembers, module, members);
+        }
+    }
+    try db.addInput(queries.ModuleCatalog, {}, catalog.items);
     return db;
 }
 
@@ -2292,7 +2622,7 @@ test "struct layouts preserve declaration order alignment and nesting" {
     try testing.expectEqualSlices(u32, &.{ 0, 4 }, pair.field_offsets);
 
     const outer = (try db.get(queries.StructLayout, outer_type)).*.?;
-    try testing.expectEqual(structures.TypeLayout{ .byte_size = 24, .byte_alignment = 8 }, outer.layout);
+    try testing.expectEqual(structures.TypeLayout{ .byte_size = 32, .byte_alignment = 8 }, outer.layout);
     try testing.expectEqualSlices(u32, &.{ 0, 4, 16 }, outer.field_offsets);
     try testing.expectEqual(outer.layout, (try db.get(queries.HostTypeLayout, outer_type)).*);
 }
@@ -2518,7 +2848,7 @@ test "callable signatures do not recursively contain structs by value" {
     const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
     const node_type = try resolvedStaticType(db, scope.resolveStatic("Node").?);
     const layout = (try db.get(queries.StructLayout, node_type)).*.?;
-    try testing.expectEqual(structures.TypeLayout{ .byte_size = 8, .byte_alignment = 8 }, layout.layout);
+    try testing.expectEqual(structures.TypeLayout{ .byte_size = 16, .byte_alignment = 8 }, layout.layout);
     try testing.expectEqualSlices(u32, &.{0}, layout.field_offsets);
 }
 
@@ -2545,7 +2875,13 @@ test "ownership capabilities compose across callable variant and struct types" {
 
     const trivial = structures.OwnershipCapabilities{ .move = .trivial, .copy = .trivial, .drop = .trivial };
     try testing.expectEqual(trivial, (try db.get(queries.OwnershipCapabilities, .int)).*.?);
-    try testing.expectEqual(trivial, (try db.get(queries.OwnershipCapabilities, callback_type)).*.?);
+    try testing.expectEqual(structures.OwnershipCapabilities{
+        .move = .trivial,
+        .copy = .custom,
+        .drop = .custom,
+        .needs_custom_copy = true,
+        .needs_automatic_drop = true,
+    }, (try db.get(queries.OwnershipCapabilities, callback_type)).*.?);
     try testing.expectEqual(
         structures.OwnershipCapabilities{ .move = .fieldwise, .copy = .fieldwise, .drop = .trivial },
         (try db.get(queries.OwnershipCapabilities, maybe_int_type)).*.?,
@@ -9476,7 +9812,7 @@ test "reference contracts reuse acyclic bodies and recover after recursive edits
     }
 }
 
-test "numeric indirect typing does not demand a factory body for reference recovery" {
+test "numeric indirect typing demands factory receiver effect contracts" {
     const db = try Database.init(testing.allocator, .{ .worker_count = 0 });
     defer db.deinit();
     try test_sources.modules.registerSources(db, testing.allocator,
@@ -9488,10 +9824,10 @@ test "numeric indirect typing does not demand a factory body for reference recov
     , &.{}, &.{});
     const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
     const instance: structures.InstanceId = .{ .item = scope.resolve("run").? };
-    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, instance)).* != null);
+    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, instance)).* == null);
     const diagnostics = try db.transitiveAccumulatorValues(queries.AnalyzeFunctionInstance, instance, structures.Diagnostic, testing.allocator);
     defer freeDiagnostics(diagnostics);
-    try testing.expectEqual(@as(usize, 0), diagnostics.len);
+    try testing.expect(diagnostics.len > 0);
     try testing.expect((try db.get(queries.BuildExecutable, 0)).* == null);
     try db.setInput(queries.SourceText, 0,
         \\func identity(value: int) int -> value

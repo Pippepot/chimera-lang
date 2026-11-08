@@ -48,6 +48,31 @@ In the optimized run, static random input takes 2.20x C++ `std::stable_sort` tim
 and static runs take 1.18x. The runtime runs lane takes 0.94x C++'s matching runtime
 `std::stable_sort` time. The full six-lane samples and ranges are in the raw records.
 
+## Nearly sorted inputs
+
+A [runtime-history worktree run](nearly-sorted-runtime.json), with refreshed C/C++
+references, compares two additional inputs with fully sorted data. These use
+65,536 integers and eight sorts per process, with seven rotated samples pinned
+to CPU 4. All medians below are milliseconds per process; every correctness probe
+and measured output passed. The raw record includes the parent commit, source
+hashes, all runtime-history results, and their C/C++ references.
+
+| Input | Chimera static | Chimera runtime | C++ sort | C++ stable_sort | C++ sort runtime | C++ stable_sort runtime |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| sorted | 4.653 | 5.539 | 7.219 | 12.079 | 16.992 | 15.890 |
+| adjacent swap | 9.106 | 10.654 | 7.304 | 12.387 | 17.378 | 16.078 |
+| minimum last | 10.571 | 12.227 | 28.541 | 12.003 | 48.998 | 15.913 |
+
+The adjacent-swap input exchanges the middle pair of an otherwise ascending
+array. It nearly doubles Chimera's time despite requiring only two elements to
+move, exposing the cost of leaving the allocation-free ordered fast path.
+The minimum-last input is `1, 2, ..., N - 1, 0`: one displaced minimum requires
+the whole array to shift. Chimera takes a little longer than for the adjacent
+swap, while C++ `std::sort` takes almost four times its fully sorted time.
+C++ `std::stable_sort` changes little across these inputs. Both cases are retained
+because they distinguish local disorder, long-distance displacement, and the
+algorithms' different responses.
+
 ## Implementation
 
 - Quicksort partitions equal keys only when an ancestor bound or an empty less-than

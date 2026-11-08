@@ -1,0 +1,32 @@
+# Raw tokens preserve the checked cursor's backing dependency until retirement.
+pub struct AllocationLayout
+    copy = fieldwise
+    pub byte_size: int
+    pub alignment: int
+
+pub struct RawBlock
+    data: StorageCursor(byte)
+    layout: AllocationLayout
+    drop = explicit
+    pub func size(imm self: RawBlock) int -> self.layout.byte_size
+    pub func alignment(imm self: RawBlock) int -> self.layout.alignment
+    pub func retire(deinit self: RawBlock) unit -> unit
+    pub func unsafe_from_span(ref bytes: Span(byte), layout: AllocationLayout) RawBlock | AllocationError
+        if not valid_layout(layout) or layout.byte_size > bytes.len() -> return AllocationError.invalid_layout
+        if not cursor_aligned(bytes.data, layout.alignment) -> return AllocationError.invalid_layout
+        return RawBlock{data = bytes.data, layout = layout}
+
+pub func valid_layout(layout: AllocationLayout) bool
+    if layout.byte_size < 0 or layout.alignment <= 0 -> return false
+    return (layout.alignment & (layout.alignment - 1)) == 0
+
+extern func cursor_aligned(imm cursor: StorageCursor(byte), alignment: int) bool
+pub extern func type_layout(static T: type) AllocationLayout
+pub func layout_for(static T: type, count: int) AllocationLayout | AllocationError
+    if count < 0 -> return AllocationError.invalid_layout
+    const element = type_layout(T)
+    if element.byte_size > 0 and count > 2147483647 / element.byte_size -> return AllocationError.size_limit
+    return AllocationLayout{byte_size = count * element.byte_size, alignment = element.alignment}
+
+pub extern func allocate_raw(layout: AllocationLayout) RawBlock | AllocationError
+pub extern func deallocate_raw(deinit block: RawBlock) unit

@@ -8,6 +8,255 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "returned callable construction facts recompute across ownership changes after restore" {
+    const source =
+        \\struct Provider
+        \\    value: int
+        \\    func read(imm self: Provider) int -> self.value
+        \\struct Capture
+        \\    copy = fieldwise
+        \\    ref drops: int
+        \\    value: int
+        \\    drop = func(deinit self: Capture)
+        \\        self.drops += 1
+        \\func make(ref provider: Provider, ref drops: int) func() int
+        \\    return provider.read
+        \\func evaluate(ref drops: int) int
+        \\    const provider = Provider{value = 42}
+        \\    const callback = make(provider, drops)
+        \\    return callback()
+        \\func run() int
+        \\    var drops = 0
+        \\    const value = evaluate(drops)
+        \\    return value + drops
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "    return provider.read",
+        \\    const capture = Capture{drops = drops, value = provider.value}
+        \\    return () => capture.value
+    );
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(44);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "owning erased callables restore environments hooks and incremental layouts" {
+    const source =
+        \\import std.callables.{erase, clone}
+        \\import std.memory.{AllocationError, List}
+        \\func make(value: int) func(int) int -> (amount) => amount + value
+        \\func run() int
+        \\    var value = 20
+        \\    ref live = value
+        \\    const first = erase(func(int) int, (amount) => amount + live)
+        \\    if first is AllocationError -> return 1
+        \\    const second = clone(first)
+        \\    if second is AllocationError -> return 2
+        \\    value = 21
+        \\    return make(1)(second(20))
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "value = 21", "value = 22");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(43);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "bound methods and erased callable descriptors restore receiver aliases effects and descriptors" {
+    const source =
+        \\struct Tracker
+        \\    value: int
+        \\    func add(mut self: Tracker, value: int) -> self.value += value
+        \\    func borrow(ref self: Tracker) ref int -> self.value
+        \\struct Service
+        \\    copy = fieldwise
+        \\    update: func(int) unit
+        \\func factory(mut tracker: Tracker) func(int) unit -> tracker.add
+        \\func invoke(callback: func(int) unit, value: int) -> callback(value)
+        \\func borrowed(callback: func() ref int) ref int -> callback()
+        \\func run() int
+        \\    var tracker = Tracker{value = 1}
+        \\    const concrete = tracker.add
+        \\    const service = Service{update = factory(tracker)}
+        \\    const copied = service
+        \\    concrete(10)
+        \\    invoke(copied.update, 31)
+        \\    const reader: func() ref int = tracker.borrow
+        \\    return borrowed(reader)
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const runtime_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "concrete(10)", "concrete(11)");
+    defer std.testing.allocator.free(runtime_edit);
+    try fixture.db.setInput(queries.SourceText, 0, runtime_edit);
+    try fixture.expectExit(43);
+    const readonly = try std.mem.replaceOwned(u8, std.testing.allocator, source, "var tracker =", "const tracker =");
+    defer std.testing.allocator.free(readonly);
+    try fixture.db.setInput(queries.SourceText, 0, readonly);
+    try fixture.expectDiagnostic(.mutable_argument_requires_mutable_place);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "bound methods and erased callable descriptors restore canonical static and opaque thin handles" {
+    const source =
+        \\func increment(value: int) int -> value + 2
+        \\func named() func(int) int -> increment
+        \\func anonymous() func(int) int -> (value) => value * 2
+        \\func erase(callback: func(int) int) func(int) int -> callback
+        \\func invoke(callback: func(int) int, value: int) int -> callback(value)
+        \\static first = named()
+        \\static second = anonymous()
+        \\func run() int
+        \\    const third = erase(increment)
+        \\    return invoke(third, first(second(9))) + 20
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const body_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "value + 2", "value + 3");
+    defer std.testing.allocator.free(body_edit);
+    try fixture.db.setInput(queries.SourceText, 0, body_edit);
+    try fixture.expectExit(44);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "callable adapter results restore concrete fields deferred construction and forwarding" {
+    const source =
+        \\struct Adapter(F: type, G: type)
+        \\    first: F
+        \\    second: G
+        \\func make(init first: func() int, init second: func() int) Adapter(func() int, func() int)
+        \\    return Adapter{second = second, first = first}
+        \\func forward(static F: type, static G: type, var adapter: Adapter(F, G)) Adapter(func() int, func() int)
+        \\    return adapter^
+        \\func run() int
+        \\    var offset = 20
+        \\    ref live = offset
+        \\    const adapter = forward(make(() => offset, () => live + 1))
+        \\    offset = 21
+        \\    return adapter.first() + adapter.second()
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const runtime_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "offset = 21", "offset = 22");
+    defer std.testing.allocator.free(runtime_edit);
+    try fixture.db.setInput(queries.SourceText, 0, runtime_edit);
+    try fixture.expectExit(43);
+    const body_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "live + 1", "live + 2");
+    defer std.testing.allocator.free(body_edit);
+    try fixture.db.setInput(queries.SourceText, 0, body_edit);
+    try fixture.expectExit(43);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "callable adapter results restore immovable environment ownership" {
+    const source =
+        \\struct Pinned
+        \\    move = none
+        \\    ref copies: int
+        \\    ref drops: int
+        \\    value: int
+        \\    copy = func(imm self: Pinned) Pinned
+        \\        self.copies += 1
+        \\        return Pinned{copies = self.copies, drops = self.drops, value = self.value}
+        \\    drop = func(deinit self: Pinned) -> self.drops += 1
+        \\struct Adapter(F: type)
+        \\    callback: F
+        \\func make(init callback: func() int) Adapter(func() int) -> Adapter{callback = callback}
+        \\func scope(mut copies: int, mut drops: int) int
+        \\    const pinned = Pinned{copies = copies, drops = drops, value = 39}
+        \\    const adapter = make(() => pinned.value)
+        \\    return adapter.callback()
+        \\func run() int
+        \\    var copies = 0
+        \\    var drops = 0
+        \\    const result = scope(copies, drops)
+        \\    return result + copies + drops
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+}
+
+test "concrete closures restore inline environments callable specializations and initializer regions" {
+    const source =
+        \\func apply(callback: func(int) int, value: int) int -> callback(value)
+        \\func deferred(init callback: func(int) int, value: int) int
+        \\    const concrete = callback
+        \\    return apply(concrete, value)
+        \\func run() int
+        \\    var offset = 2
+        \\    ref live = offset
+        \\    const callback = (value: int) => value + live
+        \\    offset = 3
+        \\    return apply(callback, 20) + deferred((value) => value + offset, 16)
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "offset = 3", "offset = 4");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(44);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "concrete closures restore overload probes and generated protocol calls" {
+    const source =
+        \\struct Cursor(F: type)
+        \\    next: F
+        \\struct Source(F: type)
+        \\    iter: F
+        \\func wrong(callback: func(bool) int) int -> callback(true)
+        \\func right(callback: func(int) int) int -> callback(40)
+        \\overload apply(wrong, right)
+        \\func poll(mut position: int) int | End
+        \\    if position >= 1 -> return End{}
+        \\    position += 1
+        \\    return apply((item) => item + 2)
+        \\func run() int
+        \\    var position = 0
+        \\    ref live = position
+        \\    const next = () => poll(live)
+        \\    const factory = () => Cursor{next = next}
+        \\    const source = Source{iter = factory}
+        \\    var total = 0
+        \\    for item in source -> total += item
+        \\    return total
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "item + 2", "item + 3");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(43);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
 test "nominal variant snapshots restore compact layouts and refresh converters and declarations" {
     const source =
         \\static Payload = int
@@ -1734,7 +1983,7 @@ test "initializer regions and native callbacks survive cache reuse and mode edit
     const diagnostics = try second.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, allocator);
     defer allocator.free(diagnostics);
     var rejected_mode = false;
-    for (diagnostics) |diagnostic| if (diagnostic.kind == .local_type_mismatch) {
+    for (diagnostics) |diagnostic| if (diagnostic.kind == .call_argument_type_mismatch) {
         rejected_mode = true;
     };
     try std.testing.expect(rejected_mode);

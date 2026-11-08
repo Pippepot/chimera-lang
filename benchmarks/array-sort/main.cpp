@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
     const int pattern = input[0];
     const int rounds = input[1] + input[2] * 256;
     const int seed = input[3] + input[4] * 256;
-    if (pattern > 4 || rounds == 0)
+    if (pattern > 6 || rounds == 0)
         return 1;
     std::array<std::int32_t, ARRAY_SIZE> values;
     std::int32_t checksum = 0;
@@ -48,6 +48,20 @@ int main(int argc, char **argv) {
                 value = state % 16;
             else if (pattern == 4)
                 value = ((ARRAY_SIZE - 1) / 256 - index / 256) * 256 + index % 256;
+            else if (pattern == 5) {
+                value = index;
+                if (ARRAY_SIZE > 1) {
+                    const int middle = (ARRAY_SIZE - 1) / 2;
+                    if (index == middle)
+                        ++value;
+                    else if (index == middle + 1)
+                        --value;
+                }
+            } else if (pattern == 6) {
+                value = index + 1;
+                if (index == ARRAY_SIZE - 1)
+                    value = 0;
+            }
             values[index] = value;
         }
         if (runtime)

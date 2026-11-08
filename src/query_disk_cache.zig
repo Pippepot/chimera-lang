@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIMERAQRY52";
+const format = "CHIMERAQRY61";
 // Snapshot records name their interner, input, or query boundary by its index here.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
 pub const persisted_inputs = .{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile, queries.InlineLimit };
@@ -51,6 +51,13 @@ fn restoreIntern(db: *query.Database, reader: *codec.Reader, kind: u8, index: us
 pub fn importIntern(comptime I: type, db: *query.Database, value: I.Value) !I.Id {
     if (!(try validateIds(I.Value, db, value))) return error.InvalidCache;
     if (I == queries.ByteStrings and !std.unicode.utf8ValidateSlice(value.bytes)) return error.InvalidCache;
+    if (I == queries.ItemLocations and value.adapter != null) {
+        if (value.kind != .function or value.owner == null) return error.InvalidCache;
+        if (value.adapter.? == .function_reference) {
+            const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+            if (try types.functionReference(value.adapter.?.function_reference) == null) return error.InvalidCache;
+        }
+    }
     if (I == queries.CompileTimeValues and !(try validRuntimeValue(db, value))) return error.InvalidCache;
     if (I == queries.FunctionOverloads) {
         if (value.candidates.len == 0) return error.InvalidCache;
@@ -74,6 +81,10 @@ pub fn importIntern(comptime I: type, db: *query.Database, value: I.Value) !I.Id
                     if (@backingInt(variant.members[member_index - 1]) >= @backingInt(member))
                         return error.InvalidCache;
                 }
+            },
+            .bound_method => |method| {
+                const location = (try db.lookupInternedAs(queries.ItemLocations, method.item)) orelse return error.InvalidCache;
+                if (location.kind != .function or location.adapter != null) return error.InvalidCache;
             },
             else => {},
         }
@@ -162,7 +173,7 @@ fn validArrayElementType(db: *query.Database, type_id: structures.TypeId) anyerr
     const interned = type_id.interned() orelse return false;
     const data = (try db.lookupInternedAs(queries.Types, interned)) orelse return false;
     switch (data.*) {
-        .structure, .callable, .reference => return true,
+        .structure, .callable, .function_reference, .bound_method, .reference => return true,
         .array => |array| return validArrayType(db, array),
         .tuple => |tuple| return validTupleType(db, tuple),
         .variant => |variant| {
@@ -189,7 +200,24 @@ fn validRuntimeValue(db: *query.Database, value: structures.CompileTimeValue) !b
             if (integer.limbs.len == 1 and integer.limbs[0] == 0) return integer.positive;
             return integer.limbs[integer.limbs.len - 1] != 0;
         },
-        .function_ref => return try types.callable(value.runtime.type_id) != null,
+        .function_ref => return try types.functionReference(value.runtime.type_id) != null,
+        .erased_callable => |callable| {
+            if (callable.type_id != value.runtime.type_id or try types.callable(callable.type_id) == null) return false;
+            const location = (try db.lookupInternedAs(queries.ItemLocations, callable.invocation.item)) orelse return false;
+            const adapter = location.adapter orelse return false;
+            if (adapter != .function and adapter != .closure and adapter != .function_reference) return false;
+            if (adapter == .closure) {
+                const environment = callable.invocation.environment orelse return false;
+                const bindings = (try db.lookupInternedAs(queries.CompileTimeBindings, environment)) orelse return false;
+                const closure = bindings.closure orelse return false;
+                if (closure.captures.len != 0) return false;
+            }
+            if (adapter == .function_reference) {
+                const payload = callable.payload orelse return false;
+                return payload.type_id == adapter.function_reference and try types.functionReference(payload.type_id) != null;
+            }
+            return callable.payload == null;
+        },
         .variant => |variant| return validVariantRuntime(db, value.runtime.type_id, variant),
         .structure => {},
         else => return true,
@@ -292,6 +320,7 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
     const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
     if (!try validArrayStorageType(db, types, body.return_type)) return false;
     if (!try validReferenceContract(db, types, body)) return false;
+    if (!try validServiceBalance(db.allocator, body)) return false;
     for (body.block_arguments) |argument| if (!try validArrayStorageType(db, types, argument.type_id)) return false;
     for (body.instructions) |instruction| {
         if (!try validArrayStorageType(db, types, instruction.resultType())) return false;
@@ -356,7 +385,54 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
             .initializer_ref => |reference| if (!try validInitializerResult(db, types, body, reference)) return false,
             .const_type => |type_id| if (!try validArrayStorageType(db, types, type_id)) return false,
             .borrow_address => |operation| if (!try validBorrowFields(types, body, operation)) return false,
+            .function_ref => |reference| if (try types.functionReference(reference.type_id) == null) return false,
+            .erased_callable => |callable| if (!try validErasedCallable(db, types, body, callable)) return false,
+            .callable_payload => |operation| {
+                const source = body.valueType(operation.source);
+                if (try types.boundMethod(source)) |method| {
+                    const signature = (try db.get(queries.FunctionCandidateSignature, method)).* orelse return false;
+                    if (signature.parameters.len == 0 or try types.borrowElement(operation.type_id) != signature.parameters[0].type_id) return false;
+                } else if (try types.callable(source) == null or
+                    (try types.borrowElement(operation.type_id) == null and try types.functionReference(operation.type_id) == null)) return false;
+            },
+            .callable_invoke => |operation| {
+                const callable = (try types.callable(body.valueType(operation.source))) orelse return false;
+                const invocation = (try types.functionReference(operation.type_id)) orelse return false;
+                if (operation.operation == .invoke) {
+                    if (invocation.parameters.len != callable.parameters.len + 1) return false;
+                    if (!structures.CallableType.eql(callable, .{ .parameters = invocation.parameters[1..], .return_type = invocation.return_type, .result_mode = invocation.result_mode })) return false;
+                } else {
+                    if (invocation.parameters.len != 1 or invocation.parameters[0].type_id != body.valueType(operation.source) or invocation.result_mode != .owned) return false;
+                    if (operation.operation == .drop) {
+                        if (invocation.parameters[0].mode != .deinit or invocation.return_type != .unit) return false;
+                    } else {
+                        if (invocation.parameters[0].mode != .imm) return false;
+                        const members = (try types.variantMembers(invocation.return_type)) orelse return false;
+                        if (members.len != 2 or std.mem.indexOfScalar(structures.TypeId, members, body.valueType(operation.source)) == null or std.mem.indexOfScalar(structures.TypeId, members, try types.allocationError()) == null) return false;
+                    }
+                }
+            },
+            .callable_allocation => |operation| {
+                const callable = (try types.callable(body.valueType(operation.source))) orelse return false;
+                const environment = (try types.allocationElement(operation.type_id)) orelse return false;
+                const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
+                if (try analysis.concreteClosureInvocation(environment) == null) return false;
+                const actual = (try analysis.callableSignature(environment)) orelse return false;
+                if (!structures.CallableType.eql(callable, actual)) return false;
+            },
             .storage_projection => |operation| if (!try validStorageProjection(types, body, operation)) return false,
+            .service_enter => |guard| {
+                if (!try queries.validCheckedServiceKey(db, guard.key, body.valueType(guard.receiver))) return false;
+            },
+            .context_read => |operation| {
+                const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
+                if (operation.type_id != try analysis.contextualType(operation.entry)) return false;
+                if (!std.meta.eql(operation.root, try analysis.contextualRoot(operation.entry))) return false;
+            },
+            .context_write => |operation| {
+                const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
+                if (body.valueType(operation.source) != try analysis.contextualType(operation.entry)) return false;
+            },
             .allocation_element => |operation| {
                 if (body.valueType(operation.index) != .int) return false;
                 const element = (try types.allocationElement(body.valueType(operation.allocation))) orelse return false;
@@ -374,6 +450,77 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
     return true;
 }
 
+/// A cached function must preserve the caller's active-service stack on every ordinary exit.
+fn validServiceBalance(allocator: std.mem.Allocator, body: structures.FunctionBodyAnalysis) !bool {
+    const depths = try allocator.alloc(?u32, body.blocks.len);
+    defer allocator.free(depths);
+    @memset(depths, null);
+    var pending: std.ArrayList(structures.FunctionBlockId) = .empty;
+    defer pending.deinit(allocator);
+    depths[@backingInt(body.entry)] = 0;
+    try pending.append(allocator, body.entry);
+    while (pending.pop()) |index| {
+        const block = body.blocks[@backingInt(index)];
+        var depth = depths[@backingInt(index)].?;
+        for (body.instructions[block.instruction_start..block.instruction_end]) |instruction| switch (instruction) {
+            .service_enter => depth = std.math.add(u32, depth, 1) catch return false,
+            .service_leave => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            else => {},
+        };
+        if ((block.terminator == .return_value or block.terminator == .return_unit) and depth != 0) return false;
+        var terminator = block.terminator;
+        for (terminator.successors()) |successor| {
+            const target = (successor orelse continue).*;
+            const previous = &depths[@backingInt(target)];
+            if (previous.*) |known| {
+                if (known != depth) return false;
+            } else {
+                previous.* = depth;
+                try pending.append(allocator, target);
+            }
+        }
+    }
+    return true;
+}
+
+fn validServiceInvocation(db: *query.Database, invocation: structures.InstanceId) !bool {
+    const location = (try db.lookupInternedAs(queries.ItemLocations, invocation.item)) orelse return false;
+    const adapter = location.adapter orelse return false;
+    if (adapter != .service) return false;
+    const symbol = (try db.get(queries.ExternalSymbol, adapter.service.key.item)).* orelse return false;
+    if (adapter.service.kind == .allocator) {
+        if (symbol != .allocator_from and symbol != .allocator_from_unchecked) return false;
+    } else if (symbol != .logger_from and symbol != .logger_from_unchecked) return false;
+    const signature = (try db.get(queries.FunctionCandidateSignature, invocation)).* orelse return false;
+    return signature.parameters.len != 0;
+}
+
+fn validErasedCallable(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis, callable: @FieldType(structures.FunctionInstruction, "erased_callable")) !bool {
+    const expected = (try types.callable(callable.type_id)) orelse return false;
+    const location = (try db.lookupInternedAs(queries.ItemLocations, callable.invocation.item)) orelse return false;
+    const adapter = location.adapter orelse return false;
+    const signature = (try db.get(queries.FunctionCandidateSignature, callable.invocation)).* orelse return false;
+    if (signature.parameters.len == 0) return false;
+    if (!structures.CallableType.eql(expected, .{ .parameters = signature.parameters[1..], .return_type = signature.return_type, .result_mode = signature.result_mode })) return false;
+    if (adapter == .closure) {
+        const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
+        if ((try analysis.callableEnvironmentType(callable.invocation) != null) != callable.owns_environment) return false;
+    }
+    if (callable.owns_environment) {
+        if (adapter != .closure) return false;
+        const payload = callable.payload orelse return false;
+        return try types.allocationElement(body.valueType(payload)) == signature.parameters[0].type_id;
+    }
+    if (adapter == .copy or adapter == .drop) return false;
+    if (adapter == .function or adapter == .closure) return callable.payload == null;
+    const payload = callable.payload orelse return false;
+    if (adapter == .function_reference) return body.valueType(payload) == adapter.function_reference;
+    return try types.borrowElement(body.valueType(payload)) == signature.parameters[0].type_id;
+}
+
 fn referencePathElement(db: *query.Database, types: anytype, type_id: structures.TypeId) !?structures.TypeId {
     if (try types.arrayType(type_id)) |array| return array.element_type;
     if (try types.boxElement(type_id)) |element| return element;
@@ -387,11 +534,27 @@ fn referencePathElement(db: *query.Database, types: anytype, type_id: structures
 fn validReferencePath(db: *query.Database, types: anytype, initial: structures.TypeId, path: []const structures.ReferencePathStep) anyerror!bool {
     var type_id = initial;
     for (path, 0..) |step, position| {
-        if (step == .field or step == .variant or step.isElement())
+        if (step == .field or step == .environment or step == .owner or step == .variant or step.isElement())
             while (try types.borrowElement(type_id)) |element| {
                 type_id = element;
             };
         switch (step) {
+            .backing => {
+                if (type_id != try types.rawBlock() and try types.allocationElement(type_id) == null) return false;
+                type_id = .unit;
+            },
+            .owner => |owner_type| {
+                if (try types.callable(type_id) == null or (owner_type != .unit and try types.allocationElement(owner_type) == null)) return false;
+                type_id = if (owner_type == .unit) (try db.get(queries.AllocationType, .unit)).* orelse return false else owner_type;
+            },
+            .environment => |environment| {
+                if (try types.callable(type_id) == null) return false;
+                if (environment != .unit) {
+                    const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
+                    if (try analysis.concreteClosureInvocation(environment) == null) return false;
+                }
+                type_id = environment;
+            },
             .field => |index| {
                 const definition = (try types.structDefinition(type_id)) orelse return false;
                 if (index >= definition.fields.len) return false;
@@ -420,6 +583,7 @@ fn validReferencePath(db: *query.Database, types: anytype, initial: structures.T
 fn validReferenceContract(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis) anyerror!bool {
     const contract = body.reference_contract;
     const parameter_count = body.parameter_modes.len;
+    if ((contract.context_effects.reads | contract.context_effects.writes) & ~@as(u8, 3) != 0) return false;
     for (contract.paths) |step| {
         const index = switch (step) {
             .element_at => |index| index,
@@ -436,56 +600,105 @@ fn validReferenceContract(db: *query.Database, types: anytype, body: structures.
         if (!try validReferenceOriginTypes(db, types, body, origin, false)) return false;
     }
     for (contract.outputs, 0..) |output, index| {
-        if (output.parameter >= parameter_count) return false;
+        if ((output.parameter != null) == (output.contextual != null)) return false;
+        if (output.parameter) |parameter| if (parameter >= parameter_count) return false;
         for (contract.outputs[0..index]) |previous| {
-            if (previous.parameter == output.parameter and previous.result_type == output.result_type) return false;
+            if (previous.parameter == output.parameter and previous.contextual == output.contextual and previous.result_type == output.result_type) return false;
         }
         if (!try hasVariantMember(types, body.return_type, output.result_type)) return false;
         for (output.origins) |origin| {
-            if (origin.output_parameter != output.parameter or !validOriginBounds(contract, origin, parameter_count)) return false;
+            if (origin.output_parameter != output.parameter or origin.output_contextual != output.contextual or !validOriginBounds(contract, origin, parameter_count)) return false;
             if (!try validReferenceOriginTypes(db, types, body, origin, true)) return false;
         }
     }
     for (contract.requirements) |requirement| {
-        if (requirement.parameter >= parameter_count or !validRange(requirement.path, contract.paths.len)) return false;
-        if (!try validReferencePath(db, types, body.block_arguments[requirement.parameter].type_id, contract.paths[requirement.path.start..requirement.path.end])) return false;
+        if ((requirement.parameter != null) == (requirement.contextual != null)) return false;
+        if (requirement.parameter) |parameter| if (parameter >= parameter_count) return false;
+        if (!validRange(requirement.path, contract.paths.len)) return false;
+        const source_type = if (requirement.contextual) |entry| try contextType(types, entry) else body.block_arguments[requirement.parameter.?].type_id;
+        if (!try validReferencePath(db, types, source_type, contract.paths[requirement.path.start..requirement.path.end])) return false;
+        if (requirement.requires_writable and (requirement.written_type != null or requirement.opaque_write or requirement.ends_lifetime)) return false;
         if (requirement.ends_lifetime and requirement.written_type == null) return false;
+        if (requirement.opaque_write and (requirement.written_type != null or requirement.ends_lifetime)) return false;
+        if (requirement.preserves_backing and !requirement.opaque_write) return false;
+    }
+    for (contract.service_mutations) |effect| {
+        switch (effect.target) {
+            .initializer => |parameter| {
+                if (parameter >= parameter_count) return false;
+                if (body.parameter_modes[parameter] != .init) return false;
+            },
+            .receiver => |mutation| {
+                if (!validOriginBounds(contract, mutation, parameter_count)) return false;
+                if (mutation.output_parameter != null or mutation.output_contextual != null or mutation.result_path.start != mutation.result_path.end) return false;
+                const source_type = if (mutation.contextual) |entry| try contextType(types, entry) else if (mutation.parameter) |parameter| body.block_arguments[parameter].type_id else return false;
+                if (!try validReferencePath(db, types, source_type, contract.paths[mutation.source_path.start..mutation.source_path.end])) return false;
+                if (mutation.service_invocation) |invocation| if (!try validServiceInvocation(db, invocation)) return false;
+            },
+        }
+        if (effect.contexts) |contexts| for (contexts, 0..) |bindings, index| for (bindings) |origin| {
+            if (!validOriginBounds(contract, origin, parameter_count)) return false;
+            if (origin.output_parameter != null or origin.output_contextual != null) return false;
+            if (origin.service_invocation) |invocation| if (!try validServiceInvocation(db, invocation)) return false;
+            const binding_type = try contextType(types, @fromBackingInt(@intCast(index)));
+            if (!try validReferencePath(db, types, binding_type, contract.paths[origin.result_path.start..origin.result_path.end])) return false;
+            if (origin.parameter != null or origin.contextual != null) {
+                const origin_type = if (origin.contextual) |entry| try contextType(types, entry) else body.block_arguments[origin.parameter.?].type_id;
+                if (!try validReferencePath(db, types, origin_type, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
+            } else if (origin.source_path.start != origin.source_path.end) return false;
+        };
     }
     for (contract.exclusions) |exclusion| {
         for ([_]structures.ReferenceOriginContract{ exclusion.reference, exclusion.invalidation }) |origin| {
-            const parameter = origin.parameter orelse return false;
-            if (origin.output_parameter != null or origin.result_path.start != origin.result_path.end) return false;
+            if (origin.parameter == null and origin.contextual == null) return false;
+            if (origin.output_parameter != null or origin.output_contextual != null or origin.result_path.start != origin.result_path.end) return false;
             if (!validOriginBounds(contract, origin, parameter_count)) return false;
             if (origin.reads_contents or origin.after_write or origin.variant_guard or origin.readonly_owned != null) return false;
-            if (!try validReferencePath(db, types, body.block_arguments[parameter].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
+            if (!try validReferencePath(db, types, if (origin.contextual) |entry| try contextType(types, entry) else body.block_arguments[origin.parameter.?].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
         }
     }
     return true;
 }
 
+fn contextType(types: anytype, entry: structures.ContextEntry) !structures.TypeId {
+    return switch (entry) {
+        .allocator => types.allocatorType(),
+        .logger => types.loggerType(),
+    };
+}
+
 fn validOriginBounds(contract: structures.ReferenceContract, origin: structures.ReferenceOriginContract, parameter_count: usize) bool {
+    if (origin.output_parameter != null and origin.output_contextual != null) return false;
+    if (origin.parameter != null and origin.contextual != null) return false;
+    if (origin.expired and (origin.parameter != null or origin.contextual != null or origin.source_path.start != origin.source_path.end)) return false;
     if (origin.parameter) |parameter| if (parameter >= parameter_count) return false;
+    if (origin.forcing_context) |forcing| if (forcing.parameter >= parameter_count) return false;
+    if (origin.owning_parameter) |parameter| if (parameter >= parameter_count) return false;
     return validRange(origin.source_path, contract.paths.len) and validRange(origin.result_path, contract.paths.len);
 }
 
 fn validReferenceOriginTypes(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis, origin: structures.ReferenceOriginContract, conditional: bool) anyerror!bool {
     const contract = body.reference_contract;
+    if (origin.service_invocation) |invocation| if (!try validServiceInvocation(db, invocation)) return false;
+    if (origin.forcing_context) |forcing| if (body.parameter_modes[forcing.parameter] != .init) return false;
     if (origin.readonly_owned) |type_id| {
         if (origin.readonly or type_id.isPrimitive()) return false;
         if (try types.borrowElement(type_id) != null or try types.storageAccess(type_id) != null) return false;
     }
-    const output_type = if (origin.output_parameter) |parameter| body.block_arguments[parameter].type_id else body.return_type;
+    const output_type = if (origin.output_contextual) |entry| try contextType(types, entry) else if (origin.output_parameter) |parameter| body.block_arguments[parameter].type_id else body.return_type;
     if (!try validReferencePath(db, types, output_type, contract.paths[origin.result_path.start..origin.result_path.end])) return false;
     if (!conditional) {
         if (origin.output_parameter) |parameter| if (body.parameter_modes[parameter] != .mut and body.parameter_modes[parameter] != .ref) {
             var through_referent = false;
             for (contract.paths[origin.result_path.start..origin.result_path.end]) |step| {
-                if (step == .referent) through_referent = true;
+                if (step == .referent or step == .environment) through_referent = true;
             }
             if (!through_referent) return false;
         };
     }
-    if (origin.parameter) |parameter| {
+    if (origin.contextual) |entry| {
+        if (!try validReferencePath(db, types, try contextType(types, entry), contract.paths[origin.source_path.start..origin.source_path.end])) return false;
+    } else if (origin.parameter) |parameter| {
         if (!try validReferencePath(db, types, body.block_arguments[parameter].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
     } else if (origin.source_path.start != origin.source_path.end or origin.storage_depth != 0 or origin.recursive_storage or origin.after_write) return false;
     return true;
@@ -710,6 +923,22 @@ fn validInitializerReference(reference: @FieldType(structures.FunctionInstructio
 
 fn validCompiledFunction(artifact: structures.CompiledFunction) bool {
     if (artifact.code.len == 0 or artifact.required_alignment == 0 or !std.math.isPowerOfTwo(artifact.required_alignment)) return false;
+    if (artifact.entry_offset >= artifact.code.len or (artifact.entry_offset != 0 and artifact.entry_offset != 24)) return false;
+    if (artifact.entry_offset != 0 and artifact.required_alignment < 8) return false;
+    if (artifact.entry_offset != 0) {
+        if (!std.mem.allEqual(u8, artifact.code[0..24], 0)) return false;
+        for (0..3) |index| {
+            var found = false;
+            for (artifact.relocations) |relocation| {
+                if (relocation.offset != index * 8) continue;
+                if (found or relocation.kind != .address_absolute_64 or relocation.reference != .function) return false;
+                if (relocation.addend < 0 or relocation.addend >= artifact.code.len - 24) return false;
+                if (index == 0 and relocation.addend != 0) return false;
+                found = true;
+            }
+            if (!found) return false;
+        }
+    }
     var previous_return: u32 = 0;
     for (artifact.trace_sites) |site| {
         if (site.return_offset <= previous_return or site.return_offset >= artifact.code.len) return false;
@@ -815,12 +1044,13 @@ test "canonical values reject mismatched aggregate and callable shapes" {
     const target = scope.resolveFunction("target").?;
     const record_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .structure = .{ .declared = scope.resolveStatic("Record").? } }));
     const callable_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .callable = .{ .parameters = &.{}, .return_type = .int } }));
+    const reference_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .function_reference = .{ .parameters = &.{}, .return_type = .int } }));
     const variant_type = structures.TypeId.fromInterned(try db.intern(queries.Types, .{ .variant = .{ .members = &.{ .int, .bool } } }));
     const payload = try db.intern(queries.CompileTimeValues, .{ .runtime = .{ .type_id = .int, .value = .{ .int = 42 } } });
     const fields = try db.intern(queries.CompileTimeValueTuples, .{ .values = &.{payload} });
 
-    try std.testing.expect(try validRuntimeValue(db, .{ .runtime = .{ .type_id = callable_type, .value = .{ .function_ref = .{ .target = target, .type_id = callable_type } } } }));
-    for ([_]structures.TypeId{ .int, record_type, variant_type }) |type_id|
+    try std.testing.expect(try validRuntimeValue(db, .{ .runtime = .{ .type_id = reference_type, .value = .{ .function_ref = .{ .target = target, .type_id = reference_type } } } }));
+    for ([_]structures.TypeId{ .int, record_type, variant_type, callable_type }) |type_id|
         try std.testing.expect(!try validRuntimeValue(db, .{ .runtime = .{ .type_id = type_id, .value = .{ .function_ref = .{ .target = target, .type_id = type_id } } } }));
     try std.testing.expect(try validRuntimeValue(db, .{ .runtime = .{ .type_id = record_type, .value = .{ .structure = fields } } }));
     try std.testing.expect(!try validRuntimeValue(db, .{ .runtime = .{ .type_id = callable_type, .value = .{ .structure = fields } } }));
@@ -829,6 +1059,55 @@ test "canonical values reject mismatched aggregate and callable shapes" {
     for ([_]structures.TypeId{ .bool, .none }) |member_type|
         try std.testing.expect(!try validRuntimeValue(db, .{ .runtime = .{ .type_id = variant_type, .value = .{ .variant = .{ .member_type = member_type, .payload = payload } } } }));
     try std.testing.expect(!try validRuntimeValue(db, .{ .runtime = .{ .type_id = callable_type, .value = .{ .variant = .{ .member_type = .int, .payload = payload } } } }));
+}
+
+test "bound methods and erased callable descriptors reject malformed native entry offsets" {
+    const code = [_]u8{0xc3};
+    var artifact: structures.CompiledFunction = .{ .code = &code, .required_alignment = 1 };
+    try std.testing.expect(validCompiledFunction(artifact));
+    artifact.entry_offset = 1;
+    try std.testing.expect(!validCompiledFunction(artifact));
+    artifact.entry_offset = 24;
+    try std.testing.expect(!validCompiledFunction(artifact));
+}
+
+test "owning callable cache validation rejects missing environments and static publication" {
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 1 });
+    defer db.deinit();
+    try @import("modules.zig").registerSources(db, allocator,
+        \\func make(offset: int) func(int) int -> (amount) => amount + offset
+        \\func empty() func(int) int -> (amount) => amount
+    , &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const types: queries.TypeFacts(*query.Database) = .{ .ctx = db };
+    const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
+    for ([_][]const u8{ "make", "empty" }) |name| {
+        const body = (try db.get(queries.AnalyzeFunctionInstance, .{ .item = scope.resolveFunction(name).? })).*.?;
+        var found = false;
+        for (body.instructions) |instruction| {
+            if (instruction != .erased_callable) continue;
+            found = true;
+            var callable = instruction.erased_callable;
+            try std.testing.expect(try validErasedCallable(db, types, body, callable));
+            const constant: structures.CompileTimeValue = .{ .runtime = .{
+                .type_id = callable.type_id,
+                .value = .{ .erased_callable = .{ .invocation = callable.invocation, .type_id = callable.type_id } },
+            } };
+            try std.testing.expectEqual(!callable.owns_environment, try validRuntimeValue(db, constant));
+            callable.owns_environment = !callable.owns_environment;
+            try std.testing.expect(!try validErasedCallable(db, types, body, callable));
+            callable = instruction.erased_callable;
+            if (callable.owns_environment) {
+                callable.payload = null;
+                try std.testing.expect(!try validErasedCallable(db, types, body, callable));
+            }
+            var ownership_constant = constant;
+            ownership_constant.runtime.value.erased_callable.invocation = try analysis.callableAdapter(instruction.erased_callable.invocation, .{ .drop = callable.type_id });
+            try std.testing.expect(!try validRuntimeValue(db, ownership_constant));
+        }
+        try std.testing.expect(found);
+    }
 }
 
 test "query restore rejects an offset past the payload" {

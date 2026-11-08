@@ -4,6 +4,9 @@ pub const File = enum(u32) {
     exit,
     memory_allocation,
     memory_host,
+    memory_raw,
+    memory_allocator,
+    logging,
     prelude,
     ownership,
     array,
@@ -16,12 +19,17 @@ pub const File = enum(u32) {
     search,
     memory_sort,
     algorithms,
+    callables,
+    context,
 
     pub fn path(file: File) []const u8 {
         return switch (file) {
             .exit => "exit.chi",
             .memory_allocation => "memory/allocation.chi",
             .memory_host => "memory/host.chi",
+            .memory_raw => "memory/raw.chi",
+            .memory_allocator => "memory/allocator.chi",
+            .logging => "logging.chi",
             .prelude => "prelude.chi",
             .ownership => "ownership.chi",
             .array => "array.chi",
@@ -34,6 +42,8 @@ pub const File = enum(u32) {
             .search => "search.chi",
             .memory_sort => "memory/sort.chi",
             .algorithms => "algorithms.chi",
+            .callables => "callables.chi",
+            .context => "context.chi",
         };
     }
 
@@ -86,6 +96,18 @@ pub const External = enum {
     io_write,
     primitive_operation,
     numeric_converter,
+    erase,
+    clone,
+    copy_callable,
+    drop_callable,
+    type_layout,
+    cursor_aligned,
+    allocate_raw,
+    deallocate_raw,
+    allocator_from,
+    allocator_from_unchecked,
+    logger_from,
+    logger_from_unchecked,
 
     pub fn file(symbol: External) File {
         return switch (symbol) {
@@ -99,6 +121,10 @@ pub const External = enum {
             .allocate_host_storage, .deallocate_host_storage => .memory_host,
             .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => .memory_allocation,
             .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow, .initialize_collection, .initialize_collection_element, .static_iteration_item => .memory_allocation,
+            .erase, .clone, .copy_callable, .drop_callable => .callables,
+            .type_layout, .cursor_aligned, .allocate_raw, .deallocate_raw => .memory_raw,
+            .allocator_from, .allocator_from_unchecked => .memory_allocator,
+            .logger_from, .logger_from_unchecked => .logging,
         };
     }
 };

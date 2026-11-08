@@ -148,7 +148,13 @@ pub fn inlineCalls(function: *Function, context: anytype, budget: usize, cache: 
         var position: usize = 0;
         while (position < function.blocks.items[block].instructions.items.len) {
             const index = function.blocks.items[block].instructions.items[position];
-            const instruction = function.instructions.items[index];
+            var instruction = function.instructions.items[index];
+            if (!function.removed.items[index] and instruction == .call and
+                try recoverDescriptorCall(function, context, block, &position, index, &instruction.call))
+            {
+                function.instructions.items[index] = instruction;
+                changed = true;
+            }
             const callee = if (!function.removed.items[index] and instruction == .call)
                 try candidate(function, context, cache, instruction.call)
             else
@@ -238,6 +244,104 @@ fn candidate(function: *Function, context: anytype, cache: *Cache, call: structu
     if (!facts.eligible) return null;
     callee.entry_taken = facts.entry_taken;
     return callee;
+}
+
+fn recoverDescriptorCall(function: *Function, context: anytype, block: u32, position: *usize, index: u32, call: *structures.FunctionCall) !bool {
+    if (!@hasDecl(@TypeOf(context), "callableInvocationPayloadParameter") or call.target != .indirect) return false;
+    const target = function.find(call.target.indirect);
+    const definition = function.definition(target) orelse return false;
+    if (definition != .callable_invoke) return false;
+    const source = function.find(definition.callable_invoke.source);
+    if (!function.plainValue(source)) return false;
+    const taken = try canonicalize.addressTaken(function);
+    if (taken[@backingInt(source)] or taken[@backingInt(target)]) return false;
+    const constructor = function.definition(source);
+    if (constructor == null or constructor.? != .erased_callable) {
+        if (definition.callable_invoke.operation != .invoke and @hasDecl(@TypeOf(context), "callableOwnershipTarget")) {
+            const instance = (try nonowningDescriptorInvocation(function, source, taken)) orelse return false;
+            call.target = .{ .direct = try context.callableOwnershipTarget(instance, definition.callable_invoke.operation, function.valueType(source)) };
+            return true;
+        }
+        return false;
+    }
+    const instance = constructor.?.erased_callable.invocation;
+    if (definition.callable_invoke.operation != .invoke) {
+        if (@hasDecl(@TypeOf(context), "callableOwnershipTarget")) {
+            call.target = .{ .direct = try context.callableOwnershipTarget(instance, definition.callable_invoke.operation, constructor.?.erased_callable.type_id) };
+            return true;
+        }
+        return false;
+    }
+    if (constructor.?.erased_callable.owns_environment) return false;
+    const payload = constructor.?.erased_callable.payload;
+    const parameter = (try context.callableInvocationPayloadParameter(instance, definition.callable_invoke.type_id, if (payload) |value| function.valueType(value) else null)) orelse return false;
+    if (payload) |value| {
+        // Repack the hidden argument instead of treating equal pointer layouts as equal IR types.
+        const arguments = try function.scratch.dupe(structures.FunctionCallArgument, function.call_arguments.items[call.arguments.start..call.arguments.end]);
+        arguments[0] = switch (parameter.mode) {
+            .ref, .mut => borrowed: {
+                const storage = try function.insertInstruction(block, position.*, .{ .borrow_read = .{ .source = value, .type_id = parameter.type_id } }, function.instructionSpan(index), function.instructionFrame(index));
+                position.* += 1;
+                break :borrowed .{ .borrowed = storage };
+            },
+            .imm => .{ .prepared = .{ .value = value } },
+            else => unreachable,
+        };
+        const start: u32 = @intCast(function.call_arguments.items.len);
+        try function.call_arguments.appendSlice(function.scratch, arguments);
+        call.arguments = .{ .start = start, .end = @intCast(function.call_arguments.items.len) };
+    }
+    call.target = .{ .direct = instance };
+    return true;
+}
+
+fn nonowningDescriptorInvocation(function: *Function, source: ValueId, taken: []const bool) !?structures.InstanceId {
+    const visited = try function.scratch.alloc(bool, function.valueCount());
+    @memset(visited, false);
+    const Operand = struct { value: ValueId, descriptor: bool = false };
+    var pending: std.ArrayList(Operand) = .empty;
+    try pending.append(function.scratch, .{ .value = source });
+    var invocation: ?structures.InstanceId = null;
+    while (pending.pop()) |next| {
+        const value = function.find(next.value);
+        if (visited[@backingInt(value)]) continue;
+        visited[@backingInt(value)] = true;
+        if (!function.plainValue(value) or taken[@backingInt(value)]) return null;
+        if (!next.descriptor and function.valueType(value) != function.valueType(source)) return null;
+        if (function.definition(value)) |definition| {
+            switch (definition) {
+                .erased_callable => |callable| {
+                    if (next.descriptor or callable.owns_environment) return null;
+                    invocation = callable.invocation;
+                },
+                .aggregate => |aggregate| {
+                    if (next.descriptor) return null;
+                    try pending.append(function.scratch, .{ .value = function.aggregate_fields.items[aggregate.fields.start], .descriptor = true });
+                },
+                .field_access => |field| {
+                    if (!next.descriptor or field.field_index != 0) return null;
+                    try pending.append(function.scratch, .{ .value = field.operand });
+                },
+                .value_copy => |copy| try pending.append(function.scratch, .{ .value = copy.source, .descriptor = next.descriptor }),
+                .select => |selection| try pending.appendSlice(function.scratch, &.{
+                    .{ .value = selection.then_value, .descriptor = next.descriptor },
+                    .{ .value = selection.else_value, .descriptor = next.descriptor },
+                }),
+                else => return null,
+            }
+            continue;
+        }
+        const argument = function.definitions.items[@backingInt(value)].argument;
+        if (argument.block == function.entry or !function.directParameter(value)) return null;
+        const parameters = function.blocks.items[argument.block].parameters.items;
+        const position = std.mem.indexOfScalar(ValueId, parameters, value).?;
+        for ((try function.controlFlowEdges()).incoming[argument.block].items) |edge| {
+            const incoming = function.branchArguments(edge.branch(function).*)[position];
+            if (incoming.coerce_to != null) return null;
+            try pending.append(function.scratch, .{ .value = incoming.value, .descriptor = next.descriptor });
+        }
+    }
+    return invocation;
 }
 
 const Exit = struct {

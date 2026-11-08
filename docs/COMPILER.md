@@ -5,6 +5,31 @@ from the repository root. Start with the [README](../README.md) for the language
 [syntax&semantics.txt](../syntax&semantics.txt) owns detailed language rules.
 Specification examples can describe planned features, not current support.
 
+Shared context, retained allocation providers, and contextual logging are currently
+an unqualified implementation draft. The latest routine suite has failures and
+crashes; see [remaining work and verification](../ROADMAP.md#scoped-context-implementation-slices)
+before treating this milestone as complete.
+
+Concrete expression closures and implicit runtime-callable specialization use
+inline copy/reference captures, immutable invocation, and ordinary ownership and
+reference checks. Callable v1 (slices 1 through 4) is implemented; deferred extensions are tracked
+in [ROADMAP.md](../ROADMAP.md).
+Generic struct result patterns infer concrete callable slots before construction,
+including deferred callback fields. Retained std adapters store concrete callbacks;
+terminal consumers borrow them.
+Bound methods retain checked references to their original receivers. Fixed
+`func(...)` storage uses a two-word descriptor/payload handle for named functions,
+noncapturing closures, and bound methods; copying these handles neither allocates
+nor copies or destroys providers. Inferred function references remain thin.
+Capturing lexical closures own allocated environments behind the same handle.
+Copying allocates and runs capture hooks; transfer moves only the handle, and
+cleanup destroys captures and releases storage. `std.callables.erase` and `clone`
+return `AllocationError` on reservation refusal; implicit erasure and ordinary
+copying panic instead. Owning environments remain transient during compile-time
+evaluation and cannot become canonical static constants. See the
+[compiler boundaries](ARCHITECTURE.md#closures-and-bound-methods)
+and [callable design](CLOSURES.md) for the contracts and deferred syntax.
+
 ## Build and Run
 
 ```sh
@@ -86,7 +111,10 @@ for invalidation and restoration details.
 - `thread ms` sums exclusive worker elapsed time after subtracting nested work.
   It is not CPU time and can exceed wall time with parallel workers.
 - Query/function counts exclude memo hits; phase counts are invocations.
-  Dependency waits count requests for incomplete work and are reported separately.
+  `dependency coordination` counts requests for incomplete work and is reported
+  separately from work totals. It sums elapsed time across requesting threads,
+  including blocking and scheduler/query bookkeeping but excluding nested query
+  computation. It can be nonzero with zero workers.
 - Body work separates semantic construction, typing/SSA, reference/lifetime and
   cleanup, IR finalization, and setup/publication. Cache stages appear only when
   used. Percentages use the containing stage or work total, not total CLI time.
@@ -176,6 +204,8 @@ memory-limited process setup suite-local.
 ## Further Reading
 
 - [Architecture](ARCHITECTURE.md): stages, queries, ownership, and persistence.
+- [Callable design](CLOSURES.md): concrete closures, implicit specialization,
+  nonallocating bound methods, and allocating lexical-closure erasure.
 - [Benchmark guide](../benchmarks/README.md): workloads, commands, and measurement
   boundaries.
 - [Roadmap](../ROADMAP.md): priorities and deferred decisions.

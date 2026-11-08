@@ -3,9 +3,9 @@ import std.array.{Array}
 struct StaticSortOrder(T: type, before: func(imm T, imm T) bool)
     pub func less(imm self: StaticSortOrder(T, before), imm left: T, imm right: T) bool -> before(left, right)
 
-struct RuntimeSortOrder(T: type)
-    before: func(imm T, imm T) bool
-    pub func less(imm self: RuntimeSortOrder(T), imm left: T, imm right: T) bool -> self.before(left, right)
+struct RuntimeSortOrder(F: type)
+    ref before: F
+    pub func less(imm self: RuntimeSortOrder(F), static T: type, imm left: T, imm right: T) bool -> self.before(left, right)
 
 # Indexing below uses `unsafe_at`. Every index stays inside its list or view whatever the
 # comparator returns: `order` is always a permutation of the source indices, and run,
@@ -21,6 +21,9 @@ struct DriftRun
 func natural_order(static T: type, imm left: T, imm right: T) bool -> left < right
 
 func sort_span(static T: type, static Order: type, mut source: Span(T), imm before: Order) unit
+    if try_sort_span(T, Order, source, before) is AllocationError -> panic "sort scratch allocation failed"
+
+func try_sort_span(static T: type, static Order: type, mut source: Span(T), imm before: Order) unit | AllocationError
     const length = source.len()
     if length < 2 -> return unit
     if length <= 20
@@ -37,12 +40,13 @@ func sort_span(static T: type, static Order: type, mut source: Span(T), imm befo
         if descending -> source.reverse()
         return unit
 
-    var order_storage = allocate(int, length)
-    if not (order_storage is Allocation(int)) -> panic "sort scratch allocation failed"
-    var scratch_storage = allocate(int, length)
-    if not (scratch_storage is Allocation(int))
+    const scratch_provider = root_allocator()
+    var order_storage = allocate_with(int, scratch_provider, length)
+    if order_storage is AllocationError -> return order_storage^
+    var scratch_storage = allocate_with(int, scratch_provider, length)
+    if scratch_storage is AllocationError
         deallocate(int, order_storage^)
-        panic "sort scratch allocation failed"
+        return scratch_storage^
     var order = Span(int){data = allocation_cursor(int, order_storage), size = length}
     var scratch = Span(int){data = allocation_cursor(int, scratch_storage), size = length}
     # The permutation is fully initialized here; each algorithm initializes the
@@ -64,13 +68,13 @@ func insertion_sort_slots(static T: type, static Order: type, mut source: Span(T
             swap_elements(T, source.data, current, current - 1)
             current -= 1
 
-func sorted_span(static T: type, static Order: type, ref source: Span(T), imm before: Order) List(T) | none
+func sorted_span(static T: type, static Order: type, ref source: Span(T), imm before: Order) List(T) | AllocationError
     var result = List(T).new(source.len())
-    if not (result is List(T)) -> return none
+    if result is AllocationError -> return result^
     for const item in source
         append_collection_moved(T, result, item^)
     var view = result.span()
-    sort_span(T, Order, view, before)
+    _ = try_sort_span(T, Order, view, before)?
     return result^
 
 func drift_indices(static T: type, static Order: type, ref source: Span(T), mut order: Span(int), mut scratch: Span(int), imm before: Order)

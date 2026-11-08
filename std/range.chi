@@ -1,3 +1,5 @@
+import std.memory.{AllocationError}
+import std.text.{integer_text}
 import std.iteration.{End}
 import std.text.{String}
 
@@ -121,25 +123,25 @@ pub converter(imm value: Range) String
     const result = format_range(value)
     if not (result is String) -> panic "string conversion allocation failed"
     return result^
-func format_range(imm value: Range) String | none
+func format_range(imm value: Range) String | AllocationError
     var result = String.empty()
-    if not (append_bound(result, value.first) is unit) -> return none
-    if not (result.append("..") is unit) -> return none
+    _ = append_bound(result, value.first)?
+    _ = result.append("..")?
     if value.inclusive
-        if not (result.append("=") is unit) -> return none
-    if not (append_bound(result, value.limit) is unit) -> return none
+        _ = result.append("=")?
+    _ = append_bound(result, value.limit)?
     return result^
 func resolve_bound(bound: int | FromEnd | none, length: int, omitted: int) int | none
     return match bound
         int -> bound
         FromEnd -> bound.resolve(length)
         none -> omitted
-func append_bound(mut result: String, bound: int | FromEnd | none) unit | none
+func append_bound(mut result: String, bound: int | FromEnd | none) unit | AllocationError
     match bound
-        int -> return result.append(String(bound))
+        int -> return result.append(integer_text(bound).view())
         FromEnd ->
-            if not (result.append("^") is unit) -> return none
-            return result.append(String(bound.distance))
+            _ = result.append("^")?
+            return result.append(integer_text(bound.distance).view())
         none -> return unit
 
 func has_steps(first: int, last: int, stride: int, count: int) bool

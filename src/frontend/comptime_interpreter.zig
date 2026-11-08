@@ -62,10 +62,26 @@ pub const Allocation = struct {
     backing: std.heap.ArenaAllocator,
     identities: std.mem.Allocator,
     elements: std.AutoHashMapUnmanaged(u32, *Cell) = .empty,
+    views: std.AutoHashMapUnmanaged(StorageViewKey, *Cell) = .empty,
+    source: ?*Cell = null,
+    byte_offset: u32 = 0,
+    element_size: u32 = 1,
 
-    pub fn element(self: *Allocation, index: u32) !*Cell {
+    pub fn element(self: *Allocation, index: u32) anyerror!*Cell {
         std.debug.assert(!self.released);
         std.debug.assert(index < self.capacity);
+        if (self.source) |source| {
+            const offset = try std.math.add(u32, self.byte_offset, try std.math.mul(u32, index, self.element_size));
+            if (self.element_type == .byte) return elementCell(source, offset);
+            const key: StorageViewKey = .{ .offset = offset, .type_id = self.element_type, .zero_index = if (self.element_size == 0) index else 0 };
+            const views = if (source.contents == .allocation) &source.contents.allocation.views else &source.views;
+            const storage = if (source.contents == .allocation) source.contents.allocation.identities else source.storage;
+            if (views.get(key)) |cell| return cell;
+            const cell = try Cell.create(storage, self.element_type, .uninitialized);
+            cell.memory = .{ .source = source, .offset = offset };
+            try views.put(storage, key, cell);
+            return cell;
+        }
         if (self.elements.get(index)) |cell| return cell;
         const cell = try Cell.create(self.identities, self.element_type, .uninitialized);
         try self.elements.put(self.backing.allocator(), index, cell);
@@ -76,6 +92,10 @@ pub const Allocation = struct {
         if (self.released) return;
         var cells = self.elements.valueIterator();
         while (cells.next()) |cell| cell.*.invalidate();
+        var views = self.views.valueIterator();
+        while (views.next()) |view| view.*.invalidate();
+        self.views.deinit(self.identities);
+        self.views = .empty;
         self.elements = .empty;
         self.backing.deinit();
         self.released = true;
@@ -96,15 +116,27 @@ pub const Value = union(enum) {
     initializer: struct { body: *const structures.FunctionBodyAnalysis, captures: []Value },
 };
 
+const StorageViewKey = struct { offset: u32, type_id: structures.TypeId, zero_index: u32 = 0 };
+const MemoryView = struct { source: *Cell, offset: u32 };
+
+const CallableHandle = struct {
+    invocation: structures.InstanceId,
+    payload: union(enum) { none, receiver: *Cell, function: structures.FunctionReference, environment: *Cell },
+};
+
 pub const Cell = struct {
     type_id: structures.TypeId,
     storage: std.mem.Allocator,
+    memory: ?MemoryView = null,
+    views: std.AutoHashMapUnmanaged(StorageViewKey, *Cell) = .empty,
     contents: union(enum) {
         uninitialized,
         value: structures.CompileTimeValue.RuntimeValue,
         fields: []Cell,
         variant_payload: *Cell,
         reference: *Cell,
+        opaque_reference: *Cell,
+        erased_callable: CallableHandle,
         storage_cursor: struct { owner: *Cell, offset: u32 },
         allocation: *Allocation,
     },
@@ -119,8 +151,10 @@ pub const Cell = struct {
         switch (self.contents) {
             .fields => |fields| for (fields) |*field| field.invalidate(),
             .variant_payload => |payload| payload.invalidate(),
-            .uninitialized, .value, .reference, .storage_cursor, .allocation => {},
+            .uninitialized, .value, .reference, .opaque_reference, .erased_callable, .storage_cursor, .allocation => {},
         }
+        var views = self.views.valueIterator();
+        while (views.next()) |view| view.*.invalidate();
         self.contents = .uninitialized;
     }
 };
@@ -189,8 +223,20 @@ pub const ValueSnapshot = struct {
                 .variant_payload => |payload| .{ .variant_payload = try self.cloneCell(payload) },
                 .storage_cursor => |pointer| .{ .storage_cursor = .{ .owner = try self.cloneCell(pointer.owner), .offset = pointer.offset } },
                 .reference => |target| .{ .reference = try self.cloneCell(target) },
+                .opaque_reference => |target| .{ .opaque_reference = try self.cloneCell(target) },
+                .erased_callable => |callable| .{ .erased_callable = .{
+                    .invocation = callable.invocation,
+                    .payload = switch (callable.payload) {
+                        .receiver => |target| .{ .receiver = try self.cloneCell(target) },
+                        .environment => |owner| .{ .environment = try self.cloneCell(owner) },
+                        .none, .function => callable.payload,
+                    },
+                } },
                 .allocation => |allocation| .{ .allocation = try self.cloneAllocation(allocation) },
             } };
+            var views = cell.views.iterator();
+            while (views.next()) |view| try snapshot.views.put(self.storage, view.key_ptr.*, try self.cloneCell(view.value_ptr.*));
+            if (cell.memory) |memory| snapshot.memory = .{ .source = try self.cloneCell(memory.source), .offset = memory.offset };
         }
 
         fn cloneAllocation(self: *@This(), allocation: *const Allocation) anyerror!*Allocation {
@@ -200,6 +246,9 @@ pub const ValueSnapshot = struct {
                 .identity = allocation.identity,
                 .element_type = allocation.element_type,
                 .capacity = allocation.capacity,
+                .source = if (allocation.source) |source| try self.cloneCell(source) else null,
+                .byte_offset = allocation.byte_offset,
+                .element_size = allocation.element_size,
                 .released = allocation.released,
                 .backing = .init(self.storage),
                 .identities = self.storage,
@@ -207,6 +256,8 @@ pub const ValueSnapshot = struct {
             try self.allocations.put(self.storage, allocation, copy);
             var entries = allocation.elements.iterator();
             while (entries.next()) |entry| try copy.elements.put(self.storage, entry.key_ptr.*, try self.cloneCell(entry.value_ptr.*));
+            var views = allocation.views.iterator();
+            while (views.next()) |view| try copy.views.put(self.storage, view.key_ptr.*, try self.cloneCell(view.value_ptr.*));
             return copy;
         }
 
@@ -251,6 +302,16 @@ pub const ValueSnapshot = struct {
             const pair: CellPair = .{ .left = left, .right = right };
             if (self.compared.contains(pair)) return true;
             try self.compared.put(self.scratch, pair, {});
+            if (left.memory) |memory| {
+                const other = right.memory orelse return false;
+                if (memory.offset != other.offset or !try self.sameCell(memory.source, other.source)) return false;
+            } else if (right.memory != null) return false;
+            if (left.views.count() != right.views.count()) return false;
+            var views = left.views.iterator();
+            while (views.next()) |view| {
+                const other = right.views.get(view.key_ptr.*) orelse return false;
+                if (!try self.sameCell(view.value_ptr.*, other)) return false;
+            }
             switch (left.contents) {
                 .uninitialized => return true,
                 .value => |value| return std.meta.eql(value, right.contents.value),
@@ -259,6 +320,18 @@ pub const ValueSnapshot = struct {
                 .storage_cursor => return self.sameStorageCursor(left, right),
                 .reference => |target| return self.left.sourceCell(target) == self.right.sourceCell(right.contents.reference) and
                     try self.sameCell(target, right.contents.reference),
+                .opaque_reference => |target| return self.left.sourceCell(target) == self.right.sourceCell(right.contents.opaque_reference) and
+                    try self.sameCell(target, right.contents.opaque_reference),
+                .erased_callable => |callable| {
+                    const other = right.contents.erased_callable;
+                    if (!std.meta.eql(callable.invocation, other.invocation) or std.meta.activeTag(callable.payload) != std.meta.activeTag(other.payload)) return false;
+                    switch (callable.payload) {
+                        .none => return true,
+                        .function => |function| return std.meta.eql(function, other.payload.function),
+                        .receiver => |target| return self.left.sourceCell(target) == self.right.sourceCell(other.payload.receiver) and try self.sameCell(target, other.payload.receiver),
+                        .environment => |owner| return self.sameCell(owner, other.payload.environment),
+                    }
+                },
                 .allocation => |allocation| return self.sameAllocation(allocation, right.contents.allocation),
             }
         }
@@ -276,12 +349,21 @@ pub const ValueSnapshot = struct {
         }
 
         fn sameAllocation(self: *@This(), left: *const Allocation, right: *const Allocation) anyerror!bool {
-            if (left.identity != right.identity or left.element_type != right.element_type or left.capacity != right.capacity or left.released != right.released) return false;
+            if (left.identity != right.identity or left.element_type != right.element_type or left.capacity != right.capacity or left.released != right.released or left.byte_offset != right.byte_offset or left.element_size != right.element_size) return false;
+            if (left.source) |source| {
+                if (right.source == null or !try self.sameCell(source, right.source.?)) return false;
+            } else if (right.source != null) return false;
             if (left.elements.count() != right.elements.count()) return false;
             var entries = left.elements.iterator();
             while (entries.next()) |entry| {
                 const other = right.elements.get(entry.key_ptr.*) orelse return false;
                 if (!try self.sameCell(entry.value_ptr.*, other)) return false;
+            }
+            if (left.views.count() != right.views.count()) return false;
+            var views = left.views.iterator();
+            while (views.next()) |view| {
+                const other = right.views.get(view.key_ptr.*) orelse return false;
+                if (!try self.sameCell(view.value_ptr.*, other)) return false;
             }
             return true;
         }
@@ -332,7 +414,7 @@ pub fn publish(result: Result, arguments: []Value, modes: []const structures.Par
 }
 
 /// A value leaving its evaluation must not retain evaluation-owned storage.
-fn publishCell(cell: *const Cell, executor: anytype, gpa: std.mem.Allocator) !Result {
+fn publishCell(cell: *Cell, executor: anytype, gpa: std.mem.Allocator) !Result {
     if (containsReference(cell)) return executionError(.escaping_storage, null);
     const runtime = (try materialize(cell, executor, gpa)) orelse return executionError(.unsupported_operation, null);
     return .{ .returned = .{ .runtime = runtime } };
@@ -433,6 +515,57 @@ fn ExecutionFrame(comptime Executor: type) type {
                 .const_unit => return .{ .returned = .{ .runtime = .unit } },
                 .const_none => return .{ .returned = .{ .runtime = .none } },
                 .function_ref => |reference| return .{ .returned = .{ .runtime = .{ .function_ref = reference } } },
+                .erased_callable => |callable| return .{ .returned = try self.erasedCallable(callable) },
+                .service_enter => |operation| {
+                    if (comptime !@hasDecl(@typeInfo(@TypeOf(self.executor)).pointer.child, "enterService")) return executionError(.unsupported_operation, span);
+                    if (!try self.executor.enterService(operation.key, try self.storageCell(operation.receiver), self.storage))
+                        return executionError(.{ .panic = try self.executor.internBytes("service cycle") }, span);
+                    return .{ .returned = .{ .runtime = .unit } };
+                },
+                .service_leave => {
+                    if (comptime !@hasDecl(@typeInfo(@TypeOf(self.executor)).pointer.child, "leaveService")) return executionError(.unsupported_operation, span);
+                    self.executor.leaveService();
+                    return .{ .returned = .{ .runtime = .unit } };
+                },
+                .context_read => |operation| {
+                    if (comptime !@hasDecl(@typeInfo(@TypeOf(self.executor)).pointer.child, "readContext")) return executionError(.unsupported_operation, span);
+                    return self.executor.readContext(operation.entry, operation.type_id, self.storage);
+                },
+                .context_write => |operation| {
+                    if (comptime !@hasDecl(@typeInfo(@TypeOf(self.executor)).pointer.child, "writeContext")) return executionError(.unsupported_operation, span);
+                    try self.executor.writeContext(operation.entry, self.slots[@backingInt(operation.source)], self.body.valueType(operation.source));
+                    return .{ .returned = .{ .runtime = .unit } };
+                },
+                .callable_payload => |operation| {
+                    const cell = try self.storageCell(operation.source);
+                    const payload: @FieldType(CallableHandle, "payload") = if (cell.contents == .fields) .{ .receiver = cell.contents.fields[0].contents.reference } else erasedHandle(cell).payload;
+                    const element = try self.executor.borrowElement(operation.type_id);
+                    if (element == null) {
+                        var function = payload.function;
+                        function.type_id = operation.type_id;
+                        return .{ .returned = .{ .runtime = .{ .function_ref = function } } };
+                    }
+                    var target = switch (payload) {
+                        .receiver => |receiver| receiver,
+                        .environment => |owner| try (try allocationView(.{ .place = owner }, (try self.executor.allocationElement(owner.type_id)).?, self.executor, self.storage)).element(0),
+                        .function => |function| try Cell.create(self.storage, function.type_id, .{ .value = .{ .function_ref = function } }),
+                        .none => try Cell.create(self.storage, .unit, .{ .value = .unit }),
+                    };
+                    if (element.? == .unit and target.type_id != .unit)
+                        target = try Cell.create(self.storage, .unit, .{ .opaque_reference = target });
+                    return .{ .returned = try referenceValue(operation.type_id, target, self.storage) };
+                },
+                .callable_invoke => |operation| {
+                    const cell = try self.storageCell(operation.source);
+                    const target = erasedHandle(cell).invocation;
+                    const invocation = if (operation.operation == .invoke) target else try self.executor.callableOwnershipAdapter(target, operation.operation, cell.type_id);
+                    const reference: structures.FunctionReference = .{ .target = invocation.item, .specialization = invocation.specialization, .environment = invocation.environment, .type_id = operation.type_id };
+                    return .{ .returned = .{ .runtime = .{ .function_ref = reference } } };
+                },
+                .callable_allocation => |operation| {
+                    const handle = erasedHandle(try self.storageCell(operation.source));
+                    return .{ .returned = try copyStoredValue(.{ .place = handle.payload.environment }, operation.type_id, self.executor, self.storage) };
+                },
                 .initializer_ref => |reference| return .{ .returned = try self.initializerValue(reference) },
                 .storage_cursor => |operation| return self.storageCursor(operation),
                 .cursor_offset => |operation| return .{ .returned = try offsetStorageCursor(slots[@backingInt(operation.cursor)], operation.type_id, @intCast(integer(slots, operation.index)), self.storage) },
@@ -483,6 +616,20 @@ fn ExecutionFrame(comptime Executor: type) type {
             return .{ .initializer = .{ .body = &self.body.initializer_regions[reference.region], .captures = captures } };
         }
 
+        fn erasedCallable(self: *const Self, callable: @FieldType(structures.FunctionInstruction, "erased_callable")) !Value {
+            var handle: CallableHandle = .{ .invocation = callable.invocation, .payload = .none };
+            if (callable.owns_environment) {
+                const owner = self.slots[@backingInt(callable.payload.?)];
+                handle.payload = .{ .environment = (try copyStoredValue(owner, owner.place.type_id, self.executor, self.storage)).place };
+                return .{ .place = try Cell.create(self.storage, callable.type_id, .{ .erased_callable = handle }) };
+            }
+            if (callable.payload) |payload| {
+                const value = self.slots[@backingInt(payload)];
+                handle.payload = if (referenceTarget(value)) |target| .{ .receiver = target } else .{ .function = scalar(self.slots, payload).function_ref };
+            }
+            return .{ .place = try Cell.create(self.storage, callable.type_id, .{ .erased_callable = handle }) };
+        }
+
         fn projectArray(self: *const Self, operation: structures.ArrayElement) !Result {
             const cell = try self.storageCell(operation.array);
             const array = (try self.executor.arrayType(cell.type_id)) orelse return .unavailable;
@@ -531,15 +678,15 @@ fn ExecutionFrame(comptime Executor: type) type {
                     const active: ?ActiveVariant = switch (cell.contents) {
                         .uninitialized, .variant_payload => null,
                         .value => |owner| try self.activeVariant(.{ .runtime = owner }, operation.owner),
-                        .fields, .reference, .storage_cursor, .allocation => unreachable,
+                        .fields, .reference, .opaque_reference, .erased_callable, .storage_cursor, .allocation => unreachable,
                     };
                     const payload = try selectVariantPayload(cell, operation.type_id);
                     if (active) |owner| if (owner.member_type == operation.type_id) try assignCell(payload, owner.payload, self.executor);
                     return .{ .returned = .{ .place = payload } };
                 },
                 .allocation_array => {
-                    const allocation = allocationRecord(.{ .place = cell });
                     const array = (try self.executor.arrayType(operation.type_id)) orelse return .unavailable;
+                    const allocation = try allocationView(.{ .place = cell }, array.element_type, self.executor, self.storage);
                     std.debug.assert(array.element_type == allocation.element_type);
                     std.debug.assert(array.length <= allocation.capacity);
                     return .{ .returned = try allocationValue(operation.type_id, allocation, self.storage) };
@@ -548,6 +695,8 @@ fn ExecutionFrame(comptime Executor: type) type {
         }
 
         fn accessField(self: *const Self, value: Value, operation: structures.FieldAccessOperation) !Result {
+            if (value == .place and value.place.memory != null and value.place.contents == .uninitialized)
+                if (!try expandFields(value.place, self.executor)) return .unavailable;
             if (value == .place and value.place.contents == .fields) {
                 const fields = value.place.contents.fields;
                 const field = &fields[operation.field_index];
@@ -610,7 +759,10 @@ fn ExecutionFrame(comptime Executor: type) type {
         }
 
         fn storageCursor(self: *const Self, operation: structures.BorrowOperation) !Result {
-            const owner = try self.storageCell(operation.source);
+            var owner = try self.storageCell(operation.source);
+            if (comptime @hasDecl(@typeInfo(@TypeOf(self.executor)).pointer.child, "allocationElement")) {
+                if (try self.executor.allocationElement(owner.type_id)) |element| owner = (try allocationValue(owner.type_id, try allocationView(.{ .place = owner }, element, self.executor, self.storage), self.storage)).place;
+            }
             if (owner.contents != .allocation and !try expandFields(owner, self.executor)) return .unavailable;
             const cell = try Cell.create(self.storage, operation.type_id, .{ .storage_cursor = .{ .owner = owner, .offset = 0 } });
             return .{ .returned = .{ .place = cell } };
@@ -641,7 +793,7 @@ fn ExecutionFrame(comptime Executor: type) type {
         }
 
         fn allocationElement(self: *const Self, operation: structures.AllocationElement) !Result {
-            const allocation = allocationRecord(self.slots[@backingInt(operation.allocation)]);
+            const allocation = try allocationView(self.slots[@backingInt(operation.allocation)], operation.type_id, self.executor, self.storage);
             std.debug.assert(allocation.element_type == operation.type_id);
             return .{ .returned = .{ .place = try allocation.element(@intCast(integer(self.slots, operation.index))) } };
         }
@@ -673,7 +825,8 @@ fn ExecutionFrame(comptime Executor: type) type {
                 }
                 const use = argument.valueUse();
                 if (argument == .borrowed or argument == .deinit or (use.coerce_to == null and try self.executor.argumentPassing(self.body.valueType(use.value)) == .indirect)) {
-                    destination.* = .{ .place = try self.storageCell(use.value) };
+                    const cell = try self.storageCell(use.value);
+                    destination.* = .{ .place = if (cell.contents == .opaque_reference) cell.contents.opaque_reference else cell };
                     continue;
                 }
                 switch (try self.evaluateUse(use)) {
@@ -772,7 +925,7 @@ fn scalar(slots: []const Value, value: structures.FunctionValueId) structures.Co
 inline fn storedRuntime(value: Value) structures.CompileTimeValue.RuntimeValue {
     return switch (value) {
         .runtime => |runtime| runtime,
-        .place => |cell| cell.contents.value,
+        .place => |cell| memoryScalar(cell) orelse cell.contents.value,
         .type, .initializer => unreachable,
     };
 }
@@ -796,16 +949,23 @@ fn predicateIntegerOrder(left: structures.CompileTimeValue.RuntimeValue, right: 
     return std.math.order(left.int, right.int);
 }
 
-fn copyStoredValue(value: Value, type_id: structures.TypeId, executor: anytype, storage: std.mem.Allocator) !Value {
+pub fn copyStoredValue(value: Value, type_id: structures.TypeId, executor: anytype, storage: std.mem.Allocator) !Value {
     if (value != .place) return value;
     const copy = try Cell.create(storage, type_id, .uninitialized);
     try assignCell(copy, value, executor);
     return .{ .place = copy };
 }
 
+fn erasedHandle(cell: *const Cell) CallableHandle {
+    if (cell.contents == .erased_callable) return cell.contents.erased_callable;
+    const constant = cell.contents.value.erased_callable;
+    return .{ .invocation = constant.invocation, .payload = if (constant.payload) |function| .{ .function = function } else .none };
+}
+
 pub fn containsReference(cell: *const Cell) bool {
     return switch (cell.contents) {
-        .reference, .storage_cursor, .allocation => true,
+        .reference, .opaque_reference, .storage_cursor, .allocation => true,
+        .erased_callable => |callable| callable.payload == .receiver or callable.payload == .environment,
         .fields => |fields| for (fields) |*field| {
             if (containsReference(field)) break true;
         } else false,
@@ -825,6 +985,20 @@ pub fn referenceValue(type_id: structures.TypeId, target: *Cell, storage: std.me
 
 pub fn assignCell(destination: *Cell, source: Value, executor: anytype) anyerror!void {
     if (source == .place and destination == source.place) return;
+    try assignCellContents(destination, source, executor);
+    if (destination.memory != null and destination.contents == .value and destination.contents.value == .structure)
+        _ = try expandFields(destination, executor);
+    try attachMemoryFields(destination, executor);
+    try writeMemory(destination, executor);
+}
+
+fn assignCellContents(destination: *Cell, source: Value, executor: anytype) anyerror!void {
+    if (source == .place and destination == source.place) return;
+    if (source == .place and source.place.memory != null) {
+        try refreshMemoryVariant(source.place, executor);
+        if (memoryScalar(source.place)) |value| return assignRuntime(destination, value, executor);
+        if (source.place.contents == .uninitialized) _ = try expandFields(source.place, executor);
+    }
     if (destination.contents == .allocation) {
         if (try executor.arrayType(destination.type_id)) |array| {
             const allocation = destination.contents.allocation;
@@ -839,7 +1013,7 @@ pub fn assignCell(destination: *Cell, source: Value, executor: anytype) anyerror
         .place => |cell| {
             switch (cell.contents) {
                 .value => |runtime| try assignRuntime(destination, runtime, executor),
-                .uninitialized, .storage_cursor, .reference => destination.contents = cell.contents,
+                .uninitialized, .storage_cursor, .reference, .opaque_reference, .erased_callable => destination.contents = cell.contents,
                 .allocation => |allocation| {
                     if (try executor.arrayType(cell.type_id)) |array| {
                         const copied = try uninitializedCells(destination.storage, array.length, array.element_type);
@@ -871,7 +1045,7 @@ fn uninitializedCells(storage: std.mem.Allocator, count: usize, element_type: st
 }
 
 /// Element `index` of inline fields, an allocation, or an interned tuple.
-fn aggregateElement(aggregate: Value, index: usize, executor: anytype) !Value {
+pub fn aggregateElement(aggregate: Value, index: usize, executor: anytype) !Value {
     if (aggregate == .place and (aggregate.place.contents == .fields or aggregate.place.contents == .allocation))
         return .{ .place = try elementCell(aggregate.place, @intCast(index)) };
     const values = try executor.lookupTuple(storedRuntime(aggregate).structure);
@@ -927,12 +1101,14 @@ fn expandFields(cell: *Cell, executor: anytype) !bool {
             cell.contents = .{ .fields = fields };
         },
         .fields => {},
-        .variant_payload, .reference, .storage_cursor, .allocation => unreachable,
+        .variant_payload, .reference, .opaque_reference, .erased_callable, .storage_cursor, .allocation => unreachable,
     }
+    try attachMemoryFields(cell, executor);
     return true;
 }
 
 fn borrowVariantCell(target: *Cell, member: structures.TypeId, executor: anytype) !?*Cell {
+    try refreshMemoryVariant(target, executor);
     if (target.contents == .value) {
         const value = (try executor.lookupRuntime(target.contents.value.variant.payload)) orelse return null;
         std.debug.assert(value.type_id == member);
@@ -943,10 +1119,17 @@ fn borrowVariantCell(target: *Cell, member: structures.TypeId, executor: anytype
     return target.contents.variant_payload;
 }
 
-fn materialize(cell: *const Cell, executor: anytype, gpa: std.mem.Allocator) !?structures.CompileTimeValue.RuntimeValue {
+fn materialize(cell: *Cell, executor: anytype, gpa: std.mem.Allocator) anyerror!?structures.CompileTimeValue.RuntimeValue {
+    if (memoryScalar(cell)) |value| return value;
+    try refreshMemoryVariant(cell, executor);
+    if (cell.memory != null and cell.contents == .uninitialized) _ = try expandFields(cell, executor);
     switch (cell.contents) {
         .value => |value| return value,
-        .reference, .storage_cursor, .allocation => return null,
+        .reference, .opaque_reference, .storage_cursor, .allocation => return null,
+        .erased_callable => |callable| {
+            if (callable.payload == .receiver or callable.payload == .environment) return null;
+            return .{ .erased_callable = .{ .invocation = callable.invocation, .payload = if (callable.payload == .function) callable.payload.function else null, .type_id = cell.type_id } };
+        },
         .uninitialized => {
             std.debug.assert(cell.type_id != .never);
             const array = try executor.arrayType(cell.type_id);
@@ -974,6 +1157,113 @@ const ActiveVariant = struct {
     member_type: structures.TypeId,
     payload: Value,
 };
+
+fn memoryScalar(cell: *const Cell) ?structures.CompileTimeValue.RuntimeValue {
+    const memory = cell.memory orelse return null;
+    const size: u32 = if (cell.type_id.numericType()) |numeric| numeric.width() / 8 else if (cell.type_id == .bool) 1 else return null;
+    const bits = memoryBits(memory, size) orelse return null;
+    return if (cell.type_id == .bool) .{ .bool = bits != 0 } else numericValue(cell.type_id, bits);
+}
+
+fn memoryByte(source: *const Cell, offset: u32) ?*const Cell {
+    switch (source.contents) {
+        .fields => |fields| return &fields[offset],
+        .allocation => |allocation| {
+            std.debug.assert(!allocation.released);
+            if (allocation.source) |backing| return memoryByte(backing, allocation.byte_offset + offset);
+            return allocation.elements.get(offset);
+        },
+        else => return null,
+    }
+}
+
+fn attachMemoryFields(cell: *Cell, executor: anytype) anyerror!void {
+    if (comptime !@hasDecl(@typeInfo(@TypeOf(executor)).pointer.child, "hostLayout")) return;
+    const memory = cell.memory orelse return;
+    if (comptime @hasDecl(@typeInfo(@TypeOf(executor)).pointer.child, "variantLayout")) {
+        if (try executor.variantMembers(cell.type_id) != null) {
+            if (cell.contents == .value and cell.contents.value == .variant) {
+                const value = (try executor.lookupRuntime(cell.contents.value.variant.payload)).?;
+                const payload = try selectVariantPayload(cell, value.type_id);
+                try assignRuntime(payload, value.value, executor);
+            }
+            if (cell.contents == .variant_payload) {
+                const layout = try executor.variantLayout(cell.type_id);
+                cell.contents.variant_payload.memory = .{ .source = memory.source, .offset = memory.offset + layout.payload_offset };
+                try attachMemoryFields(cell.contents.variant_payload, executor);
+            }
+            return;
+        }
+    }
+    if (cell.contents != .fields) return;
+    const array = try executor.arrayType(cell.type_id);
+    if (array) |shape| {
+        const layout = try executor.hostLayout(shape.element_type);
+        for (cell.contents.fields, 0..) |*field, index| {
+            field.memory = .{ .source = memory.source, .offset = memory.offset + @as(u32, @intCast(index)) * layout.byte_size };
+            try attachMemoryFields(field, executor);
+        }
+        return;
+    }
+    if (comptime @hasDecl(@typeInfo(@TypeOf(executor)).pointer.child, "structLayout")) {
+        const layout = (try executor.structLayout(cell.type_id)) orelse return;
+        for (cell.contents.fields, layout.field_offsets, 0..) |*field, offset, index| {
+            if (field.type_id == .never) field.type_id = (try executor.structFieldType(cell.type_id, index)).?;
+            field.memory = .{ .source = memory.source, .offset = memory.offset + offset };
+            try attachMemoryFields(field, executor);
+        }
+    }
+}
+
+fn refreshMemoryVariant(cell: *Cell, executor: anytype) anyerror!void {
+    if (comptime !@hasDecl(@typeInfo(@TypeOf(executor)).pointer.child, "variantLayout")) return;
+    const memory = cell.memory orelse return;
+    const members = (try executor.variantMembers(cell.type_id)) orelse return;
+    const layout = try executor.variantLayout(cell.type_id);
+    const tag = memoryBits(memory, layout.tag_size) orelse return;
+    if (tag >= members.len) return error.Unavailable;
+    const payload = try selectVariantPayload(cell, members[@intCast(tag)]);
+    payload.memory = .{ .source = memory.source, .offset = memory.offset + layout.payload_offset };
+}
+
+fn memoryBits(memory: MemoryView, size: u32) ?u64 {
+    var bits: u64 = 0;
+    for (0..size) |index| {
+        const byte = memoryByte(memory.source, memory.offset + @as(u32, @intCast(index))) orelse return null;
+        if (byte.contents != .value or byte.contents.value != .byte) return null;
+        bits |= @as(u64, byte.contents.value.byte) << @intCast(index * 8);
+    }
+    return bits;
+}
+
+fn writeMemory(cell: *Cell, executor: anytype) anyerror!void {
+    const memory = cell.memory orelse return;
+    if (cell.contents == .fields) {
+        for (cell.contents.fields) |*field| try writeMemory(field, executor);
+        return;
+    }
+    if (comptime @hasDecl(@typeInfo(@TypeOf(executor)).pointer.child, "variantLayout")) {
+        if (cell.contents == .variant_payload) {
+            const layout = try executor.variantLayout(cell.type_id);
+            const members = (try executor.variantMembers(cell.type_id)).?;
+            const tag = std.mem.indexOfScalar(structures.TypeId, members, cell.contents.variant_payload.type_id).?;
+            try writeMemoryBits(memory, layout.tag_size, tag);
+            try writeMemory(cell.contents.variant_payload, executor);
+            return;
+        }
+    }
+    if (cell.contents != .value) return;
+    const size: u32 = if (cell.type_id.numericType()) |numeric| numeric.width() / 8 else if (cell.type_id == .bool) 1 else return;
+    const bits = if (cell.type_id == .bool) @as(u64, @intFromBool(cell.contents.value.bool)) else numericBits(cell.contents.value);
+    try writeMemoryBits(memory, size, bits);
+}
+
+fn writeMemoryBits(memory: MemoryView, size: u32, bits: u64) anyerror!void {
+    for (0..size) |index| {
+        const byte = try elementCell(memory.source, memory.offset + @as(u32, @intCast(index)));
+        byte.contents = .{ .value = .{ .byte = @truncate(bits >> @intCast(index * 8)) } };
+    }
+}
 
 fn variantValue(member_type: structures.TypeId, payload: structures.CompileTimeValueId) structures.CompileTimeValue.RuntimeValue {
     return .{ .variant = .{ .member_type = member_type, .payload = payload } };
@@ -1045,17 +1335,63 @@ fn staticCursor(value: Value) ?structures.StaticStorageCursor {
     return if (runtime == .storage_cursor) runtime.storage_cursor else null;
 }
 
+fn allocationView(value: Value, element_type: structures.TypeId, executor: anytype, storage: std.mem.Allocator) anyerror!*Allocation {
+    if (value.place.contents == .allocation) return value.place.contents.allocation;
+    if (comptime !@hasDecl(@typeInfo(@TypeOf(executor)).pointer.child, "allocationElement")) return allocationRecord(value);
+    if (try executor.allocationElement(value.place.type_id) == null) return allocationRecord(value);
+    const raw = try aggregateElement(value, 0, executor);
+    var cursor = (try aggregateElement(raw, 0, executor)).place.contents.storage_cursor;
+    while (cursor.owner.contents == .allocation) {
+        const backing = cursor.owner.contents.allocation;
+        const source = backing.source orelse break;
+        std.debug.assert(backing.element_type == .byte);
+        cursor.offset = try std.math.add(u32, backing.byte_offset, cursor.offset);
+        cursor.owner = source;
+    }
+    const count = integerValue(try aggregateElement(value, 1, executor));
+    const layout = try executor.hostLayout(element_type);
+    const view = try storage.create(Allocation);
+    view.* = .{
+        .identity = @intFromPtr(cursor.owner),
+        .element_type = element_type,
+        .capacity = @intCast(count),
+        .source = cursor.owner,
+        .byte_offset = cursor.offset,
+        .element_size = layout.byte_size,
+        .backing = .init(storage),
+        .identities = storage,
+    };
+    return view;
+}
+
 pub fn allocationRecord(value: Value) *Allocation {
     const cell = value.place;
     if (cell.contents == .fields) {
-        std.debug.assert(cell.contents.fields.len == 1);
         return allocationRecord(.{ .place = &cell.contents.fields[0] });
     }
-    return cell.contents.allocation;
+    if (cell.contents == .storage_cursor) return allocationRecord(.{ .place = cell.contents.storage_cursor.owner });
+    const record = cell.contents.allocation;
+    if (record.source) |source| return allocationRecord(.{ .place = source });
+    return record;
 }
 
 pub fn allocationValue(type_id: structures.TypeId, allocation: *Allocation, storage: std.mem.Allocator) !Value {
     return .{ .place = try Cell.create(storage, type_id, .{ .allocation = allocation }) };
+}
+
+pub fn rawAllocationValue(type_id: structures.TypeId, cursor_type: structures.TypeId, layout_type: structures.TypeId, allocation: *Allocation, layout: Value, executor: anytype, storage: std.mem.Allocator) !Value {
+    const backing = try Cell.create(storage, type_id, .{ .allocation = allocation });
+    const fields = try uninitializedCells(storage, 2, .never);
+    fields[0] = .{ .type_id = cursor_type, .storage = storage, .contents = .{ .storage_cursor = .{ .owner = backing, .offset = 0 } } };
+    fields[1].type_id = layout_type;
+    try assignCell(&fields[1], layout, executor);
+    return .{ .place = try Cell.create(storage, type_id, .{ .fields = fields }) };
+}
+
+pub fn cursorAligned(cursor: Value, alignment: i32) bool {
+    if (alignment <= 0) return false;
+    if (cursor == .place and cursor.place.contents == .storage_cursor) return cursor.place.contents.storage_cursor.offset % @as(u32, @intCast(alignment)) == 0;
+    return false;
 }
 
 pub fn integerValue(value: Value) i32 {

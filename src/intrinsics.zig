@@ -8,9 +8,9 @@ pub fn validHostStorage(definition: *const structures.StructDefinition) bool {
     return true;
 }
 
-pub fn validAllocation(definition: *const structures.StructDefinition, storage_type: structures.TypeId) bool {
-    return ownedResource(definition, &.{ "storage", "count" }, .explicit) and
-        definition.fields[0].type_id == storage_type and definition.fields[1].type_id == .int;
+pub fn validAllocation(definition: *const structures.StructDefinition, storage_type: structures.TypeId, provider_type: structures.TypeId) bool {
+    return ownedResource(definition, &.{ "storage", "count", "provider" }, .explicit) and
+        definition.fields[0].type_id == storage_type and definition.fields[1].type_id == .int and definition.fields[2].type_id == provider_type;
 }
 
 pub fn validBox(definition: *const structures.StructDefinition) bool {
@@ -55,6 +55,9 @@ fn trivialView(definition: *const structures.StructDefinition, names: []const []
 
 pub fn hasTypedBody(symbol: standard_library.External) bool {
     switch (symbol) {
+        .allocate_raw,
+        .deallocate_raw,
+        .cursor_aligned,
         .allocate,
         .allocate_host_storage,
         .deallocate,
@@ -130,6 +133,12 @@ pub fn validExternalSignature(facts: anytype, symbol: standard_library.External,
     };
     if (signature.result_mode != expected_result) return false;
     switch (symbol) {
+        .allocator_from, .allocator_from_unchecked => return hasShape(signature, &.{.ref}) and signature.return_type == try facts.allocatorType(),
+        .logger_from, .logger_from_unchecked => return hasShape(signature, &.{ .ref, .imm }) and signature.return_type == try facts.loggerType(),
+        .type_layout => return hasShape(signature, &.{}) and signature.return_type == try facts.allocationLayout(),
+        .cursor_aligned => return hasShape(signature, &.{ .imm, .imm }) and signature.return_type == .bool and (try facts.storageCursorAccess(signature.parameters[0].type_id)) == .byte and signature.parameters[1].type_id == .int,
+        .allocate_raw => return hasShape(signature, &.{.imm}) and signature.parameters[0].type_id == try facts.allocationLayout() and (try errorPayload(facts, signature.return_type, try facts.allocationError())) == try facts.rawBlock(),
+        .deallocate_raw => return hasShape(signature, &.{.deinit}) and signature.parameters[0].type_id == try facts.rawBlock() and signature.return_type == .unit,
         .primitive_operation => return true,
         .numeric_converter => {
             if (!hasShape(signature, &.{.imm})) return false;
@@ -140,12 +149,16 @@ pub fn validExternalSignature(facts: anytype, symbol: standard_library.External,
         .static_iteration_item => return hasShape(signature, &.{.imm}) and signature.return_type == .unit,
         .copy_value => return hasShape(signature, &.{.imm}) and signature.parameters[0].type_id == signature.return_type,
         .move_value => return hasShape(signature, &.{.deinit}) and signature.parameters[0].type_id == signature.return_type,
+        .erase => return validCallableSignature(facts, signature, .init),
+        .clone => return validCallableSignature(facts, signature, .imm),
+        .copy_callable => return hasShape(signature, &.{.imm}) and (try facts.callable(signature.return_type)) != null and signature.parameters[0].type_id == signature.return_type,
+        .drop_callable => return hasShape(signature, &.{.deinit}) and signature.return_type == .unit and (try facts.callable(signature.parameters[0].type_id)) != null,
         .initialize_collection => return validCollectionInitializerSignature(facts, signature),
         .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => return validCursorSignature(facts, symbol, signature),
         .array_filled => return validArrayFilledSignature(facts, signature),
         .byte_int => return hasShape(signature, &.{.imm}) and signature.parameters[0].type_id == .byte and signature.return_type == .int,
         .io_write => return validByteOutputSignature(facts, signature),
-        .io_read => return (try optionalPayload(facts, signature.return_type)) == .int and signature.parameters.len == 4 and
+        .io_read => return (try errorPayload(facts, signature.return_type, try facts.ioError())) == .int and signature.parameters.len == 4 and
             signature.parameters[0].type_id == .int and (try facts.allocationElement(signature.parameters[1].type_id)) == structures.TypeId.byte and
             signature.parameters[2].type_id == .int and signature.parameters[3].type_id == .int and hasShape(signature, &.{ .imm, .imm, .imm, .imm }),
         .literal_byte => return hasShape(signature, &.{}) and signature.return_type == .byte,
@@ -162,8 +175,22 @@ pub fn validExternalSignature(facts: anytype, symbol: standard_library.External,
     }
 }
 
+fn validCallableSignature(facts: anytype, signature: structures.FunctionSignature, mode: structures.ParameterMode) !bool {
+    if (!hasShape(signature, &.{mode})) return false;
+    const members = (try facts.variantMembers(signature.return_type)) orelse return false;
+    if (members.len != 2) return false;
+    const error_type = try facts.allocationError();
+    var callable: ?structures.TypeId = null;
+    for (members) |member| {
+        if (member == error_type) continue;
+        if (try facts.callable(member) == null) return false;
+        callable = member;
+    }
+    return callable != null and (mode == .init or signature.parameters[0].type_id == callable.?);
+}
+
 fn validByteOutputSignature(facts: anytype, signature: structures.FunctionSignature) !bool {
-    if (!hasShape(signature, &.{ .imm, .imm }) or (try optionalPayload(facts, signature.return_type)) != .int or signature.parameters[0].type_id != .int) return false;
+    if (!hasShape(signature, &.{ .imm, .imm }) or (try errorPayload(facts, signature.return_type, try facts.ioError())) != .int or signature.parameters[0].type_id != .int) return false;
     return (try facts.spanAccess(signature.parameters[1].type_id)) == structures.TypeId.byte;
 }
 
@@ -180,7 +207,7 @@ fn validHostStorageSignature(facts: anytype, symbol: standard_library.External, 
 
 fn validAllocationSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
     if (signature.parameters.len != 1) return false;
-    const type_id = if (symbol == .allocate) (try optionalPayload(facts, signature.return_type)) orelse return false else signature.parameters[0].type_id;
+    const type_id = if (symbol == .allocate) (try errorPayload(facts, signature.return_type, try facts.allocationError())) orelse return false else signature.parameters[0].type_id;
     if (try facts.allocationElement(type_id) == null) return false;
     return if (symbol == .allocate)
         hasShape(signature, &.{.imm}) and signature.parameters[0].type_id == .int
@@ -284,5 +311,14 @@ pub fn optionalPayload(facts: anytype, type_id: structures.TypeId) !?structures.
     if (members.len != 2) return null;
     if (members[0] == .none) return members[1];
     if (members[1] == .none) return members[0];
+    return null;
+}
+
+/// The other alternative of a two-member service-domain result.
+pub fn errorPayload(facts: anytype, type_id: structures.TypeId, error_type: structures.TypeId) !?structures.TypeId {
+    const members = (try facts.variantMembers(type_id)) orelse return null;
+    if (members.len != 2) return null;
+    if (members[0] == error_type) return members[1];
+    if (members[1] == error_type) return members[0];
     return null;
 }

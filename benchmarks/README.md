@@ -295,7 +295,7 @@ No automatic hook or workflow is installed.
 ## Runtime History
 
 [runtime_history.py](runtime_history.py) records every runtime benchmark (the 88M sieve,
-the five-face key search, and the array sort in all five distributions with static and
+the five-face key search, and the array sort across its input distributions with static and
 runtime comparators) across commits, in `.history/runtime/`, and renders a standalone
 report to `.history/runtime.html`. It shares nothing with the compilation history's
 records or report.
@@ -303,6 +303,7 @@ records or report.
 ```sh
 python3 benchmarks/runtime_history.py --cpu 4
 python3 benchmarks/runtime_history.py --cpu 4 --worktree
+python3 benchmarks/runtime_history.py --cpu 4 --sort-pattern 'adjacent swap' --sort-pattern 'minimum last'
 python3 -m unittest discover -s benchmarks -p runtime_history_test.py -v
 ```
 
@@ -313,19 +314,27 @@ walks first-parent commits newest to oldest until it reaches an existing entry o
 compiler build, benchmark compilation, or execution/correctness failure. It saves
 each commit immediately, retaining completed benchmarks from a failed commit, and
 renders the report when it stops. A new failure exits nonzero after rendering.
-Existing entries stop the walk regardless of their suite hash or status. The optional
+Existing entries stop the default walk regardless of their suite hash or status.
+To add inputs to older records, repeat `--sort-pattern` for the desired inputs.
+This measures only missing case/comparator entries, preserving all prior samples
+and their provenance. Each backfill records its own suite hash, timestamp, environment,
+and result keys. The walk stops when all requested entries at a commit already
+exist (successful or failed), or at the first new failure. It does not rerun the
+sieve, key search, or other sort inputs. The optional
 `--since` sets an inclusive oldest commit. The sieve program is read from
 [history_benchmark.zig](history_benchmark.zig) rather than copied. Only generated programs are timed,
 pinned to `--cpu`, with the same correctness checks and adaptive sampling as the
 standalone drivers (sort: seven rotated samples). Clang C and C++ references are
 cached in `.history/runtime/references.json`; delete it to measure them again.
 References are measured only when a new entry is needed, and ratios apply to the
-machine and session that produced those references. Records carry a suite hash for
-provenance. Do not run it alongside other timed work.
+machine and session that produced those references. Adding a workload refreshes an
+incomplete reference cache. Records carry a suite hash for provenance. Do not run
+it alongside other timed work.
 
 Each chart's x-axis includes only commits with a successful measurement in one of
 its displayed Chimera lanes. Ticks show dates; commit hashes remain in point hover
-details.
+details. Each chart reports its measured commit count and date range, plus a
+recorded failure boundary for that input when available.
 
 ## Frontend attribution
 
@@ -339,7 +348,8 @@ taskset -c 0-7 zig build history-benchmark --seed=0 -Doptimize=fast -j1 -- --cas
 
 Use an affinity set available on the measurement host. Run serial first, then
 eight workers on the same eight physical cores. Each phase reports wall time; counters report exclusive
-worker elapsed milliseconds and invocations, separating dependency waits from
+worker elapsed milliseconds and invocations, separating dependency coordination
+(blocking and scheduler/query bookkeeping) from
 body construction, typing, lifetime work, publication overhead, optimization, and
 code generation. Parallel totals are summed worker time, not wall time.
 `--profile` requires the compilation case and excludes `--samples`; it prints

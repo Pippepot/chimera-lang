@@ -139,7 +139,7 @@ const work_rows = [_]WorkRow{
     .{ .label = "other queries", .categories = &.{.query_other} },
 };
 
-const dependency_wait_row: WorkRow = .{ .label = "dependency wait", .categories = &.{.dependency_wait}, .unit = .request };
+const dependency_wait_row: WorkRow = .{ .label = "dependency coordination", .categories = &.{.dependency_wait}, .unit = .request };
 
 const work_label_width = width: {
     var width: usize = dependency_wait_row.label.len + 2;
@@ -246,7 +246,7 @@ fn expectTimingRow(text: []const u8, expected: []const []const u8) !void {
     return error.TestExpectedEqual;
 }
 
-test "timing table sorts stage work and keeps waiting and the program run out of compile shares" {
+test "timing table sorts stage work and keeps dependency coordination and the program run out of compile shares" {
     var analysis: profiling.Snapshot = .{};
     analysis.counters[@backingInt(profiling.Category.body_overhead)] = .{ .nanoseconds = 1_000_000, .runs = 2 };
     analysis.counters[@backingInt(profiling.Category.body_typing)] = .{ .nanoseconds = 4_000_000, .runs = 2 };
@@ -275,12 +275,12 @@ test "timing table sorts stage work and keeps waiting and the program run out of
     try expectTimingRow(text, &.{ "body", "setup", "1.000", "10.0", "2", "×", "500.0", "µs/query" });
     try expectTimingRow(text, &.{ "codegen", "3.000", "30.0", "4", "×", "750.0", "µs/function" });
     try expectTimingRow(text, &.{ "other", "queries", "2.000", "20.0", "1", "×", "2000.0", "µs/query" });
-    try expectTimingRow(text, &.{ "dependency", "wait", "9.000", "7", "×", "1285.7", "µs/request" });
+    try expectTimingRow(text, &.{ "dependency", "coordination", "9.000", "7", "×", "1285.7", "µs/request" });
     try expectTimingRow(text, &.{ "link", "0.100", "0.050", "1.1", "▎" });
     try expectTimingRow(text, &.{ "compile", "9.100", "10.050" });
     try expectTimingRow(text, &.{ "run", "program", "50.000" });
 
-    const order = [_][]const u8{ "body analysis", "typing / SSA", "body setup", "codegen", "other queries", "dependency wait", "link", "compile", "run program", "total" };
+    const order = [_][]const u8{ "body analysis", "typing / SSA", "body setup", "codegen", "other queries", "dependency coordination", "link", "compile", "run program", "total" };
     var previous: usize = 0;
     for (order) |label| {
         const index = std.mem.indexOfPos(u8, text, previous, label) orelse return error.TestExpectedEqual;
@@ -478,7 +478,15 @@ pub fn writeTypeInner(types: anytype, writer: *std.Io.Writer, type_id: structure
         }
         return writer.writeAll(name);
     }
-    if (try types.callable(type_id)) |callable| {
+    if (try types.boundMethod(type_id)) |method| {
+        try writer.writeAll("bound ");
+        return writeFunctionName(types, writer, method);
+    }
+    const callable_type = if (try types.functionReference(type_id)) |reference| blk: {
+        try writer.writeAll("function reference ");
+        break :blk reference;
+    } else try types.callable(type_id);
+    if (callable_type) |callable| {
         try writer.writeAll("func(");
         for (callable.parameters, 0..) |parameter, index| {
             if (index != 0) try writer.writeAll(", ");
@@ -557,6 +565,16 @@ fn writeStaticRuntime(types: anytype, writer: *std.Io.Writer, runtime: structure
         .string_literal => |value| try writer.print("\"{f}\"", .{std.zig.fmtString(try types.byteString(value))}),
         .storage_cursor => |cursor| try writeStaticCursor(types, writer, cursor),
         .function_ref => |reference| try writeFunctionName(types, writer, reference.instance()),
+        .erased_callable => |callable| {
+            if (callable.payload) |reference| {
+                try writeFunctionName(types, writer, reference.instance());
+            } else {
+                const location = try types.itemLocation(callable.invocation.item);
+                var target = callable.invocation;
+                target.item = location.owner.?;
+                try writeFunctionName(types, writer, target);
+            }
+        },
         .structure => |tuple| try writeStaticAggregate(types, writer, runtime.type_id, try types.staticArguments(tuple)),
         .variant => |variant| {
             try writeStaticValue(types, writer, variant.payload);

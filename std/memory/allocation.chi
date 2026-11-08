@@ -3,24 +3,50 @@ import std.array.{Array, collection_literal}
 import std.iteration.{End}
 import std.range.{Range, FromEnd}
 import std.memory
+import std.io.{IoError}
 import std.search
+import std.context as context
 import std.ownership.{copyable, movable}
 
+pub struct AllocationError
+    error = true
+    copy = fieldwise
+    pub reason: int
+    pub static refused = AllocationError{reason = 0}
+    pub static invalid_layout = AllocationError{reason = 1}
+    pub static size_limit = AllocationError{reason = 2}
+    pub static budget = AllocationError{reason = 3}
+
 pub struct Allocation(T: type)
-    storage: HostStorage
+    storage: RawBlock
     count: int
+    provider: Allocator
     drop = explicit
-    pub func allocate(count: int) Allocation(T) | none -> std.memory.allocate(T, count)
+    pub func allocate(count: int) Allocation(T) | AllocationError -> std.memory.allocate(T, count)
     pub func deallocate(deinit self: Allocation(T)) -> std.memory.deallocate(T, self^)
-    pub func capacity(imm self: Allocation(T)) int -> allocation_count(T, self)
+    pub func allocator(imm self: Allocation(T)) Allocator -> self.provider
+    pub func allocate_replacement(imm self: Allocation(T), count: int) Allocation(T) | AllocationError -> allocate_with(T, self.provider, count)
+    pub func capacity(imm self: Allocation(T)) int -> self.count
     pub func unsafe_initialize(mut self: Allocation(T), index: int, init item: T) -> std.memory.unsafe_initialize(T, self, index, item)
     pub func unsafe_take(mut self: Allocation(T), index: int) T -> std.memory.unsafe_take(T, self, index)
     pub func unsafe_destroy(mut self: Allocation(T), index: int) -> std.memory.unsafe_destroy(T, self, index)
     pub func unsafe_borrow(ref self: Allocation(T), index: int) ref T -> std.memory.unsafe_borrow(T, self, index)
 
-pub extern func allocate(static T: type, count: int) Allocation(T) | none
-pub extern func deallocate(static T: type, deinit allocation: Allocation(T))
-extern func allocation_count(static T: type, imm allocation: Allocation(T)) int
+pub func allocate(static T: type, count: int) Allocation(T) | AllocationError -> allocate_with(T, context.allocator, count)
+pub func allocate_with(static T: type, imm provider: Allocator, count: int) Allocation(T) | AllocationError
+    const layout = layout_for(T, count)?
+    return allocate_layout_with(T, provider, count, layout)
+# The caller may reserve extra trailing bytes, but never fewer than its typed view.
+pub func allocate_layout_with(static T: type, imm provider: Allocator, count: int, layout: AllocationLayout) Allocation(T) | AllocationError
+    const required = layout_for(T, count)?
+    if not valid_layout(layout) or layout.byte_size < required.byte_size or layout.alignment < required.alignment -> return AllocationError.invalid_layout
+    var block = provider.allocate(layout)?
+    if block.size() < layout.byte_size or block.alignment() < layout.alignment or not cursor_aligned(block.data, layout.alignment)
+        provider.deallocate(block^)
+        return AllocationError.invalid_layout
+    return Allocation(T){storage = block^, count = count, provider = provider}
+pub func deallocate(static T: type, deinit allocation: Allocation(T))
+    allocation.provider.deallocate(allocation.storage^)
 pub extern func unsafe_initialize(static T: type, mut allocation: Allocation(T), index: int, init item: T)
 pub extern func unsafe_take(static T: type, mut allocation: Allocation(T), index: int) T
 pub extern func unsafe_destroy(static T: type, mut allocation: Allocation(T), index: int)
@@ -29,7 +55,7 @@ pub extern func unsafe_borrow(static T: type, ref allocation: Allocation(T), ind
 pub struct collection_sequence(T: type)
     move = none
     copy = none
-    value: List(T) | none
+    value: List(T) | AllocationError
 
 pub struct List(T: type)
     copy = none
@@ -40,21 +66,24 @@ pub struct List(T: type)
             unsafe_destroy(T, self.storage, index)
         deallocate(T, self.storage^)
 
-    pub func from(static N: int, init values: collection_literal(T, N)) List(T) | none
+    pub func from(static N: int, init values: collection_literal(T, N)) List(T) | AllocationError
         const storage = allocate(T, N)
-        if not (storage is Allocation(T)) -> return none
+        if storage is AllocationError -> return storage^
         var result = List(T){storage = storage^, initialized = 0}
         initialize_collection(T, N, result.storage, values)
         result.initialized = N
         return result^
-    pub func collect(init values: collection_sequence(T)) List(T) | none -> values
-    pub func new(reserved: int) List(T) | none
+    pub func collect(init values: collection_sequence(T)) List(T) | AllocationError -> values
+    pub func new(reserved: int) List(T) | AllocationError
         const storage = allocate(T, reserved)
-        if not (storage is Allocation(T)) -> return none
+        if storage is AllocationError -> return storage^
         return List(T){storage = storage^, initialized = 0}
-    pub func filled(imm value: T, count: int) List(T) | none where copyable(T)
+    pub func new_with(imm provider: Allocator, reserved: int) List(T) | AllocationError
+        const storage = allocate_with(T, provider, reserved)?
+        return List(T){storage = storage^, initialized = 0}
+    pub func filled(imm value: T, count: int) List(T) | AllocationError where copyable(T)
         const storage = allocate(T, count)
-        if not (storage is Allocation(T)) -> return none
+        if storage is AllocationError -> return storage^
         var result = List(T){storage = storage^, initialized = 0}
         for index in 0..count
             initialize_collection_element(T, result.storage, index, value)
@@ -75,11 +104,11 @@ pub struct List(T: type)
         var view = self.span()
         return view.sort(Element, before)
     pub overload sort(sort_default, sort_by, sort_static)
-    func sorted_default(imm self: List(T)) List(T) | none where copyable(T) and movable(T)
+    func sorted_default(imm self: List(T)) List(T) | AllocationError where copyable(T) and movable(T)
         return self.span().sorted()
-    func sorted_by(imm self: List(T), before: func(imm T, imm T) bool) List(T) | none where copyable(T) and movable(T)
+    func sorted_by(imm self: List(T), before: func(imm T, imm T) bool) List(T) | AllocationError where copyable(T) and movable(T)
         return self.span().sorted(before)
-    func sorted_static(imm self: List(T), static Element: type, static before: func(imm Element, imm Element) bool) List(T) | none where copyable(T) and movable(T) and Element == T
+    func sorted_static(imm self: List(T), static Element: type, static before: func(imm Element, imm Element) bool) List(T) | AllocationError where copyable(T) and movable(T) and Element == T
         return self.span().sorted(Element, before)
     pub overload sorted(sorted_default, sorted_by, sorted_static)
     pub func capacity(imm self: List(T)) int -> self.storage.capacity()
@@ -102,20 +131,19 @@ pub struct List(T: type)
         const view = BytesView.unsafe_from_allocation(self.storage, self.initialized)
         if not (view is BytesView) -> panic "invalid List byte view"
         return view
-    pub func read_bytes(mut self: List(byte), descriptor: int, count: int) int | none
-        if count < 0 or count > 2147483647 - self.initialized -> return none
+    pub func read_bytes(mut self: List(byte), descriptor: int, count: int) int | AllocationError | IoError
+        if count < 0 or count > 2147483647 - self.initialized -> return AllocationError.invalid_layout
         if count == 0 -> return 0
-        if not (self.reserve(self.initialized + count) is unit) -> return none
-        const actual = io_read(descriptor, self.storage, self.initialized, count)
-        if not (actual is int) -> return none
+        _ = self.reserve(self.initialized + count)?
+        const actual = io_read(descriptor, self.storage, self.initialized, count)?
         self.initialized += actual
         return actual
 
-    pub func reserve(mut self: List(T), minimum_capacity: int) unit | none
-        if minimum_capacity < 0 -> return none
+    pub func reserve(mut self: List(T), minimum_capacity: int) unit | AllocationError
+        if minimum_capacity < 0 -> return AllocationError.invalid_layout
         if minimum_capacity <= self.capacity() -> return unit
-        var replacement = allocate(T, minimum_capacity)
-        if not (replacement is Allocation(T)) -> return none
+        var replacement = allocate_with(T, self.storage.provider, minimum_capacity)
+        if replacement is AllocationError -> return replacement^
         for index in (0..self.initialized).reversed()
             const item = unsafe_take(T, self.storage, index)
             initialize_collection_element(T, replacement, index, item^)
@@ -124,8 +152,8 @@ pub struct List(T: type)
         deallocate(T, previous^)
         return unit
 
-    pub func append(mut self: List(T), var item: T) unit | none
-        if not (reserve_collection_element(T, self) is unit) -> return none
+    pub func append(mut self: List(T), var item: T) unit | AllocationError
+        _ = reserve_collection_element(T, self)?
         unsafe_initialize(T, self.storage, self.initialized, item^)
         self.initialized += 1
         return unit
@@ -202,7 +230,7 @@ func destructure_list(static T: type, static N: int, deinit value: List(T)) Arra
     return [unsafe_take(T, owner.storage, index) static for index in 0..N]
 func new_collection_list(static T: type, static capacity: int) List(T)
     return List(T){storage = allocate_literal(T, capacity), initialized = 0}
-func new_collection_list_optional(static T: type, static capacity: int) List(T) | none -> List(T).new(capacity)
+func new_collection_list_optional(static T: type, static capacity: int) List(T) | AllocationError -> List(T).new(capacity)
 extern func initialize_collection_element(static T: type, mut storage: Allocation(T), index: int, init item: T) unit
 func append_collection_bounded(static T: type, mut result: List(T), init item: T)
     if result.initialized >= result.capacity() -> panic "Collection construction bound exceeded"
@@ -215,19 +243,19 @@ func append_collection_moved(static T: type, mut result: List(T), deinit item: T
     result.initialized += 1
 func append_collection_growing(static T: type, mut result: List(T), init item: T)
     if not (append_collection_optional(T, result, item) is unit) -> panic "List literal allocation failed"
-func reserve_collection_element(static T: type, mut result: List(T)) unit | none
+func reserve_collection_element(static T: type, mut result: List(T)) unit | AllocationError
     if result.initialized == result.capacity() -> return grow_collection(T, result)
     return unit
-func grow_collection(static T: type, mut result: List(T)) unit | none
+func grow_collection(static T: type, mut result: List(T)) unit | AllocationError
     const capacity = result.capacity()
-    if capacity == 2147483647 -> return none
+    if capacity == 2147483647 -> return AllocationError.size_limit
     var next = 1
     if capacity > 0
         if capacity <= 1073741823 -> next = capacity * 2
         else next = 2147483647
     return result.reserve(next)
-func append_collection_optional(static T: type, mut result: List(T), init item: T) unit | none
-    if not (reserve_collection_element(T, result) is unit) -> return none
+func append_collection_optional(static T: type, mut result: List(T), init item: T) unit | AllocationError
+    _ = reserve_collection_element(T, result)?
     initialize_collection_element(T, result.storage, result.initialized, item)
     result.initialized += 1
     return unit
@@ -237,9 +265,13 @@ pub struct Box(T: type)
     drop = func(deinit self: Box(T))
         unsafe_destroy(T, self.allocation, 0)
         deallocate(T, self.allocation^)
-    pub func new(init item: T) Box(T) | none
+    pub func new(init item: T) Box(T) | AllocationError
         var storage = allocate(T, 1)
-        if not (storage is Allocation(T)) -> return none
+        if storage is AllocationError -> return storage^
+        unsafe_initialize(T, storage, 0, item)
+        return Box(T){allocation = storage^}
+    pub func new_with(imm provider: Allocator, init item: T) Box(T) | AllocationError
+        var storage = allocate_with(T, provider, 1)?
         unsafe_initialize(T, storage, 0, item)
         return Box(T){allocation = storage^}
     pub func borrow(ref self: Box(T)) ref T -> std.memory.borrow(T, self)
@@ -266,15 +298,15 @@ pub struct Span(T: type)
     func sort_default(mut self: Span(T)) unit where movable(T)
         return self.sort(T, natural_order)
     func sort_by(mut self: Span(T), before: func(imm T, imm T) bool) unit where movable(T)
-        return sort_span(T, RuntimeSortOrder(T), self, RuntimeSortOrder(T){before = before})
+        return sort_span(self, RuntimeSortOrder{before = before})
     func sort_static(mut self: Span(T), static Element: type, static before: func(imm Element, imm Element) bool) unit where movable(T) and Element == T
         return sort_span(T, StaticSortOrder(T, before), self, StaticSortOrder(T, before){})
     pub overload sort(sort_default, sort_by, sort_static)
-    func sorted_default(var self: Span(T)) List(T) | none where copyable(T) and movable(T)
+    func sorted_default(var self: Span(T)) List(T) | AllocationError where copyable(T) and movable(T)
         return self.sorted(T, natural_order)
-    func sorted_by(var self: Span(T), before: func(imm T, imm T) bool) List(T) | none where copyable(T) and movable(T)
-        return sorted_span(T, RuntimeSortOrder(T), self, RuntimeSortOrder(T){before = before})
-    func sorted_static(var self: Span(T), static Element: type, static before: func(imm Element, imm Element) bool) List(T) | none where copyable(T) and movable(T) and Element == T
+    func sorted_by(var self: Span(T), before: func(imm T, imm T) bool) List(T) | AllocationError where copyable(T) and movable(T)
+        return sorted_span(self, RuntimeSortOrder{before = before})
+    func sorted_static(var self: Span(T), static Element: type, static before: func(imm Element, imm Element) bool) List(T) | AllocationError where copyable(T) and movable(T) and Element == T
         return sorted_span(T, StaticSortOrder(T, before), self, StaticSortOrder(T, before){})
     pub overload sorted(sorted_default, sorted_by, sorted_static)
     func index_of_equal(static Needle: type, imm self: Span(T), imm needle: Needle) int | none -> std.search.index_of(self, needle)
@@ -352,4 +384,4 @@ pub func take(static T: type, deinit owner: Box(T)) T
     const result = unsafe_take(T, owner.allocation, 0)
     deallocate(T, owner.allocation^)
     return result^
-extern func io_read(descriptor: int, imm allocation: Allocation(byte), start: int, count: int) int | none
+extern func io_read(descriptor: int, imm allocation: Allocation(byte), start: int, count: int) int | IoError

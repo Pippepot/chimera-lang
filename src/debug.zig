@@ -134,7 +134,7 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
     const instruction = ssa.instructions[instruction_index];
     try writer.print("    %{d} = {s}", .{ @backingInt(ssa.instructionValue(instruction_index)), @tagName(instruction) });
     switch (instruction) {
-        .type_union, .storage_cursor, .borrow_read, .cursor_offset, .cursor_element, .byte_to_int, .variant_tag, .negi, .borrow_write, .addi, .subi, .muli, .divsi, .shli, .shrsi, .select, .fill => {
+        .type_union, .storage_cursor, .borrow_read, .callable_payload, .callable_allocation, .cursor_offset, .cursor_element, .byte_to_int, .variant_tag, .negi, .borrow_write, .addi, .subi, .muli, .divsi, .shli, .shrsi, .select, .fill => {
             for ((&instruction).operands(), 0..) |operand, index| {
                 if (operand) |value| try writer.print("{s}%{d}", .{ if (index == 0) " " else ", ", @backingInt(value.*) });
             }
@@ -166,6 +166,20 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
             try writer.writeAll(" @");
             try diagnostics.writeFunctionName(queries.TypeFacts(*query.Database){ .ctx = db }, writer, reference.instance());
         },
+        .service_enter => |guard| {
+            try writer.print(" %{d}, @", .{@backingInt(guard.receiver)});
+            try diagnostics.writeFunctionName(queries.TypeFacts(*query.Database){ .ctx = db }, writer, guard.key);
+        },
+        .service_leave => {},
+        .context_read => |operation| try writer.print(" {s}", .{@tagName(operation.entry)}),
+        .context_write => |operation| try writer.print(" {s}, %{d}", .{ @tagName(operation.entry), @backingInt(operation.source) }),
+        .erased_callable => |callable| {
+            try writer.writeAll(" @");
+            try diagnostics.writeFunctionName(queries.TypeFacts(*query.Database){ .ctx = db }, writer, callable.invocation);
+            if (callable.payload) |payload| try writer.print(", %{d}", .{@backingInt(payload)});
+            if (callable.owns_environment) try writer.writeAll(" owned");
+        },
+        .callable_invoke => |operation| try writer.print(" {s} %{d}", .{ @tagName(operation.operation), @backingInt(operation.source) }),
         .variant_coerce, .variant_extract => |operation| {
             try writer.print(" %{d}{s}", .{ @backingInt(operation.operand), if (instruction == .variant_coerce) " to " else " as " });
             try renderType(db, operation.target_type, writer);
@@ -282,12 +296,20 @@ fn renderCompiledAssembly(db: *query.Database, compiled: structures.CompiledFunc
     try symbols.ensureTotalCapacity(gpa, compiled.relocations.len + compiled.panic_trace_offsets.len);
     for (compiled.relocations) |relocation| {
         const name = try assemblyRelocationName(db, compiled, relocation.reference, gpa);
-        symbols.appendAssumeCapacity(.{ .offset = relocation.offset, .name = name, .addend = relocation.addend });
+        if (relocation.offset < compiled.entry_offset) {
+            defer gpa.free(name);
+            const entries = [_][]const u8{ "invoke", "copy", "drop" };
+            try writer.print("  .descriptor.{s} = {s}", .{ entries[relocation.offset / 8], name });
+            if (relocation.addend != 0) try writer.print("{s}{d}", .{ if (relocation.addend > 0) "+" else "", relocation.addend });
+            try writer.writeByte('\n');
+            continue;
+        }
+        symbols.appendAssumeCapacity(.{ .offset = relocation.offset - compiled.entry_offset, .name = name, .addend = relocation.addend });
     }
     for (compiled.panic_trace_offsets) |offset| {
-        symbols.appendAssumeCapacity(.{ .offset = offset, .name = try gpa.dupe(u8, "<panic trace>") });
+        symbols.appendAssumeCapacity(.{ .offset = offset - compiled.entry_offset, .name = try gpa.dupe(u8, "<panic trace>") });
     }
-    const assembly = try disasm.disassembleWithSymbols(compiled.code, symbols.items, gpa);
+    const assembly = try disasm.disassembleWithSymbols(compiled.code[compiled.entry_offset..], symbols.items, gpa);
     defer gpa.free(assembly);
     try writer.writeAll(assembly);
     for (compiled.constant_data, 0..) |data, index| {

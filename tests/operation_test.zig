@@ -427,7 +427,7 @@ test "operation functions minus callable ambiguity and independent invalidation"
         try fixture.db.setInput(queries.SourceText, primitives, "extern func int.-(imm value: int) int\n" ++ binary);
         try fixture.expectDiagnostic(null, .private_access);
         try fixture.db.setInput(queries.SourceText, primitives, binary);
-        try fixture.expectDiagnostic(null, if (call_index == 2) .local_type_mismatch else .missing_operation);
+        try fixture.expectDiagnostic(null, if (call_index == 2) .call_argument_type_mismatch else .missing_operation);
         try fixture.db.setInput(queries.SourceText, primitives, primitives_source);
         try fixture.expectExit(0, 42);
     };

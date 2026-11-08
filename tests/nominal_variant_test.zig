@@ -101,6 +101,186 @@ test "nominal payloadless constructors preserve distinct alternatives" {
     , 42);
 }
 
+test "qualified payloadless cases infer instance values with native interpreter parity" {
+    try Fixture.expectParity(
+        \\static Color =
+        \\    .Red
+        \\  | .Blue: unit
+        \\  | .Green: none
+        \\func run() int
+        \\    const col = Color.Red
+        \\    const blue = Color.Blue
+        \\    const green = Color.Green
+        \\    if not (col is Color.Red) -> return 1
+        \\    if not (blue is Color.Blue) -> return 2
+        \\    if not (green is Color.Green) -> return 3
+        \\    if green is none | unit -> return 4
+        \\    return 42
+    , 42);
+    try Fixture.expectSourceExit(
+        \\static Color = .Red | .Blue | .Green
+        \\const col = Color.Red
+        \\match col
+        \\    Color.Red -> exit(42)
+    , 42);
+}
+
+test "qualified payloadless references retain type contexts and construct in value contexts" {
+    try Fixture.expectParity(
+        \\static Cases = .Empty | .Unit: unit | .Absent: none | .Value: int
+        \\static Empty: type = Cases.Empty
+        \\static selected = if true -> Cases.Empty else Cases.Unit
+        \\static Absent: type = Cases.Absent
+        \\static Payloadless = Cases.Empty | Cases.Unit | Cases.Absent
+        \\static saved: Cases = Cases.Empty
+        \\static same = Cases.Empty == Cases.Empty
+        \\func empty_type() type -> Cases.Empty
+        \\func only_empty(static T: type) int where T == Cases.Empty -> 42
+        \\func identity(static T: type, value: T) T -> value
+        \\struct Box
+        \\    value: Cases
+        \\func make() Cases -> Cases.Unit
+        \\func read(value: Cases) int
+        \\    match value
+        \\        Cases.Empty -> return 20
+        \\        Cases.Unit -> return 21
+        \\        Cases.Absent | Cases.Value -> return 0
+        \\func run() int
+        \\    const first: empty_type() = Empty
+        \\    const absent: Absent = Cases.Absent
+        \\    var current: Payloadless = Cases.Empty
+        \\    current = Cases.Unit
+        \\    var box = Box{value = Cases.Empty}
+        \\    box.value = Cases.Absent
+        \\    const (a, b) = (Cases.Empty, Cases.Absent)
+        \\    const values: Array(Cases, 3) = [Cases.Empty, Cases.Unit, Cases.Absent]
+        \\    const inferred = [Cases.Empty, Cases.Empty]
+        \\    if not (absent is Cases.Absent) -> return 1
+        \\    if not (current is Cases.Unit) -> return 2
+        \\    if not (box.value is Cases.Absent) -> return 3
+        \\    if not (a is Empty) or not (b is Absent) -> return 4
+        \\    if not (values[1] is Cases.Unit) -> return 5
+        \\    if not (inferred[0] is Empty) -> return 6
+        \\    if not (identity(Cases.Empty, Cases.Empty) is Empty) -> return 7
+        \\    if not (saved is Cases.Empty) -> return 8
+        \\    if not (selected is Empty) -> return 9
+        \\    if not same or only_empty(Cases.Empty) <> 42 -> return 10
+        \\    return read(first) + read(make()) + 1
+    , 42);
+}
+
+test "qualified payloadless overload arguments use their instance types" {
+    try Fixture.expectParity(
+        \\static Color = .Red | .Blue
+        \\func red(value: Color.Red) int -> 42
+        \\func blue(value: Color.Blue) int -> 1
+        \\overload choose(blue, red)
+        \\func run() int -> choose(Color.Red)
+    , 42);
+}
+
+test "unit none and nominal references share static value and explicit type contexts" {
+    try Fixture.expectParity(
+        \\import std.ownership.{copyable, movable}
+        \\static Color = .Red | .Blue | .Absent: none
+        \\static Unit: type = unit
+        \\static None: type = none
+        \\static Red: type = Color.Red
+        \\static saved_unit = unit
+        \\static saved_none = none
+        \\static saved_red = Color.Red
+        \\static saved_absent = Color.Absent
+        \\func unit_type() type -> comptime -> unit
+        \\func none_type() type -> comptime -> none
+        \\func red_type() type -> comptime -> Color.Red
+        \\func identity(static T: type, value: T) T -> value
+        \\func red_code(static value: Color) int
+        \\    if value is Color.Red -> return 42
+        \\    return 1
+        \\func run() int
+        \\    const u: unit_type() = Unit
+        \\    const n: none_type() = None
+        \\    const red: red_type() = Red
+        \\    const inferred = identity(Color.Red)
+        \\    const computed = comptime -> Color.Red
+        \\    if not (u is unit) or not (saved_unit is unit) -> return 1
+        \\    if not (n is none) or not (saved_none is none) -> return 2
+        \\    if not (red is Color.Red) or not (saved_red is Color.Red) -> return 3
+        \\    if not (inferred is Color.Red) or not (computed is Color.Red) -> return 4
+        \\    if not (saved_absent is Color.Absent) -> return 5
+        \\    if not copyable(Color.Red) or not movable(Color.Red) -> return 6
+        \\    if not copyable(unit) or not movable(none) -> return 7
+        \\    const values: Array(Color.Red, 1) = [saved_red]
+        \\    if not (values[0] is Red) -> return 8
+        \\    return red_code(Color.Red)
+    , 42);
+}
+
+test "qualified payloadless references preserve imported alias and specialization identities" {
+    try Fixture.expectFilesParity(
+        \\import lib.{Optional}
+        \\static Integers = Optional(int)
+        \\static Bytes = Optional(byte)
+        \\static Units = Optional(unit)
+        \\static Nones = Optional(none)
+        \\static Extended = Integers | .Cancelled
+        \\static Empty: type = Extended.Empty
+        \\func run() int
+        \\    const value = Empty
+        \\    const other = Bytes.Empty
+        \\    if value is Bytes.Empty -> return 1
+        \\    if other is Integers.Empty -> return 2
+        \\    if not (value is Integers.Empty) -> return 3
+        \\    if not (Extended.Cancelled is Extended.Cancelled) -> return 4
+        \\    const unit_payload = Units.Some
+        \\    const none_payload = Nones.Some
+        \\    if not (unit_payload is Units.Some) -> return 5
+        \\    if not (none_payload is Nones.Some) -> return 6
+        \\    return 42
+    , &.{.{ .path = "lib/optional.chi", .module_path = "lib", .source =
+        \\pub func Optional(static T: type) type -> .Some: T | .Empty
+    }}, 42);
+}
+
+test "qualified nominal references require payloads and preserve private access" {
+    try Fixture.expectSourceDiagnostic("static Cases = .Value: int | .Empty\nconst value = Cases.Value", .type_value_used_as_runtime_value);
+    try Fixture.expectSourceDiagnostic("struct Empty\nconst value = Empty", .type_value_used_as_runtime_value);
+    const fixture = try Fixture.initFiles(
+        \\import lib
+        \\static Cases = lib.cases()
+        \\const forged = Cases.Empty
+    , &.{.{ .path = "lib/private.chi", .module_path = "lib", .source =
+        \\static Hidden = .Empty | .Value: int
+        \\pub func cases() type -> Hidden
+    }});
+    defer fixture.deinit();
+    try fixture.expectDiagnostic(0, .private_access);
+}
+
+test "qualified case values refresh when payload eligibility changes" {
+    const original =
+        \\static Cases = .Value: unit | .Empty
+        \\func run() int
+        \\    const value = Cases.Value
+        \\    if value is Cases.Value -> return 42
+        \\    return 1
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(original);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const absent = try std.mem.replaceOwned(u8, testing.allocator, original, ".Value: unit", ".Value: none");
+    defer testing.allocator.free(absent);
+    try fixture.db.setInput(queries.SourceText, 0, absent);
+    try fixture.expectExit(0, 42);
+    const payload = try std.mem.replaceOwned(u8, testing.allocator, original, ".Value: unit", ".Value: int");
+    defer testing.allocator.free(payload);
+    try fixture.db.setInput(queries.SourceText, 0, payload);
+    try fixture.expectDiagnostic(0, .type_value_used_as_runtime_value);
+    try fixture.db.setInput(queries.SourceText, 0, original);
+    try fixture.expectExit(0, 42);
+}
+
 test "nominal variants preserve ordinary alternatives and explicit converter values" {
     try Fixture.expectParity(
         \\static Mixed = .Value: int | int | none
@@ -245,9 +425,9 @@ test "nominal case declarations reject duplicate names while compositions preser
 test "nominal unit and none payloads have no generated conversions" {
     const fixture = try Fixture.init(
         \\static Cases = .Unit | .ExplicitUnit: unit | .Absent: none | .Value: int
-        \\static UnitCase = Cases.Unit
-        \\static ExplicitUnitCase = Cases.ExplicitUnit
-        \\static NoneCase = Cases.Absent
+        \\static UnitCase: type = Cases.Unit
+        \\static ExplicitUnitCase: type = Cases.ExplicitUnit
+        \\static NoneCase: type = Cases.Absent
         \\static ValueCase = Cases.Value
     );
     defer fixture.deinit();

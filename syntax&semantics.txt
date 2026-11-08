@@ -209,7 +209,7 @@ if not (value in collection) -> missing()
 # literal-backed String results refer to symbolic immutable storage, never host
 # addresses. Runtime descriptors and the referenced bytes have independent
 # storage. String has move and automatic drop, but no implicit copy; clone is
-# explicit and returns an optional variant. Allocation-backed text also executes at compile time,
+# explicit and returns String | AllocationError. Allocation-backed text also executes at compile time,
 # subject to the evaluation-local storage publication boundary.
 # BytesView is a copyable wrapper of Span(byte) with readonly backing access.
 # get returns readonly ref byte | none; [] returns readonly ref byte and panics
@@ -270,7 +270,7 @@ if not (value in collection) -> missing()
 # A collection literal can initialize String directly, as in String([1, 2]);
 # its consuming converter constructs an Array before formatting it. Element
 # expressions use ordinary values and lifetime cleanup, not a failure channel.
-# std.io supplies stdin/stdout/stderr handles, optional read_bytes, write_once,
+# std.io supplies stdin/stdout/stderr handles, fallible read_bytes, write_once,
 # write_all, and write_text. Ordinary print accepts an immutable value of T
 # that converts to String, converts it once, and writes
 # the text followed by a newline. Existing String inputs are borrowed without copying.
@@ -284,7 +284,7 @@ if not (value in collection) -> missing()
 # without reading. Interrupted syscalls retry. write_all advances by completed
 # counts and fails on zero progress. Output programs ignore SIGPIPE so closed
 # pipes report ordinary write failure; print handles that failure by panicking.
-# Other OS failures return none; earlier external effects are
+# Other OS failures return marked IoError with cause and completed-byte progress; earlier external effects are
 # not rolled back. Reading or allocating
 # failure preserves initialized List contents; reservation may change capacity.
 # Writes borrow initialized readonly byte spans. Reads initialize spare allocation
@@ -294,7 +294,7 @@ if not (value in collection) -> missing()
 # become text, so partial UTF-8 sequences can be accumulated before conversion.
 # print is an ordinary declaration and may be shadowed or used as a callable.
 # Reached compile-time I/O is an unavailable execution operation, even inside a
-# optional result handler; an unexecuted branch performs no I/O and causes no error.
+# error handler; an unexecuted branch performs no I/O and causes no error.
 # StaticString represents immutable literal storage. Only literal
 # materialization creates one; its bytes are permanent and readonly, so views of
 # them may outlive every binding. Ref and Span use one private StorageCursor(T)
@@ -562,12 +562,12 @@ const computed_block = comptime
 # Allocation uses the selected host target's request rules for element
 # eligibility, layout, size, and alignment. A negative count, checked layout
 # overflow, unsupported resolved request, or provider refusal produces ordinary
-# allocation refusal as none through the declared optional API. Compiler memory used
+# marked AllocationError with its service-domain cause. Compiler memory used
 # to interpret values is an implementation resource: exhausting it is the
 # infrastructure failure described above, not an allocation-provider refusal.
 # Optimization may remove an allocation and its matching deallocation when the
 # storage is otherwise unobserved; the removed request cannot then be refused.
-# Allocation refusal skips deferred initialization and returns none. Ordinary
+# Allocation refusal skips deferred initialization and returns AllocationError. Ordinary
 # returns clean completed subobjects and release storage as required by the owning
 # library declaration; captured writes and completed transfers are not rolled back.
 # Deallocation itself never destroys elements. Ordinary scope cleanup and hooks
@@ -593,12 +593,12 @@ const computed_block = comptime
 # allocations into persistent storage remains unspecified. Cached execution
 # must preserve these rules: a cached result cannot share a fresh allocation
 # between calls or extend storage beyond its evaluation.
-func make_twenty() Box(int) | none -> Box.new(20)
-func inspect_allocations() int | none
+func make_twenty() Box(int) | AllocationError -> Box.new(20)
+func inspect_allocations() int | AllocationError
     var first = make_twenty()
-    if not (first is Box(int)) -> return none
+    if first is AllocationError -> return first^
     const second = make_twenty()
-    if not (second is Box(int)) -> return none
+    if second is AllocationError -> return second
     ref borrowed = first.borrow()
     borrowed = 22
     return first.borrow() + second.borrow()
@@ -632,42 +632,172 @@ func double(a: int) int -> a * 2
 # Function references are values and may be bound, passed, returned, and called.
 # Callable types contain each parameter's access mode and type, the return type,
 # and result access mode. Parameter names are not part of type identity. Plain function
-# references do not capture local bindings; capturing closures are planned below.
+# references do not capture local bindings; lexical closures are described below.
 func choose() func(int) int -> double
 func apply(operation: func(int) int, value: int) int -> operation(value)
 const operation = choose()
 exit(apply(operation, 21))
 
-# Closures (planned)
-# A capturing closure has a concrete environment containing its captures and
-# code operating on that environment. Capture ownership, permission, lifetime,
-# and invalidation follow ordinary value and reference rules. Borrowing a value
-# does not extend its lifetime, even when the closure itself is heap allocated.
-# Captures determine the environment's ownership capabilities; closures do not
-# inherit the trivial move/copy/drop guarantees of plain function references.
-# A concrete closure can live inline and pass through generic APIs without heap
-# allocation. Returning an owning closure by value can construct its environment
-# directly in the caller's destination. Explicit Box construction instead puts
-# the environment in owned heap storage; closure creation does not implicitly box.
-# Allocations performed by captured values or their construction remain ordinary
-# effects, independently of the environment's storage.
-# Plain function references remain distinct from capturing closure types.
-# Owning type-erased callbacks are deferred, not an implicit conversion or an
-# allocation requirement of closures. Capture syntax/defaults, invocation access
-# and consumption modes, and generic callable inspection remain to be settled.
-# These illustrative examples assume offset is captured by value, not a default
-# capture policy. Capturing function expressions are not implemented yet.
+# Closures and callables
+# Concrete expression closures, runtime-callable specialization, and declared
+# generic struct adapter result patterns are supported.
+# Bound methods, nonallocating erasure, and owning erasure of capturing lexical
+# closures are supported.
+# docs/CLOSURES.md develops the design; docs/ARCHITECTURE.md owns its compiler
+# boundaries. Existing named/static functions keep their func syntax and '->'
+# inline bodies. Expression-bodied closures use '=>'.
+#
+# Each lexical closure expression has a concrete generated type and an inline
+# environment. Creating that concrete value introduces no environment allocation;
+# captures and their construction may allocate through their ordinary operations.
+# Runtime free bindings, including those needed to construct nested closures,
+# initialize once in order of first lexical occurrence. Module statics, named
+# functions, and enclosing static arguments need no runtime capture.
+# Owned bindings are copied. An existing ref binding instead preserves its alias;
+# a captured Ref(T) retains its ordinary referent provenance and permissions.
+# Copy hooks execute during capture initialization and retain their effects.
+#
+# Parameter types may come from an expected callable signature; otherwise write
+# them explicitly. Infer the expression result, or check it against that signature,
+# including parameter access modes and result ownership. An uncontextualized
+# result is owned. This does not permit omitted result types on named functions.
+# Invocation borrows the environment immutably: owned captures cannot be replaced
+# or consumed. Captured writable references retain their ordinary authority;
+# a mutable callable binding cannot upgrade a readonly capture.
+#
+# Generated closure copy/move operations are fieldwise when all captures support
+# the respective operation. Ordinary structs still default to no copy. Reference
+# captures copy their aliases without requiring the referent to be copyable.
+# Noncopyable owned captures and explicit-drop captures are rejected in this
+# revision. Copyable immovable captures may construct directly in final storage.
+# Capture lists, construction-time move captures, consuming/mutable invocation,
+# and multistatement closure bodies remain deferred. A '^' inside the body is an
+# invocation-time transfer, never a capture instruction. Pending init operations
+# cannot become stored captures.
 func stack_example() int
-    const offset = 10
-    const add = func(value: int) int -> value + offset
-    return add(32)
+    var offset = 10
+    const snapshot = (value: int) => value + offset
+    ref live_offset = offset
+    const current = (value: int) => value + live_offset
+    offset = 20
+    assert(snapshot(1) == 11)
+    return current(22)
 
-func heap_example() int | none
-    const offset = 10
-    const boxed = Box.new(func(value: int) int -> value + offset)
-    if not (boxed is Box(func(int) int)) -> return none
-    ref add = boxed.borrow()
-    return add(32)
+# A runtime declaration parameter annotated func(Args...) Return implicitly
+# specializes on the argument's concrete callable type. Matching signatures,
+# including modes and result ownership, satisfy this requirement without erasure.
+# Each callback specializes independently; hidden types add no positional static
+# arguments and runtime capture contents never become specialization keys.
+# Aliases preserve these rules. Explicit static callable parameters retain their
+# existing compile-time argument rules. Ownership modes are unchanged: omitted
+# mode/imm borrows, var copies or accepts transfer, deinit consumes, and init
+# defers construction. Inferring a callback type never executes that construction.
+func apply(callback: func(int) int, value: int) int
+    return callback(value)
+
+# Callable adapter results
+# A generic struct result annotation may use a callable signature as a pattern:
+# Map(S, A, B, func(A) B) fixes the struct and its noncallable arguments while
+# inferring the callable argument from returned values and field initializers.
+# Each slot is independent, even when signatures match; field value flow connects
+# it to the actual callback. All returns in one specialization must agree on each
+# slot's concrete type. Conflicting or unresolved slots are errors. This does not
+# invert arbitrary type-valued functions or infer arbitrary function result shapes.
+# A returned initializer may use Map{...}: its declared result supplies S/A/B,
+# and the callback field supplies F. These constraints settle before construction,
+# including for init fields. Forwarding an existing adapter keeps its actual F.
+func map(static S: type, static A: type, static B: type,
+         var source: S, init transform: func(imm A) B) Map(S, A, B, func(imm A) B)
+    return Map{source = source^, transform = transform}
+
+# Callable erasure and bound methods
+# Fixed func(...) storage accepts named functions, lexical closures, and bound
+# methods. Named functions, noncapturing closures, and bound methods erase without
+# allocation or provider copy/drop; capturing closures allocate owned environments.
+# In fixed storage positions, func(...) is the common erased callable value.
+# These include local and field annotations, collection elements, direct func
+# results, and callable types nested inside another parameter's stored type.
+# List(func(int) int) stores erased elements. A fixed local annotation
+# Map(S, A, B, func(A) B) likewise requests an erased callback field, rather than
+# the result pattern above. Different nominal struct specializations do not gain
+# implicit conversions. Erase a callback before constructing an adapter when a
+# runtime choice needs one common callable type. Taking an implicitly specialized
+# function as a value uses its expected fixed signature; indirect calls then use
+# that fixed signature rather than specializing on each runtime callback argument.
+#
+# Erased values own their captured values, not the referents of captured references.
+# Named functions and noncapturing closures need no environment allocation.
+# A bound method stores its receiver reference directly in the erased handle.
+# A capturing lexical closure instead owns an allocated concrete environment,
+# independent of the creating frame. Copying that form allocates distinct storage
+# and copies captures with ordinary hooks, retaining reference dependencies.
+# Copying named functions or bound methods allocates nothing. No implicit shared
+# ownership or reference counting is introduced. Every erased func is copyable;
+# its copy cost and effects depend on its descriptor. Transfer moves the handle
+# without relocating an allocated environment; destruction releases only owned
+# captures and storage, never a borrowed receiver.
+# Joining or forwarding bound handles preserves their nonowning construction,
+# even without one known invocation target. Copy/drop never writes their receivers;
+# invoking them can still write referenced provider state.
+func make_adder(offset: int) func(int) int
+    return (value: int) => value + offset
+
+# place.method binds an ordinary borrowed receiver after member/overload selection.
+# Type.method remains unbound; callable instance fields remain ordinary fields.
+# Bind only checked existing places and preserve the required receiver permission.
+# Mutating methods require writable authority; consuming receivers and temporary
+# receiver lifetime extension are excluded. Formation and copying retain the
+# original receiver, never a factory-local bound-value wrapper. Erasure preserves
+# this direct reference without allocation, independent of optimization.
+struct Tracker
+    calls: int
+    func record(mut self: Tracker, amount: int) unit
+        self.calls += amount
+
+func recorder(mut tracker: Tracker) func(int) unit
+    return tracker.record
+
+var tracker = Tracker{calls = 0}
+const record = recorder(tracker)
+const again = record
+record(2)
+again(3)
+assert(tracker.calls == 5)
+
+# Both callbacks borrow tracker. Returning a method of a factory-local tracker is
+# invalid. A lexical wrapper over a reference to a caller-owned tracker can return
+# safely through func(...), but allocates an owned environment. General borrowed
+# erased views of lexical environments remain deferred. Ordinary ref aliases to
+# callable storage keep their existing identity, permissions, and lifetime rules.
+#
+# Allocator/logger handle factories construct private callable fields from direct
+# bound methods or permanent named functions. Ordinary fieldwise handle copying
+# therefore allocates nothing and calls no provider; arbitrary erased lexical
+# closures are not accepted by those factories. The func field type itself does
+# not promise nonallocating copying. Capture lists and mutable lexical-closure
+# invocation are unnecessary for binding service methods.
+#
+# Allocate an erased lexical environment before its capture initializers execute.
+# Copy an existing environment only after reserving destination storage. Partial
+# construction follows ordinary initialized-prefix cleanup; panic does not unwind.
+# Implicit environment-allocation failure panics. Explicit fallible erasure and
+# cloning return the callable or a marked allocation error; copy hooks remain
+# infallible. Reservation failure does not execute deferred capture initialization
+# or transfer. Executed argument/hook effects are never rolled back. The service
+# allocation-error migration uses marked errors, not absence; existing optional
+# standard-library allocation APIs have not yet migrated.
+#
+# With scoped context, allocated environments retain their original release
+# provider through a nonallocating service handle. Copying an environment selects
+# a provider for its new allocation. Captured borrows and retained providers must
+# survive all dependent uses. Returned references into owned environment storage
+# depend on that owner; returned captured references keep their original referents.
+# Copies, containers, opaque calls, and joins retain these dependencies and the
+# permitted invocation/copy/destruction effects. Opaque targets require conservative
+# contracts, including captured authority, rather than assuming no captures.
+# Registered context entries are read when the body executes. Capturing a local
+# saved handle retains that earlier selection; creation does not snapshot context.
+# Ambient requirements remain visible even for scalar results and implicit hooks.
 
 # Explicit overload sets
 # An overload declaration binds a module or type-namespace name to a nonempty
@@ -750,18 +880,19 @@ func invalid_state() never -> panic "invalid state"
 
 # Parameters and transfer
 # imm: read-only access (default).
+# ref: aliasing access preserving caller identity and permission.
 # static: value supplied at compile time.
 # mut: mutable access to a caller-owned variable.
 # var: function-owned variable, which may be stored or returned.
 # deinit: consuming ownership, preserving storage when direct movement is unavailable.
 # init: pending construction into a destination supplied by the callee.
 # A runtime parameter's access mode is part of callable type identity. An
-# omitted mode is imm. Function declarations support static, imm, mut, var,
+# omitted mode is imm. Function declarations support static, imm, ref, mut, var,
 # deinit, and init. There is no separate consume mode.
 # Static parameters belong to the declaration and specialization key,
 # not to the specialized function's runtime callable type or calling convention.
 # Runtime callable parameter types retain these modes, for example
-# func(imm T) T, func(deinit T) T, and func(init T) Box(T) | none. Taking a function
+# func(imm T) T, func(deinit T) T, and func(init T) Box(T) | AllocationError. Taking a function
 # value, aliasing it, or calling it indirectly does not erase its modes or
 # deferred effects.
 # Callable compatibility requires identical parameter modes, parameter types,
@@ -906,6 +1037,9 @@ take(a^) # transfer ownership; any subsequent access to 'a' is an error
 # deinitialization. Remaining automatic fields are cleaned up under the normal
 # lifetime rules; explicit-drop fields require explicit disposal or transfer.
 # This contract applies to ordinary functions as well as ownership hooks.
+# Opaque stored func values have no independently deinitializable fields.
+# Remaining handles, including replaced deinit parameters, use descriptor cleanup
+# to destroy owned environments; an explicitly transferred handle is not dropped.
 
 # Runtime const and var bindings both own their values; const controls mutation,
 # not ownership. A place is a local binding followed by zero or more fields.
@@ -1257,11 +1391,11 @@ func forward_initializer(static T: type, init item: T) T
 #
 # Host storage and low-level operations:
 # `std.memory.Box(T)` uniquely owns one initialized T in separately managed
-# host storage. Its allocation returns Box(T) | none; moving preserves the storage
+# host storage. Its allocation returns Box(T) | AllocationError; moving preserves the storage
 # address, and destruction destroys T before releasing that storage. Box has
-# no copy capability; allocating a separate owner returns an explicit optional.
+# no copy capability; allocating a separate owner returns an explicit fallible result.
 # Value construction and local binding do not themselves select allocation.
-# Box(T).new has the signature func(init item: T) Box(T) | none. Box.new may infer
+# Box(T).new has the signature func(init item: T) Box(T) | AllocationError. Box.new may infer
 # T from the unevaluated initializer's type. The constructor obtains storage
 # before evaluating any part of item, for every T and every initializer shape.
 # Box.new(make(argument())) orders allocation before argument() and make().
@@ -1279,7 +1413,7 @@ func forward_initializer(static T: type, init item: T) T
 # constructor is required for different capabilities. A transferred immovable
 # value remains invalid. T must be automatically droppable.
 #
-# Allocation refusal returns none and skips the entire initializer. Otherwise
+# Allocation refusal returns AllocationError and skips the entire initializer. Otherwise
 # construction produces T in its final slot and the constructor returns the Box.
 # Panic and divergence have their ordinary behavior. An optional/error value
 # returned by the initializer must be part of T; it never signals constructor failure.
@@ -1293,14 +1427,14 @@ func forward_initializer(static T: type, init item: T) T
 # succeed with a distinct, stable storage address; the provider may reserve
 # a minimal region to supply it.
 # Zero-sized values still run their destruction hooks. Negative counts and
-# layout overflow return none.
+# layout overflow return AllocationError with the appropriate cause.
 #
 # `std.memory.Allocation(T)` uniquely owns uninitialized storage. Its layout
 # comes from the layout domain selected by the execution target and location,
 # the element count, and alignment; the checked byte size is count times that
 # domain's element stride, which is aligned even for zero-count requests.
 # Alignment is at least the natural alignment for T in that domain. Overflow
-# returns none before allocation. The logical count remains separate from the byte layout.
+# returns AllocationError before allocation. The logical count remains separate from the byte layout.
 # It must be consumed by deallocation, which releases storage but does not
 # destroy elements. unsafe_initialize(T, mut allocation, index, init value)
 # constructs into a caller-proven uninitialized element slot and returns unit.
@@ -1337,9 +1471,9 @@ func forward_initializer(static T: type, init item: T) T
 # Allocation(T).capacity() returns its allocated element count, including for
 # zero-sized T. List capacity is derived from that count rather than stored twice.
 # std.memory.List(T) owns Allocation(T) and a contiguous initialized prefix
-# of length elements within capacity allocated slots. Creation returns List(T) | none;
+# of length elements within capacity allocated slots. Creation returns List(T) | AllocationError;
 # negative capacity fails. Zero capacity still owns a distinct allocation.
-# List(T).filled(imm value: T, count: int) returns List(T) | none and requires copyable T.
+# List(T).filled(imm value: T, count: int) returns List(T) | AllocationError and requires copyable T.
 # It allocates exactly count slots once, then constructs each element by one
 # ordinary copy of value, which is not consumed. Negative count fails.
 # Destroying a List destroys only the initialized prefix, in reverse order,
@@ -1353,7 +1487,7 @@ func forward_initializer(static T: type, init item: T) T
 # relocates in reverse index order. unsafe_take extracts the owned value with
 # its contained referent origins, independently of the old slot. Internal slot
 # construction inherits only its initializer's failure; supported moves are
-# ordinary, so relocation needs no optional result after allocation succeeds.
+# ordinary, so relocation needs no failure alternative after allocation succeeds.
 # The initialized count remains unchanged, and the old allocation is released
 # after all elements have been relocated. `get(index)`
 # checks 0 <= index < length and returns (ref T) | none, with a present reference
@@ -1426,7 +1560,7 @@ func forward_initializer(static T: type, init item: T) T
 # helpers on the comparator identity; the comparator's calls execute at runtime.
 # sorted() and sorted(before) instead copy the elements into a new owned
 # List(T), sort that List, and leave the source sequence in its original order.
-# They return List(T) | none; none means the result allocation was refused.
+# They return List(T) | AllocationError, preserving the allocation failure cause.
 # Their elements must be copyable and movable, and List requires them to be
 # automatically droppable. Each element is copied once before sorting; custom
 # copy hooks may therefore change the values being ordered. Readonly collection
@@ -1446,7 +1580,7 @@ func forward_initializer(static T: type, init item: T) T
 # O(n log n) worst-case work. Small, already ordered, and strictly descending
 # inputs need no algorithm-owned scratch allocation. Other inputs use two
 # O(n) index buffers before moving any source element; if either allocation
-# fails, sort panics. sorted returns none if its result allocation fails, and
+# fails, sort panics. sorted returns AllocationError if its result allocation fails, and
 # panics if later scratch allocation fails. Panic does not unwind owners.
 #
 # These are library algorithms over private storage cursors. Private cursor
@@ -1473,6 +1607,9 @@ func forward_initializer(static T: type, init item: T) T
 # contract. An unknown callable retains every possible source, requires writable
 # inputs wherever its signature permits writes, and supplies readonly results.
 # No source-level origin annotations are required.
+# Callable contracts additionally track receiver/environment captures,
+# independently of explicit argument origins. Ambient sources belong to the
+# separate shared-context milestone.
 #
 # A function may return a borrowed input's place or references stored inside a
 # prepared value. Ref(T) owns its handle, so returning that handle does not borrow
@@ -1684,6 +1821,8 @@ func S.read_a(imm value: S) int -> value.a
 # defers evaluation until construction; a deinit receiver consumes in place.
 # Callable values stored in the namespace also support this receiver insertion;
 # callable instance fields are called directly without inserting the receiver.
+# Forming a bound value with place.method, without a call, is specified in the
+# planned closures and bound methods section above; it is not implemented yet.
 # Fields and ordinary namespace declarations share one name scope; duplicate
 # names are errors. Struct properties use a separate scope. Within a
 # namespace declaration, unqualified names search its enclosing struct
@@ -1786,8 +1925,8 @@ pub struct Interval
 # explicitly requested inside the hook follow the same rules as other code.
 # The logical effects of selected hooks are observable and cannot be omitted
 # merely because storage could be reused.
-# Potentially failing duplication is an ordinary function returning an optional,
-# not an implicit copy operation.
+# Recoverable duplication is an ordinary function returning a marked error
+# alternative, not an implicit copy operation.
 # Without copy support, an existing value passed to a var parameter requires
 # transfer with '^'. A deinit parameter consumes the original value in place.
 # move = none requires construction in final storage and a stable address.
@@ -1796,7 +1935,10 @@ pub struct Interval
 # drop = explicit requires every ownership path to transfer the value and its
 # obligation elsewhere or pass it to 'deinit' before its lifetime ends.
 
-# Primitive values and function references have trivial move, copy, and drop.
+# Primitive values and plain function references have trivial move, copy, and drop.
+# Every stored erased func remains copyable,
+# but only named functions/noncapturing closures and bound methods have trivial
+# capture copying. Capturing lexical closure copies allocate and run capture hooks.
 # A variant moves or copies fieldwise when every member supports that operation,
 # and otherwise does not support it. A variant drops trivially when every member
 # does; otherwise it drops fieldwise according to its active member.
@@ -1870,6 +2012,7 @@ reassigned = int_or_float_value
 # private generic arguments.
 static Message = .Empty | .Text: StaticString | CustomMessageType
 const empty = Message.Empty{}
+const inferred_empty = Message.Empty
 const text = Message.Text{"hello"}
 const inferred_text: Message = .Text{"hello"}
 # In a brace constructor, .Name resolves an existing nominal case by name within
@@ -1883,6 +2026,14 @@ const inferred_text: Message = .Text{"hello"}
 # corresponding element type. Shorthand and qualified types may be joined with |.
 # Bare .Name in an expression constructs the selected case when its payload is
 # unit or none; other payload types require brace construction with a payload.
+# A qualified case reference such as Message.Empty, or a static alias of that
+# case type, likewise constructs a value in a value context when its payload is
+# unit or none. Without an annotation, a const/var binding infers the narrow case
+# type. Type annotations, type arguments, type-returning functions, patterns,
+# constructor targets, compile-time type comparisons, and union type composition
+# retain the case's type meaning.
+# An unannotated static initializer also selects an instance value, just as with
+# bare unit and none. Write static Empty: type = Message.Empty for a type alias.
 # Bare .Name in a type declaration still declares a case. Runtime shorthand does
 # not introduce a new declaration. This shorthand does not yet select arbitrary
 # struct namespace members or infer an omitted struct initializer type.
@@ -2067,7 +2218,7 @@ const first: int = first_result
 # none and explicit error alternatives remain elements when the element type
 # accepts them; they do not interrupt construction.
 # List's consuming literal converter allocates before evaluating its elements
-# and panics if allocation is refused. Explicit List(T).from returns List(T) | none
+# and panics if allocation is refused. Explicit List(T).from returns List(T) | AllocationError
 # instead, leaving deferred elements unevaluated when allocation is refused.
 # Both paths share the same element construction and ownership rules.
 const values: List(int) = [1, 2, 3]
@@ -2118,13 +2269,34 @@ if not (recovered is List(int)) -> panic "allocation refused"
 # Implicit List allocation failure, including growth, panics. List(T).collect
 # receives init collection_sequence(T), a construction-only carrier for a List(T)
 # expression with recoverable bracket allocation. Its logical value field holds
-# the eventual optional List's reference shape; the carrier has no ordinary runtime value.
+# the eventual fallible List's reference shape; the carrier has no ordinary runtime value.
 # Consuming it constructs List(T), and it cannot be bound or stored. The parameter
 # type selects recoverable construction for direct calls, callable values, and
 # other init consumers uniformly. Both fixed and runtime shapes are supported;
-# collect returns List(T) | none using the ordinary variant result protocol.
+# collect returns List(T) | AllocationError using the ordinary variant result protocol.
 # Existing List(T).from remains the fixed-count pending-literal factory.
 
+
+# Scoped bindings and standard context
+# with target = expression saves an ordinary mutable location or a registered
+# contextual entry, installs one evaluated replacement, runs the body and its
+# ordinary outgoing cleanup, then restores the old value and destroys the displaced
+# value. Return, break, continue, and error propagation restore in nesting order.
+# The RHS runs with the old binding. A replaced ordinary location must remain valid
+# and initialized through restoration; restoration invalidates references into its
+# displaced contents. with expression instead retains and normally destroys one
+# ordinary resource; it does not unwrap an error alternative.
+# The prelude exports std.context as context. context.allocator and context.logger
+# are compiler-registered declarations, including through aliases and re-exports.
+# Reads copy borrowed service handles; only with can replace their binding storage.
+# Direct assignment, writable references, and moving a contextual entry are rejected.
+# Function contracts track each entry independently of ABI parameters. Calls and
+# pending initializers select bindings when invoked or forced. Returned handles
+# retain their backends, and owning allocations retain their selected release provider.
+# Installing a handle retains its checked dependencies through body cleanup and
+# restoration. It does not promote local backends to longer-lived ownership.
+# Native panic terminates without unwinding. The evaluator has isolated bindings;
+# its default logger is disabled. Native context uses thread-local root defaults.
 
 # Variants and flow typing
 # There is one ordinary return channel. Absence and errors are ordinary variant
@@ -2153,11 +2325,13 @@ func accept_small(value: int) int | none
 # the ordinary join of its success alternatives and the handler's results. Errors
 # produced by the handler remain values; this catch does not catch them again.
 const number = parse(text) catch err -> 0
+const fallback = parse(text) catch -> 0
 const annotated = parse(text) catch err: InvalidNumber | OutOfRange -> 0
 # The optional binder annotation must admit every caught logical error type.
 # It is not a filter and does not convert or copy the caught value. An infallible
 # specialization is legal and does not type-check an unreachable handler body.
-# The `_` binder may be used when the error payload is not needed.
+# The binder may be omitted when the error payload is not needed. `catch ->`
+# behaves like `catch _ ->`, including ordinary cleanup of the caught value.
 #
 # Postfix `?` yields the same success projection but returns an active error from
 # the enclosing callable. The ordinary return contract must accept that error.

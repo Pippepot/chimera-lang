@@ -1,0 +1,47 @@
+import std.memory.{AllocationError}
+import std.io.{IoError, stderr, write_text}
+import std.text.{StringView}
+import std.context as context
+
+pub struct LogLevel
+    copy = trivial
+    value: int
+    pub static trace = LogLevel{value = 0}
+    pub static debug = LogLevel{value = 1}
+    pub static info = LogLevel{value = 2}
+    pub static warning = LogLevel{value = 3}
+    pub static error = LogLevel{value = 4}
+    pub static off = LogLevel{value = 5}
+
+pub struct Logger
+    copy = fieldwise
+    emit_callback: func(LogLevel, StringView) unit | AllocationError | IoError
+    minimum_level: LogLevel
+    pub func from(static Backend: type, ref backend: Backend, minimum: LogLevel) Logger -> logger_from(Backend, backend, minimum)
+    pub func from_unchecked(static Backend: type, ref backend: Backend, minimum: LogLevel) Logger -> logger_from_unchecked(Backend, backend, minimum)
+
+pub func enabled(imm logger: Logger, level: LogLevel) bool -> level.value < LogLevel.off.value and level.value >= logger.minimum_level.value
+pub func emit(imm logger: Logger, level: LogLevel, imm message: StringView) unit | AllocationError | IoError
+    if not enabled(logger, level) -> return unit
+    return logger.emit_callback(level, message)
+
+pub func log(level: LogLevel, imm message: StringView) unit | AllocationError | IoError -> emit(context.logger, level, message)
+
+func noop_emit(level: LogLevel, imm message: StringView) unit | AllocationError | IoError -> unit
+pub func noop_logger() Logger -> Logger{emit_callback = noop_emit, minimum_level = LogLevel.off}
+func stderr_emit(level: LogLevel, imm message: StringView) unit | AllocationError | IoError
+    const prefix: StringView = match level.value
+        0 -> "trace: "
+        1 -> "debug: "
+        2 -> "info: "
+        3 -> "warning: "
+        _ -> "error: "
+    _ = write_text(stderr, prefix)?
+    const delivered = write_text(stderr, message)
+    if delivered is IoError -> return IoError{cause = delivered.cause, progress = prefix.byte_length() + delivered.progress}
+    const newline = write_text(stderr, "\n")
+    if newline is IoError -> return IoError{cause = newline.cause, progress = prefix.byte_length() + message.byte_length() + newline.progress}
+    return unit
+pub func root_logger() Logger -> Logger{emit_callback = stderr_emit, minimum_level = LogLevel.info}
+extern func logger_from(static Backend: type, ref backend: Backend, minimum: LogLevel) Logger
+extern func logger_from_unchecked(static Backend: type, ref backend: Backend, minimum: LogLevel) Logger

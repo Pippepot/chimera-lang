@@ -134,6 +134,7 @@ const Width = enum(u2) {
     }
 };
 
+const load_rax = [_]x86.Operation{ .movzx_eax_rax, .movzx_eax_word_rax, .mov_eax_rax, .mov_rax_rax_offset };
 const load_rsp = [_]x86.Operation{ .movzx_eax_rsp, .movzx_eax_word_rsp, .mov_eax_rsp, .mov_rax_rsp };
 const store_rsp = [_]x86.Operation{ .mov_rsp_al, .mov_rsp_ax, .mov_rsp_eax, .mov_rsp_rax };
 const store_rdi = [_]x86.Operation{ .mov_rdi_al, .mov_rdi_ax, .mov_rdi_eax, .mov_rdi_rax_offset };
@@ -237,6 +238,8 @@ const LocationPlan = struct {
     uses: []Usage,
     stack_slots: []StackSlot,
     local_storage_offset: u32,
+    runtime_scratch_offset: ?u32,
+    service_nodes: []?u32,
 
     const Usage = enum { unused, used, shared, returned };
 
@@ -342,6 +345,12 @@ const LocationPlan = struct {
                     addressable[@backingInt(operation.source)] = true;
                 },
                 .borrow_write => |operation| addressable[@backingInt(operation.value)] = true,
+                .service_enter => |operation| addressable[@backingInt(operation.receiver)] = true,
+                .context_read => {
+                    markUsed(&needed[value_index]);
+                    addressable[value_index] = true;
+                },
+                .context_write => |operation| addressable[@backingInt(operation.source)] = true,
                 .call => |call| markCallArguments(ssa, call, needed, addressable),
                 .aggregate => |aggregate| for (ssa.aggregate_fields[aggregate.fields.start..aggregate.fields.end]) |field| {
                     markUsed(&needed[@backingInt(field)]);
@@ -381,6 +390,8 @@ const LocationPlan = struct {
         errdefer deinitCallLayouts(&calls, gpa);
         for (ssa.instructions) |instruction| if (instruction == .call) {
             outgoing_size = @max(outgoing_size, try planCallStorage(ssa, types, value_types, instruction.call, &calls, gpa));
+        } else if (instruction == .context_read) {
+            outgoing_size = @max(outgoing_size, try planCallStorage(ssa, types, value_types, .{ .target = .{ .direct = instruction.context_read.root }, .arguments = .{ .start = 0, .end = 0 }, .return_type = instruction.context_read.type_id }, &calls, gpa));
         };
         var edge_scratch_end = outgoing_size;
         for (ssa.blocks) |block| {
@@ -395,6 +406,16 @@ const LocationPlan = struct {
         var stack_slots: std.ArrayList(StackSlot) = .empty;
         errdefer stack_slots.deinit(gpa);
         var local_end = edge_scratch_end;
+        const service_nodes = try gpa.alloc(?u32, ssa.instructions.len);
+        errdefer gpa.free(service_nodes);
+        @memset(service_nodes, null);
+        var runtime_scratch_offset: ?u32 = null;
+        for (ssa.instructions, 0..) |instruction, index| {
+            if (instruction != .service_enter and instruction != .service_leave and instruction != .context_read and instruction != .context_write) continue;
+            if (runtime_scratch_offset == null) runtime_scratch_offset = try reserveLocalStack(&local_end, &stack_slots, gpa, .{ .byte_size = 24, .byte_alignment = 8 });
+            if (instruction == .service_enter) service_nodes[index] = try reserveLocalStack(&local_end, &stack_slots, gpa, .{ .byte_size = 24, .byte_alignment = 8 });
+        }
+
         const entry_index = @backingInt(ssa.entry);
         std.debug.assert(entry_index < ssa.blocks.len);
         for (ssa.blocks, 0..) |block, block_index| {
@@ -421,7 +442,7 @@ const LocationPlan = struct {
                     },
                     .type_union, .const_type, .const_int_literal, .const_string_literal, .static_conversion => unreachable,
                     .initializer_ref => |operation| break :location_blk .{ .stack = try reserveLocalStack(&local_end, &stack_slots, gpa, try initializerSlotLayout(operation.captures)) },
-                    .const_unit, .const_none => if (!addressable[value_index]) break :location_blk .discarded,
+                    .const_unit, .const_none, .service_enter, .service_leave => if (!addressable[value_index]) break :location_blk .discarded,
                     .call => |call| if (call.return_type == .unit and !addressable[value_index]) {
                         break :location_blk .discarded;
                     },
@@ -522,6 +543,8 @@ const LocationPlan = struct {
             .uses = needed,
             .stack_slots = try stack_slots.toOwnedSlice(gpa),
             .local_storage_offset = edge_scratch_end,
+            .runtime_scratch_offset = runtime_scratch_offset,
+            .service_nodes = service_nodes,
         };
     }
 
@@ -531,7 +554,8 @@ const LocationPlan = struct {
         if (type_id.isPrimitive()) return false;
         return try types.facts().borrowElement(type_id) != null or
             try types.facts().storageCursorAccess(type_id) != null or
-            try types.facts().callable(type_id) != null;
+            try types.facts().functionReference(type_id) != null or
+            try types.facts().boundMethod(type_id) != null;
     }
 
     fn promoteRegisters(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator, locations: []ValueLocation, value_types: []const structures.TypeId, addressable: []const bool, uses: []const Usage) ![]u32 {
@@ -583,6 +607,7 @@ const LocationPlan = struct {
         gpa.free(self.allocation_bases);
         gpa.free(self.uses);
         gpa.free(self.stack_slots);
+        gpa.free(self.service_nodes);
         self.* = undefined;
     }
 };
@@ -938,6 +963,10 @@ fn FunctionEmitter(comptime Types: type) type {
             const ssa = self.ssa;
             if (self.encoder.stream != null or self.plan.stack_size != 0) try self.encoder.offset(.sub_rsp, self.plan.stack_size);
             try self.saveRegisters(.save);
+            if (self.plan.runtime_scratch_offset) |scratch| {
+                try self.encoder.immediate(.mov_eax, 0);
+                try self.encoder.offset(.mov_rsp_rax, scratch + 16);
+            }
             const entry = ssa.blocks[@backingInt(ssa.entry)];
             if (ssa.is_initializer_region) {
                 for (self.plan.locations[entry.argument_start..entry.argument_end], 0..) |location, capture| {
@@ -1041,7 +1070,7 @@ fn FunctionEmitter(comptime Types: type) type {
                     continue;
                 }
                 const destination = self.valueLocation(ssa.instructionValue(instruction_index));
-                try self.emitInstruction(ssa.instructions[instruction_index], destination);
+                try self.emitInstruction(ssa.instructions[instruction_index], destination, instruction_index);
                 const value_index = @backingInt(ssa.instructionValue(instruction_index));
                 if (self.plan.allocation_bases.len != 0 and self.plan.allocation_bases[value_index]) {
                     try self.loadAddress(destination);
@@ -1119,7 +1148,7 @@ fn FunctionEmitter(comptime Types: type) type {
             return true;
         }
 
-        fn emitInstruction(self: *Self, instruction: structures.FunctionInstruction, destination: ValueLocation) !void {
+        fn emitInstruction(self: *Self, instruction: structures.FunctionInstruction, destination: ValueLocation, index: usize) !void {
             switch (instruction) {
                 .const_numeric => |constant| try self.emitNumericConstant(constant, destination),
                 .numeric_binary => |operation| try self.emitNumericBinary(operation, destination),
@@ -1145,6 +1174,18 @@ fn FunctionEmitter(comptime Types: type) type {
                 .negi => |operand| try self.emitUnary(.dword, operand, .neg_eax, destination),
                 inline .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands, operation| try self.emitIntegerBinary(operation, operands, destination),
                 .function_ref => |reference| try self.emitFunctionReference(reference, destination),
+                .erased_callable => |callable| try self.emitErasedCallable(callable, destination),
+                .callable_payload => |operation| {
+                    const offset: u32 = if (try self.types.facts().boundMethod(self.ssa.valueType(operation.source)) != null) 0 else 8;
+                    try self.loadComponent(.qword, self.valueLocation(operation.source), offset);
+                    try self.storeAddress(destination);
+                },
+                .callable_invoke => |operation| {
+                    try self.loadComponent(.qword, self.valueLocation(operation.source), 0);
+                    try self.encoder.offset(.mov_rax_rax_offset, @as(u32, @backingInt(operation.operation)) * 8);
+                    try self.storeAddress(destination);
+                },
+                .callable_allocation => |operation| try self.emitCallableAllocation(operation, destination),
                 .initializer_ref => |reference| try self.emitInitializerReference(reference, destination),
                 .variant_coerce => |coercion| try self.emitUse(
                     .{ .value = coercion.operand, .coerce_to = coercion.target_type, .variant_tag_mapping = coercion.tag_mapping.? },
@@ -1174,6 +1215,10 @@ fn FunctionEmitter(comptime Types: type) type {
                 .borrow_write => |operation| try self.emitBorrowWrite(operation),
                 .field_access => |operation| try self.emitFieldAccess(operation, destination),
                 .call => |call| try self.emitCall(call, destination),
+                .service_enter => |guard| try self.emitServiceEnter(guard, self.plan.service_nodes[index].?),
+                .service_leave => try self.emitServiceLeave(),
+                .context_read => |operation| try self.emitContextRead(operation, destination),
+                .context_write => |operation| try self.emitContextWrite(operation),
                 .compare => |operation| try self.emitCompare(operation, destination),
                 .select => |operation| try self.emitSelect(operation, destination),
                 .aggregate => |operation| try self.emitAggregate(operation, destination),
@@ -2195,6 +2240,157 @@ fn FunctionEmitter(comptime Types: type) type {
             if (self.encoder.stream) |*stream| try stream.preserve(operation == .restore, self.plan.stack_size);
         }
 
+        fn emitRuntimeFailure(self: *Self, message: []const u8) !void {
+            const data = try self.dataIndex(message);
+            const offset = try self.encoder.patchable(.lea_rax_rip);
+            try self.relocations.append(self.gpa, .{ .offset = offset, .kind = .call_relative_32, .reference = .{ .data = data }, .addend = 0 });
+            try self.encoder.emit(.mov_rsi_rax);
+            try self.encoder.immediate(.mov_edx, @intCast(message.len));
+            try self.encoder.immediate(.mov_edi, 2);
+            try self.encoder.immediate(.mov_eax, 1);
+            try self.encoder.emit(.syscall);
+            try self.encoder.immediate(.mov_edi, 134);
+            try self.encoder.immediate(.mov_eax, linux_exit_syscall);
+            try self.encoder.emit(.syscall);
+            try self.encoder.emit(.ud2);
+        }
+
+        /// GS is private to Chimera. Query its base before accessing it; a new
+        /// thread gets its own root state even when clone inherited the old GS.
+        fn emitThreadState(self: *Self) !void {
+            const scratch = self.plan.runtime_scratch_offset.?;
+            try self.encoder.offset(.mov_rax_rsp, scratch + 16);
+            try self.encoder.emit(.test_rax);
+            const cached = try self.encoder.patchable(.jne);
+            try self.encoder.immediate(.mov_eax, 186); // gettid
+            try self.encoder.emit(.syscall);
+            try self.encoder.offset(.mov_rsp_eax, scratch + 8);
+            try self.encoder.immediate(.mov_eax, 158); // arch_prctl
+            try self.encoder.immediate(.mov_edi, 0x1004); // ARCH_GET_GS
+            try self.encoder.offset(.lea_rsi_rsp, scratch);
+            try self.encoder.emit(.syscall);
+            try self.encoder.immediate(.cmp_eax, 0);
+            const get_failed = try self.encoder.patchable(.jne);
+            try self.encoder.offset(.mov_rax_rsp, scratch);
+            try self.encoder.emit(.test_rax);
+            const unattached = try self.encoder.patchable(.je);
+            try self.encoder.emit(.mov_rsi_rax);
+            try self.encoder.offset(.mov_eax_rsi_offset, 64);
+            try self.encoder.offset(.mov_ecx_rsp, scratch + 8);
+            try self.encoder.emit(.cmp_eax_ecx);
+            const inherited = try self.encoder.patchable(.jne);
+            try self.encoder.offset(.mov_rax_rsp, scratch);
+            const ready = try self.encoder.patchable(.jmp);
+            try self.encoder.patchHere(unattached);
+            try self.encoder.patchHere(inherited);
+            try self.encoder.emit(.zero_edi);
+            try self.encoder.immediate(.mov_esi, 4096);
+            try self.encoder.immediate(.mov_edx, 3);
+            try self.encoder.immediate(.mov_r10d, 0x22);
+            try self.encoder.immediate(.mov_r8d, -1);
+            try self.encoder.emit(.zero_r9d);
+            try self.encoder.immediate(.mov_eax, linux_mmap_syscall);
+            try self.encoder.emit(.syscall);
+            try self.encoder.immediate(.cmp_rax, -4095);
+            const mapping_failed = try self.encoder.patchable(.jae);
+            try self.encoder.offset(.mov_rsp_rax, scratch);
+            try self.encoder.emit(.mov_rdi_rax);
+            try self.encoder.offset(.mov_eax_rsp, scratch + 8);
+            try self.encoder.offset(.mov_rdi_eax, 64);
+            try self.encoder.offset(.mov_rax_rsp, scratch);
+            try self.encoder.emit(.mov_rsi_rax);
+            try self.encoder.immediate(.mov_edi, 0x1001); // ARCH_SET_GS
+            try self.encoder.immediate(.mov_eax, 158);
+            try self.encoder.emit(.syscall);
+            try self.encoder.immediate(.cmp_eax, 0);
+            const set_failed = try self.encoder.patchable(.jne);
+            try self.encoder.offset(.mov_rax_rsp, scratch);
+            const initialized = try self.encoder.patchable(.jmp);
+            try self.encoder.patchHere(get_failed);
+            try self.encoder.patchHere(mapping_failed);
+            try self.encoder.patchHere(set_failed);
+            try self.emitRuntimeFailure("context initialization failed\n");
+            try self.encoder.patchHere(ready);
+            try self.encoder.patchHere(initialized);
+            try self.encoder.offset(.mov_rsp_rax, scratch + 16);
+            try self.encoder.patchHere(cached);
+        }
+
+        fn emitServiceEnter(self: *Self, guard: @FieldType(structures.FunctionInstruction, "service_enter"), node: u32) !void {
+            try self.emitThreadState();
+            const scratch = self.plan.runtime_scratch_offset.?;
+            try self.encoder.offset(.mov_rsp_rax, scratch);
+            try self.loadValueAddress(self.valueLocation(guard.receiver));
+            try self.encoder.offset(.mov_rsp_rax, node + 8);
+            const key = try self.encoder.patchable(.mov_rax);
+            try self.appendRelocation(guard.key, key, .address_absolute_64);
+            try self.encoder.offset(.mov_rsp_rax, node);
+            try self.encoder.offset(.mov_rdi_rsp, scratch);
+            try self.encoder.offset(.mov_rax_rdi, 56);
+            try self.encoder.offset(.mov_rsp_rax, node + 16);
+            const scan = try self.encoder.position();
+            try self.encoder.emit(.test_rax);
+            const done = try self.encoder.patchable(.je);
+            try self.encoder.emit(.mov_rsi_rax);
+            try self.encoder.offset(.mov_rax_rsi_offset, 0);
+            try self.encoder.offset(.mov_rcx_rsp, node);
+            try self.encoder.emit(.cmp_rax_rcx);
+            const next = try self.encoder.patchable(.jne);
+            try self.encoder.offset(.mov_rax_rsi_offset, 8);
+            try self.encoder.offset(.mov_rcx_rsp, node + 8);
+            try self.encoder.emit(.cmp_rax_rcx);
+            const cycle = try self.encoder.patchable(.je);
+            try self.encoder.patchHere(next);
+            try self.encoder.offset(.mov_rax_rsi_offset, 16);
+            try self.encoder.jumpBack(.jmp, scan);
+            try self.encoder.patchHere(cycle);
+            try self.emitRuntimeFailure("service cycle\n");
+            try self.encoder.patchHere(done);
+            try self.encoder.offset(.lea_rax_rsp, node);
+            try self.encoder.offset(.mov_rdi_rsp, scratch);
+            try self.encoder.offset(.mov_rdi_rax_offset, 56);
+        }
+
+        fn contextOffset(entry: structures.ContextEntry) u32 {
+            return switch (entry) {
+                .allocator => 0,
+                .logger => 32,
+            };
+        }
+
+        fn emitContextRead(self: *Self, operation: @FieldType(structures.FunctionInstruction, "context_read"), destination: ValueLocation) !void {
+            try self.emitThreadState();
+            try self.encoder.addRax(contextOffset(operation.entry));
+            const scratch = self.plan.runtime_scratch_offset.?;
+            try self.encoder.offset(.mov_rsp_rax, scratch);
+            try self.encoder.emit(.mov_rax_rax);
+            try self.encoder.emit(.test_rax);
+            const ready = try self.encoder.patchable(.jne);
+            try self.emitCall(.{ .target = .{ .direct = operation.root }, .arguments = .{ .start = 0, .end = 0 }, .return_type = operation.type_id }, destination);
+            const layout = try self.types.layout(operation.type_id);
+            try self.copyRange(destination, 0, .{ .reference = .{ .stack = scratch } }, 0, layout.byte_size);
+            try self.encoder.patchHere(ready);
+            try self.copyValue(operation.type_id, .{ .indirect = scratch }, destination);
+        }
+
+        fn emitContextWrite(self: *Self, operation: @FieldType(structures.FunctionInstruction, "context_write")) !void {
+            try self.emitThreadState();
+            try self.encoder.addRax(contextOffset(operation.entry));
+            const scratch = self.plan.runtime_scratch_offset.?;
+            try self.encoder.offset(.mov_rsp_rax, scratch);
+            const layout = try self.types.layout(self.valueType(operation.source));
+            try self.copyRange(self.valueLocation(operation.source), 0, .{ .reference = .{ .stack = scratch } }, 0, layout.byte_size);
+        }
+
+        fn emitServiceLeave(self: *Self) !void {
+            try self.emitThreadState();
+            try self.encoder.emit(.mov_rdi_rax);
+            try self.encoder.offset(.mov_rax_rdi, 56);
+            try self.encoder.emit(.mov_rsi_rax);
+            try self.encoder.offset(.mov_rax_rsi_offset, 16);
+            try self.encoder.offset(.mov_rdi_rax_offset, 56);
+        }
+
         fn emitCall(self: *Self, call: structures.FunctionCall, result: ValueLocation) !void {
             const destination = self.resultLocation(call.destination, result);
             const layout = self.plan.calls.get(.{ .arguments = call.arguments, .return_type = call.return_type }).?;
@@ -2293,6 +2489,43 @@ fn FunctionEmitter(comptime Types: type) type {
             const field = try self.encoder.patchable(.mov_rax);
             try self.storeAddress(destination);
             try self.appendRelocation(reference.instance(), field, .address_absolute_64);
+        }
+
+        fn emitErasedCallable(self: *Self, callable: @FieldType(structures.FunctionInstruction, "erased_callable"), destination: ValueLocation) !void {
+            if (callable.owns_environment) {
+                const payload = callable.payload.?;
+                const owner_type = self.valueType(payload);
+                const environment_type = (try self.types.facts().allocationElement(owner_type)).?;
+                const environment = try self.types.layout(environment_type);
+                const owner = try self.types.layout(owner_type);
+                const trailer = std.mem.alignForward(u32, environment.byte_size, owner.byte_alignment);
+                try self.copyRange(self.valueLocation(payload), 0, .{ .reference = self.valueLocation(payload) }, trailer, owner.byte_size);
+            }
+            if (destination == .discarded) return;
+            const field = try self.encoder.patchable(.mov_rax);
+            try self.storeComponent(.qword, destination, 0);
+            try self.appendRelocation(callable.invocation, field, .address_absolute_64);
+            self.relocations.items[self.relocations.items.len - 1].addend = -24;
+            if (callable.payload) |payload| {
+                try self.loadComponent(.qword, self.valueLocation(payload), 0);
+            } else try self.encoder.absolute(.mov_rax, 0);
+            try self.storeComponent(.qword, destination, 8);
+        }
+
+        fn emitCallableAllocation(self: *Self, operation: structures.BorrowOperation, destination: ValueLocation) !void {
+            if (destination == .discarded) return;
+            const environment_type = (try self.types.facts().allocationElement(operation.type_id)).?;
+            const environment = try self.types.layout(environment_type);
+            const owner = try self.types.layout(operation.type_id);
+            const trailer = std.mem.alignForward(u32, environment.byte_size, owner.byte_alignment);
+            var offset: u32 = 0;
+            for ([_]Width{ .qword, .dword, .byte }) |width| {
+                while (owner.byte_size - offset >= width.bytes()) : (offset += width.bytes()) {
+                    try self.loadComponent(.qword, self.valueLocation(operation.source), 8);
+                    try self.encoder.offset(width.select(&load_rax), trailer + offset);
+                    try self.storeComponent(width, destination, offset);
+                }
+            }
         }
 
         fn emitInitializerCall(self: *Self, value: structures.FunctionValueId) !void {
@@ -2857,12 +3090,46 @@ pub fn compileFunction(ssa: *const structures.FunctionBodyAnalysis, types: anyty
         const capacity = std.math.mul(usize, plan.locations.len, 4) catch return error.FunctionTooLarge;
         try stream.instructions.ensureTotalCapacity(gpa, capacity);
     }
+
     try emitter.emit();
     try emitter.encodeBody();
     try emitter.emitInitializerRegions();
     return emitter.finish();
 }
 
+pub fn attachCallableDescriptor(artifact: *structures.CompiledFunction, instance: structures.InstanceId, copy: structures.InstanceId, drop: structures.InstanceId, allocator: std.mem.Allocator) !void {
+    const code_size = std.math.add(usize, 24, artifact.code.len) catch return error.FunctionTooLarge;
+    if (code_size > std.math.maxInt(u32)) return error.FunctionTooLarge;
+    const code = try allocator.alloc(u8, code_size);
+    errdefer allocator.free(code);
+    @memset(code[0..24], 0);
+    @memcpy(code[24..][0..artifact.code.len], artifact.code);
+    const references = try allocator.alloc(structures.InstanceId, artifact.referenced_instances.len + 3);
+    errdefer allocator.free(references);
+    @memcpy(references[0..artifact.referenced_instances.len], artifact.referenced_instances);
+    @memcpy(references[artifact.referenced_instances.len..], &[_]structures.InstanceId{ instance, copy, drop });
+    const relocations = try allocator.alloc(structures.CompiledFunction.Relocation, artifact.relocations.len + 3);
+    errdefer allocator.free(relocations);
+    for (artifact.relocations, relocations[0..artifact.relocations.len]) |source, *relocation| {
+        relocation.* = source;
+        relocation.offset = std.math.add(u32, source.offset, 24) catch return error.FunctionTooLarge;
+    }
+    for (relocations[artifact.relocations.len..], 0..) |*relocation, index| {
+        relocation.* = .{ .offset = @intCast(index * 8), .kind = .address_absolute_64, .reference = .{ .function = @fromBackingInt(@intCast(artifact.referenced_instances.len + index)) }, .addend = 0 };
+    }
+    for (artifact.trace_sites) |site| _ = std.math.add(u32, site.return_offset, 24) catch return error.FunctionTooLarge;
+    for (artifact.panic_trace_offsets) |offset| _ = std.math.add(u32, offset, 24) catch return error.FunctionTooLarge;
+    allocator.free(artifact.code);
+    allocator.free(artifact.relocations);
+    allocator.free(artifact.referenced_instances);
+    artifact.code = code;
+    artifact.relocations = relocations;
+    artifact.referenced_instances = references;
+    artifact.required_alignment = @max(artifact.required_alignment, 8);
+    artifact.entry_offset = 24;
+    for (@constCast(artifact.trace_sites)) |*site| site.return_offset += 24;
+    for (@constCast(artifact.panic_trace_offsets)) |*offset| offset.* += 24;
+}
 // External functions have no frame: incoming argument storage starts at
 // rsp + 8, past the return address.
 
@@ -3011,24 +3278,37 @@ fn emitPanicTrace(encoder: *Encoder) !u32 {
 }
 
 pub fn compileExternalAllocateHostStorage(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
-    return compileExternalAllocateStorage(signature, types, gpa, 1, false);
+    return compileExternalAllocateStorage(signature, types, gpa, 1, false, false);
 }
 
 pub fn compileExternalAllocateHostTypedStorage(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator, element: structures.TypeLayout) !structures.CompiledFunction {
     if (element.byte_alignment > 4096) return error.UnsupportedAllocationAlignment;
-    return compileExternalAllocateStorage(signature, types, gpa, element.byte_size, true);
+    return compileExternalAllocateStorage(signature, types, gpa, element.byte_size, true, false);
 }
 
-fn compileExternalAllocateStorage(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator, element_size: u32, with_count: bool) !structures.CompiledFunction {
+fn compileExternalAllocateStorage(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator, element_size: u32, with_count: bool, raw_layout: bool) !structures.CompiledFunction {
     var encoder: Encoder = .{ .gpa = gpa };
     defer encoder.deinit();
     var call = try signatureLayout(types, signature, gpa);
     defer call.deinit(gpa);
-    const result = try optionalReturn(types, signature.return_type);
+    const result = try serviceReturn(types, signature.return_type, if (with_count or raw_layout) try types.facts().allocationError() else .none);
     const argument_offset = call.arguments[0].stack + 8;
     try encoder.offset(.mov_esi_rsp, argument_offset);
     try encoder.emit(.test_esi);
     const invalid_size = try encoder.patchable(.jl);
+    var invalid_alignment: [3]?u32 = .{ null, null, null };
+    if (raw_layout) {
+        try encoder.offset(.mov_eax_rsp, argument_offset + 4);
+        try encoder.immediate(.cmp_eax, 0);
+        invalid_alignment[0] = try encoder.patchable(.jle);
+        try encoder.immediate(.cmp_eax, 4096);
+        invalid_alignment[1] = try encoder.patchable(.ja);
+        try encoder.emit(.mov_ecx_eax);
+        try encoder.immediate(.sub_eax, 1);
+        try encoder.emit(.and_eax_ecx);
+        try encoder.immediate(.cmp_eax, 0);
+        invalid_alignment[2] = try encoder.patchable(.jne);
+    }
     const oversized_element = if (element_size > std.math.maxInt(i32)) try encoder.patchable(.jne) else null;
     const multiply_size = element_size > 1 and element_size <= std.math.maxInt(i32);
     if (multiply_size) {
@@ -3056,17 +3336,58 @@ fn compileExternalAllocateStorage(signature: structures.FunctionSignature, types
     try encoder.offset(.mov_rsp_eax, result.payload);
     try encoder.byteImmediate(.shr_rax, 32);
     try encoder.offset(.mov_rsp_eax, result.payload + 4);
-    try encoder.emit(.mov_eax_esi);
+    if (raw_layout) try encoder.offset(.mov_eax_rsp, argument_offset) else try encoder.emit(.mov_eax_esi);
     try encoder.offset(.mov_rsp_eax, result.payload + 8);
+    if (raw_layout) {
+        try encoder.offset(.mov_eax_rsp, argument_offset + 4);
+        try encoder.offset(.mov_rsp_eax, result.payload + 12);
+    }
     if (with_count) {
         try encoder.offset(.mov_eax_rsp, argument_offset);
         try encoder.offset(.mov_rsp_eax, result.payload + 12);
     }
     try emitOptionalReturn(&encoder, result, true);
-    for ([_]?u32{ invalid_size, allocation_failed, size_overflow, oversized_element }) |failure| {
-        if (failure) |field| try encoder.patchHere(field);
+    try encoder.patchHere(allocation_failed);
+    if (with_count or raw_layout) {
+        try encoder.immediate(.mov_eax, 0);
+        try encoder.offset(.mov_rsp_eax, result.payload);
     }
     try emitOptionalReturn(&encoder, result, false);
+    try encoder.patchHere(invalid_size);
+    for (invalid_alignment) |failure| if (failure) |field| try encoder.patchHere(field);
+    if (with_count or raw_layout) {
+        try encoder.immediate(.mov_eax, 1);
+        try encoder.offset(.mov_rsp_eax, result.payload);
+    }
+    try emitOptionalReturn(&encoder, result, false);
+    for ([_]?u32{ size_overflow, oversized_element }) |failure| {
+        if (failure) |field| try encoder.patchHere(field);
+    }
+    if (with_count or raw_layout) {
+        try encoder.immediate(.mov_eax, 2);
+        try encoder.offset(.mov_rsp_eax, result.payload);
+    }
+    try emitOptionalReturn(&encoder, result, false);
+    return externalArtifact(&encoder);
+}
+
+pub fn compileExternalAllocateRaw(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
+    return compileExternalAllocateStorage(signature, types, gpa, 1, false, true);
+}
+
+pub fn compileExternalCursorAligned(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
+    var encoder: Encoder = .{ .gpa = gpa };
+    defer encoder.deinit();
+    var layout = try signatureLayout(types, signature, gpa);
+    defer layout.deinit(gpa);
+    try emitIncomingAddress(&encoder, layout.arguments[0]);
+    try encoder.offset(.mov_ecx_rsp, layout.arguments[1].stack + 8);
+    try encoder.immediate(.sub_ecx, 1);
+    try encoder.emit(.and_eax_ecx);
+    try encoder.immediate(.cmp_eax, 0);
+    try encoder.emit(.sete_al);
+    try encoder.offset(.mov_rsp_al, 8);
+    try encoder.emit(.ret);
     return externalArtifact(&encoder);
 }
 
@@ -3079,6 +3400,10 @@ pub fn compileExternalDeallocateHostStorage(gpa: std.mem.Allocator) !structures.
     try encoder.emit(.mov_rdi_rax);
     try emitIncomingSize(&encoder, storage);
     try encoder.emit(.mov_esi_eax);
+    try encoder.emit(.test_esi);
+    const nonempty = try encoder.patchable(.jne);
+    try encoder.immediate(.mov_esi, 1);
+    try encoder.patchHere(nonempty);
     try encoder.immediate(.mov_eax, linux_munmap_syscall);
     try encoder.emit(.syscall);
     try encoder.emit(.ret);
@@ -3091,7 +3416,7 @@ pub fn compileExternalByteIo(read: bool, signature: structures.FunctionSignature
     // Arguments are (descriptor, allocation, offset, count) to read and
     // (descriptor, span) to write.
     const arguments = layout.arguments;
-    const result = try optionalReturn(types, signature.return_type);
+    const result = try serviceReturn(types, signature.return_type, try types.facts().ioError());
     var encoder: Encoder = .{ .gpa = gpa };
     defer encoder.deinit();
     if (read) try encoder.offset(.mov_eax_rsp, 8 + arguments[3].stack) else try emitIncomingSize(&encoder, arguments[1]);
@@ -3117,6 +3442,10 @@ pub fn compileExternalByteIo(read: bool, signature: structures.FunctionSignature
     try encoder.offset(.mov_rsp_eax, result.payload);
     try emitOptionalReturn(&encoder, result, true);
     try encoder.patchHere(failed);
+    try encoder.emit(.neg_eax);
+    try encoder.offset(.mov_rsp_eax, result.payload);
+    try encoder.immediate(.mov_eax, 0);
+    try encoder.offset(.mov_rsp_eax, result.payload + 4);
     try emitOptionalReturn(&encoder, result, false);
     var artifact = try externalArtifact(&encoder);
     artifact.requires_sigpipe_ignore = !read;
@@ -3137,10 +3466,10 @@ fn variantTagWidth(layout: structures.VariantLayout) Width {
 
 const OptionalReturn = struct { tag: u32, payload: u32, tag_width: Width, present: i32, absent: i32 };
 
-fn optionalReturn(types: anytype, type_id: structures.TypeId) !OptionalReturn {
+fn serviceReturn(types: anytype, type_id: structures.TypeId, error_type: structures.TypeId) !OptionalReturn {
     const members = (try types.facts().variantMembers(type_id)).?;
     std.debug.assert(members.len == 2);
-    const absent = std.mem.indexOfScalar(structures.TypeId, members, .none).?;
+    const absent = std.mem.indexOfScalar(structures.TypeId, members, error_type).?;
     const layout = try types.variantLayout(type_id);
     std.debug.assert(layout.tag_size == 1);
     return .{ .tag = 8, .payload = 8 + layout.payload_offset, .tag_width = variantTagWidth(layout), .present = @intCast(1 - absent), .absent = @intCast(absent) };
@@ -3234,7 +3563,7 @@ pub fn buildExecutableWithResultAllocator(
         try image.code.appendNTimes(result_allocator, 0x90, function_offset.* - image.code.items.len);
         try image.code.appendSlice(result_allocator, function.artifact.code);
     }
-    try image.patch(entry_call, function_offsets[entry_index]);
+    try image.patch(entry_call, function_offsets[entry_index] + functions[entry_index].artifact.entry_offset);
 
     if (needs_panic_trace) try appendPanicTrace(&image, functions, function_offsets);
 
@@ -3252,7 +3581,10 @@ pub fn buildExecutableWithResultAllocator(
 
     for (functions, function_offsets) |function, function_offset| for (function.artifact.relocations) |relocation| {
         const target = switch (relocation.reference) {
-            .function => |reference| function_offsets[function_indices.get(function.artifact.referenced_instances[@backingInt(reference)]).?],
+            .function => |reference| target: {
+                const index = function_indices.get(function.artifact.referenced_instances[@backingInt(reference)]).?;
+                break :target function_offsets[index] + functions[index].artifact.entry_offset;
+            },
             .data => |index| data_offsets.get(function.artifact.constant_data[index].bytes).?,
         };
         const field = function_offset + relocation.offset;

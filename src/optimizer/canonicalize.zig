@@ -113,6 +113,7 @@ const Rules = struct {
             .borrow_write => |operation| return self.simplifyBorrowWrite(instruction, operation),
             .select => |operation| return self.simplifySelect(instruction, operation, result),
             .call => |*call| return self.simplifyCall(call),
+            .callable_payload => |operation| return self.simplifyCallablePayload(operation, result),
             else => return false,
         }
     }
@@ -129,6 +130,15 @@ const Rules = struct {
         return true;
     }
 
+    fn simplifyCallablePayload(self: *Rules, operation: structures.BorrowOperation, result: ValueId) bool {
+        const source = self.function.find(operation.source);
+        if (!self.function.plainValue(source) or self.isAddressTaken(source)) return false;
+        const constructor = self.function.definition(source) orelse return false;
+        if (constructor != .erased_callable) return false;
+        const payload = constructor.erased_callable.payload orelse return false;
+        if (self.function.valueType(payload) != operation.type_id) return false;
+        return self.alias(result, payload);
+    }
     fn structure(self: *const Rules) Structure {
         return .{ .rules = self, .function = self.function };
     }

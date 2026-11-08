@@ -2,57 +2,73 @@ import std.iteration.{End}
 
 # Adapters own their cursors. Transfer a named noncopyable cursor with ^.
 # Item types include every non-End alternative produced by the input cursor.
-pub struct Map(S: type, A: type, B: type)
+pub struct Map(S: type, A: type, B: type, F: type)
     source: S
-    transform: func(imm A) B
-    pub func next(mut self: Map(S, A, B)) B | End
+    transform: F
+    pub func next(mut self: Map(S, A, B, F)) B | End
         const result = self.source.next()
         if result is End -> return End{}
         return self.transform(result)
 
-pub func map(static S: type, static A: type, static B: type, var source: S, transform: func(imm A) B) Map(S, A, B)
-    return Map(S, A, B){source = source^, transform = transform}
+pub func map(static S: type, static A: type, static B: type, var source: S, init transform: func(imm A) B) Map(S, A, B, func(imm A) B)
+    return Map{source = source^, transform = transform}
 
 # Borrowed delivery forwards the original reference; owned delivery moves the
 # accepted item and automatically drops rejected items.
-pub func Filter(static S: type, static T: type, static borrowed: bool) type
+func FilterResult(static T: type, static borrowed: bool) type
+    if borrowed
+        return (ref T | End)
+    return T | End
+
+func FilterDelivery(static S: type, static T: type, static borrowed: bool) type
     if borrowed
         return struct
-            source: S
-            predicate: func(imm T) bool
-            pub func next(mut self: Filter(S, T, borrowed)) ref T | End
+            pub func next(mut source: S, predicate: func(imm T) bool) ref T | End
                 loop
-                    const result = self.source.next()
+                    const result = source.next()
                     if result is End -> return End{}
                     ref item = result
-                    if self.predicate(item) -> return item
-            func find(mut source: S, predicate: func(imm T) bool) T | none
+                    if predicate(item) -> return item
+            pub func find(mut source: S, predicate: func(imm T) bool) T | none
                 loop
                     const result = source.next()
                     if result is End -> return none
                     ref item = result
                     if predicate(item) -> return item
     return struct
-        source: S
-        predicate: func(imm T) bool
-        pub func next(mut self: Filter(S, T, borrowed)) T | End
+        pub func next(mut source: S, predicate: func(imm T) bool) T | End
             loop
-                const result = self.source.next()
+                const result = source.next()
                 if result is End -> return End{}
-                if self.predicate(result) -> return result^
-        func find(mut source: S, predicate: func(imm T) bool) T | none
+                if predicate(result) -> return result^
+        pub func find(mut source: S, predicate: func(imm T) bool) T | none
             loop
                 const result = source.next()
                 if result is End -> return none
                 if predicate(result) -> return result^
 
-pub func filter(static S: type, static T: type, static borrowed: bool, var source: S, predicate: func(imm T) bool) Filter(S, T, borrowed)
-    return Filter(S, T, borrowed){source = source^, predicate = predicate}
+pub struct Filter(S: type, T: type, borrowed: bool, F: type)
+    source: S
+    predicate: F
+    pub func next(mut self: Filter(S, T, borrowed, F)) FilterResult(T, borrowed)
+        return FilterDelivery(S, T, borrowed).next(self.source, self.predicate)
+
+func filter_explicit(static S: type, static T: type, static borrowed: bool, var source: S, init predicate: func(imm T) bool) Filter(S, T, borrowed, func(imm T) bool)
+    return Filter{source = source^, predicate = predicate}
+
+func PollResult(static S: type, static R: type, next: func(mut S) R) type -> R
+
+func borrowed_source(static S: type, static T: type) bool -> PollResult(S.next) == FilterResult(T, true)
+
+func filter_inferred(static S: type, static T: type, var source: S, init predicate: func(imm T) bool) Filter(S, T, borrowed_source(S, T), func(imm T) bool)
+    return Filter{source = source^, predicate = predicate}
+
+pub overload filter(filter_explicit, filter_inferred)
 
 # Terminal algorithms resume the caller's cursor and stop at the first result.
 # find copies a borrowed match and moves an owned match.
 pub func find(static S: type, static T: type, static borrowed: bool, mut source: S, predicate: func(imm T) bool) T | none
-    return Filter(S, T, borrowed).find(source, predicate)
+    return FilterDelivery(S, T, borrowed).find(source, predicate)
 
 pub func any(static S: type, static T: type, mut source: S, predicate: func(imm T) bool) bool
     loop

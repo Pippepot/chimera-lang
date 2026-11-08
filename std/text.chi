@@ -1,11 +1,17 @@
-import std.memory.{Allocation, Span, List, Box, Ref, allocate, deallocate, unsafe_initialize}
+import std.memory.{AllocationError, Allocation, Span, List, Box, Ref, allocate, allocate_with, deallocate, unsafe_initialize}
 import std.array.{Array, collection_literal}
 import std.range.{Range, FromEnd}
 import std.search
+import std.io.{IoError}
 
 pub extern func byte_int(value: byte) int
-extern func io_write(descriptor: int, imm data: Span(byte)) int | none
+extern func io_write(descriptor: int, imm data: Span(byte)) int | IoError
 extern func panic_message(imm message: StringView) never
+
+pub struct Utf8Error
+    error = true
+    copy = fieldwise
+    pub index: int
 
 pub struct BytesView
     copy = trivial
@@ -17,7 +23,7 @@ pub struct BytesView
         return BytesView{data = view.as_imm()}
     pub func from_span(imm span: Span(byte)) BytesView -> BytesView{data = span.as_imm()}
     pub func as_span(imm self: BytesView) Span(byte) -> self.data.as_imm()
-    pub func write_to(imm self: BytesView, descriptor: int) int | none -> io_write(descriptor, self.data)
+    pub func write_to(imm self: BytesView, descriptor: int) int | IoError -> io_write(descriptor, self.data)
     pub func byte_length(imm self: BytesView) int -> self.data.len()
     func get_at(imm self: BytesView, index: int) ref byte | none -> self.data.get(index)
     func get_from_end(imm self: BytesView, index: FromEnd) ref byte | none -> self.data.get(index)
@@ -41,10 +47,11 @@ pub struct BytesView
         const view = self.data.slice(bounds)
         if not (view is Span(byte)) -> return none
         return BytesView{data = view}
-    pub func validate_utf8(imm self: BytesView) StringView | none
+    pub func validate_utf8(imm self: BytesView) StringView | Utf8Error
         var index = 0
         loop
             if index == self.byte_length() -> break
+            const sequence_start = index
             const first = byte_int(self[index])
             index += 1
             if first >= 128
@@ -61,14 +68,14 @@ pub struct BytesView
                         continuation = 3
                         if first == 240 -> minimum = 144
                         if first == 244 -> maximum = 143
-                    _ -> return none
-                if continuation > self.byte_length() - index -> return none
+                    _ -> return Utf8Error{index = sequence_start}
+                if continuation > self.byte_length() - index -> return Utf8Error{index = sequence_start}
                 const second = byte_int(self[index])
-                if second < minimum or second > maximum -> return none
+                if second < minimum or second > maximum -> return Utf8Error{index = sequence_start}
                 index += 1
                 for _ in 1..continuation
                     const next = byte_int(self[index])
-                    if next < 128 or next > 191 -> return none
+                    if next < 128 or next > 191 -> return Utf8Error{index = sequence_start}
                     index += 1
         return StringView{bytes = self}
 
@@ -125,11 +132,10 @@ pub struct String
     storage: StaticString | OwnedBytes
     pub func ==(imm left: String, imm right: StringView) bool -> equal_bytes(left.as_bytes(), right.as_bytes())
     pub func <>(imm left: String, imm right: StringView) bool -> not equal_bytes(left.as_bytes(), right.as_bytes())
-    pub func from_utf8(imm bytes: BytesView) String | none
-        const text = bytes.validate_utf8()
-        if not (text is StringView) -> return none
+    pub func from_utf8(imm bytes: BytesView) String | AllocationError | Utf8Error
+        const text = bytes.validate_utf8()?
         var result = String.empty()
-        if not (result.append(text) is unit) -> return none
+        _ = result.append(text)?
         return result^
     pub func empty() String -> String{storage = ""}
     pub func byte_length(imm self: String) int
@@ -153,14 +159,14 @@ pub struct String
     pub func contains(imm self: String, imm needle: StringView) bool -> self.view().contains(needle)
     pub func starts_with(imm self: String, imm needle: StringView) bool -> self.view().starts_with(needle)
     pub func ends_with(imm self: String, imm needle: StringView) bool -> self.view().ends_with(needle)
-    pub func reserve(mut self: String, minimum_capacity: int) unit | none
-        if minimum_capacity < 0 -> return none
+    pub func reserve(mut self: String, minimum_capacity: int) unit | AllocationError
+        if minimum_capacity < 0 -> return AllocationError.invalid_layout
         if minimum_capacity <= self.capacity() -> return unit
         const size = self.byte_length()
         var capacity = minimum_capacity
         if capacity < size -> capacity = size
-        const storage = allocate(byte, capacity)
-        if not (storage is Allocation(byte)) -> return none
+        const storage = if self.storage is OwnedBytes -> self.storage.allocation.allocate_replacement(capacity) else allocate(byte, capacity)
+        if storage is AllocationError -> return storage^
         var replacement = OwnedBytes{allocation = storage^, size = 0}
         const bytes = self.as_bytes()
         for index in 0..size
@@ -168,18 +174,18 @@ pub struct String
         replacement.size = size
         self.storage = replacement^
         return unit
-    pub func append(mut self: String, imm text: StringView) unit | none
+    pub func append(mut self: String, imm text: StringView) unit | AllocationError
         const count = text.byte_length()
         if count == 0 -> return unit
         const size = self.byte_length()
-        if count > 2147483647 - size -> return none
+        if count > 2147483647 - size -> return AllocationError.size_limit
         const required = size + count
         var capacity = self.capacity()
         if capacity < required
             if capacity <= 1073741823 -> capacity *= 2
             else capacity = 2147483647
             if capacity < required -> capacity = required
-        if not (self.reserve(capacity) is unit) -> return none
+        _ = self.reserve(capacity)?
         const bytes = text.as_bytes()
         if self.storage is OwnedBytes
             ref owned = self.storage
@@ -188,9 +194,12 @@ pub struct String
             owned.size = required
             return unit
         panic "invalid String storage during append"
-    pub func clone(imm self: String) String | none
+    pub func clear(mut self: String)
+        if self.storage is OwnedBytes -> self.storage.size = 0
+        else self.storage = ""
+    pub func clone(imm self: String) String | AllocationError
         var result = String.empty()
-        if not (result.append(self.view()) is unit) -> return none
+        _ = result.append(self.view())?
         return result^
 
 func equal_bytes(imm left: BytesView, imm right: BytesView) bool
@@ -225,19 +234,28 @@ pub converter(imm value: BytesView) String -> String(value.as_span())
 pub converter(static T: type, imm value: Box(T)) String -> require_string(format_wrapped("Box(", value.borrow()))
 pub converter(static T: type, imm value: Ref(T)) String -> require_string(format_wrapped("Ref(", value.value))
 
-func require_string(deinit result: String | none) String
+func require_string(deinit result: String | AllocationError) String
     match result
         String -> return result^
-        none -> panic "string conversion allocation failed"
+        AllocationError -> panic "string conversion allocation failed"
 
-func format_integer(value: int) String | none
-    const storage = allocate(byte, 11)
-    if not (storage is Allocation(byte)) -> return none
-    var result = OwnedBytes{allocation = storage^, size = 0}
+# Decimal formatting has bounded stack storage, including -2147483648.
+pub struct IntegerText
+    copy = fieldwise
+    buffer: Array(byte, 11)
+    size: int
+    pub func view(imm self: IntegerText) StringView
+        const bytes = BytesView.from_array(11, self.buffer)
+        const prefix = bytes.slice(0..self.size)
+        if not (prefix is BytesView) -> panic "invalid integer text length"
+        return StringView{bytes = prefix}
+
+pub func integer_text(value: int) IntegerText
     const digits: BytesView = "0123456789-"
+    var result = IntegerText{buffer = Array(byte, 11).filled(digits[0]), size = 0}
     var remaining = value
     if remaining < 0
-        unsafe_initialize(byte, result.allocation, result.size, digits[10])
+        result.buffer[result.size] = digits[10]
         result.size += 1
     if remaining > 0 -> remaining = -remaining
     var divisor = 1
@@ -246,24 +264,48 @@ func format_integer(value: int) String | none
         divisor *= 10
     loop
         const digit = -(remaining / divisor)
-        unsafe_initialize(byte, result.allocation, result.size, digits[digit])
+        result.buffer[result.size] = digits[digit]
         result.size += 1
         if divisor == 1 -> break
         remaining %= divisor
         divisor /= 10
-    return String{storage = result^}
-func format_span(static T: type, imm values: Span(T)) String | none
+    return result^
+
+func format_integer(value: int) String | AllocationError
+    const text = integer_text(value)
+    return format_view(text.view())
+
+pub overload format(format_integer, format_byte, format_bool, format_unit, format_none, format_static, format_view, format_string, format_array, format_list, format_span, format_bytes, format_box, format_ref)
+func format_byte(value: byte) String | AllocationError -> format_integer(byte_int(value))
+func format_bool(value: bool) String | AllocationError -> if value -> "true" else "false"
+func format_unit(value: unit) String | AllocationError -> "()"
+func format_none(value: none) String | AllocationError -> "none"
+func format_static(imm value: StaticString) String | AllocationError -> String{storage = value}
+func format_view(imm value: StringView) String | AllocationError
+    var result = String.empty()
+    _ = result.append(value)?
+    return result^
+func format_string(imm value: String) String | AllocationError -> value.clone()
+func format_array(static T: type, static N: int, imm value: Array(T, N)) String | AllocationError -> format_span(value.span())
+func format_list(static T: type, imm value: List(T)) String | AllocationError -> format_span(value.span())
+func format_bytes(imm value: BytesView) String | AllocationError -> format_span(value.as_span())
+func format_box(static T: type, imm value: Box(T)) String | AllocationError -> format_wrapped("Box(", value.borrow())
+func format_ref(static T: type, imm value: Ref(T)) String | AllocationError -> format_wrapped("Ref(", value.value)
+
+func format_span(static T: type, imm values: Span(T)) String | AllocationError
     var result = "["
     var separator: StringView = ""
     for value in values
-        if not (result.append(separator) is unit) -> return none
-        if not (result.append(String(value)) is unit) -> return none
+        _ = result.append(separator)?
+        const text = format(value)?
+        _ = result.append(text.view())?
         separator = ", "
-    if not (result.append("]") is unit) -> return none
+    _ = result.append("]")?
     return result^
-func format_wrapped(static T: type, imm prefix: StringView, imm value: T) String | none
+func format_wrapped(static T: type, imm prefix: StringView, imm value: T) String | AllocationError
     var result = String.empty()
-    if not (result.append(prefix) is unit) -> return none
-    if not (result.append(String(value)) is unit) -> return none
-    if not (result.append(")") is unit) -> return none
+    _ = result.append(prefix)?
+    const text = format(value)?
+    _ = result.append(text.view())?
+    _ = result.append(")")?
     return result^

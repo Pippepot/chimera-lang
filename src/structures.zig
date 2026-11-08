@@ -77,7 +77,7 @@ pub const Token = struct {
         "deinit", "init",     "else",  "extern", "false",    "func",   "for",       "if",
         "in",     "is",       "loop",  "match",  "mut",      "ref",    "not",       "none",
         "or",     "overload", "panic", "imm",    "return",   "sizeof", "static",    "struct",
-        "test",   "true",     "var",   "where",  "import",   "pub",
+        "test",   "true",     "var",   "where",  "import",   "pub",    "with",
     };
 
     pub const Tag = blk: {
@@ -162,6 +162,7 @@ pub const Node = struct {
         if_else,
         loop,
         for_loop,
+        with_scope,
         @"and",
         @"or",
         not,
@@ -213,6 +214,7 @@ pub const Node = struct {
         return_expr,
         panic_expr,
         signature,
+        closure,
         where_clauses,
         sizeof_expr,
         @"struct",
@@ -266,7 +268,7 @@ pub const Node = struct {
         return switch (self.tag) {
             .break_nothing, .continue_expr, .return_nothing, .bool_literal, .identifier, .none_literal, .number_literal, .string_literal, .unit_literal, .type, .implicit_type, .nominal_self, .nominal_payload, .contextual_member => .none,
             .break_expr, .return_expr, .panic_expr, .loop, .not, .neg, .bit_not, .from_end, .reference_type, .move_expr, .propagate_expr, .comptime_expr, .sizeof_expr, .field_access, .struct_property, .struct_init_field, .struct_init_positional, .@"pub", .collection_spread => .node,
-            .add, .sub, .mul, .div, .rem, .bit_and, .bit_xor, .shift_left, .shift_right, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .membership, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .bit_and_assign, .bit_or_assign, .bit_xor_assign, .shift_left_assign, .shift_right_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .binding_else, .func, .type_func, .@"if", .collection_if, .match_arm, .match_guard => .node_node,
+            .add, .sub, .mul, .div, .rem, .bit_and, .bit_xor, .shift_left, .shift_right, .eq, .ne, .lt, .gt, .le, .ge, .is, .as, .membership, .range, .range_inclusive, .@"and", .@"or", .assign, .add_assign, .sub_assign, .mul_assign, .div_assign, .rem_assign, .bit_and_assign, .bit_or_assign, .bit_xor_assign, .shift_left_assign, .shift_right_assign, .call, .index_access, .const_binding, .var_binding, .ref_binding, .static_binding, .namespace_declaration, .destructure_binding, .binding_annotation, .binding_else, .with_scope, .func, .closure, .type_func, .@"if", .collection_if, .match_arm, .match_guard => .node_node,
             .param => .parameter,
             .struct_field => .field,
             .signature => .signature,
@@ -551,10 +553,40 @@ pub const ItemLoc = struct {
     source_site: ?i64 = null,
     is_hook: bool = false,
     is_nominal_case: bool = false,
+    adapter: ?CallableAdapter = null,
+    contextual: ?ContextEntry = null,
     kind: ItemKind,
     name: Name,
 
     pub const eql = value_operations.Owned(@This()).eql;
+};
+
+pub const ServiceKind = enum { allocator, logger };
+
+pub const ContextEntry = enum { allocator, logger };
+
+pub const ContextEffects = struct {
+    reads: u8 = 0,
+    writes: u8 = 0,
+
+    pub fn include(self: *@This(), other: @This()) void {
+        self.reads |= other.reads;
+        self.writes |= other.writes;
+    }
+
+    pub fn bit(entry: ContextEntry) u8 {
+        return @as(u8, 1) << @intCast(@backingInt(entry));
+    }
+};
+
+pub const CallableAdapter = union(enum) {
+    function,
+    bound_method,
+    closure,
+    function_reference: TypeId,
+    service: struct { kind: ServiceKind, signature: TypeId, checked: bool, key: InstanceId },
+    copy: TypeId,
+    drop: TypeId,
 };
 
 pub const DiscoveredItem = struct {
@@ -749,6 +781,7 @@ pub const CompileTimeValue = union(enum) {
         unit,
         none,
         function_ref: FunctionReference,
+        erased_callable: ErasedCallableConstant,
         structure: CompileTimeValueTupleId,
         variant: struct { member_type: TypeId, payload: CompileTimeValueId },
 
@@ -756,7 +789,7 @@ pub const CompileTimeValue = union(enum) {
             return switch (self) {
                 // Primitive values are named after their types.
                 inline .int, .int_literal, .string_literal, .byte, .bool, .unit, .none => |_, tag| @field(TypeId, @tagName(tag)),
-                inline .storage_cursor, .function_ref => |typed| typed.type_id,
+                inline .storage_cursor, .function_ref, .erased_callable => |typed| typed.type_id,
                 .numeric, .structure, .variant => null,
             };
         }
@@ -892,6 +925,8 @@ pub const TypeData = union(enum) {
     reference: TypeId,
     variant: VariantType,
     callable: CallableType,
+    function_reference: CallableType,
+    bound_method: InstanceId,
     structure: StructIdentity,
     array: ArrayType,
     tuple: TupleType,
@@ -1211,6 +1246,18 @@ pub const FunctionReference = struct {
     }
 };
 
+pub const ErasedCallableConstant = struct {
+    invocation: InstanceId,
+    payload: ?FunctionReference = null,
+    type_id: TypeId,
+};
+
+pub const CallableEntry = struct {
+    source: FunctionValueId,
+    type_id: TypeId,
+    operation: enum(u8) { invoke, copy, drop } = .invoke,
+};
+
 pub const VariantOperation = struct {
     operand: FunctionValueId,
     target_type: TypeId,
@@ -1342,6 +1389,19 @@ pub const FunctionInstruction = union(enum) {
     const_unit,
     const_none,
     function_ref: FunctionReference,
+    erased_callable: struct {
+        invocation: InstanceId,
+        payload: ?FunctionValueId = null,
+        type_id: TypeId,
+        owns_environment: bool = false,
+    },
+    service_enter: struct { receiver: FunctionValueId, key: InstanceId },
+    service_leave,
+    context_read: struct { entry: ContextEntry, type_id: TypeId, root: InstanceId },
+    context_write: struct { entry: ContextEntry, source: FunctionValueId },
+    callable_payload: BorrowOperation,
+    callable_invoke: CallableEntry,
+    callable_allocation: BorrowOperation,
     initializer_ref: struct {
         region: u32,
         captures: FunctionValueRange,
@@ -1413,15 +1473,18 @@ pub const FunctionInstruction = union(enum) {
 
     pub fn operands(self: anytype) [3]?OperandPointer(@TypeOf(self)) {
         return switch (self.*) {
-            .const_numeric, .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage, .aggregate => .{ null, null, null },
+            .const_numeric, .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .initializer_ref, .local_storage, .result_storage, .aggregate, .service_leave, .context_read => .{ null, null, null },
             .numeric_binary => |*operation| .{ &operation.operands.lhs, &operation.operands.rhs, null },
+            .service_enter => |*operation| .{ &operation.receiver, null, null },
+            .context_write => |*operation| .{ &operation.source, null, null },
+            .erased_callable => |*operation| .{ if (operation.payload) |*payload| payload else null, null, null },
             inline .numeric_unary, .numeric_convert => |*operation| .{ &operation.operand, null, null },
             .variant_tag, .negi, .byte_to_int => |*operand| .{ operand, null, null },
             inline .variant_coerce, .variant_extract, .static_conversion => |*operation| .{ &operation.operand, if (operation.destination) |*destination| destination else null, null },
             .storage_projection => |*operation| .{ &operation.owner, null, null },
             .allocation_element => |*operation| .{ &operation.allocation, &operation.index, null },
             .array_element => |*operation| .{ &operation.array, &operation.index, null },
-            inline .borrow_read, .storage_cursor, .borrow_address => |*operation| .{ &operation.source, null, null },
+            inline .borrow_read, .storage_cursor, .borrow_address, .callable_payload, .callable_invoke, .callable_allocation => |*operation| .{ &operation.source, null, null },
             .cursor_offset, .cursor_element => |*operation| .{ &operation.cursor, &operation.index, null },
             .borrow_write => |*operation| .{ &operation.reference, &operation.value, null },
             .value_copy => |*operation| .{ &operation.source, if (operation.destination) |*destination| destination else null, null },
@@ -1466,12 +1529,13 @@ pub const FunctionInstruction = union(enum) {
             // Each primitive constant is named after the type of its value.
             inline .const_int, .const_int_literal, .const_string_literal, .const_byte, .const_bool, .const_type, .const_unit, .const_none => |_, tag| @field(TypeId, @tagName(tag)["const_".len..]),
             .variant_tag, .negi, .addi, .subi, .muli, .divsi, .shli, .shrsi, .byte_to_int => .int,
-            .borrow_write, .fill, .move => .unit,
+            .borrow_write, .fill, .move, .service_enter, .service_leave, .context_write => .unit,
+            .context_read => |operation| operation.type_id,
             .compare => .bool,
             inline .select, .aggregate => |operation| operation.type_id,
             .local_storage, .result_storage => |type_id| type_id,
             .field_access => |operation| operation.field_type,
-            inline .const_static_string, .const_storage_cursor, .storage_cursor, .cursor_offset, .cursor_element, .function_ref, .initializer_ref, .storage_projection, .allocation_element, .array_element, .borrow_read, .borrow_address => |operation| operation.type_id,
+            inline .const_static_string, .const_storage_cursor, .storage_cursor, .cursor_offset, .cursor_element, .function_ref, .erased_callable, .callable_payload, .callable_invoke, .callable_allocation, .initializer_ref, .storage_projection, .allocation_element, .array_element, .borrow_read, .borrow_address => |operation| operation.type_id,
             // Results written to a destination leave only unit in their own value.
             .variant_coerce, .variant_extract => |operation| if (operation.destination == null) operation.target_type else .unit,
             inline .value_copy, .static_conversion => |operation| if (operation.destination == null) operation.type_id else .unit,
@@ -1488,6 +1552,11 @@ pub const ReferenceIndex = struct { parameter: ?u32 = null, offset: i32 = 0 };
 
 pub const ReferencePathStep = union(enum) {
     field: u32,
+    environment: TypeId,
+    /// Complete allocation owner retained beside an erased closure environment.
+    owner: TypeId,
+    /// Lifetime of backing retained by an affine raw or typed allocation token.
+    backing,
     variant: TypeId,
     element,
     element_at: ReferenceIndex,
@@ -1516,10 +1585,15 @@ pub const ReferencePathStep = union(enum) {
 
     pub fn matches(a: @This(), b: @This()) bool {
         if (a.isElement() and b.isElement()) return a.overlaps(b);
+        if ((a == .environment and b == .environment) or (a == .owner and b == .owner)) return a.overlaps(b);
         return value_operations.equal(@This(), a, b);
     }
 
     pub fn overlaps(a: @This(), b: @This()) bool {
+        if (a == .environment and b == .environment)
+            return a.environment == .unit or b.environment == .unit or a.environment == b.environment;
+        if (a == .owner and b == .owner)
+            return a.owner == .unit or b.owner == .unit or a.owner == b.owner;
         if (a.isElement() and b.isElement()) {
             if (a == .element or b == .element) return true;
             const first = a.element_at;
@@ -1534,9 +1608,13 @@ pub const ReferencePathStep = union(enum) {
 
 pub const ReferenceSourceKind = enum { place, contents };
 
+pub const InitializerContext = struct { parameter: u32, entry: ContextEntry };
+
 pub const ReferenceOriginContract = struct {
     output_parameter: ?u32 = null,
+    output_contextual: ?ContextEntry = null,
     parameter: ?u32,
+    contextual: ?ContextEntry = null,
     kind: ReferenceSourceKind,
     source_path: FunctionValueRange,
     result_path: FunctionValueRange,
@@ -1547,14 +1625,26 @@ pub const ReferenceOriginContract = struct {
     stable: bool = false,
     after_write: bool = false,
     reads_contents: bool = false,
+    retention_only: bool = false,
+    // Physical alias identity used for flow invalidation, without a lifetime loan.
+    flow_only: bool = false,
+    expired: bool = false,
+    service_invocation: ?InstanceId = null,
+    forcing_context: ?InitializerContext = null,
+    owning_parameter: ?u32 = null,
     readonly_owned: ?TypeId = null,
 };
 
 pub const ReferenceRequirement = struct {
-    parameter: u32,
+    parameter: ?u32 = null,
+    contextual: ?ContextEntry = null,
+    requires_writable: bool = false,
     kind: ReferenceSourceKind,
     path: FunctionValueRange,
     written_type: ?TypeId = null,
+    opaque_write: bool = false,
+    preserves_backing: bool = false,
+    flow_only: bool = false,
     ends_lifetime: bool = false,
     storage_depth: u32 = 0,
     recursive_storage: bool = false,
@@ -1567,15 +1657,24 @@ pub const ReferenceExclusion = struct {
 
 pub const ReferenceOutputContract = struct {
     result_type: TypeId,
-    parameter: u32,
+    parameter: ?u32 = null,
+    contextual: ?ContextEntry = null,
     origins: []const ReferenceOriginContract,
 };
 
+pub const ReferenceServiceMutation = struct {
+    target: union(enum) { receiver: ReferenceOriginContract, initializer: u32 },
+    contexts: ?[2][]const ReferenceOriginContract = null,
+};
+
 pub const ReferenceContract = struct {
+    context_effects: ContextEffects = .{},
     origins: []const ReferenceOriginContract = &.{},
     outputs: []const ReferenceOutputContract = &.{},
     requirements: []const ReferenceRequirement = &.{},
     exclusions: []const ReferenceExclusion = &.{},
+    /// Deferred provider mutations, resolved when a service payload becomes known.
+    service_mutations: []const ReferenceServiceMutation = &.{},
     paths: []const ReferencePathStep = &.{},
 
     pub const eql = value_operations.Owned(@This()).eql;
@@ -1583,10 +1682,11 @@ pub const ReferenceContract = struct {
 
     /// Inference joins sets of dependencies; their discovery order is irrelevant.
     pub fn equivalent(left: @This(), right: @This()) bool {
+        if (!std.meta.eql(left.context_effects, right.context_effects)) return false;
         if (left.outputs.len != right.outputs.len) return false;
         for (left.outputs) |output| {
             for (right.outputs) |candidate| {
-                if (output.result_type != candidate.result_type or output.parameter != candidate.parameter) continue;
+                if (output.result_type != candidate.result_type or output.parameter != candidate.parameter or output.contextual != candidate.contextual) continue;
                 if (output.origins.len != candidate.origins.len) continue;
                 for (output.origins) |origin| {
                     for (candidate.origins) |other| {
@@ -1595,7 +1695,7 @@ pub const ReferenceContract = struct {
                 } else break;
             } else return false;
         }
-        inline for (.{ "origins", "requirements", "exclusions" }) |name| {
+        inline for (.{ "origins", "requirements", "exclusions", "service_mutations" }) |name| {
             const first = @field(left, name);
             const second = @field(right, name);
             if (first.len != second.len) return false;
@@ -1613,7 +1713,30 @@ pub const ReferenceContract = struct {
     pub fn same(left: @This(), a: anytype, right: @This(), b: @TypeOf(a)) bool {
         const Entry = @TypeOf(a);
         if (Entry == FunctionValueRange) return samePath(left, a, right, b);
-        if (@typeInfo(Entry) != .@"struct") return a == b;
+        if (Entry == []const ReferenceOriginContract) {
+            if (a.len != b.len) return false;
+            for (a) |origin| {
+                for (b) |other| {
+                    if (same(left, origin, right, other)) break;
+                } else return false;
+            }
+            return true;
+        }
+        if (@typeInfo(Entry) == .optional) {
+            if ((a == null) != (b == null)) return false;
+            return if (a) |present| same(left, present, right, b.?) else true;
+        }
+        if (@typeInfo(Entry) == .array) {
+            for (a, b) |first, second| if (!same(left, first, right, second)) return false;
+            return true;
+        }
+        if (@typeInfo(Entry) == .@"union" and @typeInfo(Entry).@"union".tag_type != null) {
+            if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+            switch (a) {
+                inline else => |payload, tag| return same(left, payload, right, @field(b, @tagName(tag))),
+            }
+        }
+        if (@typeInfo(Entry) != .@"struct") return value_operations.equal(Entry, a, b);
         inline for (@typeInfo(Entry).@"struct".field_names) |name| {
             if (!same(left, @field(a, name), right, @field(b, name))) return false;
         }
@@ -1738,7 +1861,17 @@ pub const InstanceId = struct {
 };
 
 pub const CompileTimeBindingsId = enum(u32) { _ };
-pub const CompileTimeBindings = struct { bindings: []const StaticBinding };
+pub const CompileTimeBindings = struct {
+    bindings: []const StaticBinding,
+    callable_parameters: []const ?TypeId = &.{},
+    closure: ?ClosureEnvironment = null,
+};
+
+pub const ClosureEnvironment = struct {
+    captures: []const StructField,
+    parameters: []const CallableParameter,
+    expected_result: ?MemberSpec = null,
+};
 
 pub const StaticBinding = struct {
     name: []const u8,
@@ -1777,6 +1910,7 @@ pub const CompiledFunction = struct {
     code: []const u8 = &.{},
     /// Nonzero power-of-two alignment required for the loaded code address.
     required_alignment: u32,
+    entry_offset: u32 = 0,
     relocations: []const Relocation = &.{},
     referenced_instances: []const InstanceId = &.{},
     constant_data: []const ByteString = &.{},
@@ -1957,6 +2091,9 @@ pub const Diagnostic = struct {
         .static_argument_inference_conflict = "runtime argument types infer conflicting values for a static parameter",
         .static_argument_not_supported = "this static argument is not supported yet",
         .comptime_runtime_capture = "compile-time expressions cannot capture runtime locals",
+        .closure_capture_initializer = "a pending init parameter cannot be captured by a closure",
+        .closure_capture_explicit_drop = TypeMessage{ .prefix = "closure captures cannot require explicit destruction; found " },
+        .callable_erasure_requires_concrete = "erase requires a concrete callable initializer; use clone to copy an erased callable",
         .static_argument_type_mismatch = "static argument does not match the parameter type",
         .where_condition_failed = "function specialization does not satisfy this where condition",
         .duplicate_parameter = Message{ .text = "parameter name is already declared", .source_label = true },
@@ -2047,6 +2184,13 @@ pub const Diagnostic = struct {
         .equality_operand_type_mismatch = MismatchMessage{ .prefix = "equality operand type mismatch: " },
         .missing_return_value = TypeMessage{ .prefix = "function must return ", .suffix = " on every reachable path" },
         .return_type_mismatch = MismatchMessage{ .prefix = "return type mismatch: " },
+        .callable_result_inference_conflict = MismatchMessage{ .prefix = "callable result slots disagree between returns: " },
+        .callable_result_cannot_be_inferred = Message{ .text = "callable result slots cannot be inferred", .source_label = true },
+        .callable_result_inference_cycle = Message{ .text = "callable result inference depends on its own unresolved result", .source_label = true },
+        .service_protocol_incompatible = "service backend has an incompatible callback or retains a synchronous message borrow",
+        .invalid_bound_method_receiver = Message{ .text = "bound method receiver does not match its declaration", .source_label = true },
+        .bound_method_consuming_receiver = Message{ .text = "a consuming receiver method cannot be bound", .source_label = true },
+        .bound_method_requires_receiver_place = Message{ .text = "a bound method requires an existing receiver place", .source_label = true },
         .unknown_function = Message{ .text = "unknown function", .source_label = true },
         .call_argument_count_mismatch = struct { expected: u32, found: u32 },
         .call_argument_type_mismatch = MismatchMessage{ .prefix = "argument type mismatch: " },

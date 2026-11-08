@@ -853,14 +853,16 @@ test "composed standard adapters inline their cursor state" {
         \\import std.algorithms.{map, filter, enumerate, zip, Map, Filter, Enumerate}
         \\import std.memory.{SpanIterator}
         \\import std.range.{RangeIterator}
-        \\func triple(value: int) int -> value * 3 + 1
-        \\func odd(value: int) bool -> value % 2 == 1
+        \\func triple_impl(value: int) int -> value * 3 + 1
+        \\func odd_impl(value: int) bool -> value % 2 == 1
+        \\static triple: func(int) int = triple_impl
+        \\static odd: func(int) bool = odd_impl
         \\func total(ref values: Array(int, 4)) int
         \\    const mapped = map(SpanIterator(int), int, int, values.iter(), triple)
-        \\    const selected = filter(Map(SpanIterator(int), int, int), int, false, mapped^, odd)
-        \\    const numbered = enumerate(Filter(Map(SpanIterator(int), int, int), int, false), int, false, selected^)
+        \\    const selected = filter(Map(SpanIterator(int), int, int, func(imm int) int), int, false, mapped^, odd)
+        \\    const numbered = enumerate(Filter(Map(SpanIterator(int), int, int, func(imm int) int), int, false, func(imm int) bool), int, false, selected^)
         \\    var sum = 0
-        \\    for pair in zip(Enumerate(Filter(Map(SpanIterator(int), int, int), int, false), int, false), RangeIterator, (int, int), int, false, false, numbered^, (5..8).iter()) -> sum += pair.0.0 + pair.0.1 + pair.1
+        \\    for pair in zip(Enumerate(Filter(Map(SpanIterator(int), int, int, func(imm int) int), int, false, func(imm int) bool), int, false), RangeIterator, (int, int), int, false, false, numbered^, (5..8).iter()) -> sum += pair.0.0 + pair.0.1 + pair.1
         \\    return sum
         \\func run() int
         \\    var values: Array(int, 4) = [1, 2, 3, 4]
@@ -876,22 +878,25 @@ test "deep standard adapter chains inline at every depth" {
     const program =
         \\import std.algorithms.{map, filter, enumerate, zip, Map, Filter, Enumerate, Zip}
         \\import std.range.{RangeIterator}
-        \\func triple(value: int) int -> value % 100 + 1
-        \\func sum2(pair: (int, int)) int -> pair.0 + pair.1
-        \\func odd(value: int) bool -> value % 3 <> 0
+        \\func triple_impl(value: int) int -> value % 100 + 1
+        \\func sum2_impl(pair: (int, int)) int -> pair.0 + pair.1
+        \\func odd_impl(value: int) bool -> value % 3 <> 0
+        \\static triple: func(int) int = triple_impl
+        \\static sum2: func((int, int)) int = sum2_impl
+        \\static odd: func(int) bool = odd_impl
         \\func total(limit: int) int
         \\    const e0 = enumerate(RangeIterator, int, false, (0..limit).iter())
         \\    const t0 = map(Enumerate(RangeIterator, int, false), (int, int), int, e0^, sum2)
-        \\    const s1 = filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false, t0^, odd)
-        \\    const z2 = zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false, s1^, (2..limit).iter())
-        \\    const t2 = map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int, z2^, sum2)
-        \\    const s3 = map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int, t2^, triple)
-        \\    const e4 = enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false, s3^)
-        \\    const t4 = map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false), (int, int), int, e4^, sum2)
-        \\    const s5 = filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false), (int, int), int), int, false, t4^, odd)
-        \\    const z6 = zip(Filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false), (int, int), int), int, false), RangeIterator, int, int, false, false, s5^, (6..limit).iter())
-        \\    const t6 = map(Zip(Filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int, z6^, sum2)
-        \\    const s7 = map(Map(Zip(Filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int), int, false), (int, int), int), int, false), RangeIterator, int, int, false, false), (int, int), int), int, int, t6^, triple)
+        \\    const s1 = filter(Map(Enumerate(RangeIterator, int, false), (int, int), int, func(imm (int, int)) int), int, false, t0^, odd)
+        \\    const z2 = zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false, s1^, (2..limit).iter())
+        \\    const t2 = map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false), (int, int), int, z2^, sum2)
+        \\    const s3 = map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false), (int, int), int, func(imm (int, int)) int), int, int, t2^, triple)
+        \\    const e4 = enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false, s3^)
+        \\    const t4 = map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false), (int, int), int, e4^, sum2)
+        \\    const s5 = filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false), (int, int), int, func(imm (int, int)) int), int, false, t4^, odd)
+        \\    const z6 = zip(Filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false, s5^, (6..limit).iter())
+        \\    const t6 = map(Zip(Filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false), (int, int), int, z6^, sum2)
+        \\    const s7 = map(Map(Zip(Filter(Map(Enumerate(Map(Map(Zip(Filter(Map(Enumerate(RangeIterator, int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false), (int, int), int, func(imm (int, int)) int), int, int, func(imm int) int), int, false), (int, int), int, func(imm (int, int)) int), int, false, func(imm int) bool), RangeIterator, int, int, false, false), (int, int), int, func(imm (int, int)) int), int, int, t6^, triple)
         \\    var sum = 0
         \\    for value in s7^ -> sum += value % 1000
         \\    return sum
@@ -2088,7 +2093,8 @@ test "known indirect calls recover immutable fields and common joins but retain 
     const fixture = try Fixture.init(program);
     defer fixture.deinit();
     for ([_][]const u8{ "field", "common" }) |name| {
-        try testing.expectEqual(@as(usize, 0), countCalls((try optimizedBody(fixture, name)).*.?));
+        const body = (try optimizedBody(fixture, name)).*.?;
+        try testing.expectEqual(@as(usize, 0), countCalls(body));
     }
     const different = (try optimizedBody(fixture, "different")).*.?;
     try testing.expectEqual(@as(usize, 1), countCalls(different));

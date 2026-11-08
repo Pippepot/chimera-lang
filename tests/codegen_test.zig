@@ -38,6 +38,9 @@ test "assembly debug renders named functions and constants without data dumps" {
     try std.testing.expect(std.mem.indexOf(u8, assembly, "call std.io.print_value(int)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, assembly, " $entry.id(int)\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, assembly, ".data0 = \"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembly, ".descriptor.invoke = ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembly, ".descriptor.copy = ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, assembly, ".descriptor.drop = ") != null);
     try std.testing.expect(std.mem.indexOf(u8, assembly, "db 0x") == null);
 }
 
@@ -1034,6 +1037,10 @@ const callable_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(4)
 const byte_reference_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(5)));
 
 const TestTypes = struct {
+    pub fn allocationElement(_: @This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
+    }
+
     data: []const u8 = "a*",
     pub fn byteString(self: @This(), _: structures.ByteStringId) ![]const u8 {
         return self.data;
@@ -1104,6 +1111,14 @@ const TestTypes = struct {
         else
             null;
     }
+
+    pub fn functionReference(self: @This(), type_id: structures.TypeId) !?structures.CallableType {
+        return self.callable(type_id);
+    }
+
+    pub fn boundMethod(_: @This(), _: structures.TypeId) !?structures.InstanceId {
+        return null;
+    }
 };
 
 fn integerConstant(value: i32) structures.FunctionBodyAnalysis.Instruction {
@@ -1160,6 +1175,10 @@ const array_reference_type = structures.TypeId.fromInterned(@fromBackingInt(@int
 const reference_reference_type = structures.TypeId.fromInterned(@fromBackingInt(@intCast(8)));
 
 const ArrayCopyTypes = struct {
+    pub fn allocationElement(_: *@This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
+    }
+
     pub fn byteString(_: *@This(), id: structures.ByteStringId) ![]const u8 {
         return (TestTypes{}).byteString(id);
     }
@@ -1224,6 +1243,14 @@ const ArrayCopyTypes = struct {
 
     pub fn callable(_: *@This(), type_id: structures.TypeId) !?structures.CallableType {
         return (TestTypes{}).callable(type_id);
+    }
+
+    pub fn functionReference(_: *@This(), type_id: structures.TypeId) !?structures.CallableType {
+        return (TestTypes{}).functionReference(type_id);
+    }
+
+    pub fn boundMethod(_: *@This(), _: structures.TypeId) !?structures.InstanceId {
+        return null;
     }
 };
 

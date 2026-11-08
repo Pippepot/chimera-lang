@@ -1,6 +1,12 @@
 import std.exit.{exit}
-import std.memory.{List}
+import std.memory.{List, AllocationError}
 import std.text.{BytesView, String, StringView}
+
+pub struct IoError
+    error = true
+    copy = fieldwise
+    pub cause: int
+    pub progress: int
 
 pub struct Stream
     copy = trivial
@@ -14,20 +20,20 @@ pub func unhandled_error() never
     _ = write_text(stderr, "unhandled error\n")
     exit(1)
 
-pub func write_once(stream: Stream, imm bytes: BytesView) int | none -> bytes.write_to(stream.descriptor)
-pub func write_all(stream: Stream, imm bytes: BytesView) unit | none
+pub func write_once(stream: Stream, imm bytes: BytesView) int | IoError -> bytes.write_to(stream.descriptor)
+pub func write_all(stream: Stream, imm bytes: BytesView) unit | IoError
     var offset = 0
     loop
         if offset == bytes.byte_length() -> return unit
         const remaining = bytes.slice(offset..)
-        if not (remaining is BytesView) -> return none
+        if not (remaining is BytesView) -> panic "invalid write cursor"
         const written = write_once(stream, remaining)
-        if not (written is int) -> return none
-        if written <= 0 -> return none
+        if written is IoError -> return IoError{cause = written.cause, progress = offset + written.progress}
+        if written <= 0 -> return IoError{cause = 5, progress = offset}
         offset += written
-pub func write_text(stream: Stream, imm text: StringView) unit | none -> write_all(stream, text.as_bytes())
+pub func write_text(stream: Stream, imm text: StringView) unit | IoError -> write_all(stream, text.as_bytes())
 pub overload print(print_value)
 func print_value(static T: type, imm value: T)
     if not (write_text(stdout, String(value)) is unit) -> panic "standard output write failed"
     if not (write_text(stdout, "\n") is unit) -> panic "standard output newline write failed"
-pub func read_bytes(stream: Stream, mut bytes: List(byte), count: int) int | none -> bytes.read_bytes(stream.descriptor, count)
+pub func read_bytes(stream: Stream, mut bytes: List(byte), count: int) int | AllocationError | IoError -> bytes.read_bytes(stream.descriptor, count)

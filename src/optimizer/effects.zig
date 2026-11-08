@@ -7,10 +7,10 @@ const ValueId = structures.FunctionValueId;
 const Instruction = structures.FunctionInstruction;
 const Function = function_ir.Function;
 
-/// Memory regions are typed: an allocation holds elements of one type, and its
-/// block is never part of another object, so writes to a whole scalar element
-/// cannot touch a parameter object that has fields or another allocation type.
+/// Raw backing can be adopted at another type or supplied from caller storage.
+/// Allocation types and element shapes therefore provide no aliasing proof.
 pub const Resource = union(enum) {
+    contextual: structures.ContextEntry,
     immutable,
     slot: ValueId,
     field: struct { slot: ValueId, index: u32 },
@@ -18,15 +18,8 @@ pub const Resource = union(enum) {
     parameter,
     /// Caller storage whose type is not a scalar.
     parameter_object,
-    heap: Heap,
+    heap,
     unknown,
-
-    pub const Heap = struct {
-        /// Type of the allocation value, or null when the block is unknown.
-        allocation: ?structures.TypeId = null,
-        /// The resource is a whole element of a scalar type, not a projection.
-        scalar: bool = false,
-    };
 };
 
 /// Addressable snapshots may still be immutable when their addresses remain
@@ -85,8 +78,7 @@ pub const Roots = struct {
     pub fn root(self: *const Roots, value: ValueId) Resource {
         var current = value;
         var field: ?u32 = null;
-        var projected = false;
-        for (0..64) |_| {
+        while (true) {
             switch (self.function.definitions.items[@backingInt(current)]) {
                 .argument => |argument| {
                     if (argument.block == self.function.entry) return if (function_ir.scalar(argument.data.type_id)) .parameter else .parameter_object;
@@ -97,7 +89,6 @@ pub const Roots = struct {
                     .local_storage => return slotResource(current, field),
                     .result_storage => return .parameter,
                     .storage_projection => |projection| {
-                        projected = true;
                         switch (projection.projection) {
                             .field => |field_index| {
                                 field = field_index;
@@ -107,24 +98,19 @@ pub const Roots = struct {
                                 field = null;
                                 current = projection.owner;
                             },
-                            .allocation_array => return .{ .heap = .{} },
+                            .allocation_array => return .heap,
                         }
                     },
                     .array_element => |element| {
-                        projected = true;
                         current = element.array;
                     },
-                    .allocation_element => |element| return .{ .heap = .{
-                        .allocation = self.function.valueType(element.allocation),
-                        .scalar = !projected and function_ir.scalar(element.type_id),
-                    } },
+                    .allocation_element => return .heap,
                     .cursor_element => return .unknown,
                     .borrow_read => |read| return self.referent(read.source),
                     else => return if (self.address_taken[@backingInt(current)]) slotResource(current, field) else if (self.function.plainValue(current)) .immutable else .unknown,
                 },
             }
         }
-        return .unknown;
     }
 
     fn slotResource(slot: ValueId, field: ?u32) Resource {
@@ -139,19 +125,14 @@ pub const Roots = struct {
     pub fn overlaps(first: Resource, second: Resource) bool {
         if (first == .immutable or second == .immutable) return false;
         if (first == .unknown or second == .unknown) return true;
+        if (first == .contextual or second == .contextual) return first == .contextual and second == .contextual and first.contextual == second.contextual;
         const first_slot = slotOwner(first);
         const second_slot = slotOwner(second);
         if (first_slot != null or second_slot != null) {
-            if (first_slot == null or second_slot == null or first_slot.? != second_slot.?) return false;
+            if (first_slot == null or second_slot == null) return true;
+            if (first_slot.? != second_slot.?) return false;
             return first != .field or second != .field or first.field.index == second.field.index;
         }
-        if (first == .heap and second == .heap) {
-            const first_block = first.heap.allocation orelse return true;
-            const second_block = second.heap.allocation orelse return true;
-            return first_block == second_block;
-        }
-        if (first == .heap and second == .parameter_object) return !first.heap.scalar;
-        if (first == .parameter_object and second == .heap) return !second.heap.scalar;
         return true;
     }
 
@@ -225,30 +206,21 @@ pub const Memory = struct {
 pub const Writes = struct {
     slots: std.AutoHashMapUnmanaged(ValueId, void) = .empty,
     fields: std.AutoHashMapUnmanaged(@FieldType(Resource, "field"), void) = .empty,
-    /// Allocation types with a write; a block is never part of another object.
-    blocks: std.AutoHashMapUnmanaged(structures.TypeId, void) = .empty,
     parameter: bool = false,
-    /// A write to an unknown heap block.
+    /// A write through allocation-backed storage.
     heap: bool = false,
-    /// A heap write that is not a whole scalar element.
-    heap_object: bool = false,
     unknown: bool = false,
     call: bool = false,
+    contexts: u8 = 0,
 
     pub fn add(self: *Writes, scratch: std.mem.Allocator, resource: Resource) !void {
         switch (resource) {
             .immutable => {},
+            .contextual => |entry| self.contexts |= structures.ContextEffects.bit(entry),
             .slot => |slot| try self.slots.put(scratch, slot, {}),
             .field => |field| try self.fields.put(scratch, field, {}),
             .parameter, .parameter_object => self.parameter = true,
-            .heap => |heap| {
-                const allocation = heap.allocation orelse {
-                    self.heap = true;
-                    return;
-                };
-                try self.blocks.put(scratch, allocation, {});
-                if (!heap.scalar) self.heap_object = true;
-            },
+            .heap => self.heap = true,
             .unknown => self.unknown = true,
         }
     }
@@ -259,6 +231,8 @@ pub const Writes = struct {
             .borrow_write => |write| try self.add(scratch, memory.roots.referent(write.reference)),
             .fill => |fill| try self.add(scratch, memory.roots.root(fill.first)),
             .move => |move| try self.add(scratch, memory.roots.root(move.destination)),
+            .erased_callable => |callable| if (callable.owns_environment) try self.add(scratch, .heap),
+            .context_write => |write| try self.add(scratch, .{ .contextual = write.entry }),
             .call => |call| {
                 self.call = true;
                 if (call.destination) |destination| try self.add(scratch, memory.roots.root(destination));
@@ -270,18 +244,16 @@ pub const Writes = struct {
     pub fn preserves(self: *const Writes, memory: *const Memory, resource: Resource) bool {
         return switch (resource) {
             .immutable => true,
+            .contextual => |entry| !self.call and (self.contexts & structures.ContextEffects.bit(entry)) == 0,
             .slot, .field => self.preservesSlot(memory, resource),
-            .parameter => !(self.parameter or self.heap or self.blocks.count() != 0 or self.unknown or self.call),
-            .parameter_object => !(self.parameter or self.heap or self.heap_object or self.unknown or self.call),
-            .heap => |heap| !(self.parameter or self.heap or self.unknown or self.call) and
-                if (heap.allocation) |allocation| !self.blocks.contains(allocation) else self.blocks.count() == 0,
-            .unknown => !(self.parameter or self.heap or self.blocks.count() != 0 or self.unknown or self.call) and self.slots.count() == 0 and self.fields.count() == 0,
+            .parameter, .parameter_object, .heap, .unknown => !(self.parameter or self.heap or self.unknown or self.call) and
+                self.slots.count() == 0 and self.fields.count() == 0,
         };
     }
 
     fn preservesSlot(self: *const Writes, memory: *const Memory, resource: Resource) bool {
         const slot = Roots.slotOwner(resource).?;
-        if (self.slots.contains(slot) or (memory.slotExposed(slot) and (self.unknown or self.call))) return false;
+        if (self.slots.contains(slot) or (memory.slotExposed(slot) and (self.parameter or self.heap or self.unknown or self.call))) return false;
         if (resource == .field) return !self.fields.contains(resource.field);
         var fields = self.fields.keyIterator();
         while (fields.next()) |field| if (field.slot == slot) return false;

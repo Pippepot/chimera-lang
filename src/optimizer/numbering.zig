@@ -196,12 +196,16 @@ fn kind(roots: *const effects.Roots, instruction: Instruction) Kind {
     return switch (instruction) {
         .const_numeric, .numeric_binary, .numeric_unary, .numeric_convert, .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .compare, .select, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => .pure,
         .field_access => |operation| if (roots.fieldResource(operation.operand, operation.field_index) == .immutable) .pure else .load,
+        .erased_callable => |callable| if (callable.owns_environment) .write else .pure,
+        inline .callable_payload, .callable_invoke, .callable_allocation => |operation| read(roots, operation.source),
         .variant_tag => |operand| read(roots, operand),
         .value_copy => |copy| if (copy.destination == null) read(roots, copy.source) else .write,
         inline .variant_extract, .variant_coerce => |operation| if (operation.destination == null) read(roots, operation.operand) else .write,
         .allocation_element => |element| read(roots, element.allocation),
         .type_union, .local_storage, .result_storage, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_type, .initializer_ref, .aggregate, .storage_cursor => .none,
-        .borrow_write, .call, .static_conversion, .fill, .move => .write,
+        .context_read => .load,
+        .service_enter, .service_leave => .none,
+        .borrow_write, .call, .static_conversion, .fill, .move, .context_write => .write,
     };
 }
 
@@ -227,6 +231,7 @@ fn invalidateLoads(loads: *std.HashMapUnmanaged(Instruction, ValueId, Context, 8
         .borrow_write => |write| roots.referent(write.reference),
         .fill => |fill| roots.root(fill.first),
         .move => |move| roots.root(move.destination),
+        .context_write => |write| .{ .contextual = write.entry },
         else => .unknown,
     };
     if (written == .unknown) {
@@ -241,10 +246,12 @@ fn invalidateLoads(loads: *std.HashMapUnmanaged(Instruction, ValueId, Context, 8
     while (entries.next()) |key| {
         const resource: effects.Resource = switch (key.*) {
             .field_access => |field| roots.fieldResource(field.operand, field.field_index),
+            .context_read => |read_context| .{ .contextual = read_context.entry },
             .value_copy => |copy| roots.root(copy.source),
             .variant_extract, .variant_coerce => |operation| roots.root(operation.operand),
             .variant_tag => |value| roots.root(value),
             .allocation_element => |element| roots.root(element.allocation),
+            inline .callable_payload, .callable_invoke, .callable_allocation => |operation| roots.root(operation.source),
             else => unreachable,
         };
         if (effects.Roots.overlaps(written, resource)) _ = loads.remove(key.*);

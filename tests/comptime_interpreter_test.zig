@@ -463,6 +463,10 @@ test "evaluation heap snapshots freeze lazy allocation identities aliases and re
 }
 
 const ArrayTestExecutor = struct {
+    pub fn callableOwnershipAdapter(_: *@This(), _: structures.InstanceId, _: @FieldType(structures.CallableEntry, "operation"), _: structures.TypeId) !structures.InstanceId {
+        unreachable;
+    }
+
     pub fn unionType(_: *@This(), _: structures.TypeId, _: structures.TypeId, _: ?structures.SourceSpan) !?structures.TypeId {
         unreachable;
     }
@@ -486,6 +490,10 @@ const ArrayTestExecutor = struct {
             103 => .{ .element_type = .byte, .length = 2 },
             else => null,
         };
+    }
+
+    pub fn borrowElement(_: *@This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
     }
 
     pub fn byteString(_: *@This(), _: structures.ByteStringId) ![]const u8 {
@@ -1040,6 +1048,10 @@ test "initializer capture cell subtrees survive the constructing region storage"
     const nested_type: structures.TypeId = @fromBackingInt(@intCast(101));
     const variant_type: structures.TypeId = @fromBackingInt(@intCast(102));
     const Executor = struct {
+        pub fn callableOwnershipAdapter(_: *@This(), _: structures.InstanceId, _: @FieldType(structures.CallableEntry, "operation"), _: structures.TypeId) !structures.InstanceId {
+            unreachable;
+        }
+
         pub fn unionType(_: *@This(), _: structures.TypeId, _: structures.TypeId, _: ?structures.SourceSpan) !?structures.TypeId {
             unreachable;
         }
@@ -1058,6 +1070,9 @@ test "initializer capture cell subtrees survive the constructing region storage"
             return self.call(instance, arguments, span);
         }
         pub fn arrayType(_: *@This(), _: structures.TypeId) !?structures.ArrayType {
+            return null;
+        }
+        pub fn borrowElement(_: *@This(), _: structures.TypeId) !?structures.TypeId {
             return null;
         }
         pub fn structFieldCount(_: *@This(), type_id: structures.TypeId) !?usize {

@@ -18,7 +18,7 @@ import time
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
-PATTERNS = ("random", "sorted", "reversed", "duplicates", "runs")
+PATTERNS = ("random", "sorted", "reversed", "duplicates", "runs", "adjacent swap", "minimum last")
 
 
 def expected(size: int, pattern: int, rounds: int, seed: int) -> bytes:
@@ -37,6 +37,16 @@ def expected(size: int, pattern: int, rounds: int, seed: int) -> bytes:
                 value = state % 16
             elif pattern == 4:
                 value = ((size - 1) // 256 - index // 256) * 256 + index % 256
+            elif pattern == 5:
+                value = index
+                if size > 1:
+                    middle = (size - 1) // 2
+                    if index == middle:
+                        value += 1
+                    elif index == middle + 1:
+                        value -= 1
+            elif pattern == 6:
+                value = index + 1 if index < size - 1 else 0
             values.append(value)
         for value in sorted(values):
             checksum = (checksum * 31 + value) % 1000003

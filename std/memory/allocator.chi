@@ -1,0 +1,14 @@
+pub struct Allocator
+    copy = fieldwise
+    allocate_callback: func(AllocationLayout) RawBlock | AllocationError
+    deallocate_callback: func(deinit RawBlock) unit
+    pub func from(static Provider: type, ref provider: Provider) Allocator -> allocator_from(Provider, provider)
+    pub func from_unchecked(static Provider: type, ref provider: Provider) Allocator -> allocator_from_unchecked(Provider, provider)
+    pub func allocate(imm self: Allocator, layout: AllocationLayout) RawBlock | AllocationError
+        if not valid_layout(layout) -> return AllocationError.invalid_layout
+        return self.allocate_callback(layout)
+    pub func deallocate(imm self: Allocator, deinit block: RawBlock) unit -> self.deallocate_callback(block^)
+
+pub func root_allocator() Allocator -> Allocator{allocate_callback = allocate_raw, deallocate_callback = deallocate_raw}
+extern func allocator_from(static Provider: type, ref provider: Provider) Allocator
+extern func allocator_from_unchecked(static Provider: type, ref provider: Provider) Allocator
