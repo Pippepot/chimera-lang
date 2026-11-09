@@ -1807,14 +1807,17 @@ test "inlining exposes callee bodies to scalar replacement selects and loop idio
 
     const scan = (try optimizedBody(fixture, "scan")).*.?;
     try testing.expectEqual(@as(usize, 1), count(scan, &.{.fill}));
+    var found_count_guard = false;
     for (scan.blocks) |block| if (block.terminator == .predicate_branch) {
         const predicate = block.terminator.predicate_branch;
-        if (predicate.operation == .lti) {
+        if (predicate.operation == .lti and @backingInt(predicate.operands.lhs) == 0) {
+            found_count_guard = true;
             const bound = @backingInt(predicate.operands.rhs);
             try testing.expect(bound >= scan.block_arguments.len);
             try testing.expectEqualDeep(structures.FunctionInstruction{ .const_int = 0 }, scan.instructions[bound - scan.block_arguments.len]);
         }
     };
+    try testing.expect(found_count_guard);
 
     const spin = (try optimizedBody(fixture, "spin")).*.?;
     // An arbitrary negative start eventually overflows its checked decrement.
@@ -2323,12 +2326,12 @@ fn onCycle(body: structures.FunctionBodyAnalysis, start: usize) bool {
     return false;
 }
 
-test "scalar element writes leave parameter object reads loop invariant" {
+test "writes to distinct mutable inline parameters leave object reads invariant" {
     const fixture = try Fixture.init(
         \\struct Header
         \\    pub scale: int
         \\    pub flag: bool
-        \\func fill(mut header: Header, mut values: List(int)) int
+        \\func fill(mut header: Header, mut values: Array(int, 40)) int
         \\    var total = 0
         \\    for index in 0..values.len()
         \\        values[index] = header.scale
@@ -2336,8 +2339,7 @@ test "scalar element writes leave parameter object reads loop invariant" {
         \\    return total
         \\func run() int
         \\    var header = Header{scale = 2, flag = true}
-        \\    var values = List(int).filled(1, 40)
-        \\    if not (values is List(int)) -> return 90
+        \\    var values: Array(int, 40) = [1 static for index in 0..40]
         \\    return fill(header, values) + values[39]
         \\exit(run())
     );
@@ -2354,6 +2356,42 @@ test "scalar element writes leave parameter object reads loop invariant" {
         }
     }
     try testing.expect(header_reads != 0);
+
+    const aliasing = try std.mem.replaceOwned(u8, testing.allocator, (try fixture.db.input(queries.SourceText, 0)).*, "mut header: Header, mut values: Array(int, 40)", "ref header: Header, ref values: Array(int, 40)");
+    defer testing.allocator.free(aliasing);
+    try fixture.db.setInput(queries.SourceText, 0, aliasing);
+    try fixture.expectExit(0, 42);
+    const aliasing_body = (try optimizedBody(fixture, "fill")).*.?;
+    var cyclic_reads: usize = 0;
+    for (aliasing_body.blocks, 0..) |block, index| {
+        for (aliasing_body.instructions[block.instruction_start..block.instruction_end]) |instruction| {
+            if (instruction != .field_access or instruction.field_access.field_index != 0) continue;
+            if (aliasing_body.valueType(instruction.field_access.operand) != aliasing_body.block_arguments[0].type_id) continue;
+            if (onCycle(aliasing_body, index)) cyclic_reads += 1;
+        }
+    }
+    try testing.expect(cyclic_reads != 0);
+}
+
+test "references stored in aggregates expose local storage to opaque loop writes" {
+    const fixture = try Fixture.init(
+        \\struct Holder
+        \\    item: Ref(int)
+        \\func bump(imm holder: Holder)
+        \\    holder.item.value += 1
+        \\func run() int
+        \\    var value = 10
+        \\    const holder = Holder{item = Ref.from(value)}
+        \\    var total = 0
+        \\    for index in 0..3
+        \\        total += value
+        \\        bump(holder)
+        \\    return total + 9
+        \\exit(run())
+    );
+    defer fixture.deinit();
+    try fixture.db.addInput(queries.InlineLimit, {}, 0);
+    try fixture.expectExit(0, 42);
 }
 
 fn countRemainders(body: structures.FunctionBodyAnalysis) usize {
@@ -2433,4 +2471,45 @@ test "iteration carriers thread through their tag test and leave no variants in 
         const body = (try optimizedBody(fixture, name)).*.?;
         try testing.expectEqual(@as(usize, 0), count(body, &.{ .variant_tag, .variant_coerce, .variant_extract }));
     }
+}
+
+test "mutable allocation handles preserve aliases across shared arena backing" {
+    try Fixture.expectParity(
+        \\import std.memory.{Allocator, AllocationLayout, RawBlock, AllocationError, Allocation, allocate_with, deallocate, unsafe_initialize, unsafe_borrow}
+        \\struct Arena
+        \\    bytes: List(byte)
+        \\    pub func allocate(mut self: Arena, layout: AllocationLayout) RawBlock | AllocationError
+        \\        var bytes = self.bytes.span()
+        \\        return RawBlock.unsafe_from_span(bytes, layout)
+        \\    pub func deallocate(mut self: Arena, deinit block: RawBlock) unit -> block.retire()
+        \\func mix(mut first: Allocation(int), mut second: Allocation(int), count: int) int
+        \\    if count < 0 -> return mix(first, second, -count)
+        \\    var total = 0
+        \\    for index in 0..count
+        \\        total += unsafe_borrow(int, first, 0)
+        \\        ref value = unsafe_borrow(int, second, 0)
+        \\        value += 1
+        \\        total += unsafe_borrow(int, first, 0)
+        \\    return total
+        \\func exercise() int | AllocationError
+        \\    var arena = Arena{bytes = List(byte).filled(0, 8)?}
+        \\    const provider = Allocator.from(Arena, arena)
+        \\    var first = allocate_with(int, provider, 1)?
+        \\    var second = allocate_with(int, provider, 1)
+        \\    if second is AllocationError
+        \\        const failure: AllocationError = second^
+        \\        deallocate(int, first^)
+        \\        return failure
+        \\    var second_storage: Allocation(int) = second^
+        \\    unsafe_initialize(int, first, 0, 1)
+        \\    unsafe_initialize(int, second_storage, 0, 1)
+        \\    const result = mix(first, second_storage, 3)
+        \\    deallocate(int, first^)
+        \\    deallocate(int, second_storage^)
+        \\    return result + 27
+        \\func run() int
+        \\    const result = exercise()
+        \\    if result is AllocationError -> return 91
+        \\    return result
+    , 42);
 }

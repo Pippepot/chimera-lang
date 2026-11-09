@@ -41,6 +41,10 @@ pub fn build(allocator: std.mem.Allocator) ![]u8 {
             for (diagnostics) |diagnostic| std.debug.print("{any}\n", .{diagnostic});
             return error.InvalidStandardLibrary;
         };
+        // Validate and export summaries, falling back to a precise contract
+        // when the provisional typing cannot supply merged effects.
+        if ((try db.get(queries.InferReferenceEffects, instance)).* == null and
+            (try db.get(queries.InferReferenceContract, instance)).* == null) return error.InvalidStandardLibrary;
         for (compiled.referenced_instances) |referenced| try instances.put(allocator, referenced, {});
         const location = try db.lookupInterned(queries.ItemLocations, instance.item);
         if (location.adapter) |adapter| if (adapter != .function_reference) {

@@ -26,6 +26,11 @@ pub func emit(imm logger: Logger, level: LogLevel, imm message: StringView) unit
     return logger.emit_callback(level, message)
 
 pub func log(level: LogLevel, imm message: StringView) unit | AllocationError | IoError -> emit(context.logger, level, message)
+pub func trace(imm message: StringView) unit | AllocationError | IoError -> log(LogLevel.trace, message)
+pub func debug(imm message: StringView) unit | AllocationError | IoError -> log(LogLevel.debug, message)
+pub func info(imm message: StringView) unit | AllocationError | IoError -> log(LogLevel.info, message)
+pub func warning(imm message: StringView) unit | AllocationError | IoError -> log(LogLevel.warning, message)
+pub func error(imm message: StringView) unit | AllocationError | IoError -> log(LogLevel.error, message)
 
 func noop_emit(level: LogLevel, imm message: StringView) unit | AllocationError | IoError -> unit
 pub func noop_logger() Logger -> Logger{emit_callback = noop_emit, minimum_level = LogLevel.off}

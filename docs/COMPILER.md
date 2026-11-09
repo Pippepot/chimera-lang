@@ -5,10 +5,11 @@ from the repository root. Start with the [README](../README.md) for the language
 [syntax&semantics.txt](../syntax&semantics.txt) owns detailed language rules.
 Specification examples can describe planned features, not current support.
 
-Shared context, retained allocation providers, and contextual logging are currently
-an unqualified implementation draft. The latest routine suite has failures and
-crashes; see [remaining work and verification](../ROADMAP.md#scoped-context-implementation-slices)
-before treating this milestone as complete.
+Synchronous scoped context, retained allocation providers, and contextual logging
+are implemented and qualified across native/evaluator execution, ownership,
+incremental recomputation, and persistent reuse. See the
+[acceptance record](SHAREDCONTEXT.md#13-delivery-order-and-acceptance-tests) and
+[measured runtime boundaries](../benchmarks/shared-context/README.md#recorded-qualification).
 
 Concrete expression closures and implicit runtime-callable specialization use
 inline copy/reference captures, immutable invocation, and ordinary ownership and

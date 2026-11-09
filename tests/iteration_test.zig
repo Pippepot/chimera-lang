@@ -254,21 +254,20 @@ test "pull for tracks reused buffer content lifetimes" {
         \\struct Cursor
         \\    position: int
         \\    buffered: String
-        \\    func next(mut self: Cursor) StringView | End | none
+        \\    func next(mut self: Cursor) StringView | End | AllocationError
         \\        self.position += 1
         \\        if self.position > 2 -> return End{}
-        \\        const checked_value_1 = self.buffered.append("next")
-        \\        if not (checked_value_1 is unit) -> return none
+        \\        _ = self.buffered.append("next")?
         \\        return self.buffered.view()
     ;
     try Fixture.expectParity(declarations ++ "\n" ++
-        \\func calculate() int | none
+        \\func calculate() int | AllocationError
         \\    var total = 30
         \\    var cursor = Cursor{position = 0, buffered = ""}
-        \\    match cursor.next()
+        \\    match cursor.next()?
         \\        view and view is StringView -> total += view.byte_length()
         \\        _ -> ()
-        \\    match cursor.next()
+        \\    match cursor.next()?
         \\        view and view is StringView -> total += view.byte_length()
         \\        _ -> ()
         \\    return total
@@ -279,11 +278,11 @@ test "pull for tracks reused buffer content lifetimes" {
         \\    return 90
     , 42);
     try Fixture.expectParity(declarations ++ "\n" ++
-        \\func calculate() int | none
+        \\func calculate() int | AllocationError
         \\    var total = 30
         \\    for outcome in Cursor{position = 0, buffered = ""}
         \\        const view = outcome
-        \\        if not (view is StringView) -> return none
+        \\        if view is AllocationError -> return view
         \\        total += view.byte_length()
         \\    return total
         \\func run() int
@@ -293,7 +292,7 @@ test "pull for tracks reused buffer content lifetimes" {
         \\    return 90
     , 42);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
-        \\func calculate() unit | none
+        \\func calculate() unit | AllocationError
         \\    var cursor = Cursor{position = 0, buffered = ""}
         \\    const retained = cursor.next()
         \\    _ = cursor.next()
@@ -306,12 +305,12 @@ test "pull for tracks reused buffer content lifetimes" {
         \\if (calculate() is unit) -> exit(0)
     , .borrow_outlives_source);
     try Fixture.expectAnySourceDiagnostic(declarations ++ "\n" ++
-        \\func calculate() unit | none
+        \\func calculate() unit | AllocationError
         \\    var cursor = Cursor{position = 0, buffered = ""}
         \\    var retained: StringView | none = none
         \\    for outcome in cursor
         \\        const view = outcome
-        \\        if not (view is StringView) -> return none
+        \\        if view is AllocationError -> return view
         \\        if retained is none -> retained = view
         \\    match retained
         \\        StringView ->

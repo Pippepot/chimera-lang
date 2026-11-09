@@ -132,11 +132,24 @@ on their first allocating transition. Allocation errors distinguish refusal, inv
 layout, size limits, and provider budget rejection. Infallible converters and hooks
 panic on allocation refusal.
 
+`std.memory.type_layout(T)` reports native size and alignment; non-runtime types
+and sizes that do not fit `int` are source errors. `layout_for(T, count)` checks
+element-count multiplication without allocating. Negative counts return
+`AllocationError.invalid_layout`; unrepresentable layouts or products return
+`AllocationError.size_limit`. Successful empty layouts preserve element alignment.
+
 `std.logging.emit(logger, level, message)` uses a saved Logger;
-`std.logging.log(level, message)` selects the current logger. Both return
-`unit | AllocationError | IoError`. Disabled events skip backend dispatch while
-preserving argument evaluation. Backends may store lifetime-valid owned message
+`std.logging.log(level, message)` selects the current logger. The `trace`, `debug`,
+`info`, `warning`, and `error` convenience functions select that same current logger
+with their corresponding severity. All return `unit | AllocationError | IoError`.
+Disabled events skip backend dispatch while preserving argument evaluation.
+Backends may store lifetime-valid owned message
 copies, but cannot retain a message view. Checked service dispatch detects cycles;
 `from_unchecked` permits deliberate recursion. The native root logger writes to
 stderr at info or above; the evaluator root logger is off. Logging leaves `print`
 and explicit stdout/stderr APIs on their ordinary destinations.
+Root output writes a severity prefix, message, and newline without allocation.
+An `IoError` reports the Linux errno in `cause` and the total bytes delivered for
+that event in `progress`, including any prefix and message bytes before failure.
+Output is not transactional: a broken pipe returns cause 32 without terminating
+on SIGPIPE, and a full nonblocking pipe can return cause 11 after partial output.

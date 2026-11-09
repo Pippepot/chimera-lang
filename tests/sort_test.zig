@@ -147,7 +147,7 @@ test "collection sorted accepts temporary Array and List values" {
 test "collection sorted preserves source loans and copied reference authority" {
     try Fixture.expectParity(
         \\func before(imm left: Ref(int), imm right: Ref(int)) bool -> left.value < right.value
-        \\func copy_refs(ref first: int, ref second: int) List(Ref(int)) | none
+        \\func copy_refs(ref first: int, ref second: int) List(Ref(int)) | AllocationError
         \\    const source = [Ref.from(first), Ref.from(second)]
         \\    return source.sorted(before)
         \\func make_refs(ref first: int, ref second: int) Array(Ref(int), 2) -> [Ref.from(first), Ref.from(second)]
@@ -762,13 +762,13 @@ test "collection sorting panics when either scratch allocation fails" {
     const standard_library = @import("standard_library");
     const original = standard_library.source("memory/sort.chi");
     for ([_]struct { original: []const u8, failed: []const u8 }{
-        .{ .original = "var order_storage = allocate(int, length)", .failed = "var order_storage = allocate(int, -1)" },
-        .{ .original = "var scratch_storage = allocate(int, length)", .failed = "var scratch_storage = allocate(int, -1)" },
+        .{ .original = "var order_storage = allocate_with(int, scratch_provider, length)", .failed = "var order_storage = allocate_with(int, scratch_provider, -1)" },
+        .{ .original = "var scratch_storage = allocate_with(int, scratch_provider, length)", .failed = "var scratch_storage = allocate_with(int, scratch_provider, -1)" },
     }) |allocation| {
         try std.testing.expect(std.mem.indexOf(u8, original, allocation.original) != null);
         const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, allocation.original, allocation.failed);
         defer std.testing.allocator.free(failed);
-        for ([_][]const u8{ "values.sort()", "_ = values.sorted()" }) |operation| {
+        for ([_][]const u8{ "values.sort()", "_ = values.sorted() catch -> panic \"sort scratch allocation failed\"" }) |operation| {
             const declarations = try test_sources.renderTemplate(std.testing.allocator, source, .{ .operation = operation });
             defer std.testing.allocator.free(declarations);
             for ([_]bool{ false, true }) |comptime_call| {
@@ -813,7 +813,8 @@ test "collection sort fast paths do not need scratch allocations" {
     ;
     const standard_library = @import("standard_library");
     const original = standard_library.source("memory/sort.chi");
-    const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "allocate(int, length)", "allocate(int, -1)");
+    try std.testing.expect(std.mem.indexOf(u8, original, "allocate_with(int, scratch_provider, length)") != null);
+    const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "allocate_with(int, scratch_provider, length)", "allocate_with(int, scratch_provider, -1)");
     defer std.testing.allocator.free(failed);
     for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }) |entry| {
         const program = try std.fmt.allocPrint(std.testing.allocator, "{s}\n{s}", .{ source, entry });
@@ -842,7 +843,7 @@ test "collection sorted result allocation failure leaves elements uncopied" {
         \\    copies = 0
         \\    drops = 0
         \\    const result = source.sorted(before)
-        \\    if not (result is none) -> return 90
+        \\    if not (result is AllocationError) -> return 90
         \\    if copies <> 0 or drops <> 0 -> return 91
         \\    for index in 0..32
         \\        if source[index].key <> (index * 17) % 32 -> return 92

@@ -1,5 +1,5 @@
 import std.memory.{Allocator, AllocationLayout, AllocationError, RawBlock, root_allocator, type_layout, Allocation}
-import std.logging.{Logger, LogLevel, log}
+import std.logging.{Logger, LogLevel, log, root_logger}
 import std.logging as logging
 import std.io.{stdin, read_bytes, IoError}
 
@@ -18,6 +18,28 @@ struct NoopBackend
 struct LogForwarder
     upstream: Logger
     pub func emit(imm self: LogForwarder, level: LogLevel, imm message: StringView) unit | AllocationError | IoError -> logging.emit(self.upstream, level, message)
+
+struct PlainItem
+    copy = none
+    move = fieldwise
+    value: int
+    ref drops: int
+struct TrackedItem
+    copy = none
+    move = fieldwise
+    value: int
+    ref drops: int
+    drop = func(deinit self: TrackedItem) -> self.drops += 1
+
+func element_hooks(static T: type, rounds: int) int | AllocationError
+    var drops = 0
+    var checksum = 0
+    for index in 0..rounds
+        var values = List(T).new(1)?
+        _ = values.append(T{value = index, drops = drops})?
+        checksum = wrapping(checksum + values[0].value)
+    print(drops)
+    return checksum
 
 func destroy(var values: List(List(int))) int
     var checksum = 0
@@ -41,7 +63,9 @@ func destruction(rounds: int) int | AllocationError
     return destroy(values^)
 
 func workload(rounds: int) int | AllocationError
-    if MODE >= 7 -> return destruction(rounds)
+    if MODE == 7 or MODE == 8 -> return destruction(rounds)
+    if MODE == 9 -> return element_hooks(PlainItem, rounds)
+    if MODE == 10 -> return element_hooks(TrackedItem, rounds)
     var checksum = 0
     if MODE == 0 or MODE == 1
         for index in 0..rounds
@@ -65,7 +89,7 @@ func workload(rounds: int) int | AllocationError
     return checksum
 
 func nested(rounds: int) int | AllocationError
-    if MODE >= 4 and MODE <= 6
+    if (MODE >= 4 and MODE <= 6) or MODE == 11
         var first_log = LogForwarder{upstream = context.logger}
         const one_log = Logger.from(LogForwarder, first_log, if MODE == 4 -> LogLevel.off else LogLevel.info)
         var second_log = LogForwarder{upstream = one_log}
@@ -106,10 +130,12 @@ if input[3] == 1
     print(type_layout(Logger).byte_size)
     print(type_layout(Allocation(int)).byte_size)
     print(type_layout(List(int)).byte_size)
+    print(type_layout(PlainItem).byte_size)
+    print(type_layout(TrackedItem).byte_size)
     exit(0)
 var backend = Backend{calls = 0}
 var noop = NoopBackend{}
-const selected = if MODE == 6 -> Logger.from(NoopBackend, noop, LogLevel.info) else Logger.from(Backend, backend, if MODE == 4 -> LogLevel.off else LogLevel.info)
+const selected = if MODE == 11 -> root_logger() else if MODE == 6 -> Logger.from(NoopBackend, noop, LogLevel.info) else Logger.from(Backend, backend, if MODE == 4 -> LogLevel.off else LogLevel.info)
 with context.logger = selected
     const result = nested(rounds)
     if result is AllocationError -> exit(2)

@@ -1,4 +1,4 @@
-import std.memory.{List, Span, SpanIterator}
+import std.memory.{AllocationError, List, Span, SpanIterator}
 import std.range.{Range, FromEnd}
 import std.search
 import std.ownership.{copyable, movable}
@@ -23,11 +23,11 @@ pub struct Array(T: type, N: int)
         var view = self.span()
         return view.sort(Element, before)
     pub overload sort(sort_default, sort_by, sort_static)
-    func sorted_default(imm self: Array(T, N)) List(T) | none where copyable(T) and movable(T)
+    func sorted_default(imm self: Array(T, N)) List(T) | AllocationError where copyable(T) and movable(T)
         return self.span().sorted()
-    func sorted_by(imm self: Array(T, N), before: func(imm T, imm T) bool) List(T) | none where copyable(T) and movable(T)
+    func sorted_by(imm self: Array(T, N), before: func(imm T, imm T) bool) List(T) | AllocationError where copyable(T) and movable(T)
         return self.span().sorted(before)
-    func sorted_static(imm self: Array(T, N), static Element: type, static before: func(imm Element, imm Element) bool) List(T) | none where copyable(T) and movable(T) and Element == T
+    func sorted_static(imm self: Array(T, N), static Element: type, static before: func(imm Element, imm Element) bool) List(T) | AllocationError where copyable(T) and movable(T) and Element == T
         return self.span().sorted(Element, before)
     pub overload sorted(sorted_default, sorted_by, sorted_static)
     pub func span(ref self: Array(T, N)) Span(T) -> Span(T).from_array(N, self)

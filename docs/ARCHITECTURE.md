@@ -529,10 +529,17 @@ with physical origins retain their narrowing and ownership identity. Physical
 places remain separately indexed for write invalidation. Loop rebasing removes
 iteration-local proofs before applying header correlation.
 
-Immutable callable projections recover known targets. Unambiguous factory returns
+Callable invocation, contract, and nonowning-construction discovery share storage
+traversal for copies, projections, initialization, and forwarding. Invocation
+identity and ownership form remain independent. Immutable projections recover
+known targets. Unambiguous factory returns
 derive returned reference effects from cached body analysis through a separate
 query boundary: equal effects retain caller analysis even when target identity
 changes. Immutable forwarded parameters retain their source-parameter identity.
+Conditions on owning callable storage retain the parameter and its owned-field
+path independently of invocation targets. Opaque copying and cleanup therefore
+discard potential capture-hook effects when a caller supplies a nonowning handle,
+including through nested aggregates; genuinely owning alternatives retain them.
 Reassigned storage and disagreeing return paths retain conservative callable
 effects. Opaque calls inspect captured writable references even inside immutable
 carriers; carrier immutability grants no write authority over the carrier itself.
@@ -556,20 +563,26 @@ return their own value or diverge, but cannot exit an enclosing caller or escape
 as first-class handles. Skipped regions leave captures untouched; completed
 writes and transfers do not roll back.
 
-Typing records effects at stable body-local checkpoints. Output-bearing cleanup
+Typing records effects at stable body-local checkpoints. Immutable cleanup actions
+select nominal hooks, owned fields, variant alternatives, and reverse array
+destruction once. Effect analysis and emission consume the same actions;
+invocation-time origins, contexts, and cleanup locations remain separate.
+Output-bearing cleanup
 first retains prospective referents for lifetime planning, then substitutes hook
 outputs at the scheduled boundaries and CFG edges. Fresh carrier reads resolve
 against those ordered writes; prior aliases and copied handles retain their
 captures. Outputs follow the remaining owned cleanup shape and reverse destruction
 order, including individually indexed array elements. Guarded cleanup preserves
 the untouched alternative. Final authority and lifetime checks precede lowering
-accepted cleanup to ordinary operations.
+accepted cleanup to ordinary operations. Candidate discovery and scheduling do not
+publish executed service mutations, authority requirements, or exclusions; final
+effect collection validates and attaches them to the emitted cleanup.
 Nominal hooks remain authoritative.
 Prospective candidates are grouped by target root and retain only paths and
 captures; temporal locations belong to scheduled writes. Equivalent whole-owner
 nominal-hook captures are collected once per value, generation, type, and resolved
-origins only when substitution is snapshot-only. Partial shapes, content loads,
-and read-version captures remain conservative. Empty places that cannot
+origins only when substitution is snapshot-only. Content loads and read-version
+captures remain conservative. Empty places that cannot
 store borrows and own no resource require no deferred content reads.
 A contents origin records the selections and exclusions applied to a parameter as its
 source path, and callers replay that path against their own origins. Selecting a part
@@ -578,17 +591,31 @@ dropped when the selection is made; keeping it multiplied the origins of nested 
 adapters with every stage, since each adapter excludes and re-selects its source field.
 A body whose store passes two million origins, far above ordinary bodies, fails
 analysis with `AnalysisTooLarge` instead of exhausting memory.
-Reference-bearing slots retain initial captures and ordered ordinary writes,
-including writes before cleanup discovery. A hook's captured-slot dereferences
+Reference-bearing slots retain initial captures and ordered definition and mutation
+writes, including writes before cleanup discovery. A local definition stops
+backward traversal at its actual CFG boundary, rather than inheriting the previous
+iteration's contents. Loop backedges rebase stored references, including references
+inside owned allocations, using the loop's read and result-proof checkpoints.
+A hook's captured-slot dereferences
 resolve at its scheduled cursor rather than the already-unbound live state.
 Mutable parameter outputs resolve at the return terminator after cleanup;
-ordinary returned copies retain their earlier captures.
+ordinary returned copies retain their earlier captures. Terminator cursors are
+distinct before interning and never mutate an existing ordinary-read identity.
 Pending reads use indexed stable checkpoints and resolve in reverse insertion
 order. Final lifetime effects replace provisional effects; unchanged effects keep
-the planned endings while authority checks still run.
+the planned endings while authority checks still run. Cleanup scheduling restores
+the pre-scheduling symbolic state each epoch and repeats until ending locations and
+resolved scheduled writes stabilize. Superseded cleanup writes become inactive
+without changing cursor write indices. A repeated nonstable schedule is a source
+lifetime error; final validation cannot change the accepted lifetime effects.
 Cleanup output collection and deferred reads share one CFG. Reaching-content
 lookups index ordered writes by root and block and memoize acyclic cursors within
-each read, including known-empty results. Cycle-dependent results retain the
+the analysis, including known-empty results. Canonical origin nodes, projections,
+transforms, and result-selection snapshots share identities. Origin guards are
+combined in local construction storage before immutable nodes are interned;
+merging sets cannot change either input. Frozen resolution
+memoization distinguishes physical flow aliases from lifetime loans.
+Cycle-dependent results retain the
 incoming fallback and are not shared across different traversal contexts.
 Partial-field obligations, stored-member restrictions, and reference provenance
 survive refinement and forwarding. Cleanup snapshots are selected at the latest

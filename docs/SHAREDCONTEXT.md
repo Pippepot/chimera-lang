@@ -2,7 +2,7 @@ Chimera: scoped context, allocation, and logging
 1. Scope and invariants
 Implement synchronous scoped context, general with statements, and borrowed bound functions for standard-library service handles. Allocation and logging are both in scope; neither requires service-specific scoping syntax.
 
-Use the callable construction, representation, ownership, and reference rules in [CLOSURES.md](CLOSURES.md). This is a coordinated proposal: [syntax&semantics.txt](../syntax&semantics.txt) remains the language source of truth, and [ARCHITECTURE.md](ARCHITECTURE.md) owns compiler/query boundaries. The examples describe required behavior; the implementation remains incomplete. [ROADMAP.md](../ROADMAP.md#scoped-context-implementation-slices) records implemented foundations, known findings, and remaining acceptance work.
+Use the callable construction, representation, ownership, and reference rules in [CLOSURES.md](CLOSURES.md). [syntax&semantics.txt](../syntax&semantics.txt) remains the language source of truth, and [ARCHITECTURE.md](ARCHITECTURE.md) owns compiler/query boundaries. All three implementation slices are delivered; Section 13 records their acceptance. [ROADMAP.md](../ROADMAP.md#scoped-context-implementation-slices) owns future priorities and the revision's scope boundary.
 
 Expose std.context as context through the prelude, with these initial entries:
 Entry	Handle type	Native root default
@@ -110,6 +110,8 @@ Use List(T) | AllocationError for List.new, Box(T) | AllocationError for Box con
 
 A failure before allocation produces no allocation owner and skips deferred element initialization. Error payloads retain any dependencies of their own; an error is not a borrow-escape exemption. Failed reserve preserves the original container. An ordinary append(var item: T) has already acquired its argument during eager preparation and may destroy it on failure; a deferred construction path can reserve before forcing its item. Completed bookkeeping, callback writes, transfers, and partial output are not rolled back by catch or ?.
 
+`type_layout(T)` requires a runtime-capable type whose native byte size fits `int`; an unrepresentable layout is a source diagnostic, not an internal compiler error. `layout_for(T, count)` instead returns `AllocationError.invalid_layout` for negative counts and `AllocationError.size_limit` for unrepresentable layouts or size products. Successful zero-count and zero-sized layouts retain their element alignment.
+
 Pending init operations use the context active where they are forced, not where their source expression was passed. Their errors remain within their own declared construction region: ? inside an init expression does not return from the enclosing caller. Consumers must explicitly handle/forward a declared fallible initializer result, or callers must perform the fallible work eagerly.
 
 Allocating an outer container does not migrate its elements' independently owned storage. Ordinary element hooks run under the caller's current context, not a temporarily installed container provider.
@@ -187,7 +189,29 @@ With the native callable representation in [CLOSURES.md](CLOSURES.md), Allocator
 Update native/evaluator callable ABI handling, reference relocation, recursive inference, incremental dependencies, bundled standard-library contracts, and disk-cache schemas. Serialize symbolic identities and effects, never runtime addresses. Invalidate incompatible caches and compiled artifacts.
 ## 13. Delivery order and acceptance tests
 
-This is a separate implementation task from closures. It depends on callable slice 3 in [CLOSURES.md](CLOSURES.md#7-implementation-slices); owning lexical-closure erasure in callable slice 4 can proceed independently. Each numbered item below is one complete implementation slice, with the same number and title as the [scoped context task in ROADMAP.md](../ROADMAP.md#scoped-context-implementation-slices). Include native/evaluator behavior, ownership, failures, incremental recomputation, and cache qualification in every slice.
+All three slices below are implemented and accepted. Qualification on 2026-11-09:
+
+- `zig build test --seed=0 -Doptimize=safe --summary all`: all 64 build steps
+  succeeded; 2,556 executed tests passed and 24 were skipped. The successful
+  85-test disk-cache and 18-test portable-artifact roots were reused from cache.
+  The shared-context root passed all 45 tests.
+- Lifetime/authority regressions include backing reset versus counter updates,
+  destructor output ordering and chained cleanup, return snapshots versus
+  terminator outputs, loop/recursive retention, and nested opaque callable
+  ownership. Incremental body edits, disk restoration, portable identities,
+  malformed contextual/service IR, and embedded std reuse are covered.
+- Query snapshots, portable artifacts, and embedded standard bundles use
+  `CHIMERAQRY64`, `CHIMERAART22`, and `CHIMERASTD20`. The installed Fast CLI was
+  rebuilt and its help entrypoint checked.
+- All 36 [runtime variants](../benchmarks/shared-context/README.md#recorded-qualification)
+  qualified before measurement, with 200,000 rounds and seven samples each.
+  Element-hook and real stderr-pipe costs are reported separately from the
+  27 core service variants. Raw samples and observed-repeatability flags remain
+  in the [measurement report](../benchmarks/results/shared-context/runtime.json).
+- Modified Zig formatting and `git diff --check` pass. Exhaustive compiler
+  allocation-failure sweeps were not enabled; they remain opt-in.
+
+Scoped context has separate acceptance from closures. Callable slice 3 in [CLOSURES.md](CLOSURES.md#7-implementation-slices) provides its borrowed-handle foundations; owning lexical environments use the same retained-provider rules. Each numbered item below is one complete slice, including native/evaluator behavior, ownership, failures, incremental recomputation, and cache qualification.
 
 1. **Explicit services and retained providers.** Implement raw-storage ownership/provenance, typed adoption, provider-retaining allocation owners, and explicit allocator/logger factories over the callable foundations. Validate nonallocating handle construction, provider lifetimes, release authority, and message nonretention. Preserve those guarantees through copies, fields, joins, and opaque forwarding. Qualify explicit allocation/release and logging before introducing ambient selection.
 2. **Scoped bindings and execution.** Implement registered allocator/logger entries, scoped replacement, binding retention, and cleanup/restoration on every ordinary exit. Add native TLS and isolated evaluator bindings with the specified roots. Preserve invocation-time context, forcing-time selection for pending initializers, and transient evaluation/publication policy. Qualify nested scopes, early exits, invalidation, saved handles, and independent allocator/logger replacement.

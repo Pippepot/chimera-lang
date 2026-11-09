@@ -6,7 +6,7 @@ const queries = @import("queries.zig");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIMERAQRY61";
+const format = "CHIMERAQRY64";
 // Snapshot records name their interner, input, or query boundary by its index here.
 pub const interners = .{ queries.ModulePaths, queries.ItemLocations, queries.FunctionOverloads, queries.Types, queries.ByteStrings, queries.CompileTimeValues, queries.CompileTimeValueTuples, queries.CompileTimeBindings };
 pub const persisted_inputs = .{ queries.SourceText, queries.SourcePath, queries.FileModule, queries.ModuleMembers, queries.ModuleCatalog, queries.StandardPreludeModule, queries.StandardFile, queries.InlineLimit };
@@ -532,10 +532,17 @@ fn referencePathElement(db: *query.Database, types: anytype, type_id: structures
 }
 
 fn validReferencePath(db: *query.Database, types: anytype, initial: structures.TypeId, path: []const structures.ReferencePathStep) anyerror!bool {
+    var through_referent = false;
+    return validReferencePathWithBorrow(db, types, initial, path, &through_referent);
+}
+
+fn validReferencePathWithBorrow(db: *query.Database, types: anytype, initial: structures.TypeId, path: []const structures.ReferencePathStep, through_referent: *bool) anyerror!bool {
     var type_id = initial;
     for (path, 0..) |step, position| {
+        if (step == .referent or step == .environment) through_referent.* = true;
         if (step == .field or step == .environment or step == .owner or step == .variant or step.isElement())
             while (try types.borrowElement(type_id)) |element| {
+                through_referent.* = true;
                 type_id = element;
             };
         switch (step) {
@@ -549,6 +556,7 @@ fn validReferencePath(db: *query.Database, types: anytype, initial: structures.T
             },
             .environment => |environment| {
                 if (try types.callable(type_id) == null) return false;
+                if (environment == .unit) return position + 1 == path.len or (position + 2 == path.len and path[position + 1] == .descendants);
                 if (environment != .unit) {
                     const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
                     if (try analysis.concreteClosureInvocation(environment) == null) return false;
@@ -556,6 +564,8 @@ fn validReferencePath(db: *query.Database, types: anytype, initial: structures.T
                 type_id = environment;
             },
             .field => |index| {
+                if (try types.callable(type_id) != null)
+                    if (index == 1) return position + 1 == path.len or (position + 2 == path.len and path[position + 1] == .descendants);
                 const definition = (try types.structDefinition(type_id)) orelse return false;
                 if (index >= definition.fields.len) return false;
                 type_id = try types.fieldStorageType(definition.fields[index]);
@@ -630,6 +640,7 @@ fn validReferenceContract(db: *query.Database, types: anytype, body: structures.
             },
             .receiver => |mutation| {
                 if (!validOriginBounds(contract, mutation, parameter_count)) return false;
+                if (!try validOriginConditions(types, body, mutation)) return false;
                 if (mutation.output_parameter != null or mutation.output_contextual != null or mutation.result_path.start != mutation.result_path.end) return false;
                 const source_type = if (mutation.contextual) |entry| try contextType(types, entry) else if (mutation.parameter) |parameter| body.block_arguments[parameter].type_id else return false;
                 if (!try validReferencePath(db, types, source_type, contract.paths[mutation.source_path.start..mutation.source_path.end])) return false;
@@ -638,6 +649,7 @@ fn validReferenceContract(db: *query.Database, types: anytype, body: structures.
         }
         if (effect.contexts) |contexts| for (contexts, 0..) |bindings, index| for (bindings) |origin| {
             if (!validOriginBounds(contract, origin, parameter_count)) return false;
+            if (!try validOriginConditions(types, body, origin)) return false;
             if (origin.output_parameter != null or origin.output_contextual != null) return false;
             if (origin.service_invocation) |invocation| if (!try validServiceInvocation(db, invocation)) return false;
             const binding_type = try contextType(types, @fromBackingInt(@intCast(index)));
@@ -653,6 +665,7 @@ fn validReferenceContract(db: *query.Database, types: anytype, body: structures.
             if (origin.parameter == null and origin.contextual == null) return false;
             if (origin.output_parameter != null or origin.output_contextual != null or origin.result_path.start != origin.result_path.end) return false;
             if (!validOriginBounds(contract, origin, parameter_count)) return false;
+            if (!try validOriginConditions(types, body, origin)) return false;
             if (origin.reads_contents or origin.after_write or origin.variant_guard or origin.readonly_owned != null) return false;
             if (!try validReferencePath(db, types, if (origin.contextual) |entry| try contextType(types, entry) else body.block_arguments[origin.parameter.?].type_id, contract.paths[origin.source_path.start..origin.source_path.end])) return false;
         }
@@ -673,14 +686,34 @@ fn validOriginBounds(contract: structures.ReferenceContract, origin: structures.
     if (origin.expired and (origin.parameter != null or origin.contextual != null or origin.source_path.start != origin.source_path.end)) return false;
     if (origin.parameter) |parameter| if (parameter >= parameter_count) return false;
     if (origin.forcing_context) |forcing| if (forcing.parameter >= parameter_count) return false;
-    if (origin.owning_parameter) |parameter| if (parameter >= parameter_count) return false;
+    if (origin.owning_callable) |source| {
+        if (source.parameter >= parameter_count) return false;
+        if (!validRange(source.path, contract.paths.len)) return false;
+    }
     return validRange(origin.source_path, contract.paths.len) and validRange(origin.result_path, contract.paths.len);
+}
+
+fn validOriginConditions(types: anytype, body: structures.FunctionBodyAnalysis, origin: structures.ReferenceOriginContract) !bool {
+    if (origin.forcing_context) |forcing| if (body.parameter_modes[forcing.parameter] != .init) return false;
+    if (origin.owning_callable) |source| {
+        var type_id = body.block_arguments[source.parameter].type_id;
+        for (body.reference_contract.paths[source.path.start..source.path.end]) |step| {
+            if (step != .field) return false;
+            const definition = (try types.structDefinition(type_id)) orelse return false;
+            if (step.field >= definition.fields.len) return false;
+            const field = definition.fields[step.field];
+            if (field.kind == .reference) return false;
+            type_id = field.type_id;
+        }
+        if (try types.callable(type_id) == null) return false;
+    }
+    return true;
 }
 
 fn validReferenceOriginTypes(db: *query.Database, types: anytype, body: structures.FunctionBodyAnalysis, origin: structures.ReferenceOriginContract, conditional: bool) anyerror!bool {
     const contract = body.reference_contract;
     if (origin.service_invocation) |invocation| if (!try validServiceInvocation(db, invocation)) return false;
-    if (origin.forcing_context) |forcing| if (body.parameter_modes[forcing.parameter] != .init) return false;
+    if (!try validOriginConditions(types, body, origin)) return false;
     if (origin.readonly_owned) |type_id| {
         if (origin.readonly or type_id.isPrimitive()) return false;
         if (try types.borrowElement(type_id) != null or try types.storageAccess(type_id) != null) return false;
@@ -690,9 +723,7 @@ fn validReferenceOriginTypes(db: *query.Database, types: anytype, body: structur
     if (!conditional) {
         if (origin.output_parameter) |parameter| if (body.parameter_modes[parameter] != .mut and body.parameter_modes[parameter] != .ref) {
             var through_referent = false;
-            for (contract.paths[origin.result_path.start..origin.result_path.end]) |step| {
-                if (step == .referent or step == .environment) through_referent = true;
-            }
+            if (!try validReferencePathWithBorrow(db, types, body.block_arguments[parameter].type_id, contract.paths[origin.result_path.start..origin.result_path.end], &through_referent)) return false;
             if (!through_referent) return false;
         };
     }
@@ -1122,6 +1153,7 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
     const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 2 });
     defer db.deinit();
     try modules.registerSources(db, std.testing.allocator,
+        \\import std.callables.{clone}
         \\pub struct Pair
         \\    copy = trivial
         \\    pub first: Ref(int)
@@ -1134,17 +1166,27 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
         \\struct Buffers
         \\    first: Ref(String)
         \\    second: Ref(String)
-        \\func retained(input: Buffers) int | none
+        \\func retained(input: Buffers) int | AllocationError
         \\    const view = input.first.value.view()
-        \\    input.second.value.append("x")
+        \\    _ = input.second.value.append("x")?
         \\    return view.byte_length()
         \\func conditional(mut target: Ref(int), ref source: int, chosen: bool) unit | none
         \\    if not chosen -> return none
         \\    target = Ref.from(source)
         \\    return ()
+        \\static Callback: type = func() int
+        \\struct Callbacks
+        \\    value: int
+        \\    callback: Callback
+        \\func clone_nested(imm input: Callbacks) Callback | AllocationError -> clone(input.callback)
     , &.{}, &.{});
-    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
-    for ([_][]const u8{ "nested", "copied", "selected", "install", "retained", "element", "conditional" }) |name| {
+    const scope = (try db.get(queries.BuildModuleScope, 0)).* orelse {
+        const diagnostics = try db.transitiveAccumulatorValues(queries.BuildModuleScope, 0, structures.Diagnostic, std.testing.allocator);
+        defer std.testing.allocator.free(diagnostics);
+        for (diagnostics) |diagnostic| std.debug.print("{any}\n", .{diagnostic});
+        return error.MissingScope;
+    };
+    for ([_][]const u8{ "nested", "copied", "selected", "install", "retained", "element", "conditional", "clone_nested" }) |name| {
         errdefer std.debug.print("rejected analyzed reference contract: {s}\n", .{name});
         const instance: structures.InstanceId = .{ .item = scope.resolveFunction(name).? };
         const body = (try db.get(queries.AnalyzeFunctionInstance, instance)).* orelse {
@@ -1154,6 +1196,31 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
             return error.MissingAnalysis;
         };
         try std.testing.expect(try validOutput(queries.AnalyzeFunctionInstance, db, body));
+        if (std.mem.eql(u8, name, "clone_nested")) {
+            var invalid = body;
+            const guarded = for (body.reference_contract.origins) |origin| {
+                if (origin.owning_callable != null) break origin;
+            } else return error.MissingOwningCondition;
+            var origins = [_]structures.ReferenceOriginContract{guarded};
+            invalid.reference_contract.origins = &origins;
+            origins[0].owning_callable.?.parameter = @intCast(body.parameter_modes.len);
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            origins[0] = guarded;
+            origins[0].owning_callable.?.path.end = std.math.maxInt(u32);
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            origins[0] = guarded;
+            origins[0].owning_callable.?.path.end = origins[0].owning_callable.?.path.start;
+            try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            origins[0] = guarded;
+            const paths = try std.testing.allocator.dupe(structures.ReferencePathStep, body.reference_contract.paths);
+            defer std.testing.allocator.free(paths);
+            invalid.reference_contract.paths = paths;
+            const selected = guarded.owning_callable.?.path.start;
+            for ([_]structures.ReferencePathStep{ .referent, .{ .field = 0 }, .{ .field = std.math.maxInt(u32) } }) |step| {
+                paths[selected] = step;
+                try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
+            }
+        }
         if (std.mem.eql(u8, name, "conditional")) {
             var invalid = body;
             var outputs = [_]structures.ReferenceOutputContract{body.reference_contract.outputs[0]};
@@ -1233,6 +1300,82 @@ test "cached reference contracts accept analyzed nested handles and parameter wr
             try std.testing.expect(!try validOutput(queries.AnalyzeFunctionInstance, db, invalid));
         }
     }
+}
+
+test "cached contextual operations reject incompatible entries roots and values" {
+    const allocator = std.testing.allocator;
+    const db = try query.Database.init(allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    try @import("modules.zig").registerSources(db, allocator, "func run() unit -> ()", &.{}, &.{});
+    const analysis: queries.AnalysisContext(*query.Database) = .{ .ctx = db };
+    const allocator_type = try analysis.contextualType(.allocator);
+    const allocator_root = try analysis.contextualRoot(.allocator);
+    var instructions = [_]structures.FunctionInstruction{.{ .context_read = .{
+        .entry = .allocator,
+        .type_id = allocator_type,
+        .root = allocator_root,
+    } }};
+    const body: structures.FunctionBodyAnalysis = .{
+        .return_type = .unit,
+        .entry = @fromBackingInt(0),
+        .block_arguments = &.{.{ .type_id = allocator_type }},
+        .parameter_modes = &.{.imm},
+        .instructions = &instructions,
+        .blocks = &.{.{
+            .argument_start = 0,
+            .argument_end = 1,
+            .instruction_start = 0,
+            .instruction_end = 1,
+            .terminator = .return_unit,
+        }},
+    };
+    try std.testing.expect(try validStorageOperations(db, body));
+    instructions[0].context_read.type_id = .int;
+    try std.testing.expect(!try validStorageOperations(db, body));
+    instructions[0].context_read.type_id = allocator_type;
+    instructions[0].context_read.root = try analysis.contextualRoot(.logger);
+    try std.testing.expect(!try validStorageOperations(db, body));
+    instructions[0] = .{ .context_write = .{ .entry = .allocator, .source = @fromBackingInt(0) } };
+    try std.testing.expect(try validStorageOperations(db, body));
+    instructions[0].context_write.entry = .logger;
+    try std.testing.expect(!try validStorageOperations(db, body));
+}
+
+test "cached service stacks balance returns joins and loop backedges but not panic exits" {
+    const allocator = std.testing.allocator;
+    const enter: structures.FunctionInstruction = .{ .service_enter = .{ .receiver = @fromBackingInt(0), .key = .{ .item = @fromBackingInt(0) } } };
+    const leave: structures.FunctionInstruction = .service_leave;
+    var instructions = [_]structures.FunctionInstruction{ enter, enter, leave };
+    var blocks = [_]structures.FunctionBlock{
+        .{ .argument_start = 0, .argument_end = 0, .instruction_start = 0, .instruction_end = 0, .terminator = .{ .predicate_branch = .{
+            .operation = .eqb,
+            .operands = .{ .lhs = @fromBackingInt(0), .rhs = @fromBackingInt(0) },
+            .then_branch = .{ .target = @fromBackingInt(1), .arguments = .{ .start = 0, .end = 0 } },
+            .else_branch = .{ .target = @fromBackingInt(2), .arguments = .{ .start = 0, .end = 0 } },
+        } } },
+        .{ .argument_start = 0, .argument_end = 0, .instruction_start = 0, .instruction_end = 1, .terminator = .{ .branch = .{ .target = @fromBackingInt(3), .arguments = .{ .start = 0, .end = 0 } } } },
+        .{ .argument_start = 0, .argument_end = 0, .instruction_start = 1, .instruction_end = 1, .terminator = .{ .branch = .{ .target = @fromBackingInt(3), .arguments = .{ .start = 0, .end = 0 } } } },
+        .{ .argument_start = 0, .argument_end = 0, .instruction_start = 2, .instruction_end = 2, .terminator = .diverge },
+    };
+    var body: structures.FunctionBodyAnalysis = .{ .return_type = .unit, .entry = @fromBackingInt(0), .instructions = &instructions, .blocks = &blocks };
+    try std.testing.expect(!try validServiceBalance(allocator, body));
+    blocks[2].instruction_end = 2;
+    blocks[3].instruction_end = 3;
+    blocks[3].terminator = .return_unit;
+    try std.testing.expect(try validServiceBalance(allocator, body));
+    blocks[3].instruction_end = 2;
+    try std.testing.expect(!try validServiceBalance(allocator, body));
+    blocks[3].terminator = .diverge;
+    try std.testing.expect(try validServiceBalance(allocator, body));
+    body.blocks = blocks[0..2];
+    blocks[0].terminator = .{ .branch = .{ .target = @fromBackingInt(1), .arguments = .{ .start = 0, .end = 0 } } };
+    blocks[1].terminator.branch.target = @fromBackingInt(1);
+    try std.testing.expect(!try validServiceBalance(allocator, body));
+    instructions[1] = leave;
+    blocks[1].instruction_end = 2;
+    try std.testing.expect(try validServiceBalance(allocator, body));
+    instructions[0] = leave;
+    try std.testing.expect(!try validServiceBalance(allocator, body));
 }
 
 test "cached body validation rejects invalid control flow and argument indexes" {
@@ -1480,9 +1623,9 @@ test "Box and Ref alias bodies restore and invalidate after a binding edit" {
     const io = std.testing.io;
     const initial_source =
         \\import std.memory
-        \\func run() int | none
+        \\func run() int | AllocationError
         \\  var owner = Box.new(17)
-        \\  if not (owner is Box(int)) -> return none
+        \\  if not (owner is Box(int)) -> return owner
         \\  var item = Ref.from(owner.borrow())
         \\  return item.value
         \\const result = run()
@@ -1490,9 +1633,9 @@ test "Box and Ref alias bodies restore and invalidate after a binding edit" {
     ;
     const edited_source =
         \\import std.memory
-        \\func run() int | none
+        \\func run() int | AllocationError
         \\  var owner = Box.new(17)
-        \\  if not (owner is Box(int)) -> return none
+        \\  if not (owner is Box(int)) -> return owner
         \\  var item = Ref.from(owner.borrow())
         \\  item.value = 42
         \\  return item.value
@@ -1508,7 +1651,12 @@ test "Box and Ref alias bodies restore and invalidate after a binding edit" {
     const first = try query.Database.init(allocator, .{ .worker_count = 2 });
     defer first.deinit();
     try modules.registerSources(first, allocator, initial_source, &.{}, &.{});
-    const original = (try first.get(queries.BuildExecutable, 0)).* orelse return error.TestUnexpectedResult;
+    const original = (try first.get(queries.BuildExecutable, 0)).* orelse {
+        const diagnostics = try first.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, allocator);
+        defer allocator.free(diagnostics);
+        for (diagnostics) |diagnostic| std.debug.print("{any}\n", .{diagnostic});
+        return error.TestUnexpectedResult;
+    };
     const run = (try first.get(queries.BuildModuleScope, 0)).*.?.resolveFunction("run").?;
     const original_body = (try first.get(queries.AnalyzeFunctionInstance, .{ .item = run })).*.?;
     try save(io, allocator, directory, digest, first);

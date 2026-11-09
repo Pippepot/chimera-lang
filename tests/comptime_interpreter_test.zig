@@ -21,9 +21,8 @@ test "evaluation heap empty oversized and zero sized allocations preserve native
         \\import std.memory.{Allocation, allocate, deallocate, List}
         \\struct Empty
         \\    copy = trivial
-        \\func compute() int | none
-        \\    const empty = allocate(Array(int, 536870912), 0)
-        \\    if not (empty is Allocation(Array(int, 536870912))) -> return none
+        \\func compute() int | none | AllocationError
+        \\    const empty = allocate(Array(int, 536870912), 0)?
         \\    const empty_capacity = empty.capacity()
         \\    deallocate(Array(int, 536870912), empty^)
         \\    if empty_capacity <> 0 -> return 90
@@ -31,22 +30,20 @@ test "evaluation heap empty oversized and zero sized allocations preserve native
         \\        oversized and oversized is Allocation(Array(int, 536870912)) ->
         \\            deallocate(Array(int, 536870912), oversized^)
         \\            return 91
-        \\        _ -> ()
-        \\    const logical = allocate(Empty, 2147483647)
-        \\    if not (logical is Allocation(Empty)) -> return none
+        \\        failure and failure is AllocationError ->
+        \\            if failure.reason <> AllocationError.size_limit.reason -> return 98
+        \\        _ -> return 99
+        \\    const logical = allocate(Empty, 2147483647)?
         \\    const logical_capacity = logical.capacity()
         \\    deallocate(Empty, logical^)
         \\    if logical_capacity <> 2147483647 -> return 92
-        \\    var buffer = List(Empty).new(0)
-        \\    if not (buffer is List(Empty)) -> return none
+        \\    var buffer = List(Empty).new(0)?
         \\    if (buffer.get(0) is Empty) -> return 93
         \\    const empty_view = buffer.slice(0..0)
         \\    if not (empty_view is Span(Empty)) -> return none
         \\    if (empty_view.get(0) is Empty) -> return 94
-        \\    const checked_value_5 = buffer.append(Empty{})
-        \\    if not (checked_value_5 is unit) -> return none
-        \\    const checked_value_6 = buffer.append(Empty{})
-        \\    if not (checked_value_6 is unit) -> return none
+        \\    _ = buffer.append(Empty{})?
+        \\    _ = buffer.append(Empty{})?
         \\    if (buffer.get(-1) is Empty) -> return 95
         \\    if (buffer.get(2) is Empty) -> return 96
         \\    return 40 + buffer.len()
@@ -463,6 +460,14 @@ test "evaluation heap snapshots freeze lazy allocation identities aliases and re
 }
 
 const ArrayTestExecutor = struct {
+    pub fn allocationElement(_: *@This(), _: structures.TypeId) !?structures.TypeId {
+        return null;
+    }
+
+    pub fn hostLayout(_: *@This(), _: structures.TypeId) !structures.TypeLayout {
+        unreachable;
+    }
+
     pub fn callableOwnershipAdapter(_: *@This(), _: structures.InstanceId, _: @FieldType(structures.CallableEntry, "operation"), _: structures.TypeId) !structures.InstanceId {
         unreachable;
     }
@@ -1048,6 +1053,14 @@ test "initializer capture cell subtrees survive the constructing region storage"
     const nested_type: structures.TypeId = @fromBackingInt(@intCast(101));
     const variant_type: structures.TypeId = @fromBackingInt(@intCast(102));
     const Executor = struct {
+        pub fn allocationElement(_: *@This(), _: structures.TypeId) !?structures.TypeId {
+            return null;
+        }
+
+        pub fn hostLayout(_: *@This(), _: structures.TypeId) !structures.TypeLayout {
+            unreachable;
+        }
+
         pub fn callableOwnershipAdapter(_: *@This(), _: structures.InstanceId, _: @FieldType(structures.CallableEntry, "operation"), _: structures.TypeId) !structures.InstanceId {
             unreachable;
         }

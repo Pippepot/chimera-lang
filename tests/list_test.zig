@@ -132,7 +132,9 @@ test "List failed growth destroys its prepared item and preserves initialized el
         \\func calculate() int | none
         \\    var trace = 0
         \\    var values: List(Item) = [Item{trace = Ref.from(trace), value = 1}]
-        \\    if (values.append(Item{trace = Ref.from(trace), value = 2}) is unit) -> return 90
+        \\    const failed = values.append(Item{trace = Ref.from(trace), value = 2})
+        \\    if not (failed is AllocationError) -> return 90
+        \\    if failed.reason <> AllocationError.invalid_layout.reason -> return 94
         \\    if values.len() <> 1 -> return 91
         \\    if trace == 3 -> return 42
         \\    return 92
@@ -149,8 +151,8 @@ test "List failed growth destroys its prepared item and preserves initialized el
         defer fixture.deinit();
         const allocation_file = (try fixture.db.input(test_sources.queries.StandardFile, @backingInt(@import("standard_library").File.memory_allocation))).*;
         const original = (try fixture.db.input(test_sources.queries.SourceText, allocation_file)).*;
-        try std.testing.expect(std.mem.indexOf(u8, original, "allocate(T, minimum_capacity)") != null);
-        const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "allocate(T, minimum_capacity)", "allocate(T, -1)");
+        try std.testing.expect(std.mem.indexOf(u8, original, "allocate_with(T, self.storage.provider, minimum_capacity)") != null);
+        const failed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "allocate_with(T, self.storage.provider, minimum_capacity)", "allocate_with(T, self.storage.provider, -1)");
         defer std.testing.allocator.free(failed);
         try fixture.db.setInput(test_sources.queries.SourceText, allocation_file, failed);
         try fixture.expectExit(0, 42);
@@ -285,7 +287,7 @@ test "List borrowed iteration allows replacement in stable initialized slots" {
 }
 
 test "List structural mutation is rejected while a dependent stays in use" {
-    const mutations = [_][]const u8{ "values.append(4)", "values.reserve(100)", "values.remove(0)" };
+    const mutations = [_][]const u8{ "_ = values.append(4)", "_ = values.reserve(100)", "values.remove(0)" };
     const dependents = [_]struct { setup: []const u8, use: []const u8 }{
         .{ .setup = "var cursor = values.iter()", .use = "cursor.next()" },
         .{ .setup = "ref first = values[0]", .use = "first += 1" },
@@ -319,7 +321,7 @@ test "List structural mutation is rejected while a dependent stays in use" {
 
 test "List structural mutation is allowed once every dependent has finished" {
     try expectCalculation(
-        \\func calculate() int | none
+        \\func calculate() int | none | AllocationError
         \\    var values: List(int) = [1, 2, 3]
         \\    var total = 0
         \\    for item in values -> total += item
@@ -328,11 +330,11 @@ test "List structural mutation is allowed once every dependent has finished" {
         \\    var cursor = values.iter()
         \\    const polled = cursor.next()
         \\    if not (polled is int) -> return none
-        \\    values.append(total)
+        \\    _ = values.append(total)?
         \\    values.remove(1)
         \\    const view = values.span()
         \\    total += view.len()
-        \\    values.append(5)
+        \\    _ = values.append(5)?
         \\    return total + values[0] + values[2] + values.len() + 18
     , 42);
 }
@@ -359,7 +361,7 @@ test "List index loops stay legal under structural mutation and bounds check sta
 
 test "List worklists mutate between explicit length checks without a cursor" {
     try expectCalculation(
-        \\func calculate() int | none
+        \\func calculate() int | none | AllocationError
         \\    var pending: List(int) = [3]
         \\    var total = 0
         \\    loop
@@ -368,8 +370,8 @@ test "List worklists mutate between explicit length checks without a cursor" {
         \\        if not (next is int) -> return none
         \\        total += next
         \\        if next > 1
-        \\            pending.append(next - 1)
-        \\            pending.append(next - 1)
+        \\            _ = pending.append(next - 1)?
+        \\            _ = pending.append(next - 1)?
         \\    return total * 3 + 9
     , 42);
 }
@@ -394,13 +396,13 @@ test "List content writes keep live cursors and slot references through direct a
 
 test "List content writes still reject dependents after structural calls" {
     try Fixture.expectSourceDiagnostic(
-        \\func store(mut values: List(int), index: int, item: int) unit | none
-        \\    values.append(item)
+        \\func store(mut values: List(int), index: int, item: int) unit | AllocationError
+        \\    _ = values.append(item)?
         \\    return ()
         \\func invalid() unit | none
         \\    var values: List(int) = [1, 2, 3]
         \\    ref first = values[0]
-        \\    store(values, 1, 4)
+        \\    _ = store(values, 1, 4)
         \\    first += 1
         \\    return ()
         \\if (invalid() is unit) -> ()
@@ -424,17 +426,13 @@ test "List transfer through field and conditional sources selects consuming trav
 
 test "List reference append and relocation retain independent captured authority" {
     try expectCalculation(
-        \\func calculate() int | none
+        \\func calculate() int | AllocationError
         \\    var first = 10
         \\    var second = 20
-        \\    var values = List(Ref(int)).new(0)
-        \\    if not (values is List(Ref(int))) -> return none
-        \\    const checked_value_2 = values.append(Ref.from(first))
-        \\    if not (checked_value_2 is unit) -> return none
-        \\    const checked_value_3 = values.append(Ref.from(second))
-        \\    if not (checked_value_3 is unit) -> return none
-        \\    const checked_value_4 = values.reserve(8)
-        \\    if not (checked_value_4 is unit) -> return none
+        \\    var values = List(Ref(int)).new(0)?
+        \\    _ = values.append(Ref.from(first))?
+        \\    _ = values.append(Ref.from(second))?
+        \\    _ = values.reserve(8)?
         \\    values[0].value += 1
         \\    values[1].value += 1
         \\    return first + second + values.len() + values.capacity()

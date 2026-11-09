@@ -885,10 +885,9 @@ test "references readonly recursive owners return writable captured handles" {
         \\        _ -> ()
         \\    return node.target
         \\func forward(imm node: Node) Ref(int) -> selected(node)
-        \\func calculate() int | none
+        \\func calculate() int | AllocationError
         \\    var target = 41
-        \\    var leaf = Box.new(Node{next = none, target = Ref.from(target)})
-        \\    if not (leaf is Box(Node)) -> return none
+        \\    var leaf = Box.new(Node{next = none, target = Ref.from(target)})?
         \\    const root = Node{next = leaf^, target = Ref.from(target)}
         \\    const handle = forward(root)
         \\    handle.value += 1
@@ -920,11 +919,10 @@ test "references recursive parameter outputs retain replacement authority and li
         \\            return selected(next.borrow())
         \\        _ -> ()
         \\    return node.target
-        \\func calculate() int | none
+        \\func calculate() int | AllocationError
         \\    var original = 0
         \\    var replacement = 41
-        \\    var leaf = Box.new(Node{next = none, target = Ref.from(original)})
-        \\    if not (leaf is Box(Node)) -> return none
+        \\    var leaf = Box.new(Node{next = none, target = Ref.from(original)})?
         \\    var root = Node{next = leaf^, target = Ref.from(original)}
         \\    replace(root, replacement)
         \\    const handle = selected(root)
@@ -1929,9 +1927,8 @@ test "references recursive allocated owners infer a finite borrowed-result contr
         \\            return last(next.borrow())
         \\        _ -> ()
         \\    return node.value
-        \\func calculate() int | none
-        \\    var leaf = Box.new(Node{next = none, value = 12})
-        \\    if not (leaf is Box(Node)) -> return none
+        \\func calculate() int | AllocationError
+        \\    var leaf = Box.new(Node{next = none, value = 12})?
         \\    var root = Node{next = leaf^, value = 0}
         \\    ref result = last(root)
         \\    result += 30
@@ -2661,6 +2658,76 @@ test "references unused automatic drop exports parameter writes" {
         \\    slot.value = 42
         \\invalid()
     , .reference_not_writable);
+}
+
+test "references cleanup parameter outputs do not replace earlier returned snapshots" {
+    const declarations =
+        \\struct Install
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.source
+        \\func remember(mut target: Ref(int), imm source: Ref(int)) Ref(int)
+        \\    const previous = target
+        \\    const hook = Install{target = Ref.from(target), source = source}
+        \\    _ = hook
+        \\    return previous
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 19
+        \\    var source = 22
+        \\    var slot = Ref.from(original)
+        \\    const previous = remember(slot, Ref.from(source))
+        \\    slot.value += 1
+        \\    return previous.value + source
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() unit
+        \\    const original = 19
+        \\    var source = 22
+        \\    var slot = Ref.from(original)
+        \\    const previous = remember(slot, Ref.from(source))
+        \\    previous.value = 42
+        \\invalid()
+    , .reference_not_writable);
+}
+
+test "references cleanup chains resolve the accepted source contents and lifetime" {
+    const declarations =
+        \\struct Install
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(int)
+        \\    drop = func(deinit self: Install) -> self.target.value = self.source
+        \\struct FollowSlot
+        \\    target: Ref(Ref(int))
+        \\    source: Ref(Ref(int))
+        \\    drop = func(deinit self: FollowSlot) -> self.target.value = self.source.value
+        \\func forward(mut target: Ref(int), imm source: Ref(int)) unit
+        \\    var intermediate = target
+        \\    const follow = FollowSlot{target = Ref.from(target), source = Ref.from(intermediate)}
+        \\    const install = Install{target = Ref.from(intermediate), source = source}
+        \\    _ = install
+        \\    _ = follow
+    ;
+    try Fixture.expectParity(declarations ++ "\n" ++
+        \\func run() int
+        \\    const original = 1
+        \\    var source = 41
+        \\    var slot = Ref.from(original)
+        \\    forward(slot, Ref.from(source))
+        \\    slot.value += 1
+        \\    return source
+    , 42);
+    try Fixture.expectSourceDiagnostic(declarations ++ "\n" ++
+        \\func invalid() int
+        \\    var original = 1
+        \\    var slot = Ref.from(original)
+        \\    if true
+        \\        var temporary = 42
+        \\        forward(slot, Ref.from(temporary))
+        \\    return slot.value
+        \\exit(invalid())
+    , .borrow_outlives_source);
 }
 
 test "references automatic drop follows capture and branch chronology" {

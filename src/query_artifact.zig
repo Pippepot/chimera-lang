@@ -6,7 +6,7 @@ const disk_cache = @import("query_disk_cache.zig");
 const modules = @import("modules.zig");
 const structures = @import("structures.zig");
 
-pub const format = "CHIMERAART19";
+pub const format = "CHIMERAART22";
 
 pub const ImportResult = struct {
     bodies: usize = 0,

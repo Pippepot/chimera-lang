@@ -2239,11 +2239,9 @@ test "removed postfix dereference syntax is rejected" {
 
 test "Box pointee copying uses distinct storage and consuming extraction" {
     try Fixture.expectSourceExit(
-        \\func run() int | none
-        \\  const original = Box.new(21)
-        \\  if not (original is Box(int)) -> return none
-        \\  var duplicate = Box.new(Ref.from(original.borrow()).value)
-        \\  if not (duplicate is Box(int)) -> panic "unexpected allocation refusal"
+        \\func run() int | AllocationError
+        \\  const original = Box.new(21)?
+        \\  var duplicate = Box.new(Ref.from(original.borrow()).value) catch -> panic "unexpected allocation refusal"
         \\  Ref.from(duplicate.borrow()).value = 42
         \\  return Ref.from(original.borrow()).value + duplicate^.take() - 21
         \\match run()
@@ -2804,9 +2802,8 @@ test "aggregate effects in loops preserve disjoint read-only origins" {
 
 test "boxed borrowed contents cannot outlive their original owner" {
     try Fixture.expectSourceDiagnostic(
-        \\func invalid() Box(Ref(int)) | none
-        \\  const source = Box.new(42)
-        \\  if not (source is Box(int)) -> return none
+        \\func invalid() Box(Ref(int)) | AllocationError
+        \\  const source = Box.new(42)?
         \\  return Box.new(Ref.from(source.borrow()))
         \\match invalid()
         \\    boxed and boxed is Box(Ref(int)) -> exit(Ref.from(boxed.borrow()).value.value)
@@ -2932,22 +2929,18 @@ test "a failing indirect in-place producer invalidates replaced references" {
         \\struct Pinned
         \\  move = none
         \\  value: int
-        \\func produce(var handle: Ref(Box(int))) Pinned | none
-        \\  handle.value = ((match Box.new(42)
-        \\      _selected_result_0 and _selected_result_0 is Box(int) -> _selected_result_0^
-        \\      _ -> return none))
+        \\func produce(var handle: Ref(Box(int))) Pinned | none | AllocationError
+        \\  handle.value = Box.new(42)?
         \\  if not (0 == 1) -> return none
         \\  return Pinned{value = 0}
-        \\func run() int | none
-        \\  var inner = Box.new(17)
-        \\  if not (inner is Box(int)) -> return none
-        \\  var outer = Box(Box(int)).new(inner^)
-        \\  if not (outer is Box(Box(int))) -> return none
+        \\func run() int | AllocationError
+        \\  var inner = Box.new(17)?
+        \\  var outer = Box(Box(int)).new(inner^)?
         \\  var handle = Ref.from(outer.borrow())
         \\  const old = Ref.from(handle.value.borrow())
         \\  const producer = produce
         \\  match Box.new(producer(handle))
-        \\      produced and produced is Box(Pinned | none) ->
+        \\      produced and produced is Box(Pinned | none | AllocationError) ->
         \\          match produced.borrow()
         \\              ref _matched_item and _matched_item is Pinned ->
         \\                  ref item = _matched_item
@@ -5712,16 +5705,12 @@ test "a writable Ref returned from a mut Box follows its copied-back owner" {
 
 test "a func returned writable Ref follows the replacement mut owner" {
     try Fixture.expectSourceExit(
-        \\func view(mut owner: Box(int)) Ref(int) | none
-        \\  owner = ((match Box.new(42)
-        \\      _selected_result_0 and _selected_result_0 is Box(int) -> _selected_result_0^
-        \\      _ -> return none))
+        \\func view(mut owner: Box(int)) Ref(int) | AllocationError
+        \\  owner = Box.new(42)?
         \\  return Ref.from(owner.borrow())
-        \\func run() int | none
-        \\  var owner = Box.new(17)
-        \\  if not (owner is Box(int)) -> return none
-        \\  const reference = view(owner)
-        \\  if not (reference is Ref(int)) -> return none
+        \\func run() int | AllocationError
+        \\  var owner = Box.new(17)?
+        \\  const reference = view(owner)?
         \\  return (reference).value + (Ref.from(owner.borrow())).value - 42
         \\match run()
         \\    result and result is int -> exit(result)
@@ -6850,8 +6839,8 @@ test "allocating init consumers preserve Box ordering through aliases and indire
     const cases = .{
         .{ .setup = "", .call = "Box.new(make(forbidden()))" },
         .{ .setup = "static Owner = Box(Item)\nstatic create = Owner.new", .call = "create(make(forbidden()))" },
-        .{ .setup = "const create: func(init Item) Box(Item) | none = Box(Item).new", .call = "create(make(forbidden()))" },
-        .{ .setup = "func invoke(imm create: func(init Item) Box(Item) | none, init item: Item) Box(Item) | none -> create(item)", .call = "invoke(Box(Item).new, make(forbidden()))" },
+        .{ .setup = "const create: func(init Item) Box(Item) | AllocationError = Box(Item).new", .call = "create(make(forbidden()))" },
+        .{ .setup = "func invoke(imm create: func(init Item) Box(Item) | AllocationError, init item: Item) Box(Item) | AllocationError -> create(item)", .call = "invoke(Box(Item).new, make(forbidden()))" },
     };
     inline for (cases) |case| {
         const source = try testing.allocator.print(
@@ -9661,9 +9650,8 @@ test "implicit drop effects retain reference parameter identities" {
         \\    const guard = Guard{target = reference}
         \\    0
         \\  else 0)
-        \\func run() int | none
-        \\  var owner = Box.new(Item{value = 17})
-        \\  if not (owner is Box(Item)) -> return none
+        \\func run() int | AllocationError
+        \\  var owner = Box.new(Item{value = 17})?
         \\  return inspect(Ref.from(owner.borrow()))
         \\match run()
         \\    result and result is int -> exit(result)
@@ -9690,9 +9678,8 @@ test "implicit drop effects invalidate pending expression borrows" {
         \\struct Wrapper
         \\  guard: Replacer
         \\func observe(imm previous: Item, marker: int) int -> previous.value
-        \\func run() int | none
-        \\  var owner = Box.new(Item{value = 17})
-        \\  if not (owner is Box(Item)) -> return none
+        \\func run() int | AllocationError
+        \\  var owner = Box.new(Item{value = 17})?
         \\  var reference = Ref.from(owner.borrow())
     ;
     const cases = [_]struct { before: []const u8, after: []const u8, expected: ?u8 }{
@@ -10100,9 +10087,8 @@ test "host storage layout edits invalidate compiler-owned extern signatures" {
 
     const typed = try Fixture.initFiles(
         \\import std.memory.{Allocation, allocate, deallocate}
-        \\func use_storage() unit | none
-        \\  const allocation = allocate(int, 1)
-        \\  if not (allocation is Allocation(int)) -> return none
+        \\func use_storage() unit | AllocationError
+        \\  const allocation = allocate(int, 1)?
         \\  deallocate(int, allocation^)
         \\  return ()
         \\if (use_storage() is unit) -> exit(42) else exit(1)
@@ -10111,7 +10097,6 @@ test "host storage layout edits invalidate compiler-owned extern signatures" {
     const typed_declarations = (try typed.db.get(queries.ModuleDeclarations, try typed.db.intern(queries.ModulePaths, .{ .path = "std.memory" }))).*.?;
     const typed_host = typed_declarations.resolveStatic("HostStorage").?;
     const typed_source = (try typed.db.get(queries.ResolveItem, typed_host)).*.?;
-    const typed_allocate = (try typed.db.get(queries.ResolveItem, typed_declarations.resolveFunction("allocate").?)).*.?;
     try typed.db.setInput(queries.SourceText, typed_source.file_id,
         \\struct HostStorage
         \\  address_low: bool
@@ -10121,7 +10106,12 @@ test "host storage layout edits invalidate compiler-owned extern signatures" {
         \\extern func allocate_host_storage(byte_size: int) HostStorage | none
         \\extern func deallocate_host_storage(deinit storage: HostStorage)
     );
-    try typed.expectDiagnostic(typed_allocate.file_id, .invalid_external_signature);
+    try typed.expectExit(0, 42);
+    const raw = (try typed.db.get(queries.ResolveItem, typed_declarations.resolveStatic("RawBlock").?)).*.?;
+    const changed_raw = try std.mem.replaceOwned(u8, testing.allocator, standard_library.source("memory/raw.chi"), "allocate_raw(layout: AllocationLayout) RawBlock", "allocate_raw(layout: AllocationLayout) ref RawBlock");
+    defer testing.allocator.free(changed_raw);
+    try typed.db.setInput(queries.SourceText, raw.file_id, changed_raw);
+    try typed.expectDiagnostic(raw.file_id, .invalid_external_signature);
 }
 
 test "standard storage shapes reject reference fields and recover after edits" {
@@ -10141,11 +10131,10 @@ test "standard storage shapes reject reference fields and recover after edits" {
     const facts: queries.TypeFacts(*query.Database) = .{ .ctx = db };
     const Shape = enum { allocation, box, span, literal };
     for ([_]struct { selected: []const u8, field: []const u8, shape: Shape }{
-        .{ .selected = "AllocationType", .field = "storage: HostStorage", .shape = .allocation },
+        .{ .selected = "AllocationType", .field = "storage: RawBlock", .shape = .allocation },
         .{ .selected = "AllocationType", .field = "count: int", .shape = .allocation },
+        .{ .selected = "AllocationType", .field = "provider: Allocator", .shape = .allocation },
         .{ .selected = "BoxType", .field = "allocation: Allocation(T)", .shape = .box },
-        .{ .selected = "SpanType", .field = "address_low: int", .shape = .span },
-        .{ .selected = "SpanType", .field = "address_high: int", .shape = .span },
         .{ .selected = "SpanType", .field = "data: StorageCursor(T)", .shape = .span },
         .{ .selected = "SpanType", .field = "size: int", .shape = .span },
         .{ .selected = "LiteralType", .field = "bytes: Span(byte)", .shape = .literal },
@@ -13488,9 +13477,8 @@ test "init captures reject cleanup through possibly aliased borrowed parameters"
         \\    else 0)
         \\        _selected_result_0 and _selected_result_0 is int -> _selected_result_0^
         \\        _ -> return none))
-        \\func run() int | none
-        \\    var owner = Box.new(42)
-        \\    if not (owner is Box(int)) -> return none
+        \\func run() int | none | AllocationError
+        \\    var owner = Box.new(42)?
         \\    var reference = Ref.from(owner.borrow())
         \\    return ((match relay(owner, reference)
         \\        _selected_result_1 and _selected_result_1 is int -> _selected_result_1
@@ -14075,7 +14063,7 @@ test "review fixes discard conditional tails preserve statement semantics" {
 test "review fixes mutable variant borrow preserves parameter provenance" {
     try Fixture.expectParity(
         \\import std.memory
-        \\func inspect(mut value: Box(int) | none) int
+        \\func inspect(mut value: Box(int) | none | AllocationError) int
         \\    match value
         \\        Box(int) ->
         \\            ref box = value
@@ -14083,7 +14071,7 @@ test "review fixes mutable variant borrow preserves parameter provenance" {
         \\        _ -> ()
         \\    return 1
         \\func calculate() int | none
-        \\    var value: Box(int) | none = Box.new(42)
+        \\    var value: Box(int) | none | AllocationError = Box.new(42)
         \\    return inspect(value)
         \\func run() int
         \\    match calculate()
@@ -14148,7 +14136,7 @@ test "review fixes type arguments compose unions grouping and callable types" {
 test "review fixes consuming variant extraction transfers noncopyable payloads" {
     try Fixture.expectParity(
         \\func calculate() int | none
-        \\    var source: Box(int) | none = Box.new(42)
+        \\    var source: Box(int) | none | AllocationError = Box.new(42)
         \\    match source^
         \\        payload and payload is Box(int) ->
         \\            const moved = payload^
@@ -14162,9 +14150,7 @@ test "review fixes consuming variant extraction transfers noncopyable payloads" 
         \\    return 91
     , 42);
     try Fixture.expectParity(
-        \\func create() Box(int) | none -> ((match Box.new(42)
-        \\    _selected_result_0 and _selected_result_0 is Box(int) -> _selected_result_0^
-        \\    _ -> return none))
+        \\func create() Box(int) | AllocationError -> Box.new(42)
         \\func calculate() int | none
         \\    match create()
         \\        payload and payload is Box(int) -> return Ref.from(payload.borrow()).value
@@ -14273,9 +14259,8 @@ test "review fixes reference field assignments evaluate the handle once" {
         \\func handle(mut point: Box(Point), mut calls: int) Ref(Point)
         \\    calls += 1
         \\    return Ref.from(point.borrow())
-        \\func calculate() int | none
-        \\    var point = Box.new(Point{x = 40})
-        \\    if not (point is Box(Point)) -> return none
+        \\func calculate() int | AllocationError
+        \\    var point = Box.new(Point{x = 40})?
         \\    var calls = 0
         \\    handle(point, calls).value.x += 1
         \\    return Ref.from(point.borrow()).value.x + calls
@@ -14354,9 +14339,8 @@ test "review fixes readonly reference places cannot become mutable" {
     try Fixture.expectSourceDiagnostic(
         \\func increment(mut value: int)
         \\    value += 1
-        \\func calculate() int | none
-        \\    const value = Box.new(41)
-        \\    if not (value is Box(int)) -> return none
+        \\func calculate() int | AllocationError
+        \\    const value = Box.new(41)?
         \\    increment(Ref.from(value.borrow()).value)
         \\    return 42
         \\match calculate()
@@ -14366,9 +14350,8 @@ test "review fixes readonly reference places cannot become mutable" {
     try Fixture.expectSourceDiagnostic(
         \\struct Point
         \\    pub x: int
-        \\func calculate() int | none
-        \\    const point = Box.new(Point{x = 41})
-        \\    if not (point is Box(Point)) -> return none
+        \\func calculate() int | AllocationError
+        \\    const point = Box.new(Point{x = 41})?
         \\    Ref.from(point.borrow()).value.x = 42
         \\    return 42
         \\match calculate()
@@ -14404,9 +14387,8 @@ test "review fixes disjoint fields through one explicit reference can be mutable
         \\func increment(mut left: int, mut right: int)
         \\    left += 1
         \\    right += 1
-        \\func calculate() int | none
-        \\    var pair = Box.new(Pair{first = 19, second = 21})
-        \\    if not (pair is Box(Pair)) -> return none
+        \\func calculate() int | none | AllocationError
+        \\    var pair = Box.new(Pair{first = 19, second = 21})?
         \\    var handle = Ref.from(pair.borrow())
         \\    if not (handle is Ref(Pair)) -> return none
         \\    increment(handle.value.first, handle.value.second)
@@ -14422,7 +14404,7 @@ test "review fixes disjoint fields through one explicit reference can be mutable
 test "review fixes mutable variant projection still rejects owner invalidation" {
     try Fixture.expectSourceDiagnostic(
         \\import std.memory
-        \\func inspect(mut value: Box(int) | none) int
+        \\func inspect(mut value: Box(int) | none | AllocationError) int
         \\    match value
         \\        Box(int) ->
         \\            ref box = value
@@ -14432,7 +14414,7 @@ test "review fixes mutable variant projection still rejects owner invalidation" 
         \\        _ -> ()
         \\    return 1
         \\func calculate() int | none
-        \\    var value: Box(int) | none = Box.new(42)
+        \\    var value: Box(int) | none | AllocationError = Box.new(42)
         \\    return inspect(value)
         \\match calculate()
         \\    result and result is int -> exit(result)

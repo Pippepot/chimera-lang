@@ -22,11 +22,7 @@ pub func valid_layout(layout: AllocationLayout) bool
 
 extern func cursor_aligned(imm cursor: StorageCursor(byte), alignment: int) bool
 pub extern func type_layout(static T: type) AllocationLayout
-pub func layout_for(static T: type, count: int) AllocationLayout | AllocationError
-    if count < 0 -> return AllocationError.invalid_layout
-    const element = type_layout(T)
-    if element.byte_size > 0 and count > 2147483647 / element.byte_size -> return AllocationError.size_limit
-    return AllocationLayout{byte_size = count * element.byte_size, alignment = element.alignment}
+pub extern func layout_for(static T: type, count: int) AllocationLayout | AllocationError
 
 pub extern func allocate_raw(layout: AllocationLayout) RawBlock | AllocationError
 pub extern func deallocate_raw(deinit block: RawBlock) unit

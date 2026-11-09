@@ -1,0 +1,754 @@
+{
+  "recorded_at": "2026-11-09T11:48:51.551030+00:00",
+  "revision": "2c1c9d96d22fa688357e1e40b7e8179c1deff0a0",
+  "dirty": true,
+  "machine": "Linux-7.2.9-arch1-1-x86_64-with-glibc2.44",
+  "affinity": [
+    19
+  ],
+  "zig": "0.17.0",
+  "rounds": 200000,
+  "sample_count": 7,
+  "seed": 0,
+  "repeatability_range_fraction_limit": 0.02,
+  "measurement": "whole process: startup, input, work, checksum output, cleanup",
+  "source_sha256": {
+    "benchmarks/shared-context/main.chi": "90eee2b691bddc61a4ddd18d24e826e2fd9472bb77d9432c4563526c97af3245",
+    "benchmarks/shared-context/run.py": "c3f8dc08f75021608b81cce03cc430197480e78f2e4249be00eb57bb786855be",
+    "std/logging.chi": "e1d09e16783ef76c6d032a328ec027441e0c55c2426e6e07660a1543562e11c2",
+    "std/memory/allocation.chi": "0f51559af9f6a24e21a9aede45beea34c5e90b94cdccf5ea65bf59dff757d4a8",
+    "src/backend/codegen.zig": "166902f1fa270a3355f04ac8993eeaa0c5a4480981ed09fd3e4a840b03232b46"
+  },
+  "results": [
+    {
+      "mode": "explicit lifecycle",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 0,
+      "seconds": [
+        0.362368479,
+        0.36213386,
+        0.364362596,
+        0.364238697,
+        0.364294964,
+        0.36102581,
+        0.360840415
+      ],
+      "median_seconds": 0.362368479,
+      "min_seconds": 0.360840415,
+      "max_seconds": 0.364362596,
+      "executable_bytes": 58734,
+      "full_range_fraction": 0.009719887915526883,
+      "unstable": false
+    },
+    {
+      "mode": "explicit lifecycle",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 1,
+      "seconds": [
+        0.363690363,
+        0.362753134,
+        0.361024085,
+        0.368380834,
+        0.364955731,
+        0.363855227,
+        0.364580968
+      ],
+      "median_seconds": 0.363855227,
+      "min_seconds": 0.361024085,
+      "max_seconds": 0.368380834,
+      "executable_bytes": 63309,
+      "full_range_fraction": 0.02021889052043217,
+      "unstable": true
+    },
+    {
+      "mode": "explicit lifecycle",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 4,
+      "seconds": [
+        0.360552745,
+        0.362238831,
+        0.360385517,
+        0.36539735,
+        0.362426153,
+        0.362539639,
+        0.361827613
+      ],
+      "median_seconds": 0.362238831,
+      "min_seconds": 0.360385517,
+      "max_seconds": 0.36539735,
+      "executable_bytes": 63901,
+      "full_range_fraction": 0.013835714371549585,
+      "unstable": false
+    },
+    {
+      "mode": "contextual lifecycle",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 0,
+      "seconds": [
+        0.364561624,
+        0.36410077,
+        0.359977126,
+        0.364923601,
+        0.365369133,
+        0.364894877,
+        0.364611998
+      ],
+      "median_seconds": 0.364611998,
+      "min_seconds": 0.359977126,
+      "max_seconds": 0.365369133,
+      "executable_bytes": 59491,
+      "full_range_fraction": 0.014788342209188718,
+      "unstable": false
+    },
+    {
+      "mode": "contextual lifecycle",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 1,
+      "seconds": [
+        0.43365037,
+        0.436799544,
+        0.437310974,
+        0.440060112,
+        0.439222915,
+        0.433900675,
+        0.434581183
+      ],
+      "median_seconds": 0.436799544,
+      "min_seconds": 0.43365037,
+      "max_seconds": 0.440060112,
+      "executable_bytes": 64066,
+      "full_range_fraction": 0.014674333084926472,
+      "unstable": false
+    },
+    {
+      "mode": "contextual lifecycle",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 4,
+      "seconds": [
+        0.632511578,
+        0.632424391,
+        0.635026785,
+        0.639799826,
+        0.638130081,
+        0.633591173,
+        0.631412794
+      ],
+      "median_seconds": 0.633591173,
+      "min_seconds": 0.631412794,
+      "max_seconds": 0.639799826,
+      "executable_bytes": 64658,
+      "full_range_fraction": 0.013237293001239311,
+      "unstable": false
+    },
+    {
+      "mode": "spare append",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 0,
+      "seconds": [
+        0.003343112,
+        0.00315994,
+        0.003416358,
+        0.003196248,
+        0.003225185,
+        0.003086768,
+        0.003216328
+      ],
+      "median_seconds": 0.003216328,
+      "min_seconds": 0.003086768,
+      "max_seconds": 0.003416358,
+      "executable_bytes": 59145,
+      "full_range_fraction": 0.10247400140781657,
+      "unstable": true
+    },
+    {
+      "mode": "spare append",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 1,
+      "seconds": [
+        0.003425813,
+        0.003134397,
+        0.003107857,
+        0.003289098,
+        0.00326064,
+        0.003443636,
+        0.003219696
+      ],
+      "median_seconds": 0.00326064,
+      "min_seconds": 0.003107857,
+      "max_seconds": 0.003443636,
+      "executable_bytes": 63720,
+      "full_range_fraction": 0.10297947642180677,
+      "unstable": true
+    },
+    {
+      "mode": "spare append",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 4,
+      "seconds": [
+        0.003420155,
+        0.003144167,
+        0.003511664,
+        0.00327524,
+        0.003152918,
+        0.003005414,
+        0.003251406
+      ],
+      "median_seconds": 0.003251406,
+      "min_seconds": 0.003005414,
+      "max_seconds": 0.003511664,
+      "executable_bytes": 64312,
+      "full_range_fraction": 0.15570187174410077,
+      "unstable": true
+    },
+    {
+      "mode": "growing append",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 0,
+      "seconds": [
+        0.003816065,
+        0.003642008,
+        0.003588259,
+        0.003653117,
+        0.003671432,
+        0.003623912,
+        0.003753305
+      ],
+      "median_seconds": 0.003653117,
+      "min_seconds": 0.003588259,
+      "max_seconds": 0.003816065,
+      "executable_bytes": 59638,
+      "full_range_fraction": 0.06235934956367401,
+      "unstable": true
+    },
+    {
+      "mode": "growing append",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 1,
+      "seconds": [
+        0.00364614,
+        0.003619261,
+        0.00352103,
+        0.003681838,
+        0.003717602,
+        0.003801658,
+        0.003450355
+      ],
+      "median_seconds": 0.00364614,
+      "min_seconds": 0.003450355,
+      "max_seconds": 0.003801658,
+      "executable_bytes": 64221,
+      "full_range_fraction": 0.09634928993401237,
+      "unstable": true
+    },
+    {
+      "mode": "growing append",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 4,
+      "seconds": [
+        0.00378139,
+        0.003582651,
+        0.00391775,
+        0.003708818,
+        0.003725081,
+        0.003778385,
+        0.003655468
+      ],
+      "median_seconds": 0.003725081,
+      "min_seconds": 0.003582651,
+      "max_seconds": 0.00391775,
+      "executable_bytes": 64813,
+      "full_range_fraction": 0.08995750696427814,
+      "unstable": true
+    },
+    {
+      "mode": "disabled log",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 0,
+      "seconds": [
+        0.000513699,
+        0.000555767,
+        0.000806801,
+        0.000513054,
+        0.000571368,
+        0.000663938,
+        0.000796212
+      ],
+      "median_seconds": 0.000571368,
+      "min_seconds": 0.000513054,
+      "max_seconds": 0.000806801,
+      "executable_bytes": 48407,
+      "full_range_fraction": 0.5141117458450596,
+      "unstable": true
+    },
+    {
+      "mode": "disabled log",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 1,
+      "seconds": [
+        0.000742066,
+        0.000737388,
+        0.000577456,
+        0.000759398,
+        0.000709692,
+        0.000531523,
+        0.000581764
+      ],
+      "median_seconds": 0.000709692,
+      "min_seconds": 0.000531523,
+      "max_seconds": 0.000759398,
+      "executable_bytes": 50678,
+      "full_range_fraction": 0.3210899939692148,
+      "unstable": true
+    },
+    {
+      "mode": "disabled log",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 4,
+      "seconds": [
+        0.000715579,
+        0.0007323,
+        0.000732544,
+        0.000881066,
+        0.000517008,
+        0.000751594,
+        0.000676734
+      ],
+      "median_seconds": 0.0007323,
+      "min_seconds": 0.000517008,
+      "max_seconds": 0.000881066,
+      "executable_bytes": 51080,
+      "full_range_fraction": 0.4971432473030179,
+      "unstable": true
+    },
+    {
+      "mode": "enabled counter backend",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 0,
+      "seconds": [
+        0.032342115,
+        0.032400763,
+        0.032491717,
+        0.032354611,
+        0.032531773,
+        0.032272048,
+        0.032163887
+      ],
+      "median_seconds": 0.032354611,
+      "min_seconds": 0.032163887,
+      "max_seconds": 0.032531773,
+      "executable_bytes": 48391,
+      "full_range_fraction": 0.01137043495902324,
+      "unstable": false
+    },
+    {
+      "mode": "enabled counter backend",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 1,
+      "seconds": [
+        0.064668719,
+        0.064448662,
+        0.064272849,
+        0.064755478,
+        0.064609207,
+        0.064359897,
+        0.06468207
+      ],
+      "median_seconds": 0.064609207,
+      "min_seconds": 0.064272849,
+      "max_seconds": 0.064755478,
+      "executable_bytes": 50670,
+      "full_range_fraction": 0.007469972507169114,
+      "unstable": false
+    },
+    {
+      "mode": "enabled counter backend",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 4,
+      "seconds": [
+        0.161411645,
+        0.163007959,
+        0.162507679,
+        0.162638669,
+        0.163078811,
+        0.162793617,
+        0.163238587
+      ],
+      "median_seconds": 0.162793617,
+      "min_seconds": 0.161411645,
+      "max_seconds": 0.163238587,
+      "executable_bytes": 51064,
+      "full_range_fraction": 0.011222442462225026,
+      "unstable": false
+    },
+    {
+      "mode": "enabled pure no-op backend",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 0,
+      "seconds": [
+        0.032458068,
+        0.032196235,
+        0.032251854,
+        0.032328535,
+        0.03228915,
+        0.032151196,
+        0.032177889
+      ],
+      "median_seconds": 0.032251854,
+      "min_seconds": 0.032151196,
+      "max_seconds": 0.032458068,
+      "executable_bytes": 48127,
+      "full_range_fraction": 0.009514863858679246,
+      "unstable": false
+    },
+    {
+      "mode": "enabled pure no-op backend",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 1,
+      "seconds": [
+        0.06403603,
+        0.064161054,
+        0.064047004,
+        0.06439807,
+        0.064365552,
+        0.064180917,
+        0.064146504
+      ],
+      "median_seconds": 0.064161054,
+      "min_seconds": 0.06403603,
+      "max_seconds": 0.06439807,
+      "executable_bytes": 50406,
+      "full_range_fraction": 0.005642675383730571,
+      "unstable": false
+    },
+    {
+      "mode": "enabled pure no-op backend",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 4,
+      "seconds": [
+        0.161818302,
+        0.162632385,
+        0.162442629,
+        0.161461094,
+        0.1614876,
+        0.16342451,
+        0.161611036
+      ],
+      "median_seconds": 0.161818302,
+      "min_seconds": 0.161461094,
+      "max_seconds": 0.16342451,
+      "executable_bytes": 50800,
+      "full_range_fraction": 0.012133460651440995,
+      "unstable": false
+    },
+    {
+      "mode": "explicit destruction",
+      "measurement": "ready/signal handshake, removal, destruction, checksum output, exit",
+      "wrappers": 0,
+      "seconds": [
+        0.232650912,
+        0.232269171,
+        0.241793174,
+        0.233548073,
+        0.244941197,
+        0.237256035,
+        0.236670927
+      ],
+      "median_seconds": 0.236670927,
+      "min_seconds": 0.232269171,
+      "max_seconds": 0.244941197,
+      "executable_bytes": 96073,
+      "full_range_fraction": 0.05354280798502979,
+      "unstable": true
+    },
+    {
+      "mode": "explicit destruction",
+      "measurement": "ready/signal handshake, removal, destruction, checksum output, exit",
+      "wrappers": 1,
+      "seconds": [
+        0.229673162,
+        0.23125166,
+        0.234218575,
+        0.240064975,
+        0.234525751,
+        0.234273844,
+        0.234272269
+      ],
+      "median_seconds": 0.234272269,
+      "min_seconds": 0.229673162,
+      "max_seconds": 0.240064975,
+      "executable_bytes": 100656,
+      "full_range_fraction": 0.04435784501664611,
+      "unstable": true
+    },
+    {
+      "mode": "explicit destruction",
+      "measurement": "ready/signal handshake, removal, destruction, checksum output, exit",
+      "wrappers": 4,
+      "seconds": [
+        0.234268801,
+        0.226161779,
+        0.233404959,
+        0.233787017,
+        0.235586012,
+        0.235142297,
+        0.234333341
+      ],
+      "median_seconds": 0.234268801,
+      "min_seconds": 0.226161779,
+      "max_seconds": 0.235586012,
+      "executable_bytes": 101248,
+      "full_range_fraction": 0.04022828887061237,
+      "unstable": true
+    },
+    {
+      "mode": "contextual destruction",
+      "measurement": "ready/signal handshake, removal, destruction, checksum output, exit",
+      "wrappers": 0,
+      "seconds": [
+        0.234122754,
+        0.235014779,
+        0.23417841,
+        0.237461926,
+        0.228782313,
+        0.227635307,
+        0.233487339
+      ],
+      "median_seconds": 0.234122754,
+      "min_seconds": 0.227635307,
+      "max_seconds": 0.237461926,
+      "executable_bytes": 97081,
+      "full_range_fraction": 0.04197208016782504,
+      "unstable": true
+    },
+    {
+      "mode": "contextual destruction",
+      "measurement": "ready/signal handshake, removal, destruction, checksum output, exit",
+      "wrappers": 1,
+      "seconds": [
+        0.266956077,
+        0.286997261,
+        0.269498263,
+        0.273093847,
+        0.272126728,
+        0.269952646,
+        0.267173205
+      ],
+      "median_seconds": 0.269952646,
+      "min_seconds": 0.266956077,
+      "max_seconds": 0.286997261,
+      "executable_bytes": 101664,
+      "full_range_fraction": 0.0742396279383014,
+      "unstable": true
+    },
+    {
+      "mode": "contextual destruction",
+      "measurement": "ready/signal handshake, removal, destruction, checksum output, exit",
+      "wrappers": 4,
+      "seconds": [
+        0.362187461,
+        0.369040305,
+        0.364794471,
+        0.368843849,
+        0.363823786,
+        0.367196209,
+        0.364053568
+      ],
+      "median_seconds": 0.364794471,
+      "min_seconds": 0.362187461,
+      "max_seconds": 0.369040305,
+      "executable_bytes": 102256,
+      "full_range_fraction": 0.018785493050962453,
+      "unstable": false
+    },
+    {
+      "mode": "element lifecycle without hook",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 0,
+      "seconds": [
+        0.364298944,
+        0.366014894,
+        0.365349685,
+        0.367572621,
+        0.369633242,
+        0.366410045,
+        0.364402106
+      ],
+      "median_seconds": 0.366014894,
+      "min_seconds": 0.364298944,
+      "max_seconds": 0.369633242,
+      "executable_bytes": 60104,
+      "full_range_fraction": 0.01457399162559751,
+      "unstable": false
+    },
+    {
+      "mode": "element lifecycle without hook",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 1,
+      "seconds": [
+        0.434831824,
+        0.432705329,
+        0.434614835,
+        0.434987374,
+        0.441316983,
+        0.434946974,
+        0.435408734
+      ],
+      "median_seconds": 0.434946974,
+      "min_seconds": 0.432705329,
+      "max_seconds": 0.441316983,
+      "executable_bytes": 64687,
+      "full_range_fraction": 0.01979931926138649,
+      "unstable": false
+    },
+    {
+      "mode": "element lifecycle without hook",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 4,
+      "seconds": [
+        0.625464497,
+        0.625964904,
+        0.628016732,
+        0.628156366,
+        0.633211684,
+        0.627150109,
+        0.630039252
+      ],
+      "median_seconds": 0.628016732,
+      "min_seconds": 0.625464497,
+      "max_seconds": 0.633211684,
+      "executable_bytes": 65279,
+      "full_range_fraction": 0.012335956361111889,
+      "unstable": false
+    },
+    {
+      "mode": "element lifecycle with drop hook",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 0,
+      "seconds": [
+        0.364788681,
+        0.363992553,
+        0.364507965,
+        0.366832139,
+        0.368000888,
+        0.364425188,
+        0.363889838
+      ],
+      "median_seconds": 0.364507965,
+      "min_seconds": 0.363889838,
+      "max_seconds": 0.368000888,
+      "executable_bytes": 61440,
+      "full_range_fraction": 0.011278354370116452,
+      "unstable": false
+    },
+    {
+      "mode": "element lifecycle with drop hook",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 1,
+      "seconds": [
+        0.436870973,
+        0.436689572,
+        0.442014899,
+        0.437929208,
+        0.43907765,
+        0.435452453,
+        0.435762114
+      ],
+      "median_seconds": 0.436870973,
+      "min_seconds": 0.435452453,
+      "max_seconds": 0.442014899,
+      "executable_bytes": 66023,
+      "full_range_fraction": 0.015021474086354554,
+      "unstable": false
+    },
+    {
+      "mode": "element lifecycle with drop hook",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup",
+      "wrappers": 4,
+      "seconds": [
+        0.628024219,
+        0.629692863,
+        0.632101143,
+        0.63244742,
+        0.634007446,
+        0.631575332,
+        0.630578705
+      ],
+      "median_seconds": 0.631575332,
+      "min_seconds": 0.628024219,
+      "max_seconds": 0.634007446,
+      "executable_bytes": 66615,
+      "full_range_fraction": 0.00947349697945451,
+      "unstable": false
+    },
+    {
+      "mode": "enabled root stderr pipe",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup, stderr pipe drained by parent",
+      "wrappers": 0,
+      "seconds": [
+        0.203901848,
+        0.20215161,
+        0.20270901,
+        0.197961684,
+        0.202779135,
+        0.200146494,
+        0.203383536
+      ],
+      "median_seconds": 0.20270901,
+      "min_seconds": 0.197961684,
+      "max_seconds": 0.203901848,
+      "executable_bytes": 47186,
+      "full_range_fraction": 0.02930389724659993,
+      "unstable": true
+    },
+    {
+      "mode": "enabled root stderr pipe",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup, stderr pipe drained by parent",
+      "wrappers": 1,
+      "seconds": [
+        0.271596821,
+        0.27260028,
+        0.274539027,
+        0.271200091,
+        0.275386763,
+        0.2748879,
+        0.273449044
+      ],
+      "median_seconds": 0.273449044,
+      "min_seconds": 0.271200091,
+      "max_seconds": 0.275386763,
+      "executable_bytes": 49479,
+      "full_range_fraction": 0.015310611215740812,
+      "unstable": false
+    },
+    {
+      "mode": "enabled root stderr pipe",
+      "measurement": "whole process: startup, input, work, checksum output, cleanup, stderr pipe drained by parent",
+      "wrappers": 4,
+      "seconds": [
+        0.479594809,
+        0.47883688,
+        0.477467421,
+        0.479035839,
+        0.478961592,
+        0.482215158,
+        0.477878752
+      ],
+      "median_seconds": 0.478961592,
+      "min_seconds": 0.477467421,
+      "max_seconds": 0.482215158,
+      "executable_bytes": 49872,
+      "full_range_fraction": 0.009912563093367984,
+      "unstable": false
+    }
+  ],
+  "compiler_sha256": "5546bd9e11ab311fb447ac6fa8555f09d78fd86b991495018848f2aa8b013ed8",
+  "layout_bytes": {
+    "callable": 16,
+    "Allocator": 32,
+    "Logger": 24,
+    "Allocation(int)": 56,
+    "List(int)": 64,
+    "PlainItem": 16,
+    "TrackedItem": 16
+  }
+}

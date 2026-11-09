@@ -577,3 +577,51 @@ test "owning erased callables expose fallible deferred erasure and cloning" {
         \\    return first(18) + copied(20)
     , 42);
 }
+
+test "implicit and fallible erasure reserve before moving concrete captures once" {
+    const forms = [_][]const u8{
+        "const stored: func() int = concrete^",
+        "const stored = erase(func() int, concrete^)\n        if stored is AllocationError -> return 91",
+        "const holder = Holder{callback = concrete}\n        const stored = moved_field(holder^)",
+        "const stored = moved(concrete^) ",
+        "const stored: (func() int) | none = concrete^\n        if stored is none -> return 92",
+    };
+    for (forms) |formation| {
+        const source = try std.testing.allocator.print(
+            \\import std.memory.{{Allocator, AllocationLayout, RawBlock, AllocationError, root_allocator}}
+            \\import std.callables.{{erase}}
+            \\struct Tracker
+            \\    upstream: Allocator
+            \\    ref events: int
+            \\    pub func allocate(imm self: Tracker, layout: AllocationLayout) RawBlock | AllocationError
+            \\        self.events = self.events * 10 + 1
+            \\        return self.upstream.allocate(layout)
+            \\    pub func deallocate(imm self: Tracker, deinit block: RawBlock)
+            \\        self.upstream.deallocate(block^)
+            \\struct Capture
+            \\    copy = fieldwise
+            \\    ref events: int
+            \\    value: int
+            \\    move = func(deinit self: Capture) Capture
+            \\        self.events = self.events * 10 + 2
+            \\        return Capture{{events = self.events, value = self.value + 1}}
+            \\struct Holder(F: type)
+            \\    move = fieldwise
+            \\    callback: F
+            \\func moved(static F: type, deinit callback: F) func() int -> callback^
+            \\func moved_field(static F: type, deinit holder: Holder(F)) func() int -> holder.callback^
+            \\func run() int
+            \\    var events = 0
+            \\    var tracker = Tracker{{upstream = root_allocator(), events = events}}
+            \\    const capture = Capture{{events = events, value = 41}}
+            \\    const concrete = () => capture.value
+            \\    with context.allocator = Allocator.from(Tracker, tracker)
+            \\        {s}
+            \\        if stored() <> 42 -> return 90
+            \\    if events <> 12 -> return 93
+            \\    return 42
+        , .{formation});
+        defer std.testing.allocator.free(source);
+        try Fixture.expectParity(source, 42);
+    }
+}

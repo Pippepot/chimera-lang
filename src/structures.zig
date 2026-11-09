@@ -1610,6 +1610,8 @@ pub const ReferenceSourceKind = enum { place, contents };
 
 pub const InitializerContext = struct { parameter: u32, entry: ContextEntry };
 
+pub const ReferenceCallableSource = struct { parameter: u32, path: FunctionValueRange };
+
 pub const ReferenceOriginContract = struct {
     output_parameter: ?u32 = null,
     output_contextual: ?ContextEntry = null,
@@ -1631,7 +1633,7 @@ pub const ReferenceOriginContract = struct {
     expired: bool = false,
     service_invocation: ?InstanceId = null,
     forcing_context: ?InitializerContext = null,
-    owning_parameter: ?u32 = null,
+    owning_callable: ?ReferenceCallableSource = null,
     readonly_owned: ?TypeId = null,
 };
 
@@ -2066,6 +2068,7 @@ pub const Diagnostic = struct {
         .static_initializer_type_mismatch = MismatchMessage{ .prefix = "static initializer type mismatch: " },
         .type_value_used_as_runtime_value = Message{ .text = "expected a value, found a type", .source_label = true },
         .compile_time_only_type = TypeMessage{ .prefix = "compile-time-only type ", .suffix = " cannot be materialized during runtime execution" },
+        .type_layout_too_large = TypeMessage{ .prefix = "native layout of type ", .suffix = " exceeds the representable allocation size" },
         .ambiguous_conversion = TypeMismatch,
         .ambiguous_variant_member = TypeMismatch,
         .tuple_context_not_tuple = "tuple expression requires a tuple type in this context",

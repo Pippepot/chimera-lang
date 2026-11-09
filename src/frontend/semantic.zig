@@ -3511,6 +3511,10 @@ fn testUnresolvedFunctionBodyAllocations(gpa: std.mem.Allocator) !void {
 }
 
 const TestAnalysisContext = struct {
+    pub fn contextualEntry(_: @This(), _: structures.ItemId) !?structures.ContextEntry {
+        return null;
+    }
+
     pub fn closureEnvironment(_: @This()) !?structures.ClosureEnvironment {
         unreachable;
     }

@@ -14,12 +14,11 @@ pub const Resource = union(enum) {
     immutable,
     slot: ValueId,
     field: struct { slot: ValueId, index: u32 },
-    /// Caller storage whose type is a scalar or unknown.
-    parameter,
-    /// Caller storage whose type is not a scalar.
-    parameter_object,
+    parameter: Parameter,
     heap,
     unknown,
+
+    const Parameter = struct { value: ValueId, mutable: bool };
 };
 
 /// Addressable snapshots may still be immutable when their addresses remain
@@ -81,13 +80,19 @@ pub const Roots = struct {
         while (true) {
             switch (self.function.definitions.items[@backingInt(current)]) {
                 .argument => |argument| {
-                    if (argument.block == self.function.entry) return if (function_ir.scalar(argument.data.type_id)) .parameter else .parameter_object;
+                    if (argument.block == self.function.entry) {
+                        const position = std.mem.indexOfScalar(ValueId, self.function.blocks.items[self.function.entry].parameters.items, current).?;
+                        return .{ .parameter = .{
+                            .value = current,
+                            .mutable = !self.function.is_initializer_region and position < self.function.parameter_modes.len and self.function.parameter_modes[position] == .mut,
+                        } };
+                    }
                     if (self.address_taken[@backingInt(current)]) return slotResource(current, field);
                     return if (self.function.directParameter(current)) .immutable else .unknown;
                 },
                 .instruction => |index| switch (self.function.instructions.items[index]) {
                     .local_storage => return slotResource(current, field),
-                    .result_storage => return .parameter,
+                    .result_storage => return .unknown,
                     .storage_projection => |projection| {
                         switch (projection.projection) {
                             .field => |field_index| {
@@ -126,6 +131,8 @@ pub const Roots = struct {
         if (first == .immutable or second == .immutable) return false;
         if (first == .unknown or second == .unknown) return true;
         if (first == .contextual or second == .contextual) return first == .contextual and second == .contextual and first.contextual == second.contextual;
+        if (first == .parameter and second == .parameter and first.parameter.value != second.parameter.value and
+            (first.parameter.mutable or second.parameter.mutable)) return false;
         const first_slot = slotOwner(first);
         const second_slot = slotOwner(second);
         if (first_slot != null or second_slot != null) {
@@ -158,6 +165,7 @@ pub const Roots = struct {
         const definition = self.function.definition(reference) orelse return .unknown;
         return switch (definition) {
             .borrow_address => |address| if (address.base_is_reference) self.referent(address.source) else self.borrowedRoot(address),
+            .value_copy => |copy| if (copy.destination == null) self.referent(copy.source) else .unknown,
             else => .unknown,
         };
     }
@@ -176,25 +184,35 @@ pub const Memory = struct {
             for (block.instructions.items) |index| {
                 if (function.removed.items[index]) continue;
                 switch (function.instructions.items[index]) {
-                    .borrow_address => |address| if (!address.base_is_reference) memory.expose(address.source),
+                    .borrow_address, .borrow_read, .storage_projection, .array_element, .allocation_element, .field_access, .variant_tag => {},
+                    .borrow_write => |write| memory.exposeStoredValue(write.value),
+                    .value_copy => |copy| memory.exposeStoredValue(copy.source),
                     .storage_cursor => |cursor| memory.expose(cursor.source),
                     .initializer_ref => |reference| for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |capture| memory.expose(capture),
                     .call => |call| for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
                         if (argument != .prepared) memory.expose(argument.valueId());
+                        memory.exposeStoredValue(argument.valueId());
                     },
-                    else => {},
+                    else => function_ir.visitInstructionReferences(function, &function.instructions.items[index], &memory, Memory.exposeStoredValue),
                 }
             }
             var terminator = block.terminator;
             for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
                 canonicalize.visitBranchAddresses(function, branch.*, &memory, Memory.expose);
+                for (function.branchArguments(branch.*)) |argument| memory.exposeStoredValue(argument.value);
             };
+            if (terminator == .return_value) memory.exposeStoredValue(terminator.return_value.value);
         }
         return memory;
     }
 
     fn expose(self: *Memory, value: ValueId) void {
         const resource = self.roots.root(value);
+        if (Roots.slotOwner(resource)) |slot| self.exposed[@backingInt(slot)] = true;
+    }
+
+    fn exposeStoredValue(self: *Memory, value: ValueId) void {
+        const resource = self.roots.referent(value);
         if (Roots.slotOwner(resource)) |slot| self.exposed[@backingInt(slot)] = true;
     }
 
@@ -206,7 +224,7 @@ pub const Memory = struct {
 pub const Writes = struct {
     slots: std.AutoHashMapUnmanaged(ValueId, void) = .empty,
     fields: std.AutoHashMapUnmanaged(@FieldType(Resource, "field"), void) = .empty,
-    parameter: bool = false,
+    parameters: std.AutoHashMapUnmanaged(Resource.Parameter, void) = .empty,
     /// A write through allocation-backed storage.
     heap: bool = false,
     unknown: bool = false,
@@ -219,7 +237,7 @@ pub const Writes = struct {
             .contextual => |entry| self.contexts |= structures.ContextEffects.bit(entry),
             .slot => |slot| try self.slots.put(scratch, slot, {}),
             .field => |field| try self.fields.put(scratch, field, {}),
-            .parameter, .parameter_object => self.parameter = true,
+            .parameter => |parameter| try self.parameters.put(scratch, parameter, {}),
             .heap => self.heap = true,
             .unknown => self.unknown = true,
         }
@@ -246,14 +264,25 @@ pub const Writes = struct {
             .immutable => true,
             .contextual => |entry| !self.call and (self.contexts & structures.ContextEffects.bit(entry)) == 0,
             .slot, .field => self.preservesSlot(memory, resource),
-            .parameter, .parameter_object, .heap, .unknown => !(self.parameter or self.heap or self.unknown or self.call) and
-                self.slots.count() == 0 and self.fields.count() == 0,
+            .parameter, .heap, .unknown => self.preservesExternal(resource),
         };
+    }
+
+    fn preservesExternal(self: *const Writes, resource: Resource) bool {
+        if (self.heap or self.unknown or self.call) return false;
+        var parameters = self.parameters.keyIterator();
+        while (parameters.next()) |parameter| if (Roots.overlaps(resource, .{ .parameter = parameter.* })) return false;
+        var slots = self.slots.keyIterator();
+        while (slots.next()) |slot| if (Roots.overlaps(resource, .{ .slot = slot.* })) return false;
+        var fields = self.fields.keyIterator();
+        while (fields.next()) |field| if (Roots.overlaps(resource, .{ .field = field.* })) return false;
+        return true;
     }
 
     fn preservesSlot(self: *const Writes, memory: *const Memory, resource: Resource) bool {
         const slot = Roots.slotOwner(resource).?;
-        if (self.slots.contains(slot) or (memory.slotExposed(slot) and (self.parameter or self.heap or self.unknown or self.call))) return false;
+        if (self.slots.contains(slot) or (memory.slotExposed(slot) and
+            (self.parameters.count() != 0 or self.heap or self.unknown or self.call))) return false;
         if (resource == .field) return !self.fields.contains(resource.field);
         var fields = self.fields.keyIterator();
         while (fields.next()) |field| if (field.slot == slot) return false;

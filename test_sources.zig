@@ -54,7 +54,12 @@ pub const SourceFixture = struct {
     }
 
     pub fn executable(self: SourceFixture, entry: structures.FileId) !structures.Executable {
-        if ((try self.db.get(queries.BuildExecutable, entry)).*) |program| return program;
+        const result = self.db.get(queries.BuildExecutable, entry) catch |err| {
+            std.debug.print("Chimera build failed: {s}\n", .{@errorName(err)});
+            try self.printDiagnostics(entry);
+            return err;
+        };
+        if (result.*) |program| return program;
         try self.printDiagnostics(entry);
         return error.TestUnexpectedResult;
     }
@@ -135,7 +140,12 @@ pub const SourceFixture = struct {
             defer std.testing.allocator.free(program);
             const fixture = try initFiles(program, files);
             defer fixture.deinit();
-            if (std.mem.eql(u8, entry, "exit(comptime -> run())") and (try fixture.db.get(queries.BuildExecutable, 0)).* == null) {
+            const compiled = fixture.db.get(queries.BuildExecutable, 0) catch |err| {
+                std.debug.print("Chimera build failed: {s}\n", .{@errorName(err)});
+                try fixture.printDiagnostics(0);
+                return err;
+            };
+            if (std.mem.eql(u8, entry, "exit(comptime -> run())") and compiled.* == null) {
                 const controls = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.CompilerControl, std.testing.allocator);
                 defer std.testing.allocator.free(controls);
                 if (controls.len != 1) try fixture.printDiagnostics(0);
@@ -151,6 +161,7 @@ pub const SourceFixture = struct {
 
     pub fn expectDiagnostic(self: SourceFixture, file: ?structures.FileId, kind: std.meta.Tag(structures.Diagnostic.Kind)) !void {
         if ((try self.db.get(queries.BuildExecutable, 0)).* != null) {
+            std.debug.print("Expected diagnostic {s}, but compilation succeeded\n", .{@tagName(kind)});
             try self.printDiagnostics(0);
             return error.ExpectedDiagnostic;
         }
@@ -159,6 +170,7 @@ pub const SourceFixture = struct {
         for (diagnostics) |diagnostic| {
             if ((file == null or diagnostic.file_id == file.?) and std.meta.activeTag(diagnostic.kind) == kind) return;
         }
+        std.debug.print("Expected diagnostic {s} was not emitted\n", .{@tagName(kind)});
         try self.printDiagnostics(0);
         return error.ExpectedDiagnostic;
     }

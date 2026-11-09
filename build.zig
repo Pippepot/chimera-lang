@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
         "tests/language_test.zig",
         "tests/callable_test.zig",
         "tests/shared_context_test.zig",
+        "tests/logging_test.zig",
         "tests/operation_test.zig",
         "tests/numeric_test.zig",
         "tests/optimizer_test.zig",

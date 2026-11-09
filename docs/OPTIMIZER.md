@@ -199,11 +199,11 @@ mutable roots even when their producing instruction is a plain value.
 Independent top-level fields of a private slot have separate write resources;
 whole-slot writes overlap every field. A borrowed field of a slot occupies that
 field's resource, so reads through the borrow cannot be hoisted past writes to it. Variant payload projections discard
-field separation. Memory is typed: an allocation block holds elements of one
-type and is never part of another object. Heap resources therefore carry their
-allocation type, so writes to different allocation types are disjoint, and a
-write of a whole scalar element cannot touch a parameter whose type is not a
-scalar. Other parameter/heap aliasing remains conservative. Local load
+field separation. Distinct entry parameters are separate resources when either is `mut`:
+the parameter's own storage is exclusive, but memory it refers to, such as an
+allocation's backing, is not, so allocation contents stay one shared heap resource
+that any parameter or unknown write may reach. Other
+parameter/heap aliasing remains conservative. Local load
 numbering invalidates overlapping reads rather than clearing every read after
 each known write. Unknown calls retain conservative invalidation. Within a
 block, a field or tag read of a snapshot copy reads the copied storage directly

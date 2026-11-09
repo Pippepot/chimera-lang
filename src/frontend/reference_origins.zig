@@ -2,7 +2,8 @@ const std = @import("std");
 
 pub fn Store(comptime Origin: type, comptime Projection: type, comptime Transform: type) type {
     return struct {
-        origins: std.ArrayList(Origin) = .empty,
+        /// Interned nodes are immutable, including their list links.
+        origins: std.AutoArrayHashMapUnmanaged(Origin, void) = .empty,
         /// Origin sets can grow combinatorially with the nesting of a program's types;
         /// beyond this many entries the analysis fails instead of exhausting memory.
         maximum: usize = std.math.maxInt(u32),
@@ -20,7 +21,7 @@ pub fn Store(comptime Origin: type, comptime Projection: type, comptime Transfor
         pub fn add(self: *@This(), allocator: std.mem.Allocator, head: ?u32, origin: Origin) !?u32 {
             var cursor = head;
             while (cursor) |index| {
-                const existing = &self.origins.items[index];
+                const existing = &self.origins.keys()[index];
                 if (sameOrigin(existing, &origin)) return head;
                 cursor = existing.next;
             }
@@ -29,12 +30,10 @@ pub fn Store(comptime Origin: type, comptime Projection: type, comptime Transfor
 
         /// The caller has established that this origin is absent from the set.
         pub inline fn prependAssumeUnique(self: *@This(), allocator: std.mem.Allocator, head: ?u32, origin: Origin) !u32 {
-            if (self.origins.items.len >= self.maximum) return error.AnalysisTooLarge;
-            const index: u32 = @intCast(self.origins.items.len);
             var added = origin;
             added.next = head;
-            try self.origins.append(allocator, added);
-            return index;
+            if (self.origins.count() >= self.maximum) return @intCast(self.origins.getIndex(added) orelse return error.AnalysisTooLarge);
+            return @intCast((try self.origins.getOrPut(allocator, added)).index);
         }
 
         /// Set membership ignores list links.
@@ -50,7 +49,7 @@ pub fn Store(comptime Origin: type, comptime Projection: type, comptime Transfor
             var merged = first;
             var cursor = second;
             while (cursor) |index| {
-                const origin = self.origins.items[index];
+                const origin = self.origins.keys()[index];
                 merged = try self.add(allocator, merged, origin);
                 cursor = origin.next;
             }
@@ -79,7 +78,9 @@ test "reference paths have canonical identities and origin sets ignore list link
     const first = try store.add(allocator, null, origin);
     const second = try store.add(allocator, first, .{ .projection = tail });
     try std.testing.expectEqual(second, try store.add(allocator, second, origin));
-    try std.testing.expectEqual(@as(usize, 2), store.origins.items.len);
+    try std.testing.expectEqual(first, try store.add(allocator, null, origin));
+    try std.testing.expectEqual(second, try store.add(allocator, first, .{ .projection = tail }));
+    try std.testing.expectEqual(@as(usize, 2), store.origins.count());
 }
 
 test "an origin store refuses to grow past its maximum" {
@@ -90,6 +91,7 @@ test "an origin store refuses to grow past its maximum" {
     const first = try store.add(allocator, null, .{ .value = 1 });
     const second = try store.add(allocator, first, .{ .value = 2 });
     try std.testing.expectEqual(first, try store.add(allocator, first, .{ .value = 1 }));
+    try std.testing.expectEqual(first, try store.add(allocator, null, .{ .value = 1 }));
     try std.testing.expectError(error.AnalysisTooLarge, store.add(allocator, second, .{ .value = 3 }));
-    try std.testing.expectEqual(@as(usize, 2), store.origins.items.len);
+    try std.testing.expectEqual(@as(usize, 2), store.origins.count());
 }

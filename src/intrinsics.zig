@@ -136,6 +136,8 @@ pub fn validExternalSignature(facts: anytype, symbol: standard_library.External,
         .allocator_from, .allocator_from_unchecked => return hasShape(signature, &.{.ref}) and signature.return_type == try facts.allocatorType(),
         .logger_from, .logger_from_unchecked => return hasShape(signature, &.{ .ref, .imm }) and signature.return_type == try facts.loggerType(),
         .type_layout => return hasShape(signature, &.{}) and signature.return_type == try facts.allocationLayout(),
+        .layout_for => return hasShape(signature, &.{.imm}) and signature.parameters[0].type_id == .int and
+            (try errorPayload(facts, signature.return_type, try facts.allocationError())) == try facts.allocationLayout(),
         .cursor_aligned => return hasShape(signature, &.{ .imm, .imm }) and signature.return_type == .bool and (try facts.storageCursorAccess(signature.parameters[0].type_id)) == .byte and signature.parameters[1].type_id == .int,
         .allocate_raw => return hasShape(signature, &.{.imm}) and signature.parameters[0].type_id == try facts.allocationLayout() and (try errorPayload(facts, signature.return_type, try facts.allocationError())) == try facts.rawBlock(),
         .deallocate_raw => return hasShape(signature, &.{.deinit}) and signature.parameters[0].type_id == try facts.rawBlock() and signature.return_type == .unit,

@@ -9,7 +9,7 @@ const structures = @import("structures.zig");
 const value_operations = @import("value.zig");
 const standard_library = @import("standard_library");
 
-const format = "CHIMERASTD16";
+const format = "CHIMERASTD20";
 const Files = [standard_library.paths.len]structures.FileId;
 
 const Table = struct {
@@ -201,13 +201,15 @@ pub fn install(db: *query.Database, bytes: []const u8) !*Loader {
 }
 
 pub const Loader = struct {
-    pub const query_types = .{ queries.AnalyzeFunctionInstance, queries.PrepareFunctionInstance, queries.CallComponent, queries.OptimizeFunctionInstance, queries.CompileFunction };
+    pub const query_types = .{ queries.AnalyzeFunctionInstance, queries.PrepareFunctionInstance, queries.CallComponent, queries.OptimizeFunctionInstance, queries.CompileFunction, queries.InferReferenceEffects, queries.InferReferenceContract };
     pub const Stats = struct {
         bodies: usize = 0,
         prepared: usize = 0,
         components: usize = 0,
         optimized: usize = 0,
         functions: usize = 0,
+        reference_effects: usize = 0,
+        reference_contracts: usize = 0,
     };
 
     db: *query.Database,

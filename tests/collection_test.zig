@@ -672,7 +672,7 @@ test "producer absence remains item data and preserves named cursor state and cl
 
 test "runtime collection optional destinations retain contextual element types" {
     try Fixture.expectParity(
-        \\func make() List(byte) | none -> [7 for i in [0, 1]]
+        \\func make() List(byte) | none | AllocationError -> [7 for i in [0, 1]]
         \\func calculate() int | none
         \\    match make()
         \\        values and values is List(byte) -> return byte_int(values[0]) + byte_int(values[1]) + 28
@@ -791,15 +791,14 @@ test "collection results reject cursor views invalidated by later polls" {
         \\struct Cursor
         \\    position: int
         \\    buffered: String
-        \\    pub func next(mut self: Cursor) StringView | End | none
+        \\    pub func next(mut self: Cursor) StringView | End | AllocationError
         \\        self.position += 1
         \\        if self.position > 2 -> return End{}
-        \\        const checked_value_1 = self.buffered.append("next")
-        \\        if not (checked_value_1 is unit) -> return none
+        \\        _ = self.buffered.append("next")?
         \\        return self.buffered.view()
-        \\func run() unit | none
+        \\func run() unit | none | AllocationError
         \\    var cursor = Cursor{position = 0, buffered = ""}
-        \\    const values = [view for view in cursor]
+        \\    const values = [view for view in cursor if view is StringView]
         \\    print(values)
         \\    return ()
         \\if (run() is unit) -> exit(0)
@@ -866,13 +865,11 @@ test "collection references cannot escape fresh iteration sources" {
 
 test "recoverable construction follows init parameter types through callable values" {
     try Fixture.expectParity(
-        \\func forward(init values: collection_sequence(int)) List(int) | none
+        \\func forward(init values: collection_sequence(int)) List(int) | AllocationError
         \\    return List(int).collect(values)
-        \\func invoke(imm collect: func(init collection_sequence(int)) (List(int) | none)) int | none
-        \\    const fixed = collect([19, 23])
-        \\    if not (fixed is List(int)) -> return none
-        \\    const dynamic = collect([value for value in fixed])
-        \\    if not (dynamic is List(int)) -> return none
+        \\func invoke(imm collect: func(init collection_sequence(int)) (List(int) | AllocationError)) int | AllocationError
+        \\    const fixed = collect([19, 23])?
+        \\    const dynamic = collect([value for value in fixed])?
         \\    return dynamic[0] + dynamic[1]
         \\func run() int
         \\    match invoke(forward)
@@ -884,12 +881,11 @@ test "recoverable construction follows init parameter types through callable val
 
 test "callable collection construction retains contained reference origins" {
     try Fixture.expectParity(
-        \\func invoke(imm collect: func(init collection_sequence(Ref(int))) (List(Ref(int)) | none), ref source: Array(int, 2)) List(Ref(int)) | none
+        \\func invoke(imm collect: func(init collection_sequence(Ref(int))) (List(Ref(int)) | AllocationError), ref source: Array(int, 2)) List(Ref(int)) | AllocationError
         \\    return collect([Ref.from(value) for ref value in source])
-        \\func calculate() int | none
+        \\func calculate() int | AllocationError
         \\    var source = [19, 23]
-        \\    const values = invoke(List(Ref(int)).collect, source)
-        \\    if not (values is List(Ref(int))) -> return none
+        \\    const values = invoke(List(Ref(int)).collect, source)?
         \\    return values[0].value + values[1].value
         \\func run() int
         \\    match calculate()
@@ -898,7 +894,7 @@ test "callable collection construction retains contained reference origins" {
         \\    return 90
     , 42);
     try Fixture.expectSourceDiagnostic(
-        \\func invoke(imm collect: func(init collection_sequence(Ref(int))) (List(Ref(int)) | none)) List(Ref(int)) | none
+        \\func invoke(imm collect: func(init collection_sequence(Ref(int))) (List(Ref(int)) | AllocationError)) List(Ref(int)) | AllocationError
         \\    var local = 42
         \\    return collect([Ref.from(local) for i in [0]])
         \\match invoke(List(Ref(int)).collect)
@@ -910,7 +906,7 @@ test "callable collection construction retains contained reference origins" {
 test "indirect collection allocation failure precedes element evaluation" {
     try expectLimitedExit(
         \\func skipped() Array(int, 262144) -> exit(91)
-        \\func invoke(imm collect: func(init collection_sequence(Array(int, 262144))) (List(Array(int, 262144)) | none)) List(Array(int, 262144)) | none
+        \\func invoke(imm collect: func(init collection_sequence(Array(int, 262144))) (List(Array(int, 262144)) | AllocationError)) List(Array(int, 262144)) | AllocationError
         \\    return collect([skipped() for i in [1]])
         \\func run() int
         \\    match invoke(List(Array(int, 262144)).collect)
@@ -929,15 +925,13 @@ test "collection sequence carriers cannot become ordinary values" {
 
 test "generic sequence consumers infer fixed runtime and forwarded element types" {
     try Fixture.expectParity(
-        \\func gather(static T: type, init values: collection_sequence(T)) List(T) | none
+        \\func gather(static T: type, init values: collection_sequence(T)) List(T) | AllocationError
         \\    return List(T).collect(values)
-        \\func forward(static T: type, init values: collection_sequence(T)) List(T) | none
+        \\func forward(static T: type, init values: collection_sequence(T)) List(T) | AllocationError
         \\    return gather(values)
-        \\func calculate() int | none
-        \\    const fixed = gather([19, 23])
-        \\    if not (fixed is List(int)) -> return none
-        \\    const dynamic = forward([value for value in fixed])
-        \\    if not (dynamic is List(int)) -> return none
+        \\func calculate() int | AllocationError
+        \\    const fixed = gather([19, 23])?
+        \\    const dynamic = forward([value for value in fixed])?
         \\    return dynamic[0] + dynamic[1]
         \\func run() int
         \\    match calculate()

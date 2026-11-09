@@ -227,12 +227,12 @@ pub converter(value: none) String -> "none"
 pub converter(static T: type, static N: int, init value: collection_literal(T, N)) String
     const values: Array(T, N) = value
     return String(values)
-pub converter(static T: type, static N: int, imm value: Array(T, N)) String -> require_string(format_span(value.span()))
-pub converter(static T: type, imm value: List(T)) String -> require_string(format_span(value.span()))
-pub converter(static T: type, imm value: Span(T)) String -> require_string(format_span(value))
+pub converter(static T: type, static N: int, imm value: Array(T, N)) String -> require_string(format_span_using(T, value.span(), format_converted))
+pub converter(static T: type, imm value: List(T)) String -> require_string(format_span_using(T, value.span(), format_converted))
+pub converter(static T: type, imm value: Span(T)) String -> require_string(format_span_using(T, value, format_converted))
 pub converter(imm value: BytesView) String -> String(value.as_span())
-pub converter(static T: type, imm value: Box(T)) String -> require_string(format_wrapped("Box(", value.borrow()))
-pub converter(static T: type, imm value: Ref(T)) String -> require_string(format_wrapped("Ref(", value.value))
+pub converter(static T: type, imm value: Box(T)) String -> require_string(format_wrapped_using(T, "Box(", value.borrow(), format_converted))
+pub converter(static T: type, imm value: Ref(T)) String -> require_string(format_wrapped_using(T, "Ref(", value.value, format_converted))
 
 func require_string(deinit result: String | AllocationError) String
     match result
@@ -276,6 +276,9 @@ func format_integer(value: int) String | AllocationError
     return format_view(text.view())
 
 pub overload format(format_integer, format_byte, format_bool, format_unit, format_none, format_static, format_view, format_string, format_array, format_list, format_span, format_bytes, format_box, format_ref)
+func format_converted(static T: type, imm value: T) String | AllocationError
+    if value is String -> return require_string(value.clone())
+    return String(value)
 func format_byte(value: byte) String | AllocationError -> format_integer(byte_int(value))
 func format_bool(value: bool) String | AllocationError -> if value -> "true" else "false"
 func format_unit(value: unit) String | AllocationError -> "()"
@@ -292,20 +295,22 @@ func format_bytes(imm value: BytesView) String | AllocationError -> format_span(
 func format_box(static T: type, imm value: Box(T)) String | AllocationError -> format_wrapped("Box(", value.borrow())
 func format_ref(static T: type, imm value: Ref(T)) String | AllocationError -> format_wrapped("Ref(", value.value)
 
-func format_span(static T: type, imm values: Span(T)) String | AllocationError
+func format_span(static T: type, imm values: Span(T)) String | AllocationError -> format_span_using(T, values, format)
+func format_span_using(static T: type, imm values: Span(T), static render: func(imm T) String | AllocationError) String | AllocationError
     var result = "["
     var separator: StringView = ""
     for value in values
         _ = result.append(separator)?
-        const text = format(value)?
+        const text = render(value)?
         _ = result.append(text.view())?
         separator = ", "
     _ = result.append("]")?
     return result^
-func format_wrapped(static T: type, imm prefix: StringView, imm value: T) String | AllocationError
+func format_wrapped(static T: type, imm prefix: StringView, imm value: T) String | AllocationError -> format_wrapped_using(T, prefix, value, format)
+func format_wrapped_using(static T: type, imm prefix: StringView, imm value: T, static render: func(imm T) String | AllocationError) String | AllocationError
     var result = String.empty()
     _ = result.append(prefix)?
-    const text = format(value)?
+    const text = render(value)?
     _ = result.append(text.view())?
     _ = result.append(")")?
     return result^

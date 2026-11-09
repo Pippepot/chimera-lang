@@ -7,6 +7,56 @@ const artifact = sources.query_artifact;
 const bundle = sources.standard_bundle_loader;
 const structures = sources.structures;
 
+test "portable scoped contexts remap registered entries and recompute effect-only edits" {
+    const allocator = std.testing.allocator;
+    const library: modules.SourceFile = .{ .path = "lib/events.chi", .module_path = "lib", .source =
+        \\import std.logging.{LogLevel, log}
+        \\pub func event() unit
+        \\    _ = log(LogLevel.info, "event")
+    };
+    const entry =
+        \\import lib
+        \\import std.logging.{Logger, LogLevel}
+        \\struct Backend
+        \\    delivered: int
+        \\    pub func emit(mut self: Backend, level: LogLevel, imm message: StringView) unit -> self.delivered += 1
+        \\func run() int
+        \\    var backend = Backend{delivered = 41}
+        \\    with context.logger = Logger.from(Backend, backend, LogLevel.info)
+        \\        lib.event()
+        \\    return backend.delivered
+        \\exit(run())
+    ;
+    const first = try sources.SourceFixture.initFiles(entry, &.{library});
+    defer first.deinit();
+    try first.expectExit(0, 42);
+    const bytes = try artifact.encode(first.db, allocator);
+    defer allocator.free(bytes);
+    const db = try query.Database.init(allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{ .entry_path = "restored.chi" };
+    defer registry.deinit(allocator);
+    const padding: modules.SourceFile = .{ .path = "extra.chi", .module_path = "", .source = "struct Unrelated\n    value: bool" };
+    try registry.update(db, allocator, entry, &.{ padding, library }, &.{});
+    _ = try db.intern(queries.Types, .{ .array = .{ .element_type = .byte, .length = 7 } });
+    const restored = try artifact.restore(db, bytes, &registry);
+    try std.testing.expect(restored.bodies > 0);
+    try std.testing.expect(restored.functions > 0);
+    const fixture: sources.SourceFixture = .{ .db = db };
+    try fixture.expectExit(0, 42);
+    var edited = library;
+    edited.source =
+        \\import std.logging.{LogLevel, log}
+        \\pub func event() unit
+        \\    _ = log(LogLevel.info, "first")
+        \\    _ = log(LogLevel.info, "second")
+    ;
+    try registry.update(db, allocator, entry, &.{ padding, edited }, &.{});
+    try fixture.expectExit(0, 43);
+    try registry.update(db, allocator, entry, &.{ padding, library }, &.{});
+    try fixture.expectExit(0, 42);
+}
+
 test "portable nominal variants remap case and converter identities" {
     const allocator = std.testing.allocator;
     const source =

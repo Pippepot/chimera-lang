@@ -103,20 +103,21 @@ test "integer conversion policies distinguish exact modular and clamped results"
 
 test "conversions read borrowed heap elements before their owner ends" {
     try Fixture.expectParity(
-        \\func read(index: int) int
+        \\func read(index: int) int | AllocationError
         \\    var values: List(byte) = []
-        \\    values.append(5)
-        \\    values.append(37)
+        \\    _ = values.append(5)?
+        \\    _ = values.append(37)?
         \\    return wrap(i32, values[index])
         \\func run() int
         \\    var values: List(i64) = []
-        \\    values.append(-1)
-        \\    values.append(300)
+        \\    if not (values.append(-1) is unit) -> return 92
+        \\    if not (values.append(300) is unit) -> return 93
         \\    const saturated = saturate(u8, values[1])
         \\    const checked_value = checked(i16, values[1])
         \\    if not (checked_value is i16) -> return 90
         \\    if saturated <> 255 or checked_value <> 300 -> return 91
-        \\    return read(1) + int(wrap(u8, values[0])) - 250
+        \\    const result = read(1) catch -> return 94
+        \\    return result + int(wrap(u8, values[0])) - 250
     , 42);
 }
 

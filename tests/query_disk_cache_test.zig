@@ -8,6 +8,68 @@ const query_disk_cache = test_sources.query_disk_cache;
 const structures = test_sources.structures;
 const standard_library = @import("standard_library");
 
+test "scoped context snapshots recompute contextual effects and backend body edits" {
+    const source =
+        \\import std.logging.{Logger, LogLevel, log}
+        \\struct Backend
+        \\    delivered: int
+        \\    pub func emit(mut self: Backend, level: LogLevel, imm message: StringView) unit
+        \\        self.delivered += 1
+        \\func event() unit -> ()
+        \\func run() int
+        \\    var backend = Backend{delivered = 41}
+        \\    with context.logger = Logger.from(Backend, backend, LogLevel.info)
+        \\        event()
+        \\    return backend.delivered + 1
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const effect_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "func event() unit -> ()",
+        \\func event() unit
+        \\    _ = log(LogLevel.info, "event")
+        \\    return unit
+    );
+    defer std.testing.allocator.free(effect_edit);
+    try fixture.db.setInput(queries.SourceText, 0, effect_edit);
+    try fixture.expectExit(43);
+    const backend_edit = try std.mem.replaceOwned(u8, std.testing.allocator, effect_edit, "self.delivered += 1", "self.delivered += 2");
+    defer std.testing.allocator.free(backend_edit);
+    try fixture.db.setInput(queries.SourceText, 0, backend_edit);
+    try fixture.expectExit(44);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "scoped context snapshots recompute provider retention without signature edits" {
+    const source =
+        \\import std.memory.{Allocator, AllocationLayout, RawBlock, AllocationError, root_allocator}
+        \\struct Tracker
+        \\    upstream: Allocator
+        \\    pub func allocate(imm self: Tracker, layout: AllocationLayout) RawBlock | AllocationError -> self.upstream.allocate(layout)
+        \\    pub func deallocate(imm self: Tracker, deinit block: RawBlock) unit -> self.upstream.deallocate(block^)
+        \\func create(imm provider: Allocator) List(int) | AllocationError -> List(int).new(0)
+        \\func escape() List(int) | AllocationError
+        \\    var tracker = Tracker{upstream = root_allocator()}
+        \\    return create(Allocator.from(Tracker, tracker))
+        \\func run() int
+        \\    const value = escape()
+        \\    if value is AllocationError -> return 90
+        \\    return value.len() + 42
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const retention_edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, "List(int).new(0)", "List(int).new_with(provider, 0)");
+    defer std.testing.allocator.free(retention_edit);
+    try fixture.db.setInput(queries.SourceText, 0, retention_edit);
+    try fixture.expectDiagnostic(.borrow_outlives_source);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
 test "returned callable construction facts recompute across ownership changes after restore" {
     const source =
         \\struct Provider
@@ -41,6 +103,60 @@ test "returned callable construction facts recompute across ownership changes af
     defer std.testing.allocator.free(changed);
     try fixture.db.setInput(queries.SourceText, 0, changed);
     try fixture.expectExit(44);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}
+
+test "nested callable ownership conditions survive restoration and body-only ownership edits" {
+    const source =
+        \\import std.memory.{Allocator, AllocationLayout, RawBlock, AllocationError, root_allocator}
+        \\import std.callables.{clone}
+        \\import std.logging.{Logger, LogLevel, log}
+        \\struct Tracker
+        \\    upstream: Allocator
+        \\    pub func allocate(imm self: Tracker, layout: AllocationLayout) RawBlock | AllocationError -> self.upstream.allocate(layout)
+        \\    pub func deallocate(imm self: Tracker, deinit block: RawBlock) unit -> self.upstream.deallocate(block^)
+        \\struct Callbacks
+        \\    callback: func() int
+        \\struct Holder
+        \\    callbacks: Callbacks
+        \\struct Backend
+        \\    saved: String
+        \\    pub func emit(mut self: Backend, level: LogLevel, imm message: StringView) unit | AllocationError
+        \\        var owned = String.empty()
+        \\        _ = owned.append(message)?
+        \\        self.saved = owned^
+        \\        return unit
+        \\struct Capture
+        \\    value: int
+        \\    copy = func(imm self: Capture) Capture
+        \\        _ = log(LogLevel.info, "copied")
+        \\        return Capture{value = self.value}
+        \\func read() int -> 42
+        \\func input(value: int) func() int -> read
+        \\func duplicate(imm holder: Holder) unit
+        \\    var tracker = Tracker{upstream = root_allocator()}
+        \\    with context.allocator = Allocator.from(Tracker, tracker)
+        \\        const copied = clone(holder.callbacks.callback)
+        \\        _ = copied
+        \\func escaped() String
+        \\    const callback = input(42)
+        \\    var backend = Backend{saved = String.empty()}
+        \\    with context.logger = Logger.from(Backend, backend, LogLevel.info)
+        \\        duplicate(Holder{callbacks = Callbacks{callback = callback}})
+        \\    return backend.saved^
+        \\func run() int
+        \\    const saved = escaped()
+        \\    return saved.byte_length() + 42
+        \\exit(run())
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const owning = try std.mem.replaceOwned(u8, std.testing.allocator, source, "func input(value: int) func() int -> read", "func input(value: int) func() int\n    const capture = Capture{value = value}\n    return () => capture.value");
+    defer std.testing.allocator.free(owning);
+    try fixture.db.setInput(queries.SourceText, 0, owning);
+    try fixture.expectDiagnostic(.borrow_outlives_source);
     try fixture.db.setInput(queries.SourceText, 0, source);
     try fixture.expectExit(42);
 }
@@ -661,7 +777,7 @@ test "copied optional argument snapshots preserve loop growth and reject retaine
         \\        value and value is T -> return value^
         \\        _ -> ()
         \\    panic "required operation failed"
-        \\func calculate() int | none
+        \\func calculate() int | AllocationError
         \\    var pending: List(int) = [1]
         \\    var head = 0
         \\    var total = 0
@@ -671,10 +787,8 @@ test "copied optional argument snapshots preserve loop growth and reject retaine
         \\        head += 1
         \\        total += current
         \\        if current < 4
-        \\            const checked_value_1 = pending.append(current * 2)
-        \\            if not (checked_value_1 is unit) -> return none
-        \\            const checked_value_2 = pending.append(current * 2 + 1)
-        \\            if not (checked_value_2 is unit) -> return none
+        \\            _ = pending.append(current * 2)?
+        \\            _ = pending.append(current * 2 + 1)?
         \\    return total + 14
         \\func run() int
         \\    match calculate()
@@ -858,11 +972,10 @@ test "readonly aggregate snapshots preserve independent owned and reference perm
         \\    view: Span(int)
         \\    target: Ref(int)
         \\func snapshot(imm source: Views) Views -> source
-        \\func calculate() int | none
+        \\func calculate() int | AllocationError
         \\    var values = [19, 23]
         \\    var target = 41
-        \\    var owner = Box.new(snapshot(Views{view = values.span(), target = Ref.from(target)}))
-        \\    if not (owner is Box(Views)) -> return none
+        \\    var owner = Box.new(snapshot(Views{view = values.span(), target = Ref.from(target)}))?
         \\    ref copied = owner.borrow()
         \\    copied.target.value += 1
         \\    return copied.view[0] + copied.view[1] + target - 42
@@ -889,18 +1002,15 @@ test "temporal reference snapshots recompute aliasing and mutation effects" {
         \\struct Captures(T: type)
         \\    left: Ref(T)
         \\    right: Ref(T)
-        \\func inspect(captures: Captures(String)) int | none
+        \\func inspect(captures: Captures(String)) int | AllocationError
         \\    const view = captures.left.value.view()
-        \\    const checked_value_1 = captures.right.value.append("x")
-        \\    if not (checked_value_1 is unit) -> return none
+        \\    _ = captures.right.value.append("x")?
         \\    return view.byte_length() + 39
-        \\func calculate() int | none
+        \\func calculate() int | AllocationError
         \\    var left: String = "abc"
         \\    var right: String = ""
         \\    const captures = Captures(String){left = Ref.from(left), right = Ref.from(right)}
-        \\    return ((match inspect(captures)
-        \\        _selected_result_2 and _selected_result_2 is int -> _selected_result_2
-        \\        _ -> return none))
+        \\    return inspect(captures)
         \\func run() int
         \\    match calculate()
         \\        result and result is int -> return result
@@ -917,7 +1027,7 @@ test "temporal reference snapshots recompute aliasing and mutation effects" {
     defer std.testing.allocator.free(aliased);
     try fixture.db.setInput(queries.SourceText, 0, aliased);
     try fixture.expectDiagnostic(.borrow_outlives_source);
-    const no_mutation = try std.mem.replaceOwned(u8, std.testing.allocator, aliased, "const checked_value_1 = captures.right.value.append(\"x\")\n    if not (checked_value_1 is unit) -> return none", "_ = 0");
+    const no_mutation = try std.mem.replaceOwned(u8, std.testing.allocator, aliased, "_ = captures.right.value.append(\"x\")?", "_ = 0");
     defer std.testing.allocator.free(no_mutation);
     try fixture.db.setInput(queries.SourceText, 0, no_mutation);
     try fixture.expectExit(42);
@@ -997,7 +1107,7 @@ test "pull cursor snapshots recompute delivery kind effects and protocol methods
     const changed_result = try std.mem.replaceOwned(u8, std.testing.allocator, source, "int | End", "bool | End");
     defer std.testing.allocator.free(changed_result);
     try fixture.db.setInput(queries.SourceText, 0, changed_result);
-    try fixture.expectDiagnostic(.return_type_mismatch);
+    try fixture.expectDiagnostics(&.{ .return_type_mismatch, .missing_operation });
     const missing = try std.mem.replaceOwned(u8, std.testing.allocator, source, "func next", "func advance");
     defer std.testing.allocator.free(missing);
     try fixture.db.setInput(queries.SourceText, 0, missing);
@@ -1159,11 +1269,26 @@ const Fixture = struct {
     }
 
     fn expectDiagnostic(self: Fixture, kind: std.meta.Tag(structures.Diagnostic.Kind)) !void {
+        return self.expectDiagnostics(&.{kind});
+    }
+
+    fn expectDiagnostics(self: Fixture, kinds: []const std.meta.Tag(structures.Diagnostic.Kind)) !void {
         try std.testing.expect((try self.db.get(queries.BuildExecutable, 0)).* == null);
         const diagnostics = try self.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, std.testing.allocator);
         defer std.testing.allocator.free(diagnostics);
-        try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
-        try std.testing.expectEqual(kind, std.meta.activeTag(diagnostics[0].kind));
+        errdefer for (diagnostics) |diagnostic| std.debug.print("unexpected diagnostic: {any}\n", .{diagnostic});
+        try std.testing.expectEqual(kinds.len, diagnostics.len);
+        for (kinds) |kind| {
+            var actual: usize = 0;
+            for (diagnostics) |diagnostic| if (std.meta.activeTag(diagnostic.kind) == kind) {
+                actual += 1;
+            };
+            var expected: usize = 0;
+            for (kinds) |other| if (other == kind) {
+                expected += 1;
+            };
+            try std.testing.expectEqual(expected, actual);
+        }
     }
 
     fn executable(db: *query.Database) !structures.Executable {
@@ -1300,9 +1425,8 @@ test "range snapshots restore raw bounds and recompute runtime endpoint presence
 test "raw borrow snapshots recompute source and registered signature edits" {
     const source =
         \\import std.memory.{Allocation}
-        \\func calculate() int | none
-        \\    var storage = Allocation(int).allocate(1)
-        \\    if not (storage is Allocation(int)) -> return none
+        \\func calculate() int | none | AllocationError
+        \\    var storage = Allocation(int).allocate(1)?
         \\    if (storage.unsafe_initialize(0, 20) is unit) -> unit
         \\    else
         \\        storage^.deallocate()
@@ -1457,9 +1581,8 @@ test "evaluation heap snapshots restore scalar results and recompute callee elem
         \\    value: int
         \\    drop = func(deinit self: Item) -> self.trace.value = self.trace.value + self.value
         \\func element() int -> 2
-        \\func calculate(var trace: Ref(int)) int | none
-        \\    const owner = Box(Item).new(Item{trace = trace, value = element()})
-        \\    if not (owner is Box(Item)) -> return none
+        \\func calculate(var trace: Ref(int)) int | AllocationError
+        \\    const owner = Box(Item).new(Item{trace = trace, value = element()})?
         \\    return owner.borrow().value + 38
         \\func run() int
         \\    var trace = Array(int, 1).filled(0)
@@ -1997,19 +2120,17 @@ test "allocating initializer snapshots retain named return hooks and invalidate 
         \\    move = func(deinit self: Item) Item -> Item{value = self.value + 2}
         \\static Owner = Box(Item)
         \\static create = Owner.new
-        \\func own(init item: Item) Box(Item) | none -> create(item)
+        \\func own(init item: Item) Box(Item) | AllocationError -> create(item)
         \\func copied() Item
         \\    const local = Item{value = 19}
         \\    return local
         \\func moved() Item
         \\    const local = Item{value = 20}
         \\    return local^
-        \\func run() int | none
-        \\    const callback: func(init Item) Box(Item) | none = own
-        \\    const first = callback(copied())
-        \\    if not (first is Box(Item)) -> return none
-        \\    const second = callback(moved())
-        \\    if not (second is Box(Item)) -> return none
+        \\func run() int | AllocationError
+        \\    const callback: func(init Item) Box(Item) | AllocationError = own
+        \\    const first = callback(copied())?
+        \\    const second = callback(moved())?
         \\    return first.borrow().value + second.borrow().value
         \\match run()
         \\    value and value is int -> exit(value)
@@ -2027,11 +2148,11 @@ test "allocating initializer snapshots retain named return hooks and invalidate 
     for ([_][]const u8{
         "copy = func(imm self: Item) Item -> Item{value = self.value + 1}",
         "move = func(deinit self: Item) Item -> Item{value = self.value + 2}",
-        "func own(init item: Item) Box(Item) | none -> create(item)",
+        "func own(init item: Item) Box(Item) | AllocationError -> create(item)",
     }, [_][]const u8{
         "copy = none",
         "move = none",
-        "func own(init item: Item) Box(Item) | none\n    const first = create(item)\n    return create(item)",
+        "func own(init item: Item) Box(Item) | AllocationError\n    const first = create(item)\n    return create(item)",
     }) |original, replacement| {
         const edit = try std.mem.replaceOwned(u8, std.testing.allocator, source, original, replacement);
         defer std.testing.allocator.free(edit);
@@ -2046,7 +2167,7 @@ test "allocating initializer snapshots retain skipped evaluation after allocator
     const source =
         \\func forbidden() int -> exit(90)
         \\func run() int
-        \\    const callback: func(init int) Box(int) | none = Box(int).new
+        \\    const callback: func(init int) Box(int) | AllocationError = Box(int).new
         \\    if (callback(forbidden()) is Box(int)) -> return 1
         \\    return 42
         \\exit(run())
@@ -2088,7 +2209,7 @@ test "allocating initializer snapshots retain partial cleanup and consumption on
             \\func run() int
             \\    var count = Box.new(40)
             \\    if not (count is Box(int)) -> panic "unexpected allocation refusal"
-            \\    const callback: func(init Item | none) Box(Item | none) | none = Box(Item | none).new
+            \\    const callback: func(init Item | none) Box(Item | none) | AllocationError = Box(Item | none).new
             \\    var leaf = Leaf{{count = Ref.from(count.borrow())}}
             \\    const owner = callback(assemble(leaf^, {s}))
             \\    if not (owner is Box(Item | none)) -> return 91
@@ -2117,9 +2238,8 @@ test "raw slot initializer snapshots retain immovable destruction and recompute 
         \\    drop = func(deinit self: Item) -> exit(self.value + 0)
         \\func make(value: int) Item -> Item{value = value}
         \\func initialize(mut storage: Allocation(Item), init item: Item) unit | none -> storage.unsafe_initialize(1, item)
-        \\func run() unit | none
-        \\    var storage = allocate(Item, 2)
-        \\    if not (storage is Allocation(Item)) -> return none
+        \\func run() unit | none | AllocationError
+        \\    var storage = allocate(Item, 2)?
         \\    const callback: func(mut Allocation(Item), init Item) unit | none = initialize
         \\    match callback(storage, make(42))
         \\        filtered_value_111 and filtered_value_111 is unit -> ()
@@ -2423,12 +2543,10 @@ test "text snapshots restore symbolic data borrowed projections and invalidate l
 test "text snapshots restore owned string cleanup and standard stream artifacts" {
     const source =
         \\import std.io.{write_text, stdout}
-        \\func length() int | none
+        \\func length() int | AllocationError | IoError
         \\    var text = "hé"
-        \\    const checked_value_1 = text.append("llo")
-        \\    if not (checked_value_1 is unit) -> return none
-        \\    const checked_value_2 = write_text(stdout, "")
-        \\    if not (checked_value_2 is unit) -> return none
+        \\    _ = text.append("llo")?
+        \\    _ = write_text(stdout, "")?
         \\    return text.byte_length() + 36
         \\func run() int
         \\    match length()
@@ -2555,9 +2673,8 @@ test "collection snapshots retain generated callable lexical environments" {
 
 test "collection snapshots restore sequence carriers and callable reference origins" {
     const source =
-        \\func gather(imm collect: func(init collection_sequence(Ref(int))) List(Ref(int)) | none, ref source: Array(int, 2)) int | none
-        \\    const values = collect([Ref.from(item) for ref item in source])
-        \\    if not (values is List(Ref(int))) -> return none
+        \\func gather(imm collect: func(init collection_sequence(Ref(int))) List(Ref(int)) | AllocationError, ref source: Array(int, 2)) int | AllocationError
+        \\    const values = collect([Ref.from(item) for ref item in source])?
         \\    return values[0].value + values[1].value
         \\func run() int
         \\    var source = [19, 23]
@@ -2581,7 +2698,7 @@ test "collection snapshots restore sequence carriers and callable reference orig
 
 test "collection snapshots restore inferred generic sequence construction" {
     const source =
-        \\func gather(static T: type, init values: collection_sequence(T)) List(T) | none
+        \\func gather(static T: type, init values: collection_sequence(T)) List(T) | AllocationError
         \\    return List(T).collect(values)
         \\func run() int
         \\    match gather([value for value in [19, 23]])

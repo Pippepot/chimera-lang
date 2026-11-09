@@ -2485,7 +2485,7 @@ fn callableAdapterSignature(ctx: anytype, instance: structures.InstanceId, owner
 fn shiftCallableOrigin(origin: *structures.ReferenceOriginContract) void {
     if (origin.parameter) |*parameter| parameter.* += 1;
     if (origin.forcing_context) |*forcing| forcing.parameter += 1;
-    if (origin.owning_parameter) |*parameter| parameter.* += 1;
+    if (origin.owning_callable) |*source| source.parameter += 1;
     if (origin.output_parameter) |*parameter| parameter.* += 1;
 }
 
@@ -2558,7 +2558,7 @@ fn callableAdapterBody(ctx: anytype, instance: structures.InstanceId, owner: str
     const signature = (try ctx.get(FunctionCandidateSignature, instance)).* orelse return null;
     const facts: TypeFacts(@TypeOf(ctx)) = .{ .ctx = ctx };
     const physical_result = if (signature.result_mode == .reference) try facts.referenceType(signature.return_type) else signature.return_type;
-    var body: structures.FunctionBodyAnalysis = .{ .return_type = physical_result, .entry = @fromBackingInt(0), .root_instance = instance };
+    var body: structures.FunctionBodyAnalysis = .{ .return_type = physical_result, .entry = @fromBackingInt(0) };
     errdefer body.deinit(ctx.allocator());
     body.reference_contract = (try callableAdapterReferenceContract(ctx, instance, owner, adapter)) orelse return null;
     const modes = try ctx.allocator().alloc(structures.ParameterMode, signature.parameters.len);
@@ -4387,7 +4387,7 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             if (external) |symbol| {
                 switch (symbol) {
                     .static_iteration_item => return self.captureStaticItem(signature.parameters[0].type_id, arguments[0], call_span),
-                    .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout, .primitive_operation, .numeric_converter, .copy_value, .move_value, .erase, .clone, .copy_callable, .drop_callable, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => {},
+                    .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout, .layout_for, .primitive_operation, .numeric_converter, .copy_value, .move_value, .erase, .clone, .copy_callable, .drop_callable, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => {},
                     .allocate_raw => return self.allocateRaw(signature.return_type, arguments[0], storage),
                     .cursor_aligned => return .{ .returned = .{ .runtime = .{ .bool = comptime_interpreter.cursorAligned(arguments[0], comptime_interpreter.integerValue(arguments[1])) } } },
                     .deallocate_raw => {
@@ -4768,6 +4768,52 @@ fn hasReferenceContractBody(ctx: anytype, instance: structures.InstanceId) !bool
     return true;
 }
 
+fn trivialReferenceContractBody(ctx: anytype, instance: structures.InstanceId) anyerror!bool {
+    const location = try ctx.lookupInterned(ItemLocations, instance.item);
+    const signature = (try bodySignature(ctx, instance, location.*)) orelse return false;
+    if (!signature.return_type.isPrimitive()) return false;
+    for (signature.parameters) |parameter| {
+        if (!parameter.type_id.isPrimitive()) return false;
+        if (parameter.mode == .ref or parameter.mode == .mut or parameter.mode == .init) return false;
+    }
+    const construction = (try ctx.get(ConstructFunctionBody, instance)).* orelse return false;
+    if (construction != .success) return false;
+    // This proves the absence of reference/context effects without validating
+    // a context-free scalar callee's runtime typing at an otherwise lazy call.
+    for (construction.success.expressions) |expression| {
+        switch (expression.operation) {
+            .comparison,
+            .conjunction,
+            .disjunction,
+            .negation,
+            .integer_literal,
+            .int_literal_value,
+            .numeric,
+            .float_literal,
+            .integer,
+            .byte,
+            .boolean,
+            .type_value,
+            .unit,
+            .none,
+            .local_read,
+            .local_transfer,
+            .numeric_conversion,
+            .overflow_context,
+            .discard,
+            .sequence,
+            .if_else,
+            .loop,
+            .scope,
+            => {},
+            .annotation => |annotation| if (!annotation.type_id.isPrimitive()) return false,
+            .assignment => |assignment| if (assignment.fields.start != assignment.fields.end) return false,
+            else => return false,
+        }
+    }
+    return true;
+}
+
 pub const ReferenceCalleeList = struct {
     instances: []const structures.InstanceId,
     initial_contract: structures.ReferenceContract = .{},
@@ -4877,13 +4923,12 @@ fn inferReferenceContract(ctx: anytype, instance: structures.InstanceId) anyerro
     const location = try ctx.lookupInterned(ItemLocations, instance.item);
     if (location.adapter) |adapter| return callableAdapterReferenceContract(ctx, instance, location.owner.?, adapter);
     if (!try hasReferenceContractBody(ctx, instance)) return .{};
-    const analyzed = ctx.get(AnalyzeFunctionInstance, instance) catch |err| switch (err) {
-        error.QueryCycle => null,
-        else => return err,
-    };
-    if (analyzed) |cached| {
-        const body = cached.* orelse return null;
-        return body.reference_contract;
+    if (try trivialReferenceContractBody(ctx, instance)) return .{};
+    const signature = (try bodySignature(ctx, instance, location.*)) orelse return null;
+    if (signature.return_type == .type) return analyzeFunctionBody(ctx, true, instance, true, null);
+    if (try reusableTyping(ctx, instance)) |validated| {
+        if (validated.precise or structures.ReferenceContract.equivalent(validated.body.reference_contract, .{}))
+            return validated.body.reference_contract;
     }
     const component = (try callerComponent(ctx, ReferenceCallees, instance, false)) orelse return null;
     defer ctx.allocator().free(component);
@@ -5262,7 +5307,7 @@ fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: str
         return if (contract_only) try value_operations.Owned(structures.ReferenceContract).clone(ctx.allocator(), body.reference_contract) else body;
     }
     const signature = (try bodySignature(ctx, instance, loc.*)) orelse return null;
-    if (!allow_type_values and signature.return_type == .type) return null;
+    if (!allow_type_values and !contract_only and signature.return_type == .type) return null;
     const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
     const builtin_body = try typedBuiltinBody(ctx, instance.item, loc.*);
     const construction = (try ctx.get(ConstructFunctionBody, instance)).* orelse return null;
@@ -5281,7 +5326,7 @@ fn analyzeFunctionBody(ctx: anytype, comptime contract_only: bool, instance: str
         resolved.file_id,
         signature.parameters,
         signature.return_type,
-        .{ .publish_instruction_spans = true, .is_entry = loc.kind == .top_level_entry, .allow_type_values = allow_type_values, .builtin_body = builtin_body, .result_mode = signature.result_mode, .infer_reference_contract = reference_inference != null, .widen_reference_indices = if (reference_inference) |inference| inference.recursive else false },
+        .{ .publish_instruction_spans = true, .is_entry = loc.kind == .top_level_entry, .allow_type_values = allow_type_values or contract_only, .builtin_body = builtin_body, .result_mode = signature.result_mode, .infer_reference_contract = reference_inference != null, .widen_reference_indices = if (reference_inference) |inference| inference.recursive else false },
         analysis_context,
         unresolved,
     );
@@ -5515,7 +5560,7 @@ fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?s
         .allocate_raw => try codegen.compileExternalAllocateRaw(signature, types, ctx.allocator()),
         .deallocate_raw => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
         .cursor_aligned => try codegen.compileExternalCursorAligned(signature, types, ctx.allocator()),
-        .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout => unreachable,
+        .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout, .layout_for => unreachable,
         .static_iteration_item => null,
         .primitive_operation, .numeric_converter, .copy_value, .move_value, .erase, .clone, .copy_callable, .drop_callable, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .allocation_count, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => unreachable,
         .io_read, .io_write => try codegen.compileExternalByteIo(symbol == .io_read, signature, types, ctx.allocator()),
@@ -6128,7 +6173,7 @@ test "inline array borrow containment and public annotations follow elements" {
             const analysis: AnalysisContext(@TypeOf(ctx)) = .{ .ctx = ctx, .file_id = file_id };
             for (
                 [_][]const u8{ "References", "EmptyReferences", "AllocatedReferences" },
-                [_]bool{ true, false, false },
+                [_]bool{ true, false, true },
                 [_]bool{ true, false, true },
             ) |name, contains, stores| {
                 const type_id = (try ctx.lookupInterned(CompileTimeValues, (try ctx.get(ResolveStatic, scope.resolve(name).?)).*.?)).type;

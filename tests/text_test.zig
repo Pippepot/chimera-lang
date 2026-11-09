@@ -110,7 +110,7 @@ test "collection string converters recursively borrow strings and custom move on
         \\    copy = none
         \\    pub value: int
         \\pub converter(imm value: Item) String -> String(value.value)
-        \\func inspect() int | none
+        \\func inspect() int | none | AllocationError
         \\    var values = [Item{value = -2}, Item{value = 42}]
         \\    if String(values) <> "[-2, 42]" -> return 90
         \\    if String(values.span()) <> "[-2, 42]" -> return 91
@@ -133,8 +133,7 @@ test "collection string converters recursively borrow strings and custom move on
         \\    const bytes: Array(byte, 3) = [0, 128, 255]
         \\    if String(BytesView.from_array(3, bytes)) <> "[0, 128, 255]" -> return 99
         \\    if String(Ref.from(values[1])) <> "Ref(42)" -> return 100
-        \\    const boxed = Box(Item).new(Item{value = 42})
-        \\    if not (boxed is Box(Item)) -> return none
+        \\    const boxed = Box(Item).new(Item{value = 42})?
         \\    if String(boxed) <> "Box(42)" -> return 101
         \\    return values[0].value + 44
         \\func run() int
@@ -676,12 +675,10 @@ test "variant string conversion formats heterogeneous collections without copyin
 test "text output writes exact UTF-8 NUL and newline bytes to standard streams" {
     try expectIo(
         \\import std.io.{write_text, stdout, stderr}
-        \\func output() unit | none
+        \\func output() unit | IoError
         \\    print("é\0")
-        \\    const checked_value_1 = write_text(stderr, "oops")
-        \\    if not (checked_value_1 is unit) -> return none
-        \\    const checked_value_2 = write_text(stdout, "")
-        \\    if not (checked_value_2 is unit) -> return none
+        \\    _ = write_text(stderr, "oops")?
+        \\    _ = write_text(stdout, "")?
         \\    return unit
         \\match output()
         \\    filtered_value_48 and filtered_value_48 is unit -> exit(42)
@@ -693,21 +690,15 @@ test "text output writes exact UTF-8 NUL and newline bytes to standard streams" 
 test "byte input initializes only the returned prefix and reports EOF" {
     try expectIo(
         \\import std.memory.{List}
-        \\import std.io.{read_bytes, write_all, stdin, stdout}
-        \\func echo() int | none
-        \\    var buffer = List(byte).new(0)
-        \\    if not (buffer is List(byte)) -> return none
-        \\    const count = read_bytes(stdin, buffer, 100)
-        \\    if not (count is int) -> return none
+        \\import std.io.{read_bytes, write_all, stdin, stdout, IoError}
+        \\func echo() int | AllocationError | IoError
+        \\    var buffer = List(byte).new(0)?
+        \\    const count = read_bytes(stdin, buffer, 100)?
         \\    const bytes = buffer.bytes()
-        \\    if not (bytes is BytesView) -> return none
-        \\    const checked_value_4 = write_all(stdout, bytes)
-        \\    if not (checked_value_4 is unit) -> return none
+        \\    _ = write_all(stdout, bytes)?
         \\    if (bytes.get(count) is byte) -> return 90
-        \\    const eof = read_bytes(stdin, buffer, 1)
-        \\    if not (eof is int) -> return none
-        \\    const empty = read_bytes(stdin, buffer, 0)
-        \\    if not (empty is int) -> return none
+        \\    const eof = read_bytes(stdin, buffer, 1)?
+        \\    const empty = read_bytes(stdin, buffer, 0)?
         \\    return count + eof + empty + 36
         \\match echo()
         \\    result and result is int -> exit(result)
@@ -1079,11 +1070,10 @@ test "end relative access preserves borrow permissions and invalidation" {
     defer std.testing.allocator.free(rejected);
     try SourceFixture.expectSourceDiagnostic(rejected, .reference_not_writable);
     try SourceFixture.expectSourceDiagnostic(
-        \\func inspect() int | none
+        \\func inspect() int | AllocationError
         \\    var values: List(int) = [40]
         \\    ref item = values[^1]
-        \\    const checked_value_1 = values.append(2)
-        \\    if not (checked_value_1 is unit) -> return none
+        \\    _ = values.append(2)?
         \\    return item
         \\match inspect()
         \\    result and result is int -> exit(result)
@@ -1769,14 +1759,12 @@ test "generic spans cannot escape local storage or survive owner transfer" {
         \\    _ -> ()
     , .borrow_outlives_source);
     try SourceFixture.expectAnySourceDiagnostic(
-        \\func consume(deinit values: List(int)) int -> values.len()
-        \\func inspect() int | none
-        \\    var entries = List(int).new(1)
-        \\    if not (entries is List(int)) -> return none
-        \\    const checked_value_2 = entries.append(42)
-        \\    if not (checked_value_2 is unit) -> return none
+        \\func consume(var values: List(int)) int -> values.len()
+        \\func inspect() int | AllocationError
+        \\    var entries = List(int).new(1)?
+        \\    _ = entries.append(42)?
         \\    const view = entries.span()
-        \\    consume(entries)
+        \\    consume(entries^)
         \\    return view[0]
         \\match inspect()
         \\    answer and answer is int -> exit(answer)
@@ -1846,10 +1834,9 @@ test "literal backing stays static with no prelude or a shadowed String name" {
 
 test "owned strings convert to borrowed text for ordinary print callables" {
     try expectIo(
-        \\func output() unit | none
+        \\func output() unit | AllocationError
         \\    var text = "hello"
-        \\    const checked_value_1 = text.append("!")
-        \\    if not (checked_value_1 is unit) -> return none
+        \\    _ = text.append("!")?
         \\    const writer: func(imm String) unit = print
         \\    writer(text)
         \\    return ()
@@ -1860,16 +1847,14 @@ test "owned strings convert to borrowed text for ordinary print callables" {
 
 test "from_utf8 validates before allocation and owns a copy independent of its input" {
     try expectIo(
-        \\func output() unit | none
+        \\func output() unit | none | AllocationError | Utf8Error
         \\    var array: Array(byte, 2) = [195, 169]
         \\    const bytes = BytesView.from_array(2, array)
-        \\    var text = String.from_utf8(bytes)
-        \\    if not (text is String) -> return none
+        \\    var text = String.from_utf8(bytes)?
         \\    array[0] = 65
-        \\    const checked_value_2 = text.append("!")
-        \\    if not (checked_value_2 is unit) -> return none
+        \\    _ = text.append("!")?
         \\    const invalid: Array(byte, 1) = [128]
-        \\    if (String.from_utf8(BytesView.from_array(1, invalid)) is String) -> return none
+        \\    if not (String.from_utf8(BytesView.from_array(1, invalid)) is Utf8Error) -> return none
         \\    print(text)
         \\    return ()
         \\if (output() is unit) -> exit(42)
@@ -1916,7 +1901,9 @@ test "short writes report progress" {
         \\        count and count is int ->
         \\            if count <= 0 -> return 90
         \\            if count >= 16384 -> return 91
-        \\            if (write_all(stdout, bytes) is unit) -> return 92
+        \\            const failed = write_all(stdout, bytes)
+        \\            if not (failed is IoError) -> return 92
+        \\            if failed.progress <> 0 -> return 94
         \\            return 42
         \\        _ -> ()
         \\    return 93
@@ -1938,7 +1925,9 @@ test "write_all preserves completed writes before an OS failure" {
         \\const array = Array(byte, 16384).filled(42)
         \\if not (array is Array(byte, 16384)) -> panic "unexpected none"
         \\const bytes = BytesView.from_array(16384, array)
-        \\if (write_all(stdout, bytes) is unit) -> exit(90)
+        \\const failed = write_all(stdout, bytes)
+        \\if not (failed is IoError) -> exit(90)
+        \\if failed.progress <> 4096 -> exit(91)
         \\exit(42)
     , .ignore, .{ .file = pipe[1] }, false);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, term);
@@ -1953,7 +1942,9 @@ test "broken output pipes propagate write failure instead of SIGPIPE termination
     defer pipe[1].close(std.testing.io);
     const term = try runWithStreams(
         \\import std.io.{write_text, stdout}
-        \\if (write_text(stdout, "hello") is unit) -> exit(90)
+        \\const failed = write_text(stdout, "hello")
+        \\if not (failed is IoError) -> exit(90)
+        \\if failed.progress <> 0 -> exit(91)
         \\exit(42)
     , .ignore, .{ .file = pipe[1] }, false);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, term);
@@ -1965,12 +1956,10 @@ test "failed reads preserve the initialized byte prefix" {
     const term = try runWithStreams(
         \\import std.memory.{List}
         \\import std.io.{read_bytes, stdin}
-        \\func run() int | none
-        \\    var buffer = List(byte).new(1)
-        \\    if not (buffer is List(byte)) -> return none
-        \\    const checked_value_2 = buffer.append(41)
-        \\    if not (checked_value_2 is unit) -> return none
-        \\    if (read_bytes(stdin, buffer, 16) is int) -> return 90
+        \\func run() int | AllocationError
+        \\    var buffer = List(byte).new(1)?
+        \\    _ = buffer.append(41)?
+        \\    if not (read_bytes(stdin, buffer, 16) is IoError) -> return 90
         \\    match buffer[0]
         \\        first -> return buffer.len() + byte_int(first)
         \\    return 91
@@ -1989,7 +1978,7 @@ test "allocation failure preserves strings and repeated clones release their sto
         \\    var index = 0
         \\    loop
         \\        if index == 1000 -> break
-        \\        if (text.reserve(2147483647) is unit) -> return 90
+        \\        if not (text.reserve(2147483647) is AllocationError) -> return 90
         \\        match text.clone()
         \\            copy and copy is String -> if copy.byte_length() <> 5 -> return 91
         \\            _ -> return 92

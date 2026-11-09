@@ -76,6 +76,39 @@ test "explicit borrowed allocator factories preserve the original receiver and e
     , 42);
 }
 
+test "allocation layouts preserve zero alignment and report size limits without compiler failures" {
+    try Fixture.expectParity(
+        \\import std.memory.{layout_for, type_layout, AllocationError}
+        \\func bytes(count: int) int
+        \\    const result = layout_for(int, count)
+        \\    if result is AllocationError -> return result.reason
+        \\    return result.byte_size
+        \\func run() int
+        \\    if bytes(-1) <> AllocationError.invalid_layout.reason -> return 90
+        \\    if bytes(0) <> 0 or bytes(3) <> 12 -> return 91
+        \\    if bytes(536870911) <> 2147483644 -> return 92
+        \\    if bytes(536870912) <> AllocationError.size_limit.reason -> return 93
+        \\    const empty = layout_for(Array(int, 536870912), 0)
+        \\    if empty is AllocationError -> return 94
+        \\    if empty.byte_size <> 0 or empty.alignment <> type_layout(int).alignment -> return 95
+        \\    const oversized = layout_for(Array(int, 2147483647), 1)
+        \\    if not (oversized is AllocationError) -> return 96
+        \\    if oversized.reason <> AllocationError.size_limit.reason -> return 97
+        \\    const negative = layout_for(Array(int, 2147483647), -1)
+        \\    if not (negative is AllocationError) -> return 98
+        \\    if negative.reason <> AllocationError.invalid_layout.reason -> return 99
+        \\    const zero = layout_for(unit, 2147483647)
+        \\    if zero is AllocationError -> return 100
+        \\    if zero.byte_size <> 0 or zero.alignment <> 1 -> return 101
+        \\    return 42
+    , 42);
+    for ([_][]const u8{
+        "import std.memory.{type_layout}\n_ = type_layout(Array(int, 536870912))",
+        "import std.memory.{type_layout}\n_ = type_layout(Array(int, 2147483647))",
+    }) |source| try Fixture.expectAnySourceDiagnostic(source, .type_layout_too_large);
+    try Fixture.expectAnySourceDiagnostic("import std.memory.{type_layout}\n_ = type_layout(type)", .compile_time_only_type);
+}
+
 test "explicit logger filtering and borrowed backends work in both engines" {
     try Fixture.expectParity(
         \\import std.logging.{Logger, LogLevel, emit}
@@ -998,6 +1031,16 @@ test "opaque owning callable hooks preserve contextual backend mutations and non
         const nonowning = try std.mem.replaceOwned(u8, std.testing.allocator, source, "const capture = Capture{value = 42}\n    const callback: func() int = () => capture.value", "const provider = Provider{value = 42}\n    const callback: func() int = provider.read");
         defer std.testing.allocator.free(nonowning);
         try Fixture.expectSourceExit(nonowning, 0);
+        if (std.mem.eql(u8, case.mode, "imm")) {
+            const nested_template = try std.mem.replaceOwned(u8, std.testing.allocator, template, "func opaque($MODE callback: func() int) unit", "struct Callbacks\n    callback: func() int\nstruct Holder\n    callbacks: Callbacks\nfunc opaque($MODE holder: Holder) unit");
+            defer std.testing.allocator.free(nested_template);
+            const nested = try test_sources.renderTemplate(std.testing.allocator, nested_template, .{ .HOOK = case.hook, .MODE = case.mode, .OPERATION = "const copied = clone(holder.callbacks.callback)\n        _ = copied", .ARGUMENT = "Holder{callbacks = Callbacks{callback = callback}}", .INITIALIZATION = "const capture = Capture{value = 42}\n    const callback: func() int = () => capture.value" });
+            defer std.testing.allocator.free(nested);
+            try Fixture.expectAnySourceDiagnostic(nested, .borrow_outlives_source);
+            const nested_nonowning = try std.mem.replaceOwned(u8, std.testing.allocator, nested, "const capture = Capture{value = 42}\n    const callback: func() int = () => capture.value", "const provider = Provider{value = 42}\n    const callback: func() int = provider.read");
+            defer std.testing.allocator.free(nested_nonowning);
+            try Fixture.expectSourceExit(nested_nonowning, 0);
+        }
     }
 }
 
@@ -1105,4 +1148,116 @@ test "callable reservation refusal precedes deferred capture construction and co
         \\    if copies <> before -> return 92
         \\    return original()
     , 42);
+}
+
+test "destructor backing replacement follows the same last-use boundary as explicit reset" {
+    const source =
+        \\import std.memory.{Allocator, AllocationLayout, RawBlock, AllocationError}
+        \\struct Arena
+        \\    bytes: List(byte)
+        \\    releases: int
+        \\    pub func allocate(mut self: Arena, layout: AllocationLayout) RawBlock | AllocationError
+        \\        var bytes = self.bytes.span()
+        \\        return RawBlock.unsafe_from_span(bytes, layout)
+        \\    pub func deallocate(mut self: Arena, deinit block: RawBlock)
+        \\        self.releases += 1
+        \\        block.retire()
+        \\struct Reset
+        \\    arena: Ref(Arena)
+        \\    drop = func(deinit self: Reset)
+        \\        self.arena.value.bytes = List(byte).filled(0, 8) catch -> panic "reset failed"
+        \\func exercise() int | AllocationError
+        \\    var arena = Arena{bytes = List(byte).filled(0, 8)?, releases = 0}
+        \\    var values = List(int).new_with(Allocator.from(Arena, arena), 1)?
+        \\    _ = values.append(42)?
+        \\    const reset = Reset{arena = Ref.from(arena)}
+        \\    _ = reset
+        \\    _ = values
+        \\    return arena.releases + 41
+        \\func run() int
+        \\    const result = exercise()
+        \\    if result is AllocationError -> return 90
+        \\    return result
+    ;
+    const std = @import("std");
+    const negative = try std.mem.concat(std.testing.allocator, u8, &.{ source, "\n_ = run()" });
+    defer std.testing.allocator.free(negative);
+    try Fixture.expectAnySourceDiagnostic(negative, .borrow_outlives_source);
+    const positive = try std.mem.replaceOwned(u8, std.testing.allocator, source, "_ = reset\n    _ = values", "_ = values\n    _ = reset");
+    defer std.testing.allocator.free(positive);
+    try Fixture.expectParity(positive, 42);
+}
+
+const recursive_provider_source =
+    \\import std.memory.{Allocator, AllocationLayout, RawBlock, AllocationError, root_allocator}
+    \\struct Tracker
+    \\    upstream: Allocator
+    \\    allocations: int
+    \\    releases: int
+    \\    pub func allocate(mut self: Tracker, layout: AllocationLayout) RawBlock | AllocationError
+    \\        self.allocations += 1
+    \\        return self.upstream.allocate(layout)
+    \\    pub func deallocate(mut self: Tracker, deinit block: RawBlock)
+    \\        self.releases += 1
+    \\        self.upstream.deallocate(block^)
+    \\func construct(depth: int, imm provider: Allocator) List(int) | AllocationError
+    \\    if depth > 0 -> return construct(depth - 1, provider)
+    \\    return List(int).new_with(provider, 1)
+    \\
+;
+
+test "recursive allocation forwarding retains provider lifetime and writable backend authority" {
+    try Fixture.expectParity(recursive_provider_source ++
+        \\func exercise() int | AllocationError
+        \\    var tracker = Tracker{upstream = root_allocator(), allocations = 0, releases = 0}
+        \\    var values = construct(2, Allocator.from(Tracker, tracker))?
+        \\    _ = values.append(42)?
+        \\    if values[0] <> 42 -> return 90
+        \\    _ = values
+        \\    return tracker.allocations + tracker.releases + 40
+        \\func run() int
+        \\    const result = exercise()
+        \\    if result is AllocationError -> return 91
+        \\    return result
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(recursive_provider_source ++
+        \\func escape() List(int) | AllocationError
+        \\    var tracker = Tracker{upstream = root_allocator(), allocations = 0, releases = 0}
+        \\    return construct(2, Allocator.from(Tracker, tracker))
+        \\_ = escape()
+    , .borrow_outlives_source);
+}
+
+test "loop provider forwarding preserves outer authority and rejects iteration-local retention" {
+    try Fixture.expectParity(recursive_provider_source ++
+        \\func exercise() int | AllocationError
+        \\    var tracker = Tracker{upstream = root_allocator(), allocations = 0, releases = 0}
+        \\    const provider = Allocator.from(Tracker, tracker)
+        \\    var values = List(int).new(0)?
+        \\    var index = 0
+        \\    loop
+        \\        index += 1
+        \\        values = construct(1, provider)?
+        \\        _ = values.append(20 + index)?
+        \\        if index == 2 -> break
+        \\    if values[0] <> 22 -> return 90
+        \\    _ = values
+        \\    return tracker.allocations + tracker.releases + 38
+        \\func run() int
+        \\    const result = exercise()
+        \\    if result is AllocationError -> return 91
+        \\    return result
+    , 42);
+    try Fixture.expectAnySourceDiagnostic(recursive_provider_source ++
+        \\func escape() List(int) | AllocationError
+        \\    var values = List(int).new(0)?
+        \\    var index = 0
+        \\    loop
+        \\        var tracker = Tracker{upstream = root_allocator(), allocations = 0, releases = 0}
+        \\        values = construct(1, Allocator.from(Tracker, tracker))?
+        \\        index += 1
+        \\        if index == 2 -> break
+        \\    return values^
+        \\_ = escape()
+    , .borrow_outlives_source);
 }

@@ -101,6 +101,7 @@ pub const External = enum {
     copy_callable,
     drop_callable,
     type_layout,
+    layout_for,
     cursor_aligned,
     allocate_raw,
     deallocate_raw,
@@ -122,7 +123,7 @@ pub const External = enum {
             .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => .memory_allocation,
             .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow, .initialize_collection, .initialize_collection_element, .static_iteration_item => .memory_allocation,
             .erase, .clone, .copy_callable, .drop_callable => .callables,
-            .type_layout, .cursor_aligned, .allocate_raw, .deallocate_raw => .memory_raw,
+            .type_layout, .layout_for, .cursor_aligned, .allocate_raw, .deallocate_raw => .memory_raw,
             .allocator_from, .allocator_from_unchecked => .memory_allocator,
             .logger_from, .logger_from_unchecked => .logging,
         };

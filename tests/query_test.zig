@@ -407,6 +407,7 @@ const minimal_primitives =
     \\pub extern func int.-(imm left: int, imm right: int) int
     \\pub extern func int.*(imm left: int, imm right: int) int
     \\pub extern func int./(imm left: int, imm right: int) int
+    \\pub extern func int.&(imm left: int, imm right: int) int
     \\pub extern func int.-(imm self: int) int
     \\pub extern func int.==(imm left: int, imm right: int) bool
     \\pub extern func int.<>(imm left: int, imm right: int) bool
