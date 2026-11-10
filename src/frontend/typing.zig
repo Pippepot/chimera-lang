@@ -10,6 +10,8 @@ const origin_storage = @import("reference_origins.zig");
 /// Ordinary bodies keep under a few hundred thousand reference origins. A body whose
 /// origin sets multiply past this limit fails analysis rather than exhausting memory.
 const max_reference_origins = 2_000_000;
+const max_exact_expansion_calls = 10_000;
+const max_fixpoint_passes = 64;
 const flow_snapshot = @import("flow_snapshot.zig");
 const flow_types = @import("flow_types.zig");
 const cleanup_shape = @import("cleanup_shape.zig");
@@ -733,6 +735,16 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             paths: std.AutoArrayHashMapUnmanaged(Path, void) = .empty,
             memo: std.AutoHashMapUnmanaged(Key, Result) = .empty,
             include_flow: bool = true,
+            calls: u32 = 0,
+            /// Exact expansion unrolls each loop and contents read once per order of visiting
+            /// them, which is exponential in how many are carried together. Past the call budget
+            /// the expansion restarts as a fixpoint that visits each once per pass, a superset
+            /// of the exact result.
+            fixpoint: bool = false,
+            pass: u32 = 0,
+            changed: bool = false,
+            nodes: std.AutoHashMapUnmanaged(u32, Node) = .empty,
+            const Node = struct { origins: ?u32 = null, pass: u32 = 0 };
 
             fn enter(self: *@This(), allocator: std.mem.Allocator, key: u32) !void {
                 const path = try self.paths.getOrPut(allocator, .{ .key = key, .parent = self.path });
@@ -749,6 +761,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 self.visiting.deinit(allocator);
                 self.paths.deinit(allocator);
                 self.memo.deinit(allocator);
+                self.nodes.deinit(allocator);
             }
         };
         const BindingIdentity = union(enum) { unknown, fixed: u32, join: u32 };
@@ -1214,7 +1227,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         /// change when the provisional contents are replaced, so resolved heads
         /// are remembered until then.
         reference_origins_frozen: bool = false,
-        resolved_reference_origins: std.AutoHashMapUnmanaged(ReferenceResolutionKey, ?u32) = .empty,
+        /// Resolutions are valid until a loop or contents summary changes, including while incomplete.
+        resolved_reference_origins: std.AutoHashMapUnmanaged(ReferenceResolutionKey, struct { origins: ?u32, incomplete: bool }) = .empty,
         active_reference_expansion: ?*ReferenceExpansion = null,
         loop_backedges: std.ArrayList(LoopBackedge) = .empty,
         pending_reference_uses: std.ArrayList(PendingReferenceUse) = .empty,
@@ -1449,6 +1463,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             std.debug.assert(!self.type_check_only);
             self.provisional_reference_contents = self.has_cleanup_outputs;
             for (self.reference_contents_reads.items) |*read| read.complete = true;
+            self.resolved_reference_origins.clearRetainingCapacity();
             try self.resolveDeferredServiceMutations();
             for (self.deferred_opaque_outputs.items) |deferred| {
                 const previous_state = self.state;
@@ -8844,6 +8859,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 }
                 join.complete = true;
             }
+            self.resolved_reference_origins.clearRetainingCapacity();
             for (self.loop_reference_origins.items[origin_start..origin_end]) |*loop_origins| {
                 for (self.loop_backedges.items[backedge_start..]) |backedge| {
                     var incoming = self.states.items[@backingInt(backedge.state)].values.get(loop_origins.slot).?.reference_origins;
@@ -8854,6 +8870,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 }
                 loop_origins.complete = true;
             }
+            self.resolved_reference_origins.clearRetainingCapacity();
             self.loop_backedges.shrinkRetainingCapacity(backedge_start);
 
             const merged = try self.mergeExits(baseline, self.loop_breaks.items[break_start..], mode, .loop);
@@ -11794,15 +11811,21 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             if (self.active_reference_expansion) |expansion|
                 return self.expandReferenceOrigins(origins, expansion, incomplete);
             const key: ReferenceResolutionKey = .{ .origins = origins.?, .include_flow = include_flow };
-            if (self.reference_origins_frozen) if (self.resolved_reference_origins.get(key)) |resolved| return resolved;
+            if (self.resolved_reference_origins.get(key)) |cached| {
+                if (cached.incomplete) incomplete.* = true;
+                return cached.origins;
+            }
             var expansion: ReferenceExpansion = .{ .include_flow = include_flow };
             defer expansion.deinit(self.gpa);
             self.active_reference_expansion = &expansion;
             defer self.active_reference_expansion = null;
             var expanded_incomplete = false;
-            const resolved = try self.expandReferenceOrigins(origins, &expansion, &expanded_incomplete);
-            if (expanded_incomplete) incomplete.* = true else if (self.reference_origins_frozen)
-                try self.resolved_reference_origins.put(self.gpa, key, resolved);
+            const resolved = self.expandReferenceOrigins(origins, &expansion, &expanded_incomplete) catch |err| switch (err) {
+                error.ExpansionBudget => try self.settleReferenceOrigins(origins, include_flow, &expansion, &expanded_incomplete),
+                else => return err,
+            };
+            if (expanded_incomplete) incomplete.* = true;
+            try self.resolved_reference_origins.put(self.gpa, key, .{ .origins = resolved, .incomplete = expanded_incomplete });
             return resolved;
         }
 
@@ -11819,6 +11842,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             expansion: *ReferenceExpansion,
             incomplete: *bool,
         ) !?u32 {
+            expansion.calls +|= 1;
+            if (!expansion.fixpoint and expansion.calls > max_exact_expansion_calls) return error.ExpansionBudget;
             var existing = self.originList(origins);
             while (existing.next()) |origin| {
                 if (!expansion.include_flow and origin.flow_only) break;
@@ -11841,8 +11866,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     // Contents keys are tagged so they cannot collide with loop indices.
                     const key = if (origin.contents) |contents_index| contents_index | (@as(u32, 1) << 31) else origin.loop.?;
                     const repeated = std.mem.indexOfScalar(u32, expansion.visiting.items, key) != null;
-                    if (!repeated) try expansion.enter(self.gpa, key);
-                    var expanded = if (origin.contents) |contents_index| contents: {
+                    if (!repeated and !expansion.fixpoint) try expansion.enter(self.gpa, key);
+                    var expanded = if (expansion.fixpoint) try self.settleReferenceNode(origin, key, expansion, &expanded_incomplete) else if (origin.contents) |contents_index| contents: {
                         const contents = self.reference_contents_reads.items[contents_index];
                         if (!contents.complete) expanded_incomplete = true;
                         if (!repeated) break :contents try self.expandReferenceOrigins(contents.origins, expansion, &expanded_incomplete);
@@ -11857,7 +11882,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     };
                     expanded = try self.applyResultGuards(null, expanded, origin.result_guard);
                     resolved = try self.mergeReferenceOrigins(resolved, try self.applyReferenceTransforms(expanded, origin.transform, expansion, &expanded_incomplete));
-                    if (!repeated) expansion.leave();
+                    if (!repeated and !expansion.fixpoint) expansion.leave();
                 } else if (resolved == null and current.current == null) {
                     resolved = index;
                 } else if (expanded_loop) {
@@ -11870,6 +11895,68 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             try expansion.memo.put(self.gpa, memo_key, .{ .origins = resolved, .incomplete = expanded_incomplete });
             if (expanded_incomplete) incomplete.* = true;
             return resolved;
+        }
+
+        /// Expands by iterating each loop and contents node to its least fixpoint.
+        fn settleReferenceOrigins(self: *Self, origins: ?u32, include_flow: bool, expansion: *ReferenceExpansion, incomplete: *bool) !?u32 {
+            expansion.deinit(self.gpa);
+            expansion.* = .{ .include_flow = include_flow, .fixpoint = true };
+            while (true) {
+                expansion.pass += 1;
+                if (expansion.pass > max_fixpoint_passes) return error.AnalysisTooLarge;
+                expansion.changed = false;
+                expansion.memo.clearRetainingCapacity();
+                incomplete.* = false;
+                const resolved = try self.expandReferenceOrigins(origins, expansion, incomplete);
+                if (!expansion.changed) return resolved;
+            }
+        }
+
+        /// A node's value is read from the table when it is revisited within a pass, so cycles
+        /// converge over later passes rather than being unrolled.
+        fn settleReferenceNode(self: *Self, origin: ReferenceOrigin, key: u32, expansion: *ReferenceExpansion, incomplete: *bool) anyerror!?u32 {
+            const entry = try expansion.nodes.getOrPut(self.gpa, key);
+            if (!entry.found_existing) entry.value_ptr.* = .{};
+            if (entry.value_ptr.pass == expansion.pass) return entry.value_ptr.origins;
+            entry.value_ptr.pass = expansion.pass;
+            const computed = if (origin.contents) |contents_index| contents: {
+                const contents = self.reference_contents_reads.items[contents_index];
+                if (!contents.complete) incomplete.* = true;
+                break :contents try self.expandReferenceOrigins(contents.origins, expansion, incomplete);
+            } else loop: {
+                const loop_origins = self.loop_reference_origins.items[origin.loop.?];
+                if (!loop_origins.complete) incomplete.* = true;
+                const expanded = try self.expandReferenceOrigins(loop_origins.origins, expansion, incomplete);
+                break :loop try self.transformReferenceOrigins(expanded, .{ .loop_read = .{ .instruction = loop_origins.read_checkpoint.?, .result_place_limit = loop_origins.result_place_limit } });
+            };
+            const node = expansion.nodes.getPtr(key).?;
+            const merged = try self.mergeReferenceOrigins(node.origins, computed);
+            if (!self.sameOriginSet(node.origins, merged)) {
+                node.origins = merged;
+                expansion.changed = true;
+            }
+            return merged;
+        }
+
+        fn sameOriginSet(self: *Self, first: ?u32, second: ?u32) bool {
+            if (first == second) return true;
+            var count: usize = 0;
+            var listed = self.originList(first);
+            while (listed.next()) |_| count += 1;
+            var other = self.originList(second);
+            while (other.next()) |_| count -%= 1;
+            if (count != 0) return false;
+            listed = self.originList(first);
+            while (listed.next()) |origin| {
+                var candidates = self.originList(second);
+                const found = while (candidates.next()) |candidate| {
+                    var left = origin;
+                    left.next = candidate.next;
+                    if (std.meta.eql(left, candidate)) break true;
+                } else false;
+                if (!found) return false;
+            }
+            return true;
         }
 
         fn mergeReferenceOrigins(self: *Self, first: ?u32, second: ?u32) !?u32 {
@@ -13497,8 +13584,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 const value_on_edge = exit.constructed.?;
                 const generation = value_on_edge.borrowed_generation orelse continue;
                 const cleanup_value = value_on_edge.borrowed_cleanup_value orelse value_on_edge.id;
-                for (owners.items) |owner| if (owner.generation == generation and owner.cleanup_value == cleanup_value) break else {} else
-                    try owners.append(self.gpa, .{ .generation = generation, .cleanup_value = cleanup_value });
+                for (owners.items) |owner| if (owner.generation == generation and owner.cleanup_value == cleanup_value) break else {} else try owners.append(self.gpa, .{ .generation = generation, .cleanup_value = cleanup_value });
             }
             if (owners.items.len != 0) try self.joined_borrows.put(self.gpa, @fromBackingInt(result), owners.items);
         }
@@ -16663,6 +16749,8 @@ test "reference resolution shares concrete singletons and follows changing loop 
 
     builder.loop_reference_origins.items[0].origins = try builder.addReferenceOrigin(null, .{ .parameter = 2 });
     builder.loop_reference_origins.items[0].complete = true;
+    // Completing a loop discards resolutions computed from its provisional summary.
+    builder.resolved_reference_origins.clearRetainingCapacity();
     incomplete = false;
     origins = builder.originList(try builder.resolveReferenceOrigins(mixed, &incomplete));
     try std.testing.expect(!incomplete);
@@ -16672,6 +16760,32 @@ test "reference resolution shares concrete singletons and follows changing loop 
         parameters |= @as(u8, 1) << @intCast(origin.parameter.?);
     }
     try std.testing.expectEqual(@as(u8, 0b110), parameters);
+}
+
+test "reference resolution of densely dependent loop summaries stays bounded" {
+    var context: TestMaterializerContext = .{ .gpa = std.testing.allocator };
+    defer context.deinit();
+    var builder = testInitMaterializerBuilder(&context);
+    const carried = 14;
+    for (0..carried) |index| {
+        const entry = try builder.addReferenceOrigin(null, .{ .parameter = @intCast(index) });
+        try builder.loop_reference_origins.append(builder.gpa, .{ .slot = @intCast(index), .origins = entry, .entry_origins = entry, .read_checkpoint = 0, .complete = true });
+    }
+    // Every carried value depends on all the others, so unrolling each order of visiting
+    // them would take factorial time.
+    for (0..carried) |index| {
+        var dependencies = builder.loop_reference_origins.items[index].entry_origins;
+        for (0..carried) |other| dependencies = try builder.addReferenceOrigin(dependencies, .{ .loop = @intCast(other) });
+        builder.loop_reference_origins.items[index].origins = dependencies;
+    }
+    const root = try builder.addReferenceOrigin(null, .{ .loop = 0 });
+    var origins = builder.originList(try builder.completeReferenceOrigins(root));
+    var parameters: u32 = 0;
+    while (origins.next()) |origin| {
+        try std.testing.expect(origin.loop == null);
+        parameters |= @as(u32, 1) << @intCast(origin.parameter.?);
+    }
+    try std.testing.expectEqual((@as(u32, 1) << carried) - 1, parameters);
 }
 
 test "reference resolution reuses shared nested loop expansions" {
