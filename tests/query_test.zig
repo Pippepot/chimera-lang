@@ -9813,6 +9813,90 @@ test "reference contracts reuse acyclic bodies and recover after recursive edits
     }
 }
 
+test "reference contracts reuse cleanup-sensitive runtime bodies in either demand order" {
+    const source =
+        \\func selected(value: int) int
+        \\    var values: List(int) = [value]
+        \\    return values[0]
+        \\exit(selected(42))
+    ;
+    for ([_]usize{ 0, 4 }) |workers| {
+        for ([_]bool{ false, true }) |contract_first| {
+            var profile: test_sources.profiling.Collector = .{ .io = testing.io };
+            const db = try Database.init(testing.allocator, .{ .worker_count = workers, .profile = &profile });
+            defer db.deinit();
+            try test_sources.modules.registerSources(db, testing.allocator, source, &.{}, &.{});
+            const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+            const selected: structures.InstanceId = .{ .item = scope.resolve("selected").? };
+            if (contract_first) {
+                _ = try db.get(queries.InferReferenceContract, selected);
+            } else {
+                _ = try db.get(queries.AnalyzeFunctionInstance, selected);
+            }
+            const before = profile.snapshot();
+            const contract = (try db.get(queries.InferReferenceContract, selected)).*.?;
+            const body = (try db.get(queries.AnalyzeFunctionInstance, selected)).*.?;
+            const after = profile.snapshot();
+            try testing.expectEqual(before.get(.body_typing).runs, after.get(.body_typing).runs);
+            try testing.expectEqual(before.get(.body_lifetimes).runs, after.get(.body_lifetimes).runs);
+            try testing.expect(structures.ReferenceContract.equivalent(contract, body.reference_contract));
+            try testing.expect(contract.context_effects.reads & structures.ContextEffects.bit(.allocator) != 0);
+            try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 42);
+
+            const edited = try std.mem.replaceOwned(u8, testing.allocator, source, "return values[0]", "return values[0] + 1");
+            defer testing.allocator.free(edited);
+            try db.setInput(queries.SourceText, 0, edited);
+            try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 43);
+            const invalid = try std.mem.replaceOwned(u8, testing.allocator, source, "return values[0]", "return false");
+            defer testing.allocator.free(invalid);
+            try db.setInput(queries.SourceText, 0, invalid);
+            try testing.expect((try db.get(queries.BuildExecutable, 0)).* == null);
+            const diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
+            defer freeDiagnostics(diagnostics);
+            try testing.expect(diagnostics.len != 0);
+            try db.setInput(queries.SourceText, 0, source);
+            try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 42);
+        }
+    }
+}
+
+test "reference contract scheduling leaves unselected callees dormant and recovers after edits" {
+    const source =
+        \\func leaf() int -> 42
+        \\func invalid() int -> false
+        \\func selected() int
+        \\    if true -> return leaf()
+        \\    return invalid()
+        \\exit(selected())
+    ;
+    for ([_]usize{ 0, 4 }) |workers| {
+        const db = try Database.init(testing.allocator, .{ .worker_count = workers });
+        defer db.deinit();
+        try test_sources.modules.registerSources(db, testing.allocator, source, &.{}, &.{});
+        const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+        const selected: structures.InstanceId = .{ .item = scope.resolve("selected").? };
+        const leaf: structures.InstanceId = .{ .item = scope.resolve("leaf").? };
+        const invalid: structures.InstanceId = .{ .item = scope.resolve("invalid").? };
+        const callees = (try db.get(queries.ProbeReferenceCallees, selected)).*.?;
+        var found_leaf = false;
+        for (callees.instances) |callee| {
+            try testing.expect(!std.meta.eql(callee, invalid));
+            if (std.meta.eql(callee, leaf)) found_leaf = true;
+        }
+        try testing.expect(found_leaf);
+        try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 42);
+        const diagnostics = try db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 0), diagnostics.len);
+        const changed = try std.mem.replaceOwned(u8, testing.allocator, source, "if true", "if false");
+        defer testing.allocator.free(changed);
+        try db.setInput(queries.SourceText, 0, changed);
+        try testing.expect((try db.get(queries.BuildExecutable, 0)).* == null);
+        try db.setInput(queries.SourceText, 0, source);
+        try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 42);
+    }
+}
+
 test "numeric indirect typing demands factory receiver effect contracts" {
     const db = try Database.init(testing.allocator, .{ .worker_count = 0 });
     defer db.deinit();

@@ -84,7 +84,18 @@ is reused only for transparent single-call forwarding with matching signatures
 and unchanged argument sources;
 `AnalyzeFunctionInstance` derives their precise contract from the callee.
 Rejected conservative attempts fall back to full precise analysis; probe-local
-diagnostics are not published. Cleanup-sensitive bodies retain full analysis.
+diagnostics are not published. `ProbeFunctionInstance` shares successful full
+reference/lifetime-validated bodies between runtime analysis and reference
+contract inference, including cleanup-sensitive bodies. Unsuccessful probes
+retain the ordinary precise-inference and diagnostic-producing analysis paths.
+Recursive or unavailable body probes publish no reusable body rather than
+a failed query, so successful precise fallbacks remain eligible for persistence.
+With parallel workers, `ProbeReferenceCallees` discovers visited contract
+callees through diagnostic-isolated reference inference before body typing
+waits on their effects. Their contracts are prefetched concurrently; only
+ordinary demands observe their results and diagnostics. The provisional
+discovery analysis is never reused as a validated body, and prefetch hints do
+not force revalidation of existing queries after an edit.
 Construction, typing, and cached-body reuse return views to the query engine's
 deep publication copy rather than making redundant query-local copies.
 `AnalyzeFunctionInstance` publishes typed SSA only after reference analysis and

@@ -4870,6 +4870,7 @@ fn inferReferenceContract(ctx: anytype, instance: structures.InstanceId) anyerro
         if (validated.precise or structures.ReferenceContract.equivalent(validated.body.reference_contract, .{}))
             return validated.body.reference_contract;
     }
+    if (try reusableBody(ctx, instance)) |body| return body.reference_contract;
     const component = (try callerComponent(ctx, ReferenceCallees, instance, false)) orelse return null;
     defer ctx.allocator().free(component);
     var inference: ReferenceInference = .{ .allocator = ctx.allocator(), .component = component };
@@ -4925,16 +4926,63 @@ fn analyzeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerr
             return result;
         }
     }
+    if (try reusableBody(ctx, instance)) |body| return body;
     return analyzeFunctionBody(ctx, false, instance, false, null);
 }
 
 /// Typing without the reference fixed point is reusable whenever it succeeds.
 fn reusableTyping(ctx: anytype, instance: structures.InstanceId) !?FunctionTyping {
+    if (ctx.hasParallelWorkers()) try prefetchReferenceCallees(ctx, instance);
     const typed = ctx.get(TypeFunctionInstance, instance) catch |err| switch (err) {
         error.QueryCycle, error.Unavailable, error.SourceRejected => return null,
         else => return err,
     };
     return typed.*;
+}
+
+fn prefetchReferenceCallees(ctx: anytype, instance: structures.InstanceId) !void {
+    if (try trivialReferenceContractBody(ctx, instance)) return;
+    const callees = ctx.get(ProbeReferenceCallees, instance) catch |err| switch (err) {
+        error.QueryCycle => return,
+        else => return err,
+    };
+    for ((callees.* orelse return).instances) |callee| {
+        if (!std.meta.eql(callee, instance)) try ctx.prefetch(InferReferenceContract, callee);
+    }
+}
+
+pub const ProbeReferenceCallees = CompilerQuery("ProbeReferenceCallees", .query_other, probeReferenceCallees, .{});
+
+fn probeReferenceCallees(ctx: anytype, instance: structures.InstanceId) anyerror!?DirectCalleeList {
+    var diagnostic = false;
+    const probe: ReferenceProbeContext(@TypeOf(ctx)) = .{ .ctx = ctx, .diagnostic = &diagnostic };
+    var callees = (try referenceCallees(probe, instance)) orelse return null;
+    // Only the visited callees guide scheduling; the provisional contract is not reusable.
+    defer callees.initial_contract.deinit(ctx.allocator());
+    if (diagnostic) return null;
+    return .{ .instances = callees.instances };
+}
+
+pub const ProbeFunctionInstance = CompilerQuery("ProbeFunctionInstance", .body_overhead, probeFunctionInstance, .{});
+
+fn probeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?structures.FunctionBodyAnalysis {
+    var diagnostic = false;
+    const probe: ReferenceProbeContext(@TypeOf(ctx)) = .{ .ctx = ctx, .diagnostic = &diagnostic };
+    // A precise-inference fallback must not retain a failed probe dependency.
+    const body = analyzeFunctionBody(probe, false, instance, false, null) catch |err| switch (err) {
+        error.QueryCycle, error.Unavailable, error.SourceRejected => return null,
+        else => return err,
+    };
+    if (diagnostic) return null;
+    return body;
+}
+
+fn reusableBody(ctx: anytype, instance: structures.InstanceId) !?structures.FunctionBodyAnalysis {
+    const body = ctx.get(ProbeFunctionInstance, instance) catch |err| switch (err) {
+        error.QueryCycle, error.Unavailable, error.SourceRejected => return null,
+        else => return err,
+    };
+    return body.*;
 }
 
 fn forwardingParameter(body: *const structures.FunctionBodyAnalysis, value: structures.FunctionValueId, used: []bool) ?u32 {
