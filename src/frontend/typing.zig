@@ -1009,6 +1009,18 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             span: structures.SourceSpan,
             location: PendingReferenceUseLocation,
             match_testing: bool = false,
+            /// The used value, when a join block argument whose per-edge origins constrain which
+            /// incoming paths can carry a reference.
+            value: ?structures.FunctionValueId = null,
+        };
+        /// A join result's reference origins on one incoming edge. Walking from a use back to a
+        /// read must not enter a join through an edge that supplies a different reference.
+        const JoinedBorrow = struct { generation: GenerationId, cleanup_value: structures.FunctionValueId };
+        const JoinEdgeOrigins = struct {
+            value: structures.FunctionValueId,
+            block: structures.FunctionBlockId,
+            predecessor: structures.FunctionBlockId,
+            origins: ?u32,
         };
         const PendingReferenceInvalidation = struct { origins: u32, known: ?u32, span: structures.SourceSpan };
         const PendingReferenceReturn = struct { origins: u32, span: structures.SourceSpan };
@@ -1207,6 +1219,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         loop_backedges: std.ArrayList(LoopBackedge) = .empty,
         pending_reference_uses: std.ArrayList(PendingReferenceUse) = .empty,
         reference_uses: std.ArrayList(ReferenceUse) = .empty,
+        join_edge_origins: std.ArrayList(JoinEdgeOrigins) = .empty,
+        /// Join results borrowing from more than one owner; each use keeps every owner alive.
+        joined_borrows: std.AutoHashMapUnmanaged(structures.FunctionValueId, []const JoinedBorrow) = .empty,
         cleanup_origins: std.AutoHashMapUnmanaged(structures.FunctionValueId, u32) = .empty,
         cleanup_captures: std.ArrayList(CleanupCapture) = .empty,
         reference_effects: std.AutoHashMapUnmanaged(ReferenceEffectSite, ReferenceEffects) = .empty,
@@ -3849,17 +3864,38 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         /// A completed loop without a backedge has exactly its entry identity.
         fn unwrapBindingIdentity(self: *const Self, identity: BindingIdentity) BindingIdentity {
-            var current = identity;
+            return self.unwrapBindingIdentityAtDepth(identity, null);
+        }
+
+        /// With a storage depth, writes that preserve that depth keep the binding's identity.
+        fn unwrapBindingIdentityAtDepth(self: *const Self, identity: BindingIdentity, storage_depth: ?u32) BindingIdentity {
+            var current = self.preservedBindingIdentity(identity, storage_depth);
             while (current == .join) {
                 const join = self.binding_joins.items[current.join];
                 if (!join.complete) break;
                 // A loop whose backedges forward the header or entry identity
                 // never changes the binding.
                 for (join.alternatives.items) |alternative| {
-                    const forwarded = alternative == .join and alternative.join == current.join;
-                    if (!forwarded and !std.meta.eql(alternative, join.initial)) return current;
+                    const resolved = self.preservedBindingIdentity(alternative, storage_depth);
+                    const forwarded = resolved == .join and resolved.join == current.join;
+                    if (!forwarded and !std.meta.eql(resolved, join.initial)) return current;
                 }
-                current = join.initial;
+                current = self.preservedBindingIdentity(join.initial, storage_depth);
+            }
+            return current;
+        }
+
+        fn preservedBindingIdentity(self: *const Self, identity: BindingIdentity, storage_depth: ?u32) BindingIdentity {
+            const depth = storage_depth orelse return identity;
+            var current = identity;
+            while (current == .fixed) {
+                const version = self.binding_versions.items[current.fixed] orelse break;
+                switch (version) {
+                    .alias => |previous| current = previous,
+                    .write => |write| if (depth <= write.preserved_storage_depth) {
+                        current = write.previous;
+                    } else break,
+                }
             }
             return current;
         }
@@ -6924,7 +6960,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             const copied = try self.copyValueAcrossJoin(source, span);
             self.terminate(.{ .branch = try self.valuesBranch(paths.join, &.{copied}) });
             self.enterBlock(paths.owned);
-            return self.finishConditionalJoin(paths, copied, source, span);
+            var joined = try self.finishConditionalJoin(paths, copied, source, span);
+            // The owned path's source origins describe the borrow, which the copy has ended.
+            joined.reference_origins = copied.reference_origins;
+            return joined;
         }
 
         const ConditionalJoin = struct { argument: u32, owned: structures.FunctionBlockId, join: structures.FunctionBlockId };
@@ -7604,6 +7643,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 const current = try self.refinedGenerationAt(generation, self.state.snapshot());
                 try self.recordEffect(.{ .use = .{ .generation = current.generation, .cleanup_value = current.cleanup_value orelse source.id, .cleanup_condition = source.borrow_condition } });
             }
+            if (self.joined_borrows.get(source.id)) |owners| for (owners) |owner| {
+                const current = try self.refinedGenerationAt(owner.generation, self.state.snapshot());
+                try self.recordEffect(.{ .use = .{ .generation = current.generation, .cleanup_value = current.cleanup_value orelse owner.cleanup_value } });
+            };
         }
 
         fn recordCalleeUse(self: *Self, source: Value) !void {
@@ -7619,7 +7662,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 const checkpoint = try self.newBoundary(self.activeLifetimeSpan());
                 const identity = try self.appendEffectAt(checkpoint, null);
                 try self.closeBoundary(checkpoint);
-                try self.reference_uses.append(self.gpa, .{ .origins = origins, .span = self.activeLifetimeSpan(), .location = identity });
+                try self.reference_uses.append(self.gpa, .{ .origins = origins, .span = self.activeLifetimeSpan(), .location = identity, .value = source.id });
             }
             var pending = false;
             const resolved = try self.resolveLifetimeReferenceOrigins(origins, &pending);
@@ -7659,7 +7702,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                         const storage_depth = if (origin.stable and !origin.variant_guard) origin.storage_depth else null;
                         const expected = try self.resolveBindingIdentityAtDepth(origin.binding_identity, storage_depth);
                         const actual_identity = referenceIdentity(state.values.get(slot).?, origin);
-                        const same_identity = (origin.stable or origin.deferred_capture or origin.read != null) and std.meta.eql(self.unwrapBindingIdentity(origin.binding_identity), self.unwrapBindingIdentity(actual_identity));
+                        const same_identity = (origin.stable or origin.deferred_capture or origin.read != null) and std.meta.eql(self.unwrapBindingIdentityAtDepth(origin.binding_identity, storage_depth), self.unwrapBindingIdentityAtDepth(actual_identity, storage_depth));
                         const actual = if (same_identity) expected else try self.resolveBindingIdentityAtDepth(actual_identity, storage_depth);
                         if (expected.incomplete or actual.incomplete) {
                             incomplete.* = true;
@@ -13238,6 +13281,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             defer for (selections) |*selection| selection.deinit(self.gpa);
             const incoming = try self.gpa.alloc(?GenerationId, exits.len);
             const destination = if (mode) |request| if (request.destination) |target| target.storage else null else null;
+            const edge_origins = try self.gpa.alloc(?u32, exits.len);
+            defer self.gpa.free(edge_origins);
+            @memset(edge_origins, null);
             var result: ?Value = null;
             var borrow_argument: ?u32 = null;
             var completion_argument: ?u32 = null;
@@ -13266,13 +13312,14 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 var needs_completion = false;
                 var borrowed_generation: ??GenerationId = null;
                 var borrowed_cleanup: ??structures.FunctionValueId = null;
-                for (exits, incoming, selections) |exit, *generation, *selection| {
+                for (exits, incoming, selections, edge_origins) |exit, *generation, *selection, *edge_origin| {
                     const value_on_edge = exit.constructed.?;
                     generation.* = value_on_edge.owned_generation;
                     joined.preserves_storage = joined.preserves_storage or value_on_edge.preserves_storage;
                     joined.explicit_transfer = joined.explicit_transfer or value_on_edge.explicit_transfer;
                     const edge_use = (try self.coerceValue(value_on_edge.id, value_on_edge.type_id, joined_type)).?;
-                    joined.reference_origins = try self.mergeReferenceOrigins(joined.reference_origins, try self.selectResultOriginsMemo(try self.coercedReferenceOrigins(value_on_edge, edge_use), self.states.items[@backingInt(exit.state)].refinements, selection));
+                    edge_origin.* = try self.selectResultOriginsMemo(try self.coercedReferenceOrigins(value_on_edge, edge_use), self.states.items[@backingInt(exit.state)].refinements, selection);
+                    joined.reference_origins = try self.mergeReferenceOrigins(joined.reference_origins, edge_origin.*);
                     joined.place_origins = try self.mergeReferenceOrigins(joined.place_origins, value_on_edge.place_origins);
                     joined.stable_reference_root = sharedStableReferenceRoot(joined.stable_reference_root, value_on_edge.stable_reference_root);
                     joined.pending_consumption_owners = try self.mergePendingConsumptionOwners(joined.pending_consumption_owners, value_on_edge.pending_consumption_owners);
@@ -13302,6 +13349,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 joined.borrowed_generation = borrowed_generation orelse null;
                 joined.borrowed_cleanup_value = borrowed_cleanup orelse null;
                 if (destination == null) {
+                    if (joined.borrowed_generation == null) try self.recordJoinedBorrows(exits, argument_start);
                     const argument = try self.appendBlockArgument(joined_type, joined.owned_generation);
                     self.block_arguments.items[argument].representation = if (joined.preserves_storage) .storage else joined.representation;
                 }
@@ -13384,8 +13432,11 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 try state.values.set(self.gpa, slot, output);
             }
             const merged = try self.newBlock(argument_start, @intCast(self.block_arguments.items.len));
-            for (exits) |exit| {
+            for (exits, edge_origins) |exit, edge_origin| {
                 const predecessor = try self.setJoinTerminator(merged, exit, if (result != null and destination == null) result.?.type_id else null, changed_slots.items, borrow_argument != null, completion_argument != null);
+                if (destination == null) if (result) |joined| {
+                    try self.join_edge_origins.append(self.gpa, .{ .value = joined.id, .block = merged, .predecessor = predecessor, .origins = edge_origin });
+                };
                 if (destination != null) if (result.?.owned_generation) |generation| {
                     try self.recordGenerationOnlyForward(predecessor, 0, exit.constructed.?.owned_generation, generation);
                 };
@@ -13436,6 +13487,20 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 }
             }
             return true;
+        }
+
+        /// Edges borrowing from different owners leave the join without a single borrowed
+        /// generation, so its uses must keep each owner alive.
+        fn recordJoinedBorrows(self: *Self, exits: []const FlowExit, result: u32) !void {
+            var owners: std.ArrayList(JoinedBorrow) = .empty;
+            for (exits) |exit| {
+                const value_on_edge = exit.constructed.?;
+                const generation = value_on_edge.borrowed_generation orelse continue;
+                const cleanup_value = value_on_edge.borrowed_cleanup_value orelse value_on_edge.id;
+                for (owners.items) |owner| if (owner.generation == generation and owner.cleanup_value == cleanup_value) break else {} else
+                    try owners.append(self.gpa, .{ .generation = generation, .cleanup_value = cleanup_value });
+            }
+            if (owners.items.len != 0) try self.joined_borrows.put(self.gpa, @fromBackingInt(result), owners.items);
         }
 
         fn joinBorrowedFact(comptime Fact: type, joined: *??Fact, candidate: ?Fact, include_unknown: bool) void {
@@ -15424,7 +15489,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 var origins = self.originList(try self.completeLifetimeReferenceOrigins(use.origins));
                 while (origins.next()) |origin| {
                     if (origin.flow_only or origin.read == null) continue;
-                    if (try self.referenceCrossesInvalidation(origin, use.location, graph, null)) {
+                    if (try self.referenceCrossesInvalidation(origin, use.location, use.value, graph, null)) {
                         return self.reject(use.span, if (use.match_testing) .match_guard_invalidates_subject else if (origin.deferred_capture) .initializer_capture_conflict else .borrow_outlives_source);
                     }
                     if (origin.parameter == null and origin.contextual == null) continue;
@@ -15433,7 +15498,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                         const affected = if (origin.deferred_capture or !origin.stable) entry.value_ptr.writes else if (origin.storage_depth != 0) entry.value_ptr.storage_invalidations else null;
                         if (affected == null) continue;
                         var mutations = self.originList(try self.completeReferenceOrigins(affected));
-                        if (!try self.referenceCrossesInvalidation(origin, use.location, graph, entry.key_ptr.*)) continue;
+                        if (!try self.referenceCrossesInvalidation(origin, use.location, use.value, graph, entry.key_ptr.*)) continue;
                         while (mutations.next()) |mutation| {
                             if (mutation.parameter == null and mutation.contextual == null) continue;
                             if (origin.stable and !origin.deferred_capture and origin.storage_depth <= mutation.storage_depth) continue;
@@ -15516,27 +15581,53 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             return true;
         }
 
-        fn referenceCrossesInvalidation(self: *Self, origin: ReferenceOrigin, use: PendingReferenceUseLocation, graph: ControlFlowGraph, selected: ?ReferenceEffectSite) !bool {
-            const Cursor = struct { block: structures.FunctionBlockId, end: usize, invalidated: bool = false, include_terminator: bool = false };
+        /// Whether the reference `origin` can reach the block through `predecessor` as the used
+        /// join value. Other incoming edges redefine the value, so reads reached only through them
+        /// belong to an earlier evaluation.
+        fn joinEdgeMayCarry(self: *Self, id: structures.FunctionValueId, join: structures.FunctionBlockId, predecessor: structures.FunctionBlockId, origin: ReferenceOrigin) !bool {
+            var constrained = false;
+            for (self.join_edge_origins.items) |edge| {
+                if (edge.value != id or edge.block != join) continue;
+                if (edge.predecessor != predecessor) continue;
+                constrained = true;
+                var edge_origins = self.originList(try self.completeLifetimeReferenceOrigins(edge.origins));
+                while (edge_origins.next()) |edge_origin| {
+                    if (edge_origin.flow_only) continue;
+                    const read = edge_origin.read orelse return true;
+                    if (std.meta.eql(read, origin.read.?)) return true;
+                }
+            }
+            return !constrained;
+        }
+
+        /// The value a predecessor's branch passes for the successor's `position`th argument.
+        fn forwardedArgument(self: *const Self, predecessor: structures.FunctionBlockId, ordinal: u2, position: u32) structures.FunctionValueId {
+            var terminator = self.blocks.items[@backingInt(predecessor)].terminator.?;
+            const branch = terminator.branches()[ordinal].?;
+            std.debug.assert(branch.arguments.start + position < branch.arguments.end);
+            return self.branch_arguments.items[branch.arguments.start + position].value;
+        }
+
+        fn referenceCrossesInvalidation(self: *Self, origin: ReferenceOrigin, use: PendingReferenceUseLocation, used: ?structures.FunctionValueId, graph: ControlFlowGraph, selected: ?ReferenceEffectSite) !bool {
+            // `traced` follows the used value backward through join arguments.
+            const Cursor = struct { block: structures.FunctionBlockId, end: usize, invalidated: bool = false, include_terminator: bool = false, traced: ?structures.FunctionValueId = null };
             const start: Cursor = switch (self.findEffectLocation(use)) {
                 .boundary => |location| blk: {
                     const boundary = self.findBoundary(location.id);
-                    break :blk .{ .block = boundary.block, .end = boundary.item_index };
+                    break :blk .{ .block = boundary.block, .end = boundary.item_index, .traced = used };
                 },
-                .terminator => |location| .{ .block = location.id, .end = self.blocks.items[@backingInt(location.id)].items.items.len },
+                .terminator => |location| .{ .block = location.id, .end = self.blocks.items[@backingInt(location.id)].items.items.len, .traced = used },
             };
             var worklist: std.ArrayList(Cursor) = .empty;
 
             try worklist.append(self.gpa, start);
-            const visited = try self.gpa.alloc([2]bool, self.blocks.items.len);
-
-            @memset(visited, .{ false, false });
+            const Visit = struct { block: structures.FunctionBlockId, invalidated: bool, traced: ?structures.FunctionValueId };
+            var visited: std.AutoHashMapUnmanaged(Visit, void) = .empty;
             cursors: while (worklist.pop()) |cursor| {
                 const block_index = @backingInt(cursor.block);
                 const block_value = self.blocks.items[block_index];
                 if (cursor.end == block_value.items.items.len) {
-                    if (visited[block_index][@intFromBool(cursor.invalidated)]) continue;
-                    visited[block_index][@intFromBool(cursor.invalidated)] = true;
+                    if ((try visited.getOrPut(self.gpa, .{ .block = cursor.block, .invalidated = cursor.invalidated, .traced = cursor.traced })).found_existing) continue;
                 }
                 var invalidated = cursor.invalidated;
                 if (cursor.include_terminator) if (block_value.reference_effect) |identity| {
@@ -15558,7 +15649,12 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 var incoming = graph.index.blocks[block_index].first_incoming;
                 while (incoming) |edge| : (incoming = graph.index.previous_incoming[edge]) {
                     const predecessor = graph.edges[edge].predecessor;
-                    try worklist.append(self.gpa, .{ .block = predecessor, .end = self.blocks.items[@backingInt(predecessor)].items.items.len, .invalidated = invalidated, .include_terminator = true });
+                    var traced = cursor.traced;
+                    if (traced) |value_id| if (@backingInt(value_id) >= block_value.argument_start and @backingInt(value_id) < block_value.argument_end) {
+                        if (!try self.joinEdgeMayCarry(value_id, cursor.block, predecessor, origin)) continue;
+                        traced = self.forwardedArgument(predecessor, graph.edges[edge].successor_ordinal, @backingInt(value_id) - block_value.argument_start);
+                    };
+                    try worklist.append(self.gpa, .{ .block = predecessor, .end = self.blocks.items[@backingInt(predecessor)].items.items.len, .invalidated = invalidated, .include_terminator = true, .traced = traced });
                 }
             }
             return false;

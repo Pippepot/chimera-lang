@@ -625,3 +625,28 @@ test "implicit and fallible erasure reserve before moving concrete captures once
         try Fixture.expectParity(source, 42);
     }
 }
+
+test "joined borrows keep every selectable owner alive until the join is used" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    const factor = 3
+        \\    const add: func(int) int = (value: int) => value + factor
+        \\    const multiply: func(int) int = (value: int) => value * factor
+        \\    const chosen = if factor > 10 -> add else multiply
+        \\    return chosen(1) + (if factor > 10 -> add else multiply)(5)
+    , 18);
+    try Fixture.expectParity(
+        \\struct Tracker
+        \\    copy = fieldwise
+        \\    ref drops: int
+        \\    id: int
+        \\    drop = func(deinit self: Tracker)
+        \\        self.drops += 1
+        \\func run() int
+        \\    var drops = 0
+        \\    const first = Tracker{drops = drops, id = 4}
+        \\    const second = Tracker{drops = drops, id = 5}
+        \\    const chosen = if drops == 0 -> first else second
+        \\    return chosen.id
+    , 4);
+}

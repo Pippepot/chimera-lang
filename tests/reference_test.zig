@@ -3185,3 +3185,50 @@ test "borrows of a conditionally mutated list survive loops that leave it unchan
         \\exit(run(1))
     , .borrow_outlives_source);
 }
+
+test "copying a conditionally borrowed value ends its borrow on every join path" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var values = [5, 20, 6, 22]
+        \\    for index in 0..3
+        \\        const larger = if values[index] > values[index + 1] -> values[index] else values[index + 1]
+        \\        values[index] = larger + 1
+        \\    var total = 0
+        \\    for index in 0..3
+        \\        const chosen = if index == 1 -> values[0] else 7
+        \\        values[0] = 1
+        \\        total += chosen
+        \\    return values[0] + values[3] + total
+    , 38);
+    try Fixture.expectSourceDiagnostic(
+        \\func run() int
+        \\    var values: List(int) = [1, 2]
+        \\    var flag = 2
+        \\    ref first = if flag > 1 -> values[0] else values[1]
+        \\    for _ in 0..2
+        \\        _ = values.append(3)
+        \\        first += 1
+        \\    return 0
+        \\exit(run())
+    , .borrow_outlives_source);
+}
+
+test "iterating a list inside a loop that also rewrites it keeps element borrows valid" {
+    try Fixture.expectParity(
+        \\func run() int
+        \\    var values: List(int) = [13, 27, 21, 22]
+        \\    for _ in 0..2
+        \\        for value in values -> values[0] = value
+        \\        values.reverse()
+        \\    return values[0] + values[3]
+    , 44);
+    try Fixture.expectSourceDiagnostic(
+        \\func run() int
+        \\    var values: List(int) = [13, 27]
+        \\    for _ in 0..2
+        \\        for value in values -> _ = values.append(value)
+        \\        values.reverse()
+        \\    return 0
+        \\exit(run())
+    , .borrow_outlives_source);
+}
