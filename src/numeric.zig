@@ -110,29 +110,19 @@ pub const Integer = struct {
         defer number.deinit();
         return .{ .limbs = try allocator.dupe(std.math.big.Limb, number.toConst().limbs), .positive = number.toConst().positive };
     }
+    /// The text has passed `validSeparators`, which `setString` then ignores.
     pub fn parse(allocator: std.mem.Allocator, text: []const u8, negative: bool) !Integer {
-        var digits: std.ArrayList(u8) = .empty;
-        defer digits.deinit(allocator);
-        var base: u8 = 10;
-        var start: usize = 0;
-        if (text.len >= 2 and text[0] == '0') {
-            base = switch (text[1]) {
-                'x', 'X' => 16,
-                'b', 'B' => 2,
-                'o', 'O' => 8,
-                else => 10,
-            };
-            if (base != 10) start = 2;
-        }
-        for (text[start..], start..) |character, index| {
-            if (character == '_') {
-                if (index == start or index + 1 == text.len or text[index - 1] == '_') return error.InvalidCharacter;
-            } else try digits.append(allocator, character);
-        }
-        if (digits.items.len == 0) return error.InvalidCharacter;
+        const base: u8 = if (text.len >= 2 and text[0] == '0') switch (text[1]) {
+            'x', 'X' => 16,
+            'b', 'B' => 2,
+            'o', 'O' => 8,
+            else => 10,
+        } else 10;
+        const digits = if (base == 10) text else text[2..];
+        if (digits.len == 0) return error.InvalidCharacter;
         var number = try std.math.big.int.Managed.init(allocator);
         defer number.deinit();
-        try number.setString(base, digits.items);
+        try number.setString(base, digits);
         const constant = number.toConst();
         return .{ .limbs = try allocator.dupe(std.math.big.Limb, constant.limbs), .positive = !negative or constant.eqlZero() };
     }

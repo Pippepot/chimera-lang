@@ -33,6 +33,30 @@ pub const Encoded = struct {
     }
 };
 
+/// The instructions a peephole examines, starting at the current one; positions past the end match nothing.
+const Window = struct {
+    instructions: []const Instruction,
+
+    fn register(window: Window, offset: usize, operation: x86.RegisterOperation) ?ValueId {
+        if (offset >= window.instructions.len) return null;
+        const instruction = window.instructions[offset];
+        if (instruction != .register or instruction.register.operation != operation) return null;
+        return instruction.register.value;
+    }
+
+    /// The operand bits of a fixed instruction with this operation.
+    fn fixed(window: Window, offset: usize, operation: x86.Operation) ?u64 {
+        if (offset >= window.instructions.len) return null;
+        const instruction = window.instructions[offset];
+        if (instruction != .fixed or instruction.fixed.operation != operation) return null;
+        return instruction.fixed.bits;
+    }
+
+    fn scratchDead(window: Window, offset: usize) bool {
+        return offset < window.instructions.len and window.instructions[offset] == .scratch_dead;
+    }
+};
+
 pub const Function = struct {
     const PeepholeContext = struct { registers: []const ?x86.Register, spills: []const u32, widths: []const WriteWidth };
     /// Combined encodings tried in order; each returns how many instructions it consumed.
@@ -176,11 +200,11 @@ pub const Function = struct {
                     // These overwrite the whole accumulator and read at most its low half.
                     .mov_eax, .mov_eax_rsp, .mov_rax, .mov_rax_rsp, .lea_rax_rsp, .mov_eax_eax, .call_relative => return true,
                     .add_eax, .sub_eax, .imul_eax, .add_eax_rsp, .sub_eax_rsp, .imul_eax_rsp, .add_eax_ecx, .sub_eax_ecx, .imul_eax_ecx => return true,
-                    .add_eax_rcx, .sub_eax_rcx, .imul_eax_rcx, .shl_eax, .sar_eax, .shl_eax_cl, .sar_eax_cl, .neg_eax => return true,
+                    .add_eax_mem_rcx, .sub_eax_mem_rcx, .imul_eax_mem_rcx, .shl_eax, .sar_eax, .shl_eax_cl, .sar_eax_cl, .neg_eax => return true,
                     .movzx_eax_al, .movzx_eax_ax, .movzx_eax_rsp, .movzx_eax_word_rsp, .mov_eax_rsi_offset, .movzx_eax_rsi_offset, .cmove_eax_ecx => return true,
                     // These read at most the low half and leave the accumulator intact.
                     .mov_rsp_eax, .mov_ecx_eax, .mov_edi_eax, .mov_edx_eax, .mov_esi_eax, .mov_rdi_eax, .mov_rsp_al, .mov_rdi_al, .mov_rsp_ax, .mov_rdi_ax => {},
-                    .cmp_eax, .cmp_eax_rsp, .cmp_eax_rcx, .test_eax, .movsxd_rcx_eax, .cdq => {},
+                    .cmp_eax, .cmp_eax_rsp, .cmp_eax_mem_rcx, .test_eax, .movsxd_rcx_eax, .cdq => {},
                     .sete_al, .setne_al, .setl_al, .setg_al, .setle_al, .setge_al => {},
                     else => return false,
                 },
@@ -296,77 +320,59 @@ pub const Function = struct {
         return initial; // A jump cycle remains a cycle.
     }
 
+    fn windowAt(self: *const Function, index: usize) Window {
+        return .{ .instructions = self.instructions.items[index..] };
+    }
+
     fn encodeIndex(self: *const Function, code: *std.ArrayList(u8), index: usize, context: PeepholeContext) !usize {
-        const instructions = self.instructions.items[index..];
-        if (instructions.len < 3) return 0;
-        if (instructions[0] != .register or instructions[0].register.operation != .load_eax) return 0;
-        if (instructions[1] != .fixed) return 0;
-        const operation = instructions[1].fixed.operation;
-        if (operation != .movsxd_rcx_eax and operation != .mov_ecx_eax) return 0;
+        const window = self.windowAt(index);
+        const copied = window.register(0, .load_eax) orelse return 0;
+        const sign_extend = window.fixed(1, .movsxd_rcx_eax) != null;
+        if (!sign_extend and window.fixed(1, .mov_ecx_eax) == null) return 0;
         // The original eax copy is dead only when the base load overwrites rax
         // immediately, without a label or a read of the old accumulator.
-        switch (instructions[2]) {
-            .register => |base| if (base.operation != .load_rax) return 0,
-            .fixed => |base| {
-                if (base.operation != .lea_rax_rsp and base.operation != .mov_rax_rsp) return 0;
-            },
-            else => return 0,
-        }
-        const source = context.registers[@backingInt(instructions[0].register.value)] orelse return 0;
-        try x86.appendRegister(code, self.gpa, if (operation == .movsxd_rcx_eax) .sign_extend_rcx else .load_ecx, source, 0);
+        if (window.register(2, .load_rax) == null and window.fixed(2, .lea_rax_rsp) == null and window.fixed(2, .mov_rax_rsp) == null) return 0;
+        const source = context.registers[@backingInt(copied)] orelse return 0;
+        try x86.appendRegister(code, self.gpa, if (sign_extend) .sign_extend_rcx else .load_ecx, source, 0);
         return 2;
     }
 
     fn encodeCopy(self: *const Function, code: *std.ArrayList(u8), index: usize, context: PeepholeContext) !usize {
-        const instructions = self.instructions.items[index..];
-        if (instructions.len < 3) return 0;
-        if (instructions[0] != .register) return 0;
-        const wide = instructions[0].register.operation == .load_rax;
-        if (!wide and instructions[0].register.operation != .load_eax) return 0;
-        if (instructions[1] != .register or instructions[1].register.operation != (if (wide) x86.RegisterOperation.store_rax else .store_eax)) return 0;
-        if (instructions[2] != .scratch_dead) return 0;
-        const source = context.registers[@backingInt(instructions[0].register.value)] orelse return 0;
-        const destination = context.registers[@backingInt(instructions[1].register.value)] orelse return 0;
+        const window = self.windowAt(index);
+        const wide = window.register(0, .load_rax) != null;
+        const source_value = window.register(0, if (wide) .load_rax else .load_eax) orelse return 0;
+        const destination_value = window.register(1, if (wide) .store_rax else .store_eax) orelse return 0;
+        if (!window.scratchDead(2)) return 0;
+        const source = context.registers[@backingInt(source_value)] orelse return 0;
+        const destination = context.registers[@backingInt(destination_value)] orelse return 0;
         // A coalesced 32-bit copy must still clear unknown upper bits before
         // its result can supply a zero-extended address index.
-        if (destination != source or (!wide and context.widths[@backingInt(instructions[0].register.value)] != .narrow)) try x86.appendRegisterBinary(code, self.gpa, if (wide) .store_rax else .store_eax, destination, source);
+        if (destination != source or (!wide and context.widths[@backingInt(source_value)] != .narrow)) try x86.appendRegisterBinary(code, self.gpa, if (wide) .store_rax else .store_eax, destination, source);
         return 2;
     }
 
     fn encodeComparison(self: *const Function, code: *std.ArrayList(u8), index: usize, context: PeepholeContext) !usize {
-        const instructions = self.instructions.items[index..];
-        if (instructions.len < 3) return 0;
-        if (instructions[0] != .register or instructions[0].register.operation != .load_eax) return 0;
-        if (instructions[2] != .scratch_dead) return 0;
-        const lhs = context.registers[@backingInt(instructions[0].register.value)] orelse return 0;
-        const comparison = instructions[1];
-        switch (comparison) {
-            .fixed => |fixed| {
-                const operation: x86.RegisterOperation = switch (fixed.operation) {
-                    .cmp_eax => .cmp_immediate,
-                    .cmp_eax_rsp => .cmp_stack,
-                    else => return 0,
-                };
-                try x86.appendRegister(code, self.gpa, operation, lhs, fixed.bits);
-            },
-            .register => |operand| {
-                if (operand.operation != .cmp_eax) return 0;
-                const value = @backingInt(operand.value);
-                if (context.registers[value]) |rhs| {
-                    try x86.appendRegisterBinary(code, self.gpa, .cmp_eax, lhs, rhs);
-                } else try x86.appendRegister(code, self.gpa, .cmp_stack, lhs, context.spills[value]);
-            },
-            else => return 0,
-        }
+        const window = self.windowAt(index);
+        const lhs_value = window.register(0, .load_eax) orelse return 0;
+        if (!window.scratchDead(2)) return 0;
+        const lhs = context.registers[@backingInt(lhs_value)] orelse return 0;
+        if (window.fixed(1, .cmp_eax)) |bits| {
+            try x86.appendRegister(code, self.gpa, .cmp_immediate, lhs, bits);
+        } else if (window.fixed(1, .cmp_eax_rsp)) |bits| {
+            try x86.appendRegister(code, self.gpa, .cmp_stack, lhs, bits);
+        } else if (window.register(1, .cmp_eax)) |rhs_value| {
+            const value = @backingInt(rhs_value);
+            if (context.registers[value]) |rhs| {
+                try x86.appendRegisterBinary(code, self.gpa, .cmp_eax, lhs, rhs);
+            } else try x86.appendRegister(code, self.gpa, .cmp_stack, lhs, context.spills[value]);
+        } else return 0;
         return 2;
     }
 
     fn encodeDirectIndexedLoad(self: *const Function, code: *std.ArrayList(u8), index: usize, context: PeepholeContext) !usize {
-        const instructions = self.instructions.items[index..];
-        if (instructions.len < 7 or instructions[0] != .register or instructions[0].register.operation != .load_eax) return 0;
-        if (instructions[1] != .fixed or instructions[1].fixed.operation != .mov_ecx_eax) return 0;
-        const value = @backingInt(instructions[0].register.value);
-        if (context.widths[value] != .narrow) return 0;
+        const window = self.windowAt(index);
+        const value = @backingInt(window.register(0, .load_eax) orelse return 0);
+        if (window.fixed(1, .mov_ecx_eax) == null or context.widths[value] != .narrow) return 0;
         const selected = context.registers[value] orelse return 0;
         const consumed = try self.encodeIndexedLoadFrom(code, index + 2, context.registers, selected);
         return if (consumed == 0) 0 else consumed + 2;
@@ -377,122 +383,80 @@ pub const Function = struct {
     }
 
     fn encodeIndexedLoadFrom(self: *const Function, code: *std.ArrayList(u8), index: usize, registers: []const ?x86.Register, selected_index: ?x86.Register) !usize {
-        const instructions = self.instructions.items[index..];
-        if (instructions.len < 5 or instructions[1] != .fixed or instructions[2] != .fixed) return 0;
-        if (instructions[4] != .scratch_dead) return 0;
+        const window = self.windowAt(index);
+        if (!window.scratchDead(4)) return 0;
         var destination_register: ?x86.Register = null;
-        switch (instructions[3]) {
-            .register => |destination| {
-                if (destination.operation != .store_eax) return 0;
-                destination_register = registers[@backingInt(destination.value)];
-            },
-            .fixed => |destination| if (destination.operation != .mov_rsp_eax and destination.operation != .mov_rsp_al) return 0,
-            else => return 0,
-        }
-        const byte = switch (instructions[2].fixed.operation) {
-            .mov_eax_rax => false,
-            .movzx_eax_rax => true,
-            else => return 0,
-        };
-        if (instructions[2].fixed.bits != 0) return 0;
-        if (instructions[1].fixed.operation != (if (byte) x86.Operation.add_rax_rcx else .lea_rax_rax_rcx_4)) return 0;
-        switch (instructions[0]) {
-            .register => |source| {
-                if (source.operation != .load_rax) return 0;
-                const base = registers[@backingInt(source.value)] orelse return 0;
-                try x86.appendIndexedLoad(code, self.gpa, byte, base, destination_register, selected_index, 0);
-            },
-            .fixed => |source| {
-                if (source.operation != .lea_rax_rsp) return 0;
-                try x86.appendIndexedLoad(code, self.gpa, byte, null, destination_register, selected_index, source.bits);
-            },
-            else => return 0,
-        }
+        if (window.register(3, .store_eax)) |destination| {
+            destination_register = registers[@backingInt(destination)];
+        } else if (window.fixed(3, .mov_rsp_eax) == null and window.fixed(3, .mov_rsp_al) == null) return 0;
+        const byte = window.fixed(2, .movzx_eax_rax) != null;
+        if ((window.fixed(2, if (byte) .movzx_eax_rax else .mov_eax_rax) orelse return 0) != 0) return 0;
+        if (window.fixed(1, if (byte) .add_rax_rcx else .lea_rax_rax_rcx_4) == null) return 0;
+        if (window.register(0, .load_rax)) |source| {
+            const base = registers[@backingInt(source)] orelse return 0;
+            try x86.appendIndexedLoad(code, self.gpa, byte, base, destination_register, selected_index, 0);
+        } else if (window.fixed(0, .lea_rax_rsp)) |stack_offset| {
+            try x86.appendIndexedLoad(code, self.gpa, byte, null, destination_register, selected_index, stack_offset);
+        } else return 0;
         return if (destination_register != null) 4 else 3;
     }
 
     fn encodeIndexedStore(self: *const Function, code: *std.ArrayList(u8), index: usize, context: PeepholeContext) !usize {
-        const instructions = self.instructions.items[index..];
-        if (instructions.len < 4) return 0;
+        const window = self.windowAt(index);
         var base: ?x86.Register = null;
         var base_offset: u64 = 0;
-        switch (instructions[0]) {
-            .register => |operation| {
-                if (operation.operation != .load_rax) return 0;
-                base = context.registers[@backingInt(operation.value)] orelse return 0;
-            },
-            .fixed => |operation| {
-                if (operation.operation != .lea_rax_rsp) return 0;
-                base_offset = operation.bits;
-            },
-            else => return 0,
-        }
-        if (instructions[1] != .fixed or instructions[1].fixed.operation != .lea_rax_rax_rcx_4) return 0;
-        if (instructions[2] != .fixed) return 0;
-        if (instructions[2].fixed.operation == .mov_rax_i32) {
-            if (base == null or instructions[3] != .scratch_dead) return 0;
-            try x86.appendRegister(code, self.gpa, .store_indexed_i32, base.?, instructions[2].fixed.bits);
+        if (window.register(0, .load_rax)) |value| {
+            base = context.registers[@backingInt(value)] orelse return 0;
+        } else if (window.fixed(0, .lea_rax_rsp)) |stack_offset| {
+            base_offset = stack_offset;
+        } else return 0;
+        if (window.fixed(1, .lea_rax_rax_rcx_4) == null) return 0;
+        if (window.fixed(2, .mov_rax_i32)) |value| {
+            if (base == null or !window.scratchDead(3)) return 0;
+            try x86.appendRegister(code, self.gpa, .store_indexed_i32, base.?, value);
             return 3;
         }
-        if (instructions.len < 6 or instructions[2].fixed.operation != .mov_rdi_rax) return 0;
-        if (instructions[4] != .fixed or instructions[4].fixed.operation != .mov_rdi_eax or instructions[4].fixed.bits != 0) return 0;
-        if (instructions[5] != .scratch_dead) return 0;
+        if (window.fixed(2, .mov_rdi_rax) == null or window.fixed(4, .mov_rdi_eax) != 0 or !window.scratchDead(5)) return 0;
         var source: ?x86.Register = null;
-        switch (instructions[3]) {
-            .register => |operation| {
-                if (operation.operation != .load_eax) return 0;
-                source = context.registers[@backingInt(operation.value)];
-                if (source == null) try self.encodeRegister(code, operation, context.registers, context.spills);
-            },
-            .fixed => |operation| {
-                if (operation.operation != .mov_eax and operation.operation != .mov_eax_rsp) return 0;
-                try x86.append(code, self.gpa, operation.operation, operation.bits);
-            },
-            else => return 0,
-        }
+        if (window.register(3, .load_eax)) |value| {
+            source = context.registers[@backingInt(value)];
+            if (source == null) try self.encodeRegister(code, window.instructions[3].register, context.registers, context.spills);
+        } else if (window.fixed(3, .mov_eax)) |bits| {
+            try x86.append(code, self.gpa, .mov_eax, bits);
+        } else if (window.fixed(3, .mov_eax_rsp)) |bits| {
+            try x86.append(code, self.gpa, .mov_eax_rsp, bits);
+        } else return 0;
         try x86.appendIndexedStore(code, self.gpa, base, source, base_offset);
         return 5;
     }
 
     fn encodeInPlace(self: *const Function, code: *std.ArrayList(u8), index: usize, context: PeepholeContext) !usize {
-        const instructions = self.instructions.items[index..];
-        if (instructions.len < 4) return 0;
-        if (instructions[0] != .register or instructions[0].register.operation != .load_eax) return 0;
-        if (instructions[2] != .register or instructions[2].register.operation != .store_eax) return 0;
-        if (instructions[3] != .scratch_dead) return 0;
-        const destination = context.registers[@backingInt(instructions[2].register.value)] orelse return 0;
-        const reuse_lhs = context.registers[@backingInt(instructions[0].register.value)] == destination;
-        const operation = instructions[1];
-        if (operation == .fixed) {
-            if (!reuse_lhs) return 0;
-            const update: x86.RegisterOperation = switch (operation.fixed.operation) {
-                .add_eax => .add_immediate,
-                .sub_eax => .sub_immediate,
-                .imul_eax => .imul_immediate,
-                .add_eax_rsp => .add_stack,
-                .sub_eax_rsp => .sub_stack,
-                .imul_eax_rsp => .imul_stack,
-                else => return 0,
-            };
-            try x86.appendRegister(code, self.gpa, update, destination, operation.fixed.bits);
+        const window = self.windowAt(index);
+        const lhs = window.register(0, .load_eax) orelse return 0;
+        const result = window.register(2, .store_eax) orelse return 0;
+        if (!window.scratchDead(3)) return 0;
+        const destination = context.registers[@backingInt(result)] orelse return 0;
+        const reuse_lhs = context.registers[@backingInt(lhs)] == destination;
+        if (reuse_lhs) inline for (.{
+            .{ .add_eax, .add_immediate },
+            .{ .sub_eax, .sub_immediate },
+            .{ .imul_eax, .imul_immediate },
+            .{ .add_eax_rsp, .add_stack },
+            .{ .sub_eax_rsp, .sub_stack },
+            .{ .imul_eax_rsp, .imul_stack },
+        }) |update| if (window.fixed(1, update[0])) |bits| {
+            try x86.appendRegister(code, self.gpa, update[1], destination, bits);
             return 3;
-        }
-        if (operation != .register) return 0;
-        const update: x86.RegisterOperation = switch (operation.register.operation) {
-            .add_eax => .add_stack,
-            .sub_eax => .sub_stack,
-            .imul_eax => .imul_stack,
-            else => return 0,
         };
-        if (!reuse_lhs and operation.register.operation == .sub_eax) return 0;
-        if (!reuse_lhs and context.registers[@backingInt(operation.register.value)] != destination) return 0;
-        const source = if (reuse_lhs) operation.register.value else instructions[0].register.value;
-        if (context.registers[@backingInt(source)]) |selected| {
-            try x86.appendRegisterBinary(code, self.gpa, operation.register.operation, destination, selected);
+        inline for (.{ .{ .add_eax, .add_stack }, .{ .sub_eax, .sub_stack }, .{ .imul_eax, .imul_stack } }) |update| if (window.register(1, update[0])) |rhs| {
+            if (!reuse_lhs and (update[0] == .sub_eax or context.registers[@backingInt(rhs)] != destination)) return 0;
+            const source = @backingInt(if (reuse_lhs) rhs else lhs);
+            if (context.registers[source]) |selected| {
+                try x86.appendRegisterBinary(code, self.gpa, update[0], destination, selected);
+            } else try x86.appendRegister(code, self.gpa, update[1], destination, context.spills[source]);
             return 3;
-        }
-        try x86.appendRegister(code, self.gpa, update, destination, context.spills[@backingInt(source)]);
-        return 3;
+        };
+        return 0;
     }
 
     fn encodeRegister(self: *const Function, code: *std.ArrayList(u8), operation: @FieldType(Instruction, "register"), registers: []const ?x86.Register, spills: []const u32) !void {
@@ -505,21 +469,8 @@ pub const Function = struct {
             .store_eax => .mov_rsp_eax,
             .load_rax => .mov_rax_rsp,
             .store_rax => .mov_rsp_rax,
-            .add_eax => .add_eax_rsp,
-            .sub_eax => .sub_eax_rsp,
-            .imul_eax => .imul_eax_rsp,
-            .cmp_eax => .cmp_eax_rsp,
-            .and_rax => .and_rax_rsp,
-            .or_rax => .or_rax_rsp,
-            .xor_rax => .xor_rax_rsp,
-            .and_eax => .and_eax_rsp,
-            .or_eax => .or_eax_rsp,
-            .xor_eax => .xor_eax_rsp,
-            .add_rax => .add_rax_rsp,
-            .sub_rax => .sub_rax_rsp,
-            .imul_rax => .imul_rax_rsp,
-            .cmp_rax => .cmp_rax_rsp,
             .load_ecx => .mov_ecx_rsp,
+            inline .add_eax, .sub_eax, .imul_eax, .cmp_eax, .and_eax, .or_eax, .xor_eax, .add_rax, .sub_rax, .imul_rax, .cmp_rax, .and_rax, .or_rax, .xor_rax => |alu| @field(x86.Operation, @tagName(alu) ++ "_rsp"),
             else => unreachable,
         };
         try x86.append(code, self.gpa, spilled, spills[value]);

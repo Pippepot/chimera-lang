@@ -565,8 +565,9 @@ writes and transfers do not roll back.
 
 Typing records effects at stable body-local checkpoints. Immutable cleanup actions
 select nominal hooks, owned fields, variant alternatives, and reverse array
-destruction once. Effect analysis and emission consume the same actions;
-invocation-time origins, contexts, and cleanup locations remain separate.
+destruction once. Effect analysis, emission, and remaining drop obligations consume
+the same actions; hook contracts are queried only for effects, and invocation-time
+origins, contexts, and cleanup locations remain separate.
 Output-bearing cleanup
 first retains prospective referents for lifetime planning, then substitutes hook
 outputs at the scheduled boundaries and CFG edges. Fresh carrier reads resolve

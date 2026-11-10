@@ -92,7 +92,7 @@ const VariantUses = struct {
         for (body.instructions.items) |index| {
             if (function.removed.items[index]) continue;
             const instruction = &function.instructions.items[index];
-            function_ir.visitInstructionReferences(function, instruction, self, count);
+            function_ir.visitOperands(function, instruction, .all, self, count);
             const result = function.results.items[index];
             if (@backingInt(result) >= self.taken.len or !self.taken[@backingInt(result)]) switch (instruction.*) {
                 .variant_tag => |operand| if (self.lookup(operand)) |candidate| {
@@ -110,7 +110,7 @@ const VariantUses = struct {
             };
             if (self.touched and !self.anyAlive()) return true;
         }
-        function_ir.visitTerminatorReferences(function, &body.terminator, self, count);
+        function_ir.visitTerminatorOperands(function, &body.terminator, .all, self, count);
         return self.touched and !self.anyAlive();
     }
 
@@ -137,9 +137,7 @@ fn splitScalarVariants(parameters: *ParameterSimplifier) !bool {
             if (function.valueType(parameter).isPrimitive()) continue;
             if (!function.plainValue(parameter)) continue;
             for (edges) |edge| {
-                const use = function.branchArguments(edge.branch(function).*)[position];
-                const mapping = use.variant_tag_mapping orelse break;
-                if (use.coerce_to == null or mapping.end - mapping.start != 1) break;
+                if (function.injectedTag(function.branchArguments(edge.branch(function).*)[position]) == null) break;
             } else {
                 if ((try parameters.addressTaken())[@backingInt(parameter)]) continue;
                 try candidates.append(function.scratch, .{ .block = block, .position = position, .parameter = parameter });
@@ -188,12 +186,11 @@ fn splitScalarVariant(function: *Function, candidate: SplitCandidate, edges: []c
     for (edges) |edge| {
         const branch = edge.branch(function);
         const use = function.branchArguments(branch.*)[position];
-        const source = function.blocks.items[edge.block];
-        const discriminator: i32 = @bitCast(function.variant_coercion_tags.items[use.variant_tag_mapping.?.start]);
+        const discriminator: i32 = @bitCast(function.injectedTag(use).?);
         var appended: std.ArrayList(ValueId) = .empty;
-        try appended.append(function.scratch, try function.appendInstruction(edge.block, .{ .const_int = discriminator }, source.span, source.frame));
+        try appended.append(function.scratch, try function.appendLocal(edge.block, .{ .const_int = discriminator }));
         for (parameters, scalar_types) |payload, type_id| if (payload != null) {
-            const value = if (function.valueType(use.value) == type_id) use.value else try function.appendInstruction(edge.block, function_ir.zero(type_id), source.span, source.frame);
+            const value = if (function.valueType(use.value) == type_id) use.value else try function.appendLocal(edge.block, function_ir.zero(type_id));
             try appended.append(function.scratch, value);
         };
         branch.arguments = try function.copyBranchArguments(branch.arguments, appended.items);
@@ -240,24 +237,20 @@ fn narrowParameters(parameters: *ParameterSimplifier) !bool {
             if (function.valueType(parameter).isPrimitive() or !function.directParameter(parameter)) continue;
             const edges = graph.incoming[block].items;
             const first = function.branchArguments(edges[0].branch(function).*)[position];
-            const mapping = first.variant_tag_mapping orelse continue;
-            if (first.coerce_to == null or mapping.end - mapping.start != 1) continue;
+            const tag = function.injectedTag(first) orelse continue;
             const type_id = function.valueType(first.value);
             if (!function.direct(type_id)) continue;
-            const tag = function.variant_coercion_tags.items[mapping.start];
             const taken = try parameters.addressTaken();
             if (taken[@backingInt(parameter)]) continue;
             for (edges) |edge| {
                 const argument = function.branchArguments(edge.branch(function).*)[position];
-                const tags = argument.variant_tag_mapping orelse break;
-                if (argument.coerce_to != first.coerce_to or tags.end - tags.start != 1 or function.valueType(argument.value) != type_id) break;
-                if (function.variant_coercion_tags.items[tags.start] != tag) break;
+                if (argument.coerce_to != first.coerce_to or function.injectedTag(argument) != tag or function.valueType(argument.value) != type_id) break;
             } else {
                 const payload = try function.addParameter(block, .{ .type_id = type_id });
                 const rebuilt = try function.insertInstruction(block, 0, .{ .variant_coerce = .{
                     .operand = payload,
                     .target_type = function.valueType(parameter),
-                    .tag_mapping = mapping,
+                    .tag_mapping = first.variant_tag_mapping,
                 } }, function.blocks.items[block].span, function.blocks.items[block].frame);
                 for (edges) |edge| {
                     const branch = edge.branch(function);
@@ -335,14 +328,6 @@ const ParameterSimplifier = struct {
     }
 
     const FieldRead = struct { instruction: u32, field: u32 };
-    const CountUses = struct {
-        parameter: ValueId,
-        count: usize = 0,
-
-        fn visit(self: *CountUses, value: ValueId) void {
-            if (value == self.parameter) self.count += 1;
-        }
-    };
 
     fn splitAggregate(self: *ParameterSimplifier, block: u32, position: usize) !bool {
         const function = self.function;
@@ -364,11 +349,10 @@ const ParameterSimplifier = struct {
         for (function.blocks.items) |*body| {
             for (body.instructions.items) |index| {
                 if (function.removed.items[index]) continue;
-                const instruction = function.instructions.items[index];
-                var uses: CountUses = .{ .parameter = parameter };
-                function_ir.visitInstructionReferences(function, &instruction, &uses, CountUses.visit);
-                if (uses.count == 0) continue;
-                if (instruction != .field_access or uses.count != 1) return false;
+                const instruction = &function.instructions.items[index];
+                const uses = function_ir.countInstructionUses(function, instruction, &.{parameter});
+                if (uses == 0) continue;
+                if (instruction.* != .field_access or uses != 1) return false;
                 if ((try self.addressTaken())[@backingInt(function.results.items[index])]) return false;
                 try reads.append(function.scratch, .{ .instruction = index, .field = instruction.field_access.field_index });
             }
@@ -467,13 +451,8 @@ const ParameterSimplifier = struct {
             if (!try self.stable(value) or !self.availableAt(graph, value, fork)) return false;
             values[arm.ordinal] = value;
         }
-        const source = function.blocks.items[fork];
-        const condition = try function.appendInstruction(fork, .{ .compare = .{ .operation = predicate.operation, .operands = predicate.operands } }, source.span, source.frame);
-        const selected = if (function.constantBool(values[0]) == true and function.constantBool(values[1]) == false)
-            condition
-        else
-            try function.appendInstruction(fork, .{ .select = .{ .condition = condition, .then_value = values[0], .else_value = values[1], .type_id = .bool } }, source.span, source.frame);
-        function.replace(parameter, selected);
+        const condition = try function.appendLocal(fork, .{ .compare = .{ .operation = predicate.operation, .operands = predicate.operands } });
+        function.replace(parameter, try choose(function, fork, condition, values[0], values[1]));
         return true;
     }
 };
@@ -568,7 +547,8 @@ const Sweep = struct {
                 // A tag test may bypass a variant parameter that the exit never reads.
                 if (!function.plainValue(parameter) or self.address_taken[@backingInt(parameter)] or (tag == null and !function.valueType(parameter).isPrimitive())) break;
             } else {
-                if (!try self.independentExit(target, @backingInt(selected.target), join.parameters.items, if (tag) |test_| test_.result else null)) continue;
+                const watched = if (tag) |test_| try std.mem.concat(function.scratch, ValueId, &.{ join.parameters.items, &.{test_.result} }) else join.parameters.items;
+                if (!try self.independentExit(target, @backingInt(selected.target), watched)) continue;
                 var arguments: std.ArrayList(structures.FunctionValueUse) = .empty;
                 for (function.branchArguments(selected)) |argument| {
                     var forwarded = argument;
@@ -589,17 +569,15 @@ const Sweep = struct {
     // Bypassing a join cannot leave its parameters in use along the selected
     // continuation. Re-entering the join defines them again, so it is a barrier
     // rather than a reason to reject loop exits and outer-loop continuations.
-    fn independentExit(self: *Sweep, join: u32, start: u32, parameters: []const ValueId, tag_result: ?ValueId) !bool {
+    fn independentExit(self: *Sweep, join: u32, start: u32, watched: []const ValueId) !bool {
         const function = self.function;
         var visited = try std.DynamicBitSetUnmanaged.initEmpty(function.scratch, function.blocks.items.len);
         var pending: std.ArrayList(u32) = .empty;
         try pending.append(function.scratch, start);
         visited.set(start);
         visited.set(join);
-        var uses: ParameterUses = .{ .function = function, .parameters = parameters, .extra = tag_result };
         while (pending.pop()) |block| {
-            function_ir.visitBlockReferences(function, &function.blocks.items[block], &uses, ParameterUses.reference);
-            if (uses.found) return false;
+            if (function_ir.countUses(function, &function.blocks.items[block], watched) != 0) return false;
             for (function.successors(block)) |successor| if (successor) |target| {
                 if (visited.isSet(target)) continue;
                 visited.set(target);
@@ -641,11 +619,10 @@ const Sweep = struct {
     /// The tag of a variant argument built by injecting exactly one alternative.
     fn injectedTag(self: *Sweep, argument: structures.FunctionValueUse) ?i32 {
         const function = self.function;
-        const mapping = if (argument.coerce_to != null) argument.variant_tag_mapping orelse return null else mapping: {
-            const definition = function.definition(function.find(argument.value)) orelse return null;
-            if (definition != .variant_coerce or definition.variant_coerce.destination != null) return null;
-            break :mapping definition.variant_coerce.tag_mapping orelse return null;
-        };
+        if (argument.coerce_to != null) return if (function.injectedTag(argument)) |tag| @intCast(tag) else null;
+        const definition = function.definition(function.find(argument.value)) orelse return null;
+        if (definition != .variant_coerce or definition.variant_coerce.destination != null) return null;
+        const mapping = definition.variant_coerce.tag_mapping orelse return null;
         if (mapping.end - mapping.start != 1) return null;
         return @intCast(function.variant_coercion_tags.items[mapping.start]);
     }
@@ -694,17 +671,11 @@ const Sweep = struct {
         }
         try self.hoistArm(block, predicate.then_branch);
         try self.hoistArm(block, predicate.else_branch);
-        const span = function.blocks.items[block].span;
-        const frame = function.blocks.items[block].frame;
-        const condition = try function.appendInstruction(block, .{ .compare = .{ .operation = predicate.operation, .operands = predicate.operands } }, span, frame);
+        const condition = try function.appendLocal(block, .{ .compare = .{ .operation = predicate.operation, .operands = predicate.operands } });
         var merged: std.ArrayList(structures.FunctionValueUse) = .empty;
         for (function.branchArguments(then_exit), function.branchArguments(else_exit)) |then_argument, else_argument| {
-            const then_value = function.find(then_argument.value);
-            const else_value = function.find(else_argument.value);
-            try merged.append(function.scratch, .{ .value = if (then_value == else_value) then_value else if (function.constantBool(then_value) == true and function.constantBool(else_value) == false)
-                condition
-            else
-                try function.appendInstruction(block, .{ .select = .{ .condition = condition, .then_value = then_value, .else_value = else_value, .type_id = function.valueType(then_value) } }, span, frame) });
+            const chosen = try choose(function, block, condition, function.find(then_argument.value), function.find(else_argument.value));
+            try merged.append(function.scratch, .{ .value = chosen });
         }
         function.blocks.items[block].terminator = .{ .branch = .{ .target = then_exit.target, .arguments = try function.appendBranchArguments(merged.items) } };
         self.touch(block);
@@ -749,8 +720,7 @@ const Sweep = struct {
                 function.replace(parameter, value);
                 continue;
             }
-            const source = function.blocks.items[predecessor];
-            function.replace(parameter, try function.appendInstruction(predecessor, .{ .value_copy = .{ .source = value, .type_id = function.valueType(parameter) } }, source.span, source.frame));
+            function.replace(parameter, try function.appendLocal(predecessor, .{ .value_copy = .{ .source = value, .type_id = function.valueType(parameter) } }));
         }
         try function.blocks.items[predecessor].instructions.ensureUnusedCapacity(function.scratch, function.blocks.items[block].instructions.items.len);
         const merged = &function.blocks.items[block];
@@ -791,17 +761,12 @@ const Sweep = struct {
     }
 };
 
-const ParameterUses = struct {
-    function: *const Function,
-    parameters: []const ValueId,
-    extra: ?ValueId = null,
-    found: bool = false,
-
-    fn reference(self: *ParameterUses, value: ValueId) void {
-        const resolved = self.function.find(value);
-        if (std.mem.indexOfScalar(ValueId, self.parameters, resolved) != null or self.extra == resolved) self.found = true;
-    }
-};
+/// A value that is `then_value` when `condition` holds and `else_value` otherwise.
+fn choose(function: *Function, block: u32, condition: ValueId, then_value: ValueId, else_value: ValueId) !ValueId {
+    if (then_value == else_value) return then_value;
+    if (function.constantBool(then_value) == true and function.constantBool(else_value) == false) return condition;
+    return function.appendLocal(block, .{ .select = .{ .condition = condition, .then_value = then_value, .else_value = else_value, .type_id = function.valueType(then_value) } });
+}
 
 fn speculatable(instruction: structures.FunctionInstruction) bool {
     return switch (instruction) {

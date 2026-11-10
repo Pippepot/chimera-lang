@@ -26,7 +26,7 @@ pub fn canonicalize(function: *Function) !function_ir.Changes {
                 rules.position = position;
                 if (!function.removed.items[index]) {
                     // Rules may append instructions and relocate the function's arrays.
-                    function_ir.allOperands(function, &function.instructions.items[index], function, Function.resolveOperand);
+                    function_ir.visitOperands(function, &function.instructions.items[index], .all, function, Function.resolveOperand);
                     const result = function.results.items[index];
                     const original = function.instructions.items[index];
                     var instruction = original;
@@ -50,7 +50,7 @@ pub fn canonicalize(function: *Function) !function_ir.Changes {
             }
         }
         for (function.blocks.items) |*block| {
-            function_ir.terminatorAllOperands(function, &block.terminator, function, Function.resolveOperand);
+            function_ir.visitTerminatorOperands(function, &block.terminator, .all, function, Function.resolveOperand);
             if (rules.simplifyTerminator(&block.terminator)) changed = true;
         }
         changes.changed = changes.changed or changed;
@@ -93,7 +93,9 @@ const Rules = struct {
     fn simplify(self: *Rules, instruction: *Instruction, result: ValueId) !bool {
         if (self.function.find(result) != result) return false;
         switch (instruction.*) {
-            .numeric_binary, .numeric_unary, .numeric_convert => return try self.rewriteDivisibilityTest(instruction) or self.simplifyNumeric(instruction, result),
+            .numeric_binary => return try self.rewriteDivisibilityTest(instruction) or self.simplifyBinary(instruction, result),
+            .numeric_unary => |operation| return self.simplifyNumericUnary(instruction, operation),
+            .numeric_convert => |operation| return self.simplifyNumericConversion(instruction, result, operation),
             .addi, .subi, .muli, .shli, .shrsi => return self.simplifyBinary(instruction, result),
             .divsi => return self.simplifyDivision(instruction, result),
             .negi => |operand| return self.simplifyNegation(instruction, result, operand),
@@ -148,12 +150,7 @@ const Rules = struct {
         const operands = operation.operands;
         if (operation.operation.isComparison()) {
             const predicate: structures.PredicateOperation = switch (operation.operation) {
-                .eq => .eqi,
-                .ne => .nei,
-                .lt => .lti,
-                .gt => .gti,
-                .le => .lei,
-                .ge => .gei,
+                inline .eq, .ne, .lt, .gt, .le, .ge => |tag| @field(structures.PredicateOperation, @tagName(tag) ++ "i"),
                 else => unreachable,
             };
             instruction.* = .{ .compare = .{ .operation = predicate, .operands = operands } };
@@ -166,9 +163,7 @@ const Rules = struct {
                     if (!result.fits()) return false;
                 }
                 instruction.* = switch (operation.operation) {
-                    .add => .{ .addi = operands },
-                    .sub => .{ .subi = operands },
-                    .mul => .{ .muli = operands },
+                    inline .add, .sub, .mul => |tag| @unionInit(Instruction, @tagName(tag) ++ "i", operands),
                     else => unreachable,
                 };
             },
@@ -197,15 +192,6 @@ const Rules = struct {
 
     fn numericConstant(self: *const Rules, value: ValueId) ?structures.NumericConstant {
         return (self.function.definition(value) orelse return null).numericConstant();
-    }
-
-    fn simplifyNumeric(self: *Rules, instruction: *Instruction, result: ValueId) bool {
-        switch (instruction.*) {
-            .numeric_binary => return self.simplifyBinary(instruction, result),
-            .numeric_unary => |operation| return self.simplifyNumericUnary(instruction, operation),
-            .numeric_convert => |operation| return self.simplifyNumericConversion(instruction, result, operation),
-            else => unreachable,
-        }
     }
 
     fn simplifyNumericUnary(self: *Rules, instruction: *Instruction, operation: structures.NumericUnary) bool {
@@ -299,7 +285,6 @@ const Rules = struct {
     /// Tests the remainder by a power of two against zero with a mask instead, which needs
     /// no sign correction. The remainder itself stays for any other users.
     fn rewriteDivisibilityTest(self: *Rules, instruction: *Instruction) !bool {
-        if (instruction.* != .numeric_binary) return false;
         const comparison = instruction.numeric_binary;
         if (comparison.operation != .eq and comparison.operation != .ne) return false;
         const zero = self.numericConstant(comparison.operands.rhs) orelse return false;
@@ -538,18 +523,6 @@ const Structure = struct {
     pub fn trusted(self: Structure, value: ValueId) bool {
         return !self.rules.isAddressTaken(value) and self.function.plainValue(value);
     }
-
-    pub fn leaf(_: Structure, _: ValueId, _: u32) ?ranges.Interval {
-        return null;
-    }
-
-    pub fn narrow(_: Structure, _: ValueId, range: ranges.Interval, _: u32) ranges.Interval {
-        return range;
-    }
-
-    pub fn facts(_: Structure, _: ValueId, range: ranges.Interval, _: ?ValueId) ranges.Interval {
-        return range;
-    }
 };
 
 /// Views a numeric or wrapping i32 instruction as one binary operation.
@@ -574,70 +547,15 @@ pub fn integerOperation(instruction: Instruction) ?structures.NumericBinary {
     };
 }
 
-const AddressSet = struct {
-    taken: []bool,
-
-    fn mark(self: @This(), value: ValueId) void {
-        self.taken[@backingInt(value)] = true;
-    }
-};
-
 pub fn addressTaken(function: *Function) ![]const bool {
     if (function.address_taken) |taken| return taken;
     const taken = try function.scratch.alloc(bool, function.valueCount());
     @memset(taken, false);
-    const addresses: AddressSet = .{ .taken = taken };
-    for (function.blocks.items) |block| for (block.instructions.items) |index| {
-        if (!function.removed.items[index]) visitInstructionAddresses(function, function.instructions.items[index], addresses, AddressSet.mark);
-    };
-    for (function.blocks.items) |*block| {
-        for (block.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| visitBranchAddresses(function, branch.*, addresses, AddressSet.mark);
-    }
+    for (function.blocks.items) |*block| function_ir.visitBlockOperands(function, block, .addresses, taken, markTaken);
     function.address_taken = taken;
     return taken;
 }
 
-pub fn visitInstructionAddresses(function: *const Function, instruction: Instruction, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    switch (instruction) {
-        inline .value_copy, .variant_coerce, .variant_extract => |operation| {
-            if (operation.destination) |destination| visit(context, destination);
-        },
-        .static_conversion => |operation| {
-            visit(context, operation.operand);
-            if (operation.destination) |destination| visit(context, destination);
-        },
-        .storage_projection => |projection| visit(context, projection.owner),
-        .array_element => |element| visit(context, element.array),
-        .storage_cursor => |cursor| visit(context, cursor.source),
-        .borrow_address => |address| if (!address.base_is_reference) {
-            visit(context, address.source);
-        },
-        .initializer_ref => |reference| {
-            for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |capture| visit(context, capture);
-        },
-        .call => |call| visitCallAddresses(function, call, context, visit),
-        .fill => |operation| visit(context, operation.first),
-        .move => |operation| {
-            visit(context, operation.destination);
-            visit(context, operation.source);
-        },
-        else => {},
-    }
-}
-
-fn visitCallAddresses(function: *const Function, call: structures.FunctionCall, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    if (call.destination) |destination| visit(context, destination);
-    for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
-        if (argument != .prepared) visit(context, argument.valueId());
-    }
-}
-
-pub fn visitBranchAddresses(function: *const Function, branch: structures.FunctionBranch, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    const arguments = function.branch_arguments.items[branch.arguments.start..branch.arguments.end];
-    const parameters = function.blocks.items[@backingInt(branch.target)].parameters.items;
-    const count = @min(arguments.len, parameters.len);
-    for (arguments[0..count], parameters[0..count]) |argument, parameter| {
-        if (!function.directParameter(parameter)) visit(context, argument.value);
-    }
-    for (arguments[count..]) |argument| visit(context, argument.value);
+fn markTaken(taken: []bool, value: ValueId) void {
+    taken[@backingInt(value)] = true;
 }

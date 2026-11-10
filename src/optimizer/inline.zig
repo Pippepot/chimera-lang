@@ -11,6 +11,7 @@ const Range = structures.FunctionValueRange;
 const SourceSpan = structures.SourceSpan;
 const InlineFrameId = structures.InlineFrameId;
 const Function = function_ir.Function;
+const Interval = @import("ranges.zig").Interval;
 
 pub const Callee = struct {
     instance: structures.InstanceId,
@@ -23,25 +24,13 @@ pub const Callee = struct {
 pub const Facts = struct {
     eligible: bool,
     entry_taken: []const bool = &.{},
-    normal_return_ranges: []const ?@import("ranges.zig").Interval = &.{},
+    normal_return_ranges: []const ?Interval = &.{},
 };
 
 /// Constants copied from callees live once in the entry block, which dominates
 /// every use, instead of once per inlined body.
 const Constants = struct {
-    const Context = struct {
-        pub fn hash(_: Context, instruction: Instruction) u64 {
-            var hasher = std.hash.Wyhash.init(0);
-            std.hash.autoHash(&hasher, instruction);
-            return hasher.final();
-        }
-
-        pub fn eql(_: Context, left: Instruction, right: Instruction) bool {
-            return std.meta.eql(left, right);
-        }
-    };
-
-    values: std.HashMapUnmanaged(Instruction, ValueId, Context, 80) = .empty,
+    values: std.AutoHashMapUnmanaged(Instruction, ValueId) = .empty,
     inserted: usize = 0,
 
     fn shareable(instruction: Instruction) bool {
@@ -105,7 +94,7 @@ pub fn analyzeCallee(scratch: std.mem.Allocator, body: *const Body) !Facts {
     const loops = @import("loops.zig");
     const graph = (try function.controlFlow()).*;
     const analysis = try loops.Analysis.init(&function, graph, &.{});
-    const ranges = try scratch.alloc(?@import("ranges.zig").Interval, parameters.len);
+    const ranges = try scratch.alloc(?Interval, parameters.len);
     @memset(ranges, null);
     for (graph.order) |block| {
         switch (function.blocks.items[block].terminator) {
@@ -115,18 +104,13 @@ pub fn analyzeCallee(scratch: std.mem.Allocator, body: *const Body) !Facts {
         for (parameters, entry_taken, ranges) |parameter, exposed, *range| {
             if (exposed or function.valueType(parameter) != .int or !function.plainValue(parameter)) continue;
             const found = analysis.rangeAt(parameter, block, 16);
-            if (range.*) |previous| {
-                range.* = .{ .lower = @min(previous.lower, found.lower), .upper = @max(previous.upper, found.upper) };
-            } else range.* = found;
+            range.* = if (range.*) |previous| previous.join(found) else found;
         }
     }
     var narrowed = false;
     for (ranges) |*range| {
-        if (range.*) |found| {
-            if (found.lower == std.math.minInt(i32) and found.upper == std.math.maxInt(i32)) {
-                range.* = null;
-            } else narrowed = true;
-        }
+        const found = range.* orelse continue;
+        if (std.meta.eql(found, Interval{})) range.* = null else narrowed = true;
     }
     return .{ .eligible = true, .entry_taken = entry_taken, .normal_return_ranges = if (narrowed) ranges else &.{} };
 }
@@ -237,7 +221,7 @@ fn candidate(function: *Function, context: anytype, cache: *Cache, call: structu
     const body = callee.body;
     if (cache.limit == null) cache.limit = try context.inlineLimit();
     if (body.instructions.len + body.blocks.len > cache.limit.? and cost(body) > cache.limit.? + allowance(function, call)) return null;
-    const facts = if (@hasDecl(@TypeOf(context), "inlineFacts") and !callee.region)
+    const facts = if (!callee.region)
         (try cache.instanceFacts(function.scratch, context, callee.instance)) orelse return null
     else
         try cache.analyze(function.scratch, body);
@@ -247,7 +231,7 @@ fn candidate(function: *Function, context: anytype, cache: *Cache, call: structu
 }
 
 fn recoverDescriptorCall(function: *Function, context: anytype, block: u32, position: *usize, index: u32, call: *structures.FunctionCall) !bool {
-    if (!@hasDecl(@TypeOf(context), "callableInvocationPayloadParameter") or call.target != .indirect) return false;
+    if (call.target != .indirect) return false;
     const target = function.find(call.target.indirect);
     const definition = function.definition(target) orelse return false;
     if (definition != .callable_invoke) return false;
@@ -256,21 +240,17 @@ fn recoverDescriptorCall(function: *Function, context: anytype, block: u32, posi
     const taken = try canonicalize.addressTaken(function);
     if (taken[@backingInt(source)] or taken[@backingInt(target)]) return false;
     const constructor = function.definition(source);
+    const operation = definition.callable_invoke.operation;
     if (constructor == null or constructor.? != .erased_callable) {
-        if (definition.callable_invoke.operation != .invoke and @hasDecl(@TypeOf(context), "callableOwnershipTarget")) {
-            const instance = (try nonowningDescriptorInvocation(function, source, taken)) orelse return false;
-            call.target = .{ .direct = try context.callableOwnershipTarget(instance, definition.callable_invoke.operation, function.valueType(source)) };
-            return true;
-        }
-        return false;
+        if (operation == .invoke) return false;
+        const instance = (try nonowningDescriptorInvocation(function, source, taken)) orelse return false;
+        call.target = .{ .direct = try context.callableOwnershipTarget(instance, operation, function.valueType(source)) };
+        return true;
     }
     const instance = constructor.?.erased_callable.invocation;
-    if (definition.callable_invoke.operation != .invoke) {
-        if (@hasDecl(@TypeOf(context), "callableOwnershipTarget")) {
-            call.target = .{ .direct = try context.callableOwnershipTarget(instance, definition.callable_invoke.operation, constructor.?.erased_callable.type_id) };
-            return true;
-        }
-        return false;
+    if (operation != .invoke) {
+        call.target = .{ .direct = try context.callableOwnershipTarget(instance, operation, constructor.?.erased_callable.type_id) };
+        return true;
     }
     if (constructor.?.erased_callable.owns_environment) return false;
     const payload = constructor.?.erased_callable.payload;
@@ -359,8 +339,7 @@ fn inlineInstruction(function: *Function, context: anytype, cache: *Cache, block
     const span = function.instructionSpan(index);
     const frame = function.instructionFrame(index);
     const returns_value = call.destination == null and call.return_type != .unit and call.return_type != .never;
-    var splice = try Splice.init(function, callee, span, frame, block, null);
-    splice.constants = &cache.constants;
+    var splice = try Splice.init(function, callee, &cache.constants, span, frame, block, null);
     try splice.bindArguments(call, block);
     try splice.copyBody(.{ .block = tail, .parameter = returns_value, .destination = call.destination });
     if (returns_value) {
@@ -398,8 +377,7 @@ fn inlineStraight(function: *Function, context: anytype, cache: *Cache, block: u
     function.removed.items[index] = true;
     const span = function.instructionSpan(index);
     const frame = function.instructionFrame(index);
-    var splice = try Splice.init(function, callee, span, frame, block, block);
-    splice.constants = &cache.constants;
+    var splice = try Splice.init(function, callee, &cache.constants, span, frame, block, block);
     const body = callee.body;
     const arguments = function.call_arguments.items[call.arguments.start..call.arguments.end];
     for (arguments, body.blocks[0].argument_start..) |argument, parameter| splice.values[parameter] = switch (argument) {
@@ -451,9 +429,9 @@ const Splice = struct {
     region: bool,
     captures: []const ValueId,
     entry_taken: []const bool,
-    constants: ?*Constants = null,
+    constants: *Constants,
 
-    fn init(function: *Function, callee: Callee, span: SourceSpan, parent: InlineFrameId, after: u32, reuse: ?u32) !Splice {
+    fn init(function: *Function, callee: Callee, constants: *Constants, span: SourceSpan, parent: InlineFrameId, after: u32, reuse: ?u32) !Splice {
         const scratch = function.scratch;
         const body = callee.body;
         var splice: Splice = .{
@@ -468,6 +446,7 @@ const Splice = struct {
             .region = callee.region,
             .captures = try scratch.dupe(ValueId, callee.captures),
             .entry_taken = callee.entry_taken,
+            .constants = constants,
         };
         if (function.publishes_spans) {
             splice.root = @fromBackingInt(@intCast(function.inline_frames.items.len));
@@ -566,10 +545,10 @@ const Splice = struct {
                     instruction = .{ .local_storage = storage_type };
                 }
                 const source = self.origin(body.instruction_spans, body.instruction_frames, index);
-                if (self.constants) |constants| if (Constants.shareable(instruction)) {
-                    self.values[@backingInt(body.instructionValue(index))] = try constants.get(function, instruction, source.span, source.frame);
+                if (Constants.shareable(instruction)) {
+                    self.values[@backingInt(body.instructionValue(index))] = try self.constants.get(function, instruction, source.span, source.frame);
                     continue;
-                };
+                }
                 const copied = try function.newInstruction(instruction, source.span, source.frame);
                 try function.blocks.items[self.blocks[block_index]].instructions.append(function.scratch, copied);
                 self.values[@backingInt(body.instructionValue(index))] = function.results.items[copied];

@@ -123,7 +123,7 @@ pub fn number(function: *Function, workspace: *Workspace) !function_ir.Changes {
             if (function.removed.items[index]) continue;
             // Operands were resolved above; only this pass's own eliminations stale them.
             // Users follow their definitions, so resolving in place leaves nothing for a later sweep.
-            if (changes.changed) function_ir.allOperands(function, &function.instructions.items[index], function, Function.resolveOperand);
+            if (changes.changed) function_ir.visitOperands(function, &function.instructions.items[index], .all, function, Function.resolveOperand);
             var instruction = function.instructions.items[index];
             const result = function.results.items[index];
             const shareable = !taken[@backingInt(result)];
@@ -172,11 +172,11 @@ pub fn number(function: *Function, workspace: *Workspace) !function_ir.Changes {
                 .none => {},
             }
         }
-        if (changes.changed) function_ir.terminatorAllOperands(function, &function.blocks.items[block].terminator, function, Function.resolveOperand);
+        if (changes.changed) function_ir.visitTerminatorOperands(function, &function.blocks.items[block].terminator, .all, function, Function.resolveOperand);
     }
     if (changes.changed) {
         for (function.blocks.items, graph.reachable) |*block, reachable| {
-            if (!reachable) function_ir.visitBlockOperands(function, block, function, Function.resolveOperand);
+            if (!reachable) function_ir.visitBlockOperands(function, block, .all, function, Function.resolveOperand);
         }
         function.operands_dirty = false;
     }

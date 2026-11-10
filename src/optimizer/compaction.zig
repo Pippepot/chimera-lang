@@ -44,10 +44,13 @@ pub fn compact(scratch: std.mem.Allocator, function: *Function) !Body {
     var instructions: std.ArrayList(Instruction) = .empty;
     var instruction_spans: std.ArrayList(structures.SourceSpan) = .empty;
     var instruction_frames: std.ArrayList(InlineFrameId) = .empty;
-    const instruction_ranges = try scratch.alloc(Range, function.blocks.items.len);
+    var blocks: std.ArrayList(structures.FunctionBlock) = .empty;
+    var terminator_spans: std.ArrayList(structures.SourceSpan) = .empty;
+    var terminator_frames: std.ArrayList(InlineFrameId) = .empty;
     for (layout.items) |block_index| {
+        const block = function.blocks.items[block_index];
         const start: u32 = @intCast(instructions.items.len);
-        for (function.blocks.items[block_index].instructions.items) |index| {
+        for (block.instructions.items) |index| {
             const result = function.results.items[index];
             if (function.removed.items[index] or !live[@backingInt(result)]) continue;
             value_map[@backingInt(result)] = argument_count + @as(u32, @intCast(instructions.items.len));
@@ -59,14 +62,6 @@ pub fn compact(scratch: std.mem.Allocator, function: *Function) !Body {
                 try instruction_frames.append(scratch, try rebuilt.frame(scratch, function.frames.items[index]));
             }
         }
-        instruction_ranges[block_index] = .{ .start = start, .end = @intCast(instructions.items.len) };
-    }
-
-    var blocks: std.ArrayList(structures.FunctionBlock) = .empty;
-    var terminator_spans: std.ArrayList(structures.SourceSpan) = .empty;
-    var terminator_frames: std.ArrayList(InlineFrameId) = .empty;
-    for (layout.items) |index| {
-        const block = function.blocks.items[index];
         var terminator = block.terminator;
         for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
             try rebuilt.relocateBranch(scratch, branch);
@@ -74,10 +69,10 @@ pub fn compact(scratch: std.mem.Allocator, function: *Function) !Body {
         };
         if (terminator == .return_value) terminator.return_value.variant_tag_mapping = try rebuilt.tagMapping(scratch, terminator.return_value.variant_tag_mapping);
         try blocks.append(scratch, .{
-            .argument_start = argument_ranges[index].start,
-            .argument_end = argument_ranges[index].end,
-            .instruction_start = instruction_ranges[index].start,
-            .instruction_end = instruction_ranges[index].end,
+            .argument_start = argument_ranges[block_index].start,
+            .argument_end = argument_ranges[block_index].end,
+            .instruction_start = start,
+            .instruction_end = @intCast(instructions.items.len),
             .terminator = terminator,
         });
         if (function.publishes_spans) {
@@ -208,8 +203,8 @@ pub fn removeDead(function: *Function) !function_ir.Changes {
         if (!removed.* and !live[@backingInt(result)]) {
             changes.storage = changes.storage or function_ir.usesStorage(function, instruction);
             if (!uses.changed) {
-                function_ir.visitInstructionReferences(function, instruction, &uses, DeadUses.reference);
-                canonicalize.visitInstructionAddresses(function, instruction.*, &uses, DeadUses.address);
+                function_ir.visitOperands(function, instruction, .all, &uses, DeadUses.reference);
+                function_ir.visitOperands(function, instruction, .addresses, &uses, DeadUses.address);
             }
             removed.* = true;
             changes.changed = true;
@@ -218,10 +213,8 @@ pub fn removeDead(function: *Function) !function_ir.Changes {
     for (function.blocks.items, reachable) |*block, kept| if (!kept) {
         if (block.instructions.items.len != 0 or block.terminator != .diverge) changes.changed = true;
         if (!uses.changed) {
-            function_ir.visitTerminatorReferences(function, &block.terminator, &uses, DeadUses.reference);
-            for (block.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
-                canonicalize.visitBranchAddresses(function, branch.*, &uses, DeadUses.address);
-            };
+            function_ir.visitTerminatorOperands(function, &block.terminator, .all, &uses, DeadUses.reference);
+            function_ir.visitTerminatorOperands(function, &block.terminator, .addresses, &uses, DeadUses.address);
         }
         block.instructions.clearRetainingCapacity();
         block.terminator = .diverge;
@@ -309,7 +302,7 @@ fn liveValues(scratch: std.mem.Allocator, function: *Function, reachable: []cons
         switch (function.definitions.items[@backingInt(value)]) {
             .instruction => |index| {
                 std.debug.assert(!function.removed.items[index]);
-                function_ir.visitInstructionReferences(function, &function.instructions.items[index], &liveness, Liveness.mark);
+                function_ir.visitOperands(function, &function.instructions.items[index], .all, &liveness, Liveness.mark);
             },
             .argument => |argument| {
                 const position = std.mem.indexOfScalar(ValueId, function.blocks.items[argument.block].parameters.items, value).?;

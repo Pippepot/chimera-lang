@@ -100,7 +100,7 @@ fn collectSlots(function: *Function, graph: Graph) ![]const Slot {
             scan.site = .{ .block = block_index, .instruction = index };
             const instruction = &function.instructions.items[index];
             scan.hit = false;
-            function_ir.visitInstructionReferences(function, instruction, &scan, Scan.reference);
+            function_ir.visitOperands(function, instruction, .all, &scan, Scan.reference);
             if (!scan.hit) continue;
             if (instruction.* == .value_copy) if (instruction.value_copy.destination) |destination| {
                 if (destination != instruction.value_copy.source and instruction.value_copy.type_id == function.valueType(destination)) {
@@ -108,12 +108,12 @@ fn collectSlots(function: *Function, graph: Graph) ![]const Slot {
                     scan.accept(&storage);
                 }
             };
-            function_ir.readOperands(function, instruction, &scan, Scan.accept);
+            function_ir.visitOperands(function, instruction, .reads, &scan, Scan.accept);
         }
         scan.site = .{ .block = block_index, .instruction = null };
         scan.hit = false;
-        function_ir.visitTerminatorReferences(function, &block.terminator, &scan, Scan.reference);
-        if (scan.hit) function_ir.terminatorReadOperands(function, &block.terminator, &scan, Scan.accept);
+        function_ir.visitTerminatorOperands(function, &block.terminator, .all, &scan, Scan.reference);
+        if (scan.hit) function_ir.visitTerminatorOperands(function, &block.terminator, .reads, &scan, Scan.accept);
     }
     if (scan.failed) return error.OutOfMemory;
     var kept: usize = 0;
@@ -237,12 +237,12 @@ fn promoteShared(function: *Function, address_taken: []const bool, slots: []cons
             var observer: Rewrite = .{ .slot = slot.storage, .current = slot.storage };
             if (site.instruction) |index| {
                 if (function.removed.items[index]) continue;
-                function_ir.readOperands(function, &function.instructions.items[index], &observer, Rewrite.observe);
+                function_ir.visitOperands(function, &function.instructions.items[index], .reads, &observer, Rewrite.observe);
                 if (observer.reads and !defines.contains(site.block, slot_index)) _ = live_in.insert(site.block, slot_index);
                 if (storedValue(function.instructions.items[index], slot.storage) != null and defines.insert(site.block, slot_index))
                     try definitions[slot_index].append(scratch, site.block);
             } else {
-                function_ir.terminatorReadOperands(function, &function.blocks.items[site.block].terminator, &observer, Rewrite.observe);
+                function_ir.visitTerminatorOperands(function, &function.blocks.items[site.block].terminator, .reads, &observer, Rewrite.observe);
                 if (observer.reads and !defines.contains(site.block, slot_index)) _ = live_in.insert(site.block, slot_index);
             }
         }
@@ -323,7 +323,7 @@ fn promoteShared(function: *Function, address_taken: []const bool, slots: []cons
         for (function.blocks.items[block].instructions.items) |index| {
             if (function.removed.items[index]) continue;
             const instruction = &function.instructions.items[index];
-            function_ir.readOperands(function, instruction, &rename, Renaming.substitute);
+            function_ir.visitOperands(function, instruction, .reads, &rename, Renaming.substitute);
             if (instruction.* == .value_copy) if (instruction.value_copy.destination) |destination| {
                 if (@backingInt(destination) >= mapping.len) continue;
                 const slot_index = mapping[@backingInt(destination)] orelse continue;
@@ -337,7 +337,7 @@ fn promoteShared(function: *Function, address_taken: []const bool, slots: []cons
                 }
             };
         }
-        function_ir.terminatorReadOperands(function, &function.blocks.items[block].terminator, &rename, Renaming.substitute);
+        function_ir.visitTerminatorOperands(function, &function.blocks.items[block].terminator, .reads, &rename, Renaming.substitute);
         for (function.blocks.items[block].terminator.branches()) |maybe_edge| if (maybe_edge) |edge| {
             for (phis[@backingInt(edge.target)].items) |phi| edge.arguments = try function.copyBranchArguments(edge.arguments, &.{rename.current[phi.slot]});
         };
@@ -354,7 +354,7 @@ fn taken(address_taken: []const bool, value: ValueId) bool {
 
 fn rewriteSite(function: *Function, address_taken: []const bool, slot: Slot, site: Site, rewrite: *Rewrite) void {
     const index = site.instruction orelse {
-        function_ir.terminatorReadOperands(function, &function.blocks.items[site.block].terminator, rewrite, Rewrite.substitute);
+        function_ir.visitTerminatorOperands(function, &function.blocks.items[site.block].terminator, .reads, rewrite, Rewrite.substitute);
         return;
     };
     if (function.removed.items[index]) return;
@@ -370,7 +370,7 @@ fn rewriteSite(function: *Function, address_taken: []const bool, slot: Slot, sit
         }
         return;
     }
-    function_ir.readOperands(function, instruction, rewrite, Rewrite.substitute);
+    function_ir.visitOperands(function, instruction, .reads, rewrite, Rewrite.substitute);
 }
 
 fn undefinedValue(function: *Function, slot: Slot, cache: *[@backingInt(structures.TypeId.f64) + 1]?ValueId) !ValueId {

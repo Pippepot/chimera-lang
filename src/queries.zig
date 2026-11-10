@@ -216,9 +216,7 @@ fn discoverItems(ctx: anytype, file_id: structures.FileId) anyerror!?structures.
     if (file_id == try standardFile(ctx, .context)) {
         for (@constCast(tree.items)) |*item| {
             if (item.parent != null or item.qualified_owner != null) continue;
-            inline for (std.meta.tags(structures.ContextEntry)) |entry| {
-                if (std.mem.eql(u8, item.loc.name.text(), @tagName(entry))) item.loc.contextual = entry;
-            }
+            item.loc.contextual = std.meta.stringToEnum(structures.ContextEntry, item.loc.name.text());
         }
     }
 
@@ -462,6 +460,11 @@ fn standardFunction(ctx: anytype, file: standard_library.File, name: []const u8)
     return standardDeclaration(ctx, file, name, structures.ModuleScope.resolveFunction);
 }
 
+fn standardStructType(ctx: anytype, file: standard_library.File, name: []const u8) !?structures.TypeId {
+    const item = (try standardDeclaration(ctx, file, name, structures.ModuleScope.resolveStatic)) orelse return null;
+    return try internStructType(ctx, item);
+}
+
 fn internStandardArrayType(ctx: anytype, identity: structures.GeneratedStructIdentity) !structures.TypeId {
     const item_source = (try itemSource(ctx, identity.owner.item)) orelse return error.Unavailable;
     const site = semantic.parameterizedStructSite(&item_source.parsed, item_source.resolved.declaration) orelse return error.Unavailable;
@@ -485,7 +488,7 @@ fn internStandardArrayType(ctx: anytype, identity: structures.GeneratedStructIde
     return error.Unavailable;
 }
 
-fn validArrayElementType(ctx: anytype, type_id: structures.TypeId) anyerror!bool {
+pub fn validArrayElementType(ctx: anytype, type_id: structures.TypeId) anyerror!bool {
     if (type_id.isPrimitive()) return type_id != .type;
     switch ((try typeData(ctx, type_id)).?) {
         .structure, .callable, .function_reference, .bound_method, .reference => return true,
@@ -784,33 +787,27 @@ pub fn TypeFacts(comptime Context: type) type {
         }
 
         pub fn allocatorType(self: @This()) !structures.TypeId {
-            const item = (try standardDeclaration(self.ctx, .memory_allocator, "Allocator", structures.ModuleScope.resolveStatic)) orelse return error.Unavailable;
-            return internStructType(self.ctx, item);
+            return (try standardStructType(self.ctx, .memory_allocator, "Allocator")) orelse error.Unavailable;
         }
 
         pub fn loggerType(self: @This()) !structures.TypeId {
-            const item = (try standardDeclaration(self.ctx, .logging, "Logger", structures.ModuleScope.resolveStatic)) orelse return error.Unavailable;
-            return internStructType(self.ctx, item);
+            return (try standardStructType(self.ctx, .logging, "Logger")) orelse error.Unavailable;
         }
 
         pub fn allocationLayout(self: @This()) !structures.TypeId {
-            const item = (try standardDeclaration(self.ctx, .memory_raw, "AllocationLayout", structures.ModuleScope.resolveStatic)) orelse return error.Unavailable;
-            return internStructType(self.ctx, item);
+            return (try standardStructType(self.ctx, .memory_raw, "AllocationLayout")) orelse error.Unavailable;
         }
 
         pub fn rawBlock(self: @This()) !structures.TypeId {
-            const item = (try standardDeclaration(self.ctx, .memory_raw, "RawBlock", structures.ModuleScope.resolveStatic)) orelse return error.Unavailable;
-            return internStructType(self.ctx, item);
+            return (try standardStructType(self.ctx, .memory_raw, "RawBlock")) orelse error.Unavailable;
         }
 
         pub fn allocationError(self: @This()) !structures.TypeId {
-            const item = (try standardDeclaration(self.ctx, .memory_allocation, "AllocationError", structures.ModuleScope.resolveStatic)) orelse return error.Unavailable;
-            return internStructType(self.ctx, item);
+            return (try standardStructType(self.ctx, .memory_allocation, "AllocationError")) orelse error.Unavailable;
         }
 
         pub fn ioError(self: @This()) !structures.TypeId {
-            const item = (try standardDeclaration(self.ctx, .io, "IoError", structures.ModuleScope.resolveStatic)) orelse return error.Unavailable;
-            return internStructType(self.ctx, item);
+            return (try standardStructType(self.ctx, .io, "IoError")) orelse error.Unavailable;
         }
 
         pub fn panicMessageType(self: @This()) !structures.TypeId {
@@ -1141,8 +1138,7 @@ pub fn AnalysisContext(comptime Context: type) type {
         pub fn probeConcreteClosureType(self: @This(), instance: structures.InstanceId, captures: []const structures.StructField, expected: ?structures.TypeId) !?structures.TypeId {
             var diagnostic = false;
             const probe: ReferenceProbeContext(Context) = .{ .ctx = self.ctx, .diagnostic = &diagnostic };
-            var analysis: AnalysisContext(@TypeOf(probe)) = .{ .ctx = probe, .file_id = self.file_id, .instance = self.instance };
-            analysis.static_bindings = self.static_bindings;
+            const analysis: AnalysisContext(@TypeOf(probe)) = .{ .ctx = probe, .file_id = self.file_id, .instance = self.instance, .static_bindings = self.static_bindings };
             return unlessUnavailable(analysis.concreteClosureType(instance, captures, expected));
         }
 
@@ -1158,12 +1154,8 @@ pub fn AnalysisContext(comptime Context: type) type {
         pub fn callableSignature(self: @This(), type_id: structures.TypeId) !?structures.CallableType {
             if (try self.facts().callable(type_id)) |signature| return signature;
             if (try self.facts().functionReference(type_id)) |signature| return signature;
-            if (try self.facts().boundMethod(type_id)) |method| {
-                const signature = (try self.functionSignature(method)) orelse return error.Unavailable;
-                return .{ .parameters = signature.parameters[1..], .return_type = signature.return_type, .result_mode = signature.result_mode };
-            }
-            const invocation = (try self.concreteClosureInvocation(type_id)) orelse return null;
-            const signature = (try self.functionSignature(invocation)) orelse return error.Unavailable;
+            const invoked = (try self.facts().boundMethod(type_id)) orelse (try self.concreteClosureInvocation(type_id)) orelse return null;
+            const signature = (try self.functionSignature(invoked)) orelse return error.Unavailable;
             return .{ .parameters = signature.parameters[1..], .return_type = signature.return_type, .result_mode = signature.result_mode };
         }
 
@@ -1297,12 +1289,10 @@ pub fn AnalysisContext(comptime Context: type) type {
             return .{ .query_key = .{ .generated = .{ .owner = factory, .node_offset = site } }, .specialization = factory.specialization, .environment = factory.environment };
         }
 
-        fn visibleTypeMember(self: @This(), namespace: structures.ModuleScope, name: structures.Name, span: ?structures.SourceSpan) !?structures.ItemId {
+        fn visibleTypeMember(self: @This(), namespace: structures.ModuleScope, name: structures.Name, span: structures.SourceSpan) !?structures.ItemId {
             const entry = namespace.resolveName(name) orelse return null;
-            if (span) |access_span| {
-                const member = try self.ctx.lookupInterned(ItemLocations, entry.item_id);
-                if (!entry.is_public and try self.currentModule() != member.origin.module) try self.reject(access_span, .private_access);
-            }
+            const member = try self.ctx.lookupInterned(ItemLocations, entry.item_id);
+            if (!entry.is_public and try self.currentModule() != member.origin.module) try self.reject(span, .private_access);
             return entry.item_id;
         }
 
@@ -1596,32 +1586,31 @@ pub fn AnalysisContext(comptime Context: type) type {
 
         pub fn callBehavior(self: @This(), item: structures.ItemId) !structures.CallBehavior {
             const location = try self.ctx.lookupInterned(ItemLocations, item);
-            const names = std.StaticStringMap(structures.CallBehavior).initComptime(.{
-                .{ "take", .box_value },
-                .{ "append_collection_bounded", .collection_append_bounded },
-                .{ "append_collection_moved", .collection_append_bounded },
-                .{ "append_collection_growing", .collection_append_growing },
-                .{ "append_collection_optional", .collection_append_growing },
-            });
-            if (location.owner == null) {
-                const behavior = names.get(location.name.text()) orelse return .ordinary;
-                return if (item == (try self.stdMemoryFunction(location.name.text()))) behavior else .ordinary;
-            }
-            const Member = struct { factory: []const u8, name: []const u8, behavior: structures.CallBehavior };
-            const members = [_]Member{
+            // Entries without a factory are top-level functions; the rest are members of a factory's struct.
+            const Entry = struct { factory: ?[]const u8 = null, name: []const u8, behavior: structures.CallBehavior };
+            const entries = [_]Entry{
+                .{ .name = "take", .behavior = .box_value },
+                .{ .name = "append_collection_bounded", .behavior = .collection_append_bounded },
+                .{ .name = "append_collection_moved", .behavior = .collection_append_bounded },
+                .{ .name = "append_collection_growing", .behavior = .collection_append_growing },
+                .{ .name = "append_collection_optional", .behavior = .collection_append_growing },
                 .{ .factory = "Box", .name = "new", .behavior = .box_new },
                 .{ .factory = "List", .name = "append", .behavior = .list_append },
                 .{ .factory = "List", .name = "reserve", .behavior = .list_reserve },
                 .{ .factory = "List", .name = "remove", .behavior = .list_remove },
                 .{ .factory = "List", .name = "consume_iter", .behavior = .list_consume },
             };
-            for (members) |member| {
-                if (!std.mem.eql(u8, location.name.text(), member.name)) continue;
-                const factory = (try self.stdMemoryFunction(member.factory)) orelse continue;
+            for (entries) |entry| {
+                if (!std.mem.eql(u8, location.name.text(), entry.name)) continue;
+                const factory_name = entry.factory orelse {
+                    if (location.owner == null and item == try self.stdMemoryFunction(entry.name)) return entry.behavior;
+                    continue;
+                };
+                const factory = (try self.stdMemoryFunction(factory_name)) orelse continue;
                 if (location.owner != factory) continue;
                 const association = (try self.factoryNamespace(.{ .item = factory })) orelse continue;
                 const namespace = (try self.ctx.get(TypeNamespace, association.query_key)).* orelse return error.Unavailable;
-                if (namespace.resolve(member.name) == item) return member.behavior;
+                if (namespace.resolve(entry.name) == item) return entry.behavior;
             }
             return .ordinary;
         }
@@ -1962,13 +1951,9 @@ pub fn AnalysisContext(comptime Context: type) type {
 
         pub fn validateNominalVariant(self: @This(), type_id: structures.TypeId, span: structures.SourceSpan) !void {
             const members = (try self.facts().variantMembers(type_id)) orelse &.{type_id};
-            var has_cases = false;
-            for (members) |member| {
-                if (try nominalCaseIdentity(self.ctx, member) != null) {
-                    has_cases = true;
-                    break;
-                }
-            }
+            const has_cases = for (members) |member| {
+                if (try nominalCaseIdentity(self.ctx, member) != null) break true;
+            } else false;
             if (has_cases and try self.nominalDeclarationIsPublic() and !try self.isPublicNominalPayload(type_id))
                 try self.reject(span, .public_variant_private_type);
         }
@@ -2304,9 +2289,7 @@ pub fn AnalysisContext(comptime Context: type) type {
             if (child) |found| return .{ .namespace = found };
             if (!namespace.members_visible) try self.reject(span, .unknown_imported_name);
             const origin: ImportOrigin = .{ .file_id = self.file_id.?, .span = span };
-            var visited: std.ArrayList(ExportVisit) = .empty;
-            defer visited.deinit(self.ctx.allocator());
-            const exported = (try resolveModuleExport(self.ctx, try self.currentModule(), namespace.module, name, origin, &visited, true)) orelse return error.Unavailable;
+            const exported = (try resolveModuleExport(self.ctx, try self.currentModule(), namespace.module, name, origin, true)) orelse return error.Unavailable;
             return switch (exported) {
                 .declaration => |item| try self.declarationReference(.{ .item = item }),
                 .namespace => |target| .{ .namespace = target },
@@ -2725,25 +2708,21 @@ fn structLayout(ctx: anytype, type_id: structures.TypeId) anyerror!?structures.S
     if ((try ctx.get(OwnershipCapabilities, type_id)).* == null) return null;
     if (!try facts.isRuntimeCapable(type_id)) return null;
 
-    const field_offsets = try ctx.allocator().alloc(u32, definition.fields.len);
-    var keep_offsets = false;
-    defer if (!keep_offsets) ctx.allocator().free(field_offsets);
+    var field_offsets: std.ArrayList(u32) = .empty;
+    defer field_offsets.deinit(ctx.allocator());
+    try field_offsets.ensureTotalCapacityPrecise(ctx.allocator(), definition.fields.len);
     var byte_size: u32 = 0;
     var byte_alignment: u32 = 1;
-    for (definition.fields, field_offsets) |field, *field_offset| {
+    for (definition.fields) |field| {
         const field_layout = ((try unlessUnavailable(ctx.get(HostTypeLayout, try facts.fieldStorageType(field)))) orelse return null).*;
-        field_offset.* = try alignForward(byte_size, field_layout.byte_alignment);
-        byte_size = std.math.add(u32, field_offset.*, field_layout.byte_size) catch return error.TypeTooLarge;
+        const field_offset = try alignForward(byte_size, field_layout.byte_alignment);
+        field_offsets.appendAssumeCapacity(field_offset);
+        byte_size = std.math.add(u32, field_offset, field_layout.byte_size) catch return error.TypeTooLarge;
         byte_alignment = @max(byte_alignment, field_layout.byte_alignment);
     }
-    const aligned_size = try alignForward(byte_size, byte_alignment);
-    keep_offsets = true;
     return .{
-        .layout = .{
-            .byte_size = aligned_size,
-            .byte_alignment = byte_alignment,
-        },
-        .field_offsets = field_offsets,
+        .layout = .{ .byte_size = try alignForward(byte_size, byte_alignment), .byte_alignment = byte_alignment },
+        .field_offsets = try field_offsets.toOwnedSlice(ctx.allocator()),
     };
 }
 
@@ -3219,8 +3198,7 @@ pub const TextTypeName = enum { String, StaticString, StringView };
 pub const TextType = CompilerQuery("TextType", .declarations, textType, .{});
 
 fn textType(ctx: anytype, name: TextTypeName) anyerror!?structures.TypeId {
-    const item = (try standardDeclaration(ctx, .text, @tagName(name), structures.ModuleScope.resolveStatic)) orelse return null;
-    const type_id = try internStructType(ctx, item);
+    const type_id = (try standardStructType(ctx, .text, @tagName(name))) orelse return null;
     if (name == .StaticString and try (TypeFacts(@TypeOf(ctx)){ .ctx = ctx }).staticStringBytes(type_id) == null) return null;
     return type_id;
 }
@@ -3415,7 +3393,13 @@ fn mergeExport(ctx: anytype, origin: ImportOrigin, result: *?structures.ImportTa
 }
 
 /// Prelude defaults skip the catalog check; the module graph validates their paths.
-fn resolveModuleExport(
+fn resolveModuleExport(ctx: anytype, importer: structures.ModuleId, target: structures.ModuleId, name: []const u8, origin: ImportOrigin, validate_module_catalog: bool) !?structures.ImportTarget {
+    var visited: std.ArrayList(ExportVisit) = .empty;
+    defer visited.deinit(ctx.allocator());
+    return resolveExportVisiting(ctx, importer, target, name, origin, &visited, validate_module_catalog);
+}
+
+fn resolveExportVisiting(
     ctx: anytype,
     importer: structures.ModuleId,
     target: structures.ModuleId,
@@ -3444,7 +3428,7 @@ fn resolveModuleExport(
                 for (items) |item| {
                     if (!std.mem.eql(u8, item.bound.spelling, name)) continue;
                     const reexported = (try reexportedModule(ctx, file_id, entry, validate_module_catalog)) orelse return null;
-                    const candidate = (try resolveModuleExport(ctx, target, reexported, item.original.spelling, origin, visited, validate_module_catalog)) orelse return null;
+                    const candidate = (try resolveExportVisiting(ctx, target, reexported, item.original.spelling, origin, visited, validate_module_catalog)) orelse return null;
                     if (!try mergeExport(ctx, origin, &result, candidate, declaration != null)) return null;
                 }
                 continue;
@@ -3482,33 +3466,29 @@ fn importBoundName(entry: structures.ImportDeclaration) []const u8 {
 const ImportBindings = struct {
     declarations: structures.ModuleScope,
     imports: std.ArrayList(structures.FileImport) = .empty,
-    bound: std.StringHashMapUnmanaged(u32) = .empty,
 
     fn deinit(self: *ImportBindings, allocator: std.mem.Allocator) void {
         for (self.imports.items) |binding| allocator.free(binding.name);
         self.imports.deinit(allocator);
-        self.bound.deinit(allocator);
     }
 
     fn bind(self: *ImportBindings, ctx: anytype, origin: ImportOrigin, name: []const u8, target: structures.ImportTarget, reexport: bool) !bool {
-        if (self.bound.get(name)) |index| {
-            if (!mergeImportTarget(&self.imports.items[index].target, target)) {
+        for (self.imports.items) |*existing| {
+            if (!std.mem.eql(u8, existing.name, name)) continue;
+            if (!mergeImportTarget(&existing.target, target)) {
                 try rejectImport(ctx, origin, .import_conflict);
                 return false;
             }
-            self.imports.items[index].reexport = self.imports.items[index].reexport or reexport;
+            existing.reexport = existing.reexport or reexport;
             return true;
         }
         if (self.declarations.resolve(name) != null) {
             try rejectImport(ctx, origin, .import_conflict);
             return false;
         }
-        try self.imports.ensureUnusedCapacity(ctx.allocator(), 1);
-        try self.bound.ensureUnusedCapacity(ctx.allocator(), 1);
         const owned = try ctx.allocator().dupe(u8, name);
-        const index: u32 = @intCast(self.imports.items.len);
-        self.imports.appendAssumeCapacity(.{ .name = owned, .target = target, .reexport = reexport });
-        self.bound.putAssumeCapacity(owned, index);
+        errdefer ctx.allocator().free(owned);
+        try self.imports.append(ctx.allocator(), .{ .name = owned, .target = target, .reexport = reexport });
         return true;
     }
 
@@ -3553,10 +3533,8 @@ fn resolvePreludeImports(ctx: anytype, _: void) anyerror!?structures.FileImports
     var iterator = names.keyIterator();
     while (iterator.next()) |name_ptr| {
         const name = name_ptr.*;
-        var visited: std.ArrayList(ExportVisit) = .empty;
-        defer visited.deinit(ctx.allocator());
         const origin: ImportOrigin = .{ .file_id = members[0], .span = .{ .start = 0, .end = 0 } };
-        const exported = (try resolveModuleExport(ctx, importer, prelude, name, origin, &visited, false)) orelse return null;
+        const exported = (try resolveModuleExport(ctx, importer, prelude, name, origin, false)) orelse return null;
         const owned = try ctx.allocator().dupe(u8, name);
         errdefer ctx.allocator().free(owned);
         try bindings.imports.append(ctx.allocator(), .{ .name = owned, .target = exported, .reexport = false });
@@ -3576,10 +3554,8 @@ fn resolveImportStatement(
     const target_module = (try resolveImportedModule(ctx, path_origin, entry.path.spelling)) orelse return false;
     if (entry.selective) |items| {
         for (items) |item| {
-            var visited: std.ArrayList(ExportVisit) = .empty;
-            defer visited.deinit(ctx.allocator());
             const origin: ImportOrigin = .{ .file_id = file_id, .span = item.original.span };
-            const exported = (try resolveModuleExport(ctx, module, target_module, item.original.spelling, origin, &visited, true)) orelse return false;
+            const exported = (try resolveModuleExport(ctx, module, target_module, item.original.spelling, origin, true)) orelse return false;
             if (!try bindings.bind(ctx, .{ .file_id = file_id, .span = item.bound.span }, item.bound.spelling, exported, entry.is_public)) return false;
         }
         return true;
@@ -4023,31 +3999,19 @@ fn resolveStaticInstance(ctx: anytype, instance: structures.InstanceId) anyerror
         .exit => return null,
     };
     const value = (try ctx.lookupInterned(CompileTimeValues, value_id)).*;
-    if (runtime_annotation == null) {
+    const expected_type = runtime_annotation orelse {
         if (value == .type) try analysis_context.validateNominalVariant(value.type, nodeSpan(&parsed, initializer));
         return value_id;
-    }
-    const expected_type = runtime_annotation.?;
-    if (value == .type) {
-        try typing.emitSemanticIssue(ctx, resolved.file_id, .{
-            .span = nodeSpan(&parsed, initializer),
-            .kind = .type_value_used_as_runtime_value,
-        });
-        return null;
-    }
-    const typed_runtime = value.runtime;
-    if (!try semantic.canWidenTo(analysis_context, typed_runtime.type_id, expected_type)) {
-        try typing.emitSemanticIssue(ctx, resolved.file_id, .{
-            .span = nodeSpan(&parsed, initializer),
-            .kind = .{ .static_initializer_type_mismatch = .{
-                .expected = expected_type,
-                .found = typed_runtime.type_id,
-            } },
-        });
-        return null;
-    }
-    std.debug.assert(typed_runtime.type_id == expected_type);
-    return value_id;
+    };
+    const issue: structures.Diagnostic.Kind = switch (value) {
+        .type => .type_value_used_as_runtime_value,
+        .runtime => |runtime| if (try semantic.canWidenTo(analysis_context, runtime.type_id, expected_type)) {
+            std.debug.assert(runtime.type_id == expected_type);
+            return value_id;
+        } else .{ .static_initializer_type_mismatch = .{ .expected = expected_type, .found = runtime.type_id } },
+    };
+    try typing.emitSemanticIssue(ctx, resolved.file_id, .{ .span = nodeSpan(&parsed, initializer), .kind = issue });
+    return null;
 }
 
 pub const AnalyzeComptimeThunk = CompilerQuery("AnalyzeComptimeThunk", .body_overhead, analyzeComptimeThunk, .{});
@@ -4448,12 +4412,7 @@ fn ComptimeCallExecutor(comptime Context: type) type {
         fn allocateRaw(self: *@This(), return_type: structures.TypeId, layout: comptime_interpreter.Value, storage: std.mem.Allocator) !comptime_interpreter.Result {
             const size = comptime_interpreter.integerValue(try comptime_interpreter.aggregateElement(layout, 0, self));
             const alignment = comptime_interpreter.integerValue(try comptime_interpreter.aggregateElement(layout, 1, self));
-            const error_type = try self.facts().allocationError();
-            if (size < 0 or alignment <= 0 or alignment > 4096 or (alignment & (alignment - 1)) != 0) {
-                const reason = try self.internRuntime(.int, .{ .int = 1 });
-                const failure: comptime_interpreter.Value = .{ .runtime = .{ .structure = try self.internTuple(&.{reason}) } };
-                return .{ .returned = try comptime_interpreter.storedVariantValue(return_type, error_type, failure, self) };
-            }
+            if (size < 0 or alignment <= 0 or alignment > 4096 or (alignment & (alignment - 1)) != 0) return self.allocationFailure(return_type, 1);
             const raw_type = try self.facts().rawBlock();
             const raw = (try self.facts().structDefinition(raw_type)).?;
             const allocated = try self.heap.allocate(.byte, @intCast(size));
@@ -4461,19 +4420,21 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             return .{ .returned = try comptime_interpreter.storedVariantValue(return_type, raw_type, value, self) };
         }
 
+        /// An `AllocationError` result carrying the failure reason code.
+        fn allocationFailure(self: *@This(), return_type: structures.TypeId, reason_code: i32) !comptime_interpreter.Result {
+            const reason = try self.internRuntime(.int, .{ .int = reason_code });
+            const failure: comptime_interpreter.Value = .{ .runtime = .{ .structure = try self.internTuple(&.{reason}) } };
+            return .{ .returned = try comptime_interpreter.storedVariantValue(return_type, try self.facts().allocationError(), failure, self) };
+        }
+
         fn allocateStorage(self: *@This(), symbol: standard_library.External, return_type: structures.TypeId, arguments: []comptime_interpreter.Value, storage: std.mem.Allocator) !comptime_interpreter.Result {
-            const payload = (try (if (symbol == .allocate) intrinsics.errorPayload(self.facts(), return_type, try self.facts().allocationError()) else intrinsics.optionalPayload(self.facts(), return_type))) orelse unreachable;
+            const payload = (try (if (symbol == .allocate) intrinsics.errorPayload(self.facts(), return_type, try self.facts().allocationError()) else intrinsics.errorPayload(self.facts(), return_type, .none))) orelse unreachable;
             const element_type = if (symbol == .allocate) (try self.facts().allocationElement(payload)) orelse unreachable else structures.TypeId.byte;
             const layout = (try self.ctx.get(HostTypeLayout, element_type)).*;
             const count = comptime_interpreter.integerValue(arguments[0]);
             const value = try self.heap.allocateValue(payload, element_type, layout.byte_size, count, storage);
             if (value) |allocated| return .{ .returned = try comptime_interpreter.storedVariantValue(return_type, payload, allocated, self) };
-            if (symbol == .allocate) {
-                const error_type = try self.facts().allocationError();
-                const reason = try self.internRuntime(.int, .{ .int = if (count < 0) 1 else 2 });
-                const failure: comptime_interpreter.Value = .{ .runtime = .{ .structure = try self.internTuple(&.{reason}) } };
-                return .{ .returned = try comptime_interpreter.storedVariantValue(return_type, error_type, failure, self) };
-            }
+            if (symbol == .allocate) return self.allocationFailure(return_type, if (count < 0) 1 else 2);
             return .{ .returned = try comptime_interpreter.storedVariantValue(return_type, .none, .{ .runtime = .none }, self) };
         }
 
@@ -4782,30 +4743,9 @@ fn trivialReferenceContractBody(ctx: anytype, instance: structures.InstanceId) a
     // a context-free scalar callee's runtime typing at an otherwise lazy call.
     for (construction.success.expressions) |expression| {
         switch (expression.operation) {
-            .comparison,
-            .conjunction,
-            .disjunction,
-            .negation,
-            .integer_literal,
-            .int_literal_value,
-            .numeric,
-            .float_literal,
-            .integer,
-            .byte,
-            .boolean,
-            .type_value,
-            .unit,
-            .none,
-            .local_read,
-            .local_transfer,
-            .numeric_conversion,
-            .overflow_context,
-            .discard,
-            .sequence,
-            .if_else,
-            .loop,
-            .scope,
-            => {},
+            .comparison, .conjunction, .disjunction, .negation, .numeric, .numeric_conversion, .overflow_context => {},
+            .integer_literal, .int_literal_value, .float_literal, .integer, .byte, .boolean, .type_value, .unit, .none => {},
+            .local_read, .local_transfer, .discard, .sequence, .if_else, .loop, .scope => {},
             .annotation => |annotation| if (!annotation.type_id.isPrimitive()) return false,
             .assignment => |assignment| if (assignment.fields.start != assignment.fields.end) return false,
             else => return false,
@@ -5560,9 +5500,8 @@ fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?s
         .allocate_raw => try codegen.compileExternalAllocateRaw(signature, types, ctx.allocator()),
         .deallocate_raw => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
         .cursor_aligned => try codegen.compileExternalCursorAligned(signature, types, ctx.allocator()),
-        .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout, .layout_for => unreachable,
         .static_iteration_item => null,
-        .primitive_operation, .numeric_converter, .copy_value, .move_value, .erase, .clone, .copy_callable, .drop_callable, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .allocation_count, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => unreachable,
+        .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout, .layout_for, .primitive_operation, .numeric_converter, .copy_value, .move_value, .erase, .clone, .copy_callable, .drop_callable, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .allocation_count, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => unreachable,
         .io_read, .io_write => try codegen.compileExternalByteIo(symbol == .io_read, signature, types, ctx.allocator()),
         .exit => try codegen.compileExternalExit(ctx.allocator()),
         .panic_message => try codegen.compileExternalPanic(signature, types, ctx.allocator()),
@@ -5628,10 +5567,8 @@ fn collectInlineSources(ctx: anytype, body: *const structures.FunctionBodyAnalys
 fn addInlineSource(ctx: anytype, sources: *std.ArrayList(codegen.InlineSource), instance: structures.InstanceId) !bool {
     for (sources.items) |existing| if (std.meta.eql(existing.instance, instance)) return true;
     const source = (try traceSource(ctx, instance)) orelse return false;
-    sources.append(ctx.allocator(), .{ .instance = instance, .source = source }) catch |err| {
-        ctx.allocator().free(source.name);
-        return err;
-    };
+    errdefer ctx.allocator().free(source.name);
+    try sources.append(ctx.allocator(), .{ .instance = instance, .source = source });
     return true;
 }
 
@@ -5725,17 +5662,15 @@ fn validateModuleGraph(ctx: anytype, root: structures.ModuleId) anyerror!bool {
     return true;
 }
 fn validateExport(ctx: anytype, module: structures.ModuleId, file: structures.FileId, entry: structures.ImportDeclaration) !bool {
-    var visited: std.ArrayList(ExportVisit) = .empty;
-    defer visited.deinit(ctx.allocator());
     if (entry.selective) |selections| {
         for (selections) |selection| {
-            if (try resolveModuleExport(ctx, module, module, selection.bound.spelling, .{ .file_id = file, .span = selection.bound.span }, &visited, true) == null)
+            if (try resolveModuleExport(ctx, module, module, selection.bound.spelling, .{ .file_id = file, .span = selection.bound.span }, true) == null)
                 return false;
         }
         return true;
     }
     const origin: ImportOrigin = .{ .file_id = file, .span = (entry.alias orelse entry.path).span };
-    return try resolveModuleExport(ctx, module, module, importBoundName(entry), origin, &visited, true) != null;
+    return try resolveModuleExport(ctx, module, module, importBoundName(entry), origin, true) != null;
 }
 
 pub const BuildExecutable = CompilerQuery("BuildExecutable", .query_other, buildExecutable, .{ .result_arena = true });

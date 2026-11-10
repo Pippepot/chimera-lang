@@ -74,7 +74,10 @@ pub fn importIntern(comptime I: type, db: *query.Database, value: I.Value) !I.Id
     if (I == queries.Types) {
         switch (value) {
             .array => |array| if (!try validArrayType(db, array)) return error.InvalidCache,
-            .tuple => |tuple| if (!try validTupleType(db, tuple)) return error.InvalidCache,
+            .tuple => |tuple| {
+                if (tuple.members.len == 0) return error.InvalidCache;
+                for (tuple.members) |member| if (!try queries.validArrayElementType(db, member.type_id)) return error.InvalidCache;
+            },
             .variant => |variant| {
                 if (variant.members.len < 2) return error.InvalidCache;
                 for (variant.members[1..], 1..) |member, member_index| {
@@ -159,28 +162,7 @@ const SnapshotValues = struct {
 };
 
 fn validArrayType(db: *query.Database, array: structures.ArrayType) !bool {
-    return array.length <= std.math.maxInt(i32) and try validArrayElementType(db, array.element_type);
-}
-
-fn validTupleType(db: *query.Database, tuple: structures.TupleType) anyerror!bool {
-    if (tuple.members.len == 0) return false;
-    for (tuple.members) |member| if (!try validArrayElementType(db, member.type_id)) return false;
-    return true;
-}
-
-fn validArrayElementType(db: *query.Database, type_id: structures.TypeId) anyerror!bool {
-    if (type_id.isPrimitive()) return type_id != .type;
-    const interned = type_id.interned() orelse return false;
-    const data = (try db.lookupInternedAs(queries.Types, interned)) orelse return false;
-    switch (data.*) {
-        .structure, .callable, .function_reference, .bound_method, .reference => return true,
-        .array => |array| return validArrayType(db, array),
-        .tuple => |tuple| return validTupleType(db, tuple),
-        .variant => |variant| {
-            for (variant.members) |member| if (!try validArrayElementType(db, member)) return false;
-            return true;
-        },
-    }
+    return array.length <= std.math.maxInt(i32) and try queries.validArrayElementType(db, array.element_type);
 }
 
 fn validRuntimeValue(db: *query.Database, value: structures.CompileTimeValue) !bool {

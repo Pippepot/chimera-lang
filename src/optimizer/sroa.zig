@@ -128,7 +128,7 @@ fn splitSlots(function: *Function, context: anytype, order: []const u32, layouts
         for (block.instructions.items) |index| {
             if (function.removed.items[index]) continue;
             const instruction = &function.instructions.items[index];
-            function_ir.visitInstructionReferences(function, instruction, &uses, Uses.reference);
+            function_ir.visitOperands(function, instruction, .all, &uses, Uses.reference);
             switch (instruction.*) {
                 .storage_projection => |projection| if (uses.index(projection.owner)) |owner| {
                     try analyzeProjection(function, context, layouts, &uses, owner, projection, function.results.items[index]);
@@ -147,10 +147,10 @@ fn splitSlots(function: *Function, context: anytype, order: []const u32, layouts
                 },
                 else => {},
             }
-            function_ir.readOperands(function, instruction, &uses, Uses.accept);
+            function_ir.visitOperands(function, instruction, .reads, &uses, Uses.accept);
         }
-        function_ir.visitTerminatorReferences(function, &block.terminator, &uses, Uses.reference);
-        function_ir.terminatorReadOperands(function, &block.terminator, &uses, Uses.accept);
+        function_ir.visitTerminatorOperands(function, &block.terminator, .all, &uses, Uses.reference);
+        function_ir.visitTerminatorOperands(function, &block.terminator, .reads, &uses, Uses.accept);
     }
     var changed = false;
     for (uses.slots.items[0..root_count]) |*slot| {
@@ -326,8 +326,8 @@ const Rewriter = struct {
         self.epoch += 1;
         self.needed.clearRetainingCapacity();
         if (instruction) |index| {
-            function_ir.readOperands(self.function, &self.function.instructions.items[index], self, observe);
-        } else function_ir.terminatorReadOperands(self.function, &self.function.blocks.items[block].terminator, self, observe);
+            function_ir.visitOperands(self.function, &self.function.instructions.items[index], .reads, self, observe);
+        } else function_ir.visitTerminatorOperands(self.function, &self.function.blocks.items[block].terminator, .reads, self, observe);
         if (self.failed) return error.OutOfMemory;
         for (self.needed.items) |index| self.slots[index].whole = try self.load(&self.slots[index]);
         return self.needed.items.len != 0;
@@ -384,7 +384,7 @@ fn replace(function: *Function, order: []const u32, touched: []const bool, mappi
                 else => {},
             }
             if (try rewriter.prepare(index, block_index))
-                function_ir.readOperands(function, &function.instructions.items[index], &rewriter, Rewriter.substitute);
+                function_ir.visitOperands(function, &function.instructions.items[index], .reads, &rewriter, Rewriter.substitute);
             try rewriter.keep(index);
         }
         const block = &function.blocks.items[block_index];
@@ -392,7 +392,7 @@ fn replace(function: *Function, order: []const u32, touched: []const bool, mappi
         rewriter.span = block.span;
         rewriter.frame = block.frame;
         if (try rewriter.prepare(null, block_index))
-            function_ir.terminatorReadOperands(function, &block.terminator, &rewriter, Rewriter.substitute);
+            function_ir.visitTerminatorOperands(function, &block.terminator, .reads, &rewriter, Rewriter.substitute);
         if (rewriter.diverged) block.instructions = rewriter.list;
     }
 }

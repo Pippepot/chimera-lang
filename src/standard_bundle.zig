@@ -48,16 +48,11 @@ pub fn encode(db: *query.Database, allocator: std.mem.Allocator) ![]u8 {
         defer _ = scratch.reset(.retain_capacity);
         const kind = try reader.read(u8);
         const start = reader.offset;
-        var found = false;
-        inline for (disk_cache.interners, 0..) |I, interner_index| {
-            if (kind == interner_index) {
-                // Decode only to find the end of this producer-owned value.
-                _ = try reader.read(I.Value);
-                found = true;
-                break;
-            }
+        // Decode only to find the end of this producer-owned value.
+        switch (kind) {
+            inline 0...disk_cache.interners.len - 1 => |interner_index| _ = try reader.read(disk_cache.interners[interner_index].Value),
+            else => unreachable,
         }
-        std.debug.assert(found);
         try index.write(u8, kind);
         try index.write(u64, @intCast(data.bytes.items.len));
         try index.write(u64, @intCast(reader.offset - start));
@@ -155,18 +150,16 @@ const Variants = struct {
         const count = try reader.read(u64);
         for (0..count) |_| {
             const kind = try reader.read(u8);
-            var found = false;
-            inline for (candidates, 0..) |Owner, index| {
-                if (kind == index) {
+            switch (kind) {
+                inline 0...candidates.len - 1 => |index| {
+                    const Owner = candidates[index];
                     const Key = if (inputs) Owner.Key else Owner.Input;
                     const Value = if (inputs) ?Owner.Value else Owner.Output;
                     try self.collect(Key, try reader.read(Key));
                     try self.collect(Value, try reader.read(Value));
-                    found = true;
-                    break;
-                }
+                },
+                else => unreachable,
             }
-            std.debug.assert(found);
         }
     }
 };

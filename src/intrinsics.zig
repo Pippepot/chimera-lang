@@ -199,7 +199,7 @@ fn validByteOutputSignature(facts: anytype, signature: structures.FunctionSignat
 fn validHostStorageSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
     const storage_type = (try facts.hostStorage()) orelse return false;
     switch (symbol) {
-        .allocate_host_storage => return hasShape(signature, &.{.imm}) and (try optionalPayload(facts, signature.return_type)) == storage_type and
+        .allocate_host_storage => return hasShape(signature, &.{.imm}) and (try errorPayload(facts, signature.return_type, .none)) == storage_type and
             signature.parameters[0].type_id == .int,
         .deallocate_host_storage => return hasShape(signature, &.{.deinit}) and signature.return_type == .unit and
             signature.parameters[0].type_id == storage_type,
@@ -307,16 +307,8 @@ fn hasShape(signature: structures.FunctionSignature, modes: []const structures.P
     return true;
 }
 
-/// The native allocation and I/O boundary returns an ordinary two-member variant.
-pub fn optionalPayload(facts: anytype, type_id: structures.TypeId) !?structures.TypeId {
-    const members = (try facts.variantMembers(type_id)) orelse return null;
-    if (members.len != 2) return null;
-    if (members[0] == .none) return members[1];
-    if (members[1] == .none) return members[0];
-    return null;
-}
-
-/// The other alternative of a two-member service-domain result.
+/// The other alternative of a two-member variant, such as the result of a native
+/// allocation or I/O call; `.none` names the error of an optional result.
 pub fn errorPayload(facts: anytype, type_id: structures.TypeId, error_type: structures.TypeId) !?structures.TypeId {
     const members = (try facts.variantMembers(type_id)) orelse return null;
     if (members.len != 2) return null;

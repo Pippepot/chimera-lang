@@ -770,13 +770,7 @@ pub fn renderDiagnostic(
     try writer.writeByte(' ');
     try writeKindMessage(types, writer, file.source, diagnostic.span, diagnostic.kind);
     try writer.writeByte('\n');
-    if (info) |line| {
-        try writer.print("{s}\n", .{file.source[line.line_start..line.line_end]});
-        try writer.splatByteAll(' ', line.column - 1);
-        try writer.writeByte('^');
-        try writer.splatByteAll('~', highlightLen(diagnostic.span.?, line.line_start, line.line_end) - 1);
-        try writer.writeByte('\n');
-    }
+    if (info) |line| try writeExcerpt(writer, file.source, line, diagnostic.span.?);
     try writeFunctionContext(types, writer, diagnostic.instance);
     for (diagnostic.notes) |note| {
         const line = lineInfoForOffset(file.source, note.span.start);
@@ -785,12 +779,16 @@ pub fn renderDiagnostic(
             .type_proof => ": this type proof was established here\n",
             .proof_invalidated => ": this write invalidated the type proof\n",
         });
-        try writer.print("{s}\n", .{file.source[line.line_start..line.line_end]});
-        try writer.splatByteAll(' ', line.column - 1);
-        try writer.writeByte('^');
-        try writer.splatByteAll('~', highlightLen(note.span, line.line_start, line.line_end) - 1);
-        try writer.writeByte('\n');
+        try writeExcerpt(writer, file.source, line, note.span);
     }
+}
+
+fn writeExcerpt(writer: *std.Io.Writer, source: []const u8, line: LineInfo, span: structures.SourceSpan) !void {
+    try writer.print("{s}\n", .{source[line.line_start..line.line_end]});
+    try writer.splatByteAll(' ', line.column - 1);
+    try writer.writeByte('^');
+    try writer.splatByteAll('~', highlightLen(span, line.line_start, line.line_end) - 1);
+    try writer.writeByte('\n');
 }
 
 fn writeFunctionContext(types: anytype, writer: *std.Io.Writer, instance: ?structures.InstanceId) !void {

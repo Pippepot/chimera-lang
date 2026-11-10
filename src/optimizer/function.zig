@@ -160,13 +160,9 @@ pub const Function = struct {
             function.replacement.appendAssumeCapacity(@fromBackingInt(@intCast(function.replacement.items.len)));
             function.results.appendAssumeCapacity(body.instructionValue(index));
         }
-        try function.call_arguments.appendSlice(scratch, body.call_arguments);
-        try function.branch_arguments.appendSlice(scratch, body.branch_arguments);
-        try function.initializer_captures.appendSlice(scratch, body.initializer_captures);
-        try function.aggregate_fields.appendSlice(scratch, body.aggregate_fields);
-        try function.variant_coercion_tags.appendSlice(scratch, body.variant_coercion_tags);
-        try function.borrow_fields.appendSlice(scratch, body.borrow_fields);
-        try function.inline_frames.appendSlice(scratch, body.inline_frames);
+        inline for (.{ "call_arguments", "branch_arguments", "initializer_captures", "aggregate_fields", "variant_coercion_tags", "borrow_fields", "inline_frames" }) |table| {
+            try @field(function, table).appendSlice(scratch, @field(body, table));
+        }
         try function.regions.appendSlice(scratch, regions);
         return function;
     }
@@ -284,6 +280,12 @@ pub const Function = struct {
         return self.insertInstruction(block, self.blocks.items[block].instructions.items.len, instruction, span, frame);
     }
 
+    /// Appends an instruction that carries the block's own source position.
+    pub fn appendLocal(self: *Function, block: u32, instruction: Instruction) !ValueId {
+        const site = self.blocks.items[block];
+        return self.appendInstruction(block, instruction, site.span, site.frame);
+    }
+
     pub fn instructionSpan(self: *const Function, index: u32) SourceSpan {
         return if (self.publishes_spans) self.spans.items[index] else .{ .start = 0, .end = 0 };
     }
@@ -367,6 +369,13 @@ pub const Function = struct {
         return result;
     }
 
+    /// The tag of an argument that injects exactly one alternative into a variant.
+    pub fn injectedTag(self: *const Function, use: structures.FunctionValueUse) ?u32 {
+        const mapping = use.variant_tag_mapping orelse return null;
+        if (use.coerce_to == null or mapping.end - mapping.start != 1) return null;
+        return self.variant_coercion_tags.items[mapping.start];
+    }
+
     pub fn branchTo(self: *const Function, block: u32, target: u32) ?*structures.FunctionBranch {
         for (self.blocks.items[block].terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
             if (@backingInt(branch.target) == target) return branch;
@@ -379,9 +388,9 @@ pub const Function = struct {
         self.address_taken = null;
         for (self.blocks.items) |*block| {
             for (block.instructions.items) |index| {
-                if (!self.removed.items[index]) allOperands(self, &self.instructions.items[index], self, resolveOperand);
+                if (!self.removed.items[index]) visitOperands(self, &self.instructions.items[index], .all, self, resolveOperand);
             }
-            terminatorAllOperands(self, &block.terminator, self, resolveOperand);
+            visitTerminatorOperands(self, &block.terminator, .all, self, resolveOperand);
         }
         self.operands_dirty = false;
     }
@@ -474,7 +483,7 @@ const StorageUses = struct {
 
 pub fn usesStorage(function: *const Function, instruction: *const Instruction) bool {
     var uses: StorageUses = .{ .function = function };
-    visitInstructionReferences(function, instruction, &uses, StorageUses.reference);
+    visitOperands(function, instruction, .all, &uses, StorageUses.reference);
     return uses.found;
 }
 
@@ -521,89 +530,153 @@ pub fn validConstantRhs(function: *const Function, instruction: Instruction, rhs
     return constant == .const_int and instruction.integerRhsIsValid(constant.const_int);
 }
 
-pub fn visitInstructionReferences(function: *const Function, instruction: *const Instruction, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    for (instruction.operands()) |operand| if (operand) |value| visit(context, value.*);
-    switch (instruction.*) {
-        .call => |call| for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| visit(context, argument.valueId()),
-        .initializer_ref => |reference| for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |capture| visit(context, capture),
-        .aggregate => |aggregate| for (function.aggregate_fields.items[aggregate.fields.start..aggregate.fields.end]) |field| visit(context, field),
-        else => {},
-    }
-}
+/// Which operands a traversal reaches. A read operand supplies a value; an address
+/// operand names storage that the instruction reads or writes through.
+pub const Roles = struct {
+    read: bool,
+    address: bool,
 
-/// Visits the live instructions and terminator of one block.
-pub fn visitBlockReferences(function: *const Function, block: *const Block, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    for (block.instructions.items) |index| {
-        if (!function.removed.items[index]) visitInstructionReferences(function, &function.instructions.items[index], context, visit);
-    }
-    visitTerminatorReferences(function, &block.terminator, context, visit);
-}
+    pub const all: Roles = .{ .read = true, .address = true };
+    pub const reads: Roles = .{ .read = true, .address = false };
+    pub const addresses: Roles = .{ .read = false, .address = true };
+};
 
-/// Visits mutable operands of the live instructions and terminator of one block.
-pub fn visitBlockOperands(function: *Function, block: *Block, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
-    for (block.instructions.items) |index| {
-        if (!function.removed.items[index]) allOperands(function, &function.instructions.items[index], context, visit);
-    }
-    terminatorAllOperands(function, &block.terminator, context, visit);
-}
+/// Forwards operands of the selected roles; `visit` takes either the operand pointer or its value.
+fn Walk(comptime Context: type, comptime roles: Roles, comptime visit: anytype) type {
+    return struct {
+        context: Context,
 
-pub fn allOperands(function: *Function, instruction: *Instruction, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
-    for (instruction.operands()) |operand| if (operand) |value| visit(context, value);
-    switch (instruction.*) {
-        .call => |call| for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |*argument| visit(context, argument.operand()),
-        .initializer_ref => |reference| for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |*capture| visit(context, capture),
-        .aggregate => |aggregate| for (function.aggregate_fields.items[aggregate.fields.start..aggregate.fields.end]) |*field| visit(context, field),
-        else => {},
-    }
-}
+        inline fn emit(self: @This(), operand: anytype) void {
+            const by_value = @typeInfo(@TypeOf(visit)).@"fn".param_types[1].? == ValueId;
+            visit(self.context, if (by_value) operand.* else operand);
+        }
 
-pub fn terminatorAllOperands(function: *Function, terminator: *Terminator, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
-    for (terminator.operands()) |operand| if (operand) |value| visit(context, value);
-    for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
-        for (function.branchArguments(branch.*)) |*argument| visit(context, &argument.value);
-    };
-}
+        inline fn read(self: @This(), operand: anytype) void {
+            if (roles.read) self.emit(operand);
+        }
 
-/// Visits operands whose values are read, excluding destinations and storage addresses.
-pub fn readOperands(function: *Function, instruction: *Instruction, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
-    switch (instruction.*) {
-        .value_copy => |*operation| visit(context, &operation.source),
-        inline .variant_coerce, .variant_extract => |*operation| visit(context, &operation.operand),
-        .array_element => |*operation| visit(context, &operation.index),
-        .borrow_address => |*operation| if (operation.base_is_reference) visit(context, &operation.source),
-        .fill => |*operation| {
-            visit(context, &operation.count);
-            visit(context, &operation.value);
-        },
-        .move => |*operation| visit(context, &operation.count),
-        .aggregate => |aggregate| for (function.aggregate_fields.items[aggregate.fields.start..aggregate.fields.end]) |*field| visit(context, field),
-        .call => |*call| {
-            if (call.target == .indirect) visit(context, &call.target.indirect);
-            for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |*argument| {
-                if (argument.* == .prepared) visit(context, &argument.prepared.value);
-            }
-        },
-        .static_conversion, .storage_projection, .storage_cursor => {},
-        else => for (instruction.operands()) |operand| if (operand) |value| visit(context, value),
-    }
-}
-
-pub fn terminatorReadOperands(function: *Function, terminator: *Terminator, context: anytype, comptime visit: fn (@TypeOf(context), *ValueId) void) void {
-    for (terminator.operands()) |operand| if (operand) |value| visit(context, value);
-    for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
-        const arguments = function.branchArguments(branch.*);
-        const parameters = function.blocks.items[@backingInt(branch.target)].parameters.items;
-        const count = @min(arguments.len, parameters.len);
-        for (arguments[0..count], parameters[0..count]) |*argument, parameter| {
-            if (function.directParameter(parameter)) visit(context, &argument.value);
+        inline fn address(self: @This(), operand: anytype) void {
+            if (roles.address) self.emit(operand);
         }
     };
 }
 
-pub fn visitTerminatorReferences(function: *const Function, terminator: *const Terminator, context: anytype, comptime visit: fn (@TypeOf(context), ValueId) void) void {
-    for (terminator.operands()) |operand| if (operand) |value| visit(context, value.*);
-    var targets = terminator.*;
-    for (targets.branches()) |maybe_branch| if (maybe_branch) |branch| {
-        for (function.branchArguments(branch.*)) |argument| visit(context, argument.value);
+/// Visits the operands of an instruction, including its side-table operands.
+pub fn visitOperands(function: *const Function, instruction: anytype, comptime roles: Roles, context: anytype, comptime visit: anytype) void {
+    const walk: Walk(@TypeOf(context), roles, visit) = .{ .context = context };
+    // Every operand: the hot path of operand resolution, so it avoids per-kind dispatch.
+    if (roles.read and roles.address) {
+        for (instruction.operands()) |operand| if (operand) |value| walk.read(value);
+        switch (instruction.*) {
+            .call => |call| for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |*argument| walk.read(argument.operand()),
+            .initializer_ref => |reference| for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |*capture| walk.read(capture),
+            .aggregate => |aggregate| for (function.aggregate_fields.items[aggregate.fields.start..aggregate.fields.end]) |*field| walk.read(field),
+            else => {},
+        }
+        return;
+    }
+    switch (instruction.*) {
+        .value_copy => |*operation| {
+            walk.read(&operation.source);
+            if (operation.destination) |*destination| walk.address(destination);
+        },
+        inline .variant_coerce, .variant_extract => |*operation| {
+            walk.read(&operation.operand);
+            if (operation.destination) |*destination| walk.address(destination);
+        },
+        .static_conversion => |*operation| {
+            walk.address(&operation.operand);
+            if (operation.destination) |*destination| walk.address(destination);
+        },
+        .storage_projection => |*operation| walk.address(&operation.owner),
+        .storage_cursor => |*operation| walk.address(&operation.source),
+        .array_element => |*operation| {
+            walk.address(&operation.array);
+            walk.read(&operation.index);
+        },
+        .borrow_address => |*operation| if (operation.base_is_reference) walk.read(&operation.source) else walk.address(&operation.source),
+        .fill => |*operation| {
+            walk.address(&operation.first);
+            walk.read(&operation.count);
+            walk.read(&operation.value);
+        },
+        .move => |*operation| {
+            walk.address(&operation.destination);
+            walk.address(&operation.source);
+            walk.read(&operation.count);
+        },
+        .aggregate => |aggregate| if (roles.read) for (function.aggregate_fields.items[aggregate.fields.start..aggregate.fields.end]) |*field| walk.read(field),
+        .initializer_ref => |reference| if (roles.address) for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |*capture| walk.address(capture),
+        .call => |*call| {
+            switch (call.target) {
+                .indirect, .initializer => |*target| walk.read(target),
+                .direct => {},
+            }
+            if (call.destination) |*destination| walk.address(destination);
+            for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |*argument| switch (argument.*) {
+                .prepared => |*use| walk.read(&use.value),
+                .deinit, .borrowed, .initializer => |*source| walk.address(source),
+            };
+        },
+        else => if (roles.read) for (instruction.operands()) |operand| if (operand) |value| walk.read(value),
+    }
+}
+
+/// Visits the terminator operands and the branch arguments. An argument passed to a
+/// direct parameter is a read; any other argument shares storage with its parameter.
+pub fn visitTerminatorOperands(function: *const Function, terminator: anytype, comptime roles: Roles, context: anytype, comptime visit: anytype) void {
+    const walk: Walk(@TypeOf(context), roles, visit) = .{ .context = context };
+    if (roles.read) for (terminator.operands()) |operand| if (operand) |value| walk.read(value);
+    var copy = terminator.*;
+    for (copy.branches()) |maybe_branch| if (maybe_branch) |branch| {
+        if (roles.read and roles.address) {
+            for (function.branchArguments(branch.*)) |*argument| walk.read(&argument.value);
+            continue;
+        }
+        const parameters = function.blocks.items[@backingInt(branch.target)].parameters.items;
+        for (function.branchArguments(branch.*), 0..) |*argument, position| {
+            if (position < parameters.len and function.directParameter(parameters[position])) walk.read(&argument.value) else walk.address(&argument.value);
+        }
     };
+}
+
+/// Visits the live instructions and the terminator of one block.
+pub fn visitBlockOperands(function: *const Function, block: anytype, comptime roles: Roles, context: anytype, comptime visit: anytype) void {
+    for (block.instructions.items) |index| {
+        if (!function.removed.items[index]) visitOperands(function, &function.instructions.items[index], roles, context, visit);
+    }
+    visitTerminatorOperands(function, &block.terminator, roles, context, visit);
+}
+
+const Uses = struct {
+    function: *const Function,
+    from: []const ValueId,
+    to: []const ValueId = &.{},
+    count: u32 = 0,
+
+    fn visit(self: *Uses, operand: *ValueId) void {
+        const position = std.mem.indexOfScalar(ValueId, self.from, self.function.find(operand.*)) orelse return;
+        self.count += 1;
+        if (self.to.len != 0) operand.* = self.to[position];
+    }
+};
+
+/// The number of operands in an instruction that name one of `values`.
+pub fn countInstructionUses(function: *const Function, instruction: *Instruction, values: []const ValueId) u32 {
+    var uses: Uses = .{ .function = function, .from = values };
+    visitOperands(function, instruction, .all, &uses, Uses.visit);
+    return uses.count;
+}
+
+/// The number of operands in a block that name one of `values`.
+pub fn countUses(function: *const Function, block: *Block, values: []const ValueId) u32 {
+    var uses: Uses = .{ .function = function, .from = values };
+    visitBlockOperands(function, block, .all, &uses, Uses.visit);
+    return uses.count;
+}
+
+/// Replaces each operand of a block that names `from[position]` by `to[position]`.
+pub fn replaceUses(function: *const Function, block: *Block, from: []const ValueId, to: []const ValueId) void {
+    var uses: Uses = .{ .function = function, .from = from, .to = to };
+    visitBlockOperands(function, block, .all, &uses, Uses.visit);
 }

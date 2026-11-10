@@ -34,17 +34,21 @@ pub const Tokenizer = struct {
             var indent_levels = std.ArrayList(u32).initBuffer(&indent_storage);
             indent_levels.appendAssumeCapacity(0);
             var scanner = initialState(std.heap.page_allocator, buffer, indent_levels);
-            var tokens: [buffer.len * 2 + 1]Token = undefined;
-            var count: usize = 0;
-            while (true) {
-                const token = scanner.next() catch |err| @compileError(@errorName(err));
-                tokens[count] = token;
-                count += 1;
-                if (token.tag == .eof) break;
-            }
-            const result = tokens[0..count].*;
+            var storage: [buffer.len * 2 + 1]Token = undefined;
+            var tokens = std.ArrayList(Token).initBuffer(&storage);
+            scanner.collect(&tokens) catch |err| @compileError(@errorName(err));
+            const result = tokens.items[0..tokens.items.len].*;
             break :blk &result;
         };
+    }
+
+    /// Appends every token through the terminating `eof`.
+    pub fn collect(self: *Tokenizer, tokens: *std.ArrayList(Token)) !void {
+        while (true) {
+            const token = try self.next();
+            try tokens.append(self.gpa, token);
+            if (token.tag == .eof) return;
+        }
     }
 
     pub fn deinit(self: *Tokenizer) void {
@@ -104,11 +108,7 @@ pub const Tokenizer = struct {
         const current_indent = self.indent_levels.items[self.indent_levels.items.len - 1];
         if (self.indent > current_indent) {
             self.at_line_start = false;
-            if (@inComptime()) {
-                self.indent_levels.appendAssumeCapacity(self.indent);
-            } else {
-                try self.indent_levels.append(self.gpa, self.indent);
-            }
+            try self.indent_levels.append(self.gpa, self.indent);
             return Token{ .tag = .indent, .loc = .{ .start = self.index - self.indent, .end = self.index } };
         }
 

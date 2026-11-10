@@ -98,7 +98,7 @@ const Motion = struct {
     fn invariant(self: *Motion, instruction: Instruction, executes: bool) bool {
         const read = self.classify(instruction) orelse return false;
         self.outside = true;
-        function_ir.visitInstructionReferences(self.function, &instruction, self, defined);
+        function_ir.visitOperands(self.function, &instruction, .all, self, defined);
         if (!self.outside) return false;
         const resource = switch (read) {
             .pure => return true,

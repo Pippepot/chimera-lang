@@ -84,7 +84,8 @@ pub fn bounds(context: anytype, value: ValueId, depth: u32) Interval {
     // Guards cannot refine an immutable literal on a reachable path.
     if (function.constantInt(resolved)) |number| return Interval.point(number);
     if (@hasDecl(@TypeOf(context), "cached")) if (context.cached(resolved, depth)) |range| return range;
-    const range = context.narrow(resolved, structure(context, resolved, depth) orelse context.leaf(resolved, depth) orelse .{}, depth);
+    const base = structure(context, resolved, depth) orelse (if (@hasDecl(@TypeOf(context), "leaf")) context.leaf(resolved, depth) else null) orelse Interval{};
+    const range = if (@hasDecl(@TypeOf(context), "narrow")) context.narrow(resolved, base, depth) else base;
     if (@hasDecl(@TypeOf(context), "remember")) context.remember(resolved, depth, range);
     return range;
 }
@@ -96,9 +97,13 @@ pub fn exact(context: anytype, operation: structures.NumericBinary, user: ?Value
         .add, .sub, .mul => {},
         else => return null,
     }
-    const left = context.facts(operation.operands.lhs, bounds(context, operation.operands.lhs, depth - 1), user);
-    const right = context.facts(operation.operands.rhs, bounds(context, operation.operands.rhs, depth - 1), user);
-    return Interval.arithmetic(operation.operation, left, right);
+    const operands = [_]ValueId{ operation.operands.lhs, operation.operands.rhs };
+    var intervals: [2]Interval = undefined;
+    for (operands, &intervals) |operand, *interval| {
+        interval.* = bounds(context, operand, depth - 1);
+        if (@hasDecl(@TypeOf(context), "facts")) interval.* = context.facts(operand, interval.*, user);
+    }
+    return Interval.arithmetic(operation.operation, intervals[0], intervals[1]);
 }
 
 fn structure(context: anytype, value: ValueId, depth: u32) ?Interval {

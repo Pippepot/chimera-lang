@@ -79,25 +79,14 @@ pub fn disassembleWithSymbols(code: []const u8, named_operands: []const Symbol, 
             cursor += pat.length();
             continue;
         }
+        const operand = code[cursor + pat.prefix.len ..];
         switch (pat.operand) {
             .none => try out.print(gpa, "  {s}{s}\n", .{ pat.asm_prefix, pat.asm_suffix }),
-            .i8 => {
-                const val: i8 = @bitCast(code[cursor + pat.prefix.len]);
-                try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
-            },
-            .u8 => try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, code[cursor + pat.prefix.len], pat.asm_suffix }),
-            .i32 => {
-                const val = std.mem.readInt(i32, code[cursor + pat.prefix.len ..][0..4], .little);
-                try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
-            },
-            .u32 => {
-                const val = std.mem.readInt(u32, code[cursor + pat.prefix.len ..][0..4], .little);
-                try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
-            },
-            .u64 => {
-                const val = std.mem.readInt(u64, code[cursor + pat.prefix.len ..][0..8], .little);
-                try out.print(gpa, "  {s}0x{x}{s}\n", .{ pat.asm_prefix, val, pat.asm_suffix });
-            },
+            .i8 => try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, @as(i8, @bitCast(operand[0])), pat.asm_suffix }),
+            .u8 => try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, operand[0], pat.asm_suffix }),
+            .i32 => try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, std.mem.readInt(i32, operand[0..4], .little), pat.asm_suffix }),
+            .u32 => try out.print(gpa, "  {s}{d}{s}\n", .{ pat.asm_prefix, std.mem.readInt(u32, operand[0..4], .little), pat.asm_suffix }),
+            .u64 => try out.print(gpa, "  {s}0x{x}{s}\n", .{ pat.asm_prefix, std.mem.readInt(u64, operand[0..8], .little), pat.asm_suffix }),
             .rel => {
                 const target = relativeTarget(code, cursor, pat);
                 const label = targets.get(target) orelse std.math.maxInt(usize);

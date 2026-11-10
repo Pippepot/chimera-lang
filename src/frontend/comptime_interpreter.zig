@@ -220,10 +220,8 @@ pub const ValueSnapshot = struct {
             snapshot.* = .{ .type_id = cell.type_id, .storage = self.storage, .contents = switch (cell.contents) {
                 .uninitialized, .value => cell.contents,
                 .fields => |fields| .{ .fields = try self.cloneFields(fields) },
-                .variant_payload => |payload| .{ .variant_payload = try self.cloneCell(payload) },
                 .storage_cursor => |pointer| .{ .storage_cursor = .{ .owner = try self.cloneCell(pointer.owner), .offset = pointer.offset } },
-                .reference => |target| .{ .reference = try self.cloneCell(target) },
-                .opaque_reference => |target| .{ .opaque_reference = try self.cloneCell(target) },
+                inline .variant_payload, .reference, .opaque_reference => |target, tag| @unionInit(@FieldType(Cell, "contents"), @tagName(tag), try self.cloneCell(target)),
                 .erased_callable => |callable| .{ .erased_callable = .{
                     .invocation = callable.invocation,
                     .payload = switch (callable.payload) {
@@ -306,34 +304,42 @@ pub const ValueSnapshot = struct {
                 const other = right.memory orelse return false;
                 if (memory.offset != other.offset or !try self.sameCell(memory.source, other.source)) return false;
             } else if (right.memory != null) return false;
-            if (left.views.count() != right.views.count()) return false;
-            var views = left.views.iterator();
-            while (views.next()) |view| {
-                const other = right.views.get(view.key_ptr.*) orelse return false;
-                if (!try self.sameCell(view.value_ptr.*, other)) return false;
-            }
+            if (!try self.sameCells(left.views, right.views)) return false;
             switch (left.contents) {
                 .uninitialized => return true,
                 .value => |value| return std.meta.eql(value, right.contents.value),
                 .fields => |fields| return self.sameFields(fields, right.contents.fields),
                 .variant_payload => |payload| return self.sameCell(payload, right.contents.variant_payload),
                 .storage_cursor => return self.sameStorageCursor(left, right),
-                .reference => |target| return self.left.sourceCell(target) == self.right.sourceCell(right.contents.reference) and
-                    try self.sameCell(target, right.contents.reference),
-                .opaque_reference => |target| return self.left.sourceCell(target) == self.right.sourceCell(right.contents.opaque_reference) and
-                    try self.sameCell(target, right.contents.opaque_reference),
+                inline .reference, .opaque_reference => |target, tag| return self.sameTarget(target, @field(right.contents, @tagName(tag))),
                 .erased_callable => |callable| {
                     const other = right.contents.erased_callable;
                     if (!std.meta.eql(callable.invocation, other.invocation) or std.meta.activeTag(callable.payload) != std.meta.activeTag(other.payload)) return false;
                     switch (callable.payload) {
                         .none => return true,
                         .function => |function| return std.meta.eql(function, other.payload.function),
-                        .receiver => |target| return self.left.sourceCell(target) == self.right.sourceCell(other.payload.receiver) and try self.sameCell(target, other.payload.receiver),
+                        .receiver => |target| return self.sameTarget(target, other.payload.receiver),
                         .environment => |owner| return self.sameCell(owner, other.payload.environment),
                     }
                 },
                 .allocation => |allocation| return self.sameAllocation(allocation, right.contents.allocation),
             }
+        }
+
+        /// A pointer denotes the same original cell and equal contents on both sides.
+        fn sameTarget(self: *@This(), left: *const Cell, right: *const Cell) anyerror!bool {
+            return self.left.sourceCell(left) == self.right.sourceCell(right) and try self.sameCell(left, right);
+        }
+
+        /// Whether two cell maps hold equal cells under equal keys.
+        fn sameCells(self: *@This(), left: anytype, right: anytype) anyerror!bool {
+            if (left.count() != right.count()) return false;
+            var entries = left.iterator();
+            while (entries.next()) |entry| {
+                const other = right.get(entry.key_ptr.*) orelse return false;
+                if (!try self.sameCell(entry.value_ptr.*, other)) return false;
+            }
+            return true;
         }
 
         fn sameStorageCursor(self: *@This(), left: *const Cell, right: *const Cell) anyerror!bool {
@@ -344,8 +350,7 @@ pub const ValueSnapshot = struct {
             // inline arrays retain the identity of their original storage cell.
             if (first.owner.contents == .allocation and second.owner.contents == .allocation)
                 return self.sameAllocation(first.owner.contents.allocation, second.owner.contents.allocation);
-            return self.left.sourceCell(first.owner) == self.right.sourceCell(second.owner) and
-                try self.sameCell(first.owner, second.owner);
+            return self.sameTarget(first.owner, second.owner);
         }
 
         fn sameAllocation(self: *@This(), left: *const Allocation, right: *const Allocation) anyerror!bool {
@@ -353,19 +358,7 @@ pub const ValueSnapshot = struct {
             if (left.source) |source| {
                 if (right.source == null or !try self.sameCell(source, right.source.?)) return false;
             } else if (right.source != null) return false;
-            if (left.elements.count() != right.elements.count()) return false;
-            var entries = left.elements.iterator();
-            while (entries.next()) |entry| {
-                const other = right.elements.get(entry.key_ptr.*) orelse return false;
-                if (!try self.sameCell(entry.value_ptr.*, other)) return false;
-            }
-            if (left.views.count() != right.views.count()) return false;
-            var views = left.views.iterator();
-            while (views.next()) |view| {
-                const other = right.views.get(view.key_ptr.*) orelse return false;
-                if (!try self.sameCell(view.value_ptr.*, other)) return false;
-            }
-            return true;
+            return try self.sameCells(left.elements, right.elements) and try self.sameCells(left.views, right.views);
         }
 
         fn sameFields(self: *@This(), left: []const Cell, right: []const Cell) anyerror!bool {
@@ -993,7 +986,6 @@ pub fn assignCell(destination: *Cell, source: Value, executor: anytype) anyerror
 }
 
 fn assignCellContents(destination: *Cell, source: Value, executor: anytype) anyerror!void {
-    if (source == .place and destination == source.place) return;
     if (source == .place and source.place.memory != null) {
         try refreshMemoryVariant(source.place, executor);
         if (memoryScalar(source.place)) |value| return assignRuntime(destination, value, executor);

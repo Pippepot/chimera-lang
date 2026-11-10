@@ -2,31 +2,69 @@ const std = @import("std");
 const structures = @import("../structures.zig");
 const shape = @import("cleanup_shape.zig");
 
+/// What destroying a value demands of its owner.
+pub const Obligations = struct {
+    automatic: bool = false,
+    explicit: bool = false,
+
+    pub fn any(self: Obligations) bool {
+        return self.automatic or self.explicit;
+    }
+
+    fn include(self: *Obligations, child: Obligations) void {
+        self.automatic = self.automatic or child.automatic;
+        self.explicit = self.explicit or child.explicit;
+    }
+};
+
 /// An immutable selection of destruction operations, shared by provenance
-/// analysis and emission. Locations and invocation-time origins remain separate.
+/// analysis, emission, and ownership obligations. Locations and invocation-time
+/// origins remain separate. Hook contracts are queried only by consumers of effects.
 pub const Actions = struct {
     type_id: structures.TypeId,
     operation: union(enum) {
         none,
-        drop: ?structures.ReferenceContract,
+        /// The type's custom drop hook.
+        hook,
+        /// A value that must be transferred or passed to a `deinit` parameter.
+        explicit,
         array: struct { length: u32, element: *const Actions },
         parts: []const Part,
     },
 
     pub const Part = struct { step: structures.ReferencePathStep, actions: *const Actions };
 
-    pub fn hasReferenceEffects(self: Actions) bool {
+    pub fn obligations(self: Actions) Obligations {
         switch (self.operation) {
-            .none => return false,
-            .drop => |contract| {
-                const references = contract orelse return false;
+            .none => return .{},
+            .hook => return .{ .automatic = true },
+            .explicit => return .{ .explicit = true },
+            .array => |array| return if (array.length == 0) .{} else array.element.obligations(),
+            .parts => |parts| {
+                var result: Obligations = .{};
+                for (parts) |part| result.include(part.actions.obligations());
+                return result;
+            },
+        }
+    }
+
+    pub fn hookContract(analysis: anytype, type_id: structures.TypeId) anyerror!structures.ReferenceContract {
+        const definition = (try analysis.facts().structDefinition(type_id)).?;
+        return (try analysis.functionReferenceContract(definition.ownership.drop.?.hook.?)) orelse error.Unavailable;
+    }
+
+    pub fn hasReferenceEffects(self: Actions, analysis: anytype) anyerror!bool {
+        switch (self.operation) {
+            .none, .explicit => return false,
+            .hook => {
+                const references = try hookContract(analysis, self.type_id);
                 if (references.requirements.len != 0 or references.service_mutations.len != 0) return true;
                 for (references.origins) |origin| if (origin.output_parameter != null or origin.output_contextual != null) return true;
                 return false;
             },
-            .array => |array| return array.length != 0 and array.element.hasReferenceEffects(),
+            .array => |array| return array.length != 0 and try array.element.hasReferenceEffects(analysis),
             .parts => |parts| {
-                for (parts) |part| if (part.actions.hasReferenceEffects()) return true;
+                for (parts) |part| if (try part.actions.hasReferenceEffects(analysis)) return true;
                 return false;
             },
         }
@@ -43,9 +81,8 @@ pub fn build(allocator: std.mem.Allocator, analysis: anytype, cache: *Cache, typ
     const capabilities = (try analysis.facts().ownershipCapabilities(type_id)) orelse return error.Unavailable;
     if ((!fields_only or (capabilities.drop == .custom and try analysis.facts().callable(type_id) != null)) and capabilities.drop != .fieldwise) {
         if (capabilities.drop == .custom) {
-            const definition = (try analysis.facts().structDefinition(type_id)).?;
-            result.operation = .{ .drop = (try analysis.functionReferenceContract(definition.ownership.drop.?.hook.?)) orelse return error.Unavailable };
-        } else if (capabilities.requires_explicit_drop) result.operation = .{ .drop = null };
+            result.operation = .hook;
+        } else if (capabilities.requires_explicit_drop) result.operation = .explicit;
     } else if (capabilities.needs_automatic_drop or capabilities.requires_explicit_drop) {
         result.operation = try children(allocator, analysis, cache, type_id, selections, missing);
     }

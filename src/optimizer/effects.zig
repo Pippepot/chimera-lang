@@ -188,20 +188,16 @@ pub const Memory = struct {
                     .borrow_write => |write| memory.exposeStoredValue(write.value),
                     .value_copy => |copy| memory.exposeStoredValue(copy.source),
                     .storage_cursor => |cursor| memory.expose(cursor.source),
-                    .initializer_ref => |reference| for (function.initializer_captures.items[reference.captures.start..reference.captures.end]) |capture| memory.expose(capture),
+                    .initializer_ref => function_ir.visitOperands(function, &function.instructions.items[index], .addresses, &memory, Memory.expose),
                     .call => |call| for (function.call_arguments.items[call.arguments.start..call.arguments.end]) |argument| {
                         if (argument != .prepared) memory.expose(argument.valueId());
                         memory.exposeStoredValue(argument.valueId());
                     },
-                    else => function_ir.visitInstructionReferences(function, &function.instructions.items[index], &memory, Memory.exposeStoredValue),
+                    else => function_ir.visitOperands(function, &function.instructions.items[index], .all, &memory, Memory.exposeStoredValue),
                 }
             }
-            var terminator = block.terminator;
-            for (terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
-                canonicalize.visitBranchAddresses(function, branch.*, &memory, Memory.expose);
-                for (function.branchArguments(branch.*)) |argument| memory.exposeStoredValue(argument.value);
-            };
-            if (terminator == .return_value) memory.exposeStoredValue(terminator.return_value.value);
+            function_ir.visitTerminatorOperands(function, &block.terminator, .addresses, &memory, Memory.expose);
+            function_ir.visitTerminatorOperands(function, &block.terminator, .all, &memory, Memory.exposeStoredValue);
         }
         return memory;
     }

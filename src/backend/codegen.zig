@@ -200,7 +200,6 @@ fn deinitCallLayouts(layouts: *CallLayouts, gpa: std.mem.Allocator) void {
 fn planCallStorage(
     ssa: *const structures.FunctionBodyAnalysis,
     types: anytype,
-    value_types: []const structures.TypeId,
     call: structures.FunctionCall,
     layouts: *CallLayouts,
     gpa: std.mem.Allocator,
@@ -212,7 +211,7 @@ fn planCallStorage(
     for (ssa.call_arguments[call.arguments.start..call.arguments.end], parameters) |argument, *parameter| {
         const use = argument.valueUse();
         parameter.* = .{
-            .type_id = use.coerce_to orelse value_types[@backingInt(use.value)],
+            .type_id = use.coerce_to orelse ssa.valueType(use.value),
             .representation = switch (argument) {
                 .prepared => .value,
                 .deinit, .borrowed => .storage,
@@ -228,7 +227,6 @@ fn planCallStorage(
 
 const LocationPlan = struct {
     locations: []ValueLocation,
-    value_types: []structures.TypeId,
     stack_size: u32,
     edge_scratch_offset: u32,
     return_buffer_offset: ?u32,
@@ -271,11 +269,11 @@ const LocationPlan = struct {
     }
 
     fn storageProjectionLocation(
+        ssa: *const structures.FunctionBodyAnalysis,
         types: anytype,
         operation: structures.StorageProjection,
         value_index: usize,
         locations: []const ValueLocation,
-        value_types: []const structures.TypeId,
         local_end: *u32,
         slots: *std.ArrayList(StackSlot),
         gpa: std.mem.Allocator,
@@ -285,8 +283,8 @@ const LocationPlan = struct {
         // result storage receive their locations after frame sizing.
         if (owner < value_index and locations[owner] == .stack) {
             const offset: ?u32 = switch (operation.projection) {
-                .field => |index| ((try types.structLayout(value_types[owner])) orelse return error.Unavailable).field_offsets[index],
-                .variant => (try types.variantLayout(value_types[owner])).payload_offset,
+                .field => |index| ((try types.structLayout(ssa.valueType(operation.owner))) orelse return error.Unavailable).field_offsets[index],
+                .variant => (try types.variantLayout(ssa.valueType(operation.owner))).payload_offset,
                 .allocation_array => null,
             };
             if (offset) |bytes| return .{ .stack = std.math.add(u32, locations[owner].stack, bytes) catch return error.FunctionTooLarge };
@@ -296,7 +294,7 @@ const LocationPlan = struct {
 
     /// A consumed private snapshot can supply the storage of a wrapper or a
     /// whole-size field read. Its bytes and observable storage identity agree.
-    fn consumedSnapshot(ssa: *const structures.FunctionBodyAnalysis, types: anytype, instruction: structures.FunctionInstruction, index: usize, locations: []const ValueLocation, value_types: []const structures.TypeId, uses: []const Usage, addressable: []const bool) !?ValueLocation {
+    fn consumedSnapshot(ssa: *const structures.FunctionBodyAnalysis, types: anytype, instruction: structures.FunctionInstruction, index: usize, locations: []const ValueLocation, uses: []const Usage, addressable: []const bool) !?ValueLocation {
         if (addressable[index]) return null;
         const source = switch (instruction) {
             .aggregate => |aggregate| if (aggregate.fields.end - aggregate.fields.start == 1) ssa.aggregate_fields[aggregate.fields.start] else return null,
@@ -305,8 +303,8 @@ const LocationPlan = struct {
         };
         const from = @backingInt(source);
         if (from >= index or uses[from] != .used or addressable[from] or locations[from] != .stack) return null;
-        const source_layout = try types.layout(value_types[from]);
-        const target_layout = try types.layout(value_types[index]);
+        const source_layout = try types.layout(ssa.valueType(source));
+        const target_layout = try types.layout(instruction.resultType());
         if (source_layout.byte_size != target_layout.byte_size) return null;
         return locations[from];
     }
@@ -318,14 +316,10 @@ const LocationPlan = struct {
         const addressable = try gpa.alloc(bool, ssa.valueCount());
         defer gpa.free(addressable);
         @memset(addressable, false);
-        const value_types = try gpa.alloc(structures.TypeId, ssa.valueCount());
-        errdefer gpa.free(value_types);
-        for (ssa.block_arguments, value_types[0..ssa.block_arguments.len]) |argument, *type_id| type_id.* = argument.type_id;
 
         for (ssa.instructions, 0..) |original, instruction_index| {
             var instruction = original;
             const value_index = @backingInt(ssa.instructionValue(instruction_index));
-            value_types[value_index] = instruction.resultType();
             for (instruction.operands()) |operand| if (operand) |value| {
                 markUsed(&needed[@backingInt(value.*)]);
             };
@@ -389,9 +383,9 @@ const LocationPlan = struct {
         var calls: CallLayouts = .empty;
         errdefer deinitCallLayouts(&calls, gpa);
         for (ssa.instructions) |instruction| if (instruction == .call) {
-            outgoing_size = @max(outgoing_size, try planCallStorage(ssa, types, value_types, instruction.call, &calls, gpa));
+            outgoing_size = @max(outgoing_size, try planCallStorage(ssa, types, instruction.call, &calls, gpa));
         } else if (instruction == .context_read) {
-            outgoing_size = @max(outgoing_size, try planCallStorage(ssa, types, value_types, .{ .target = .{ .direct = instruction.context_read.root }, .arguments = .{ .start = 0, .end = 0 }, .return_type = instruction.context_read.type_id }, &calls, gpa));
+            outgoing_size = @max(outgoing_size, try planCallStorage(ssa, types, .{ .target = .{ .direct = instruction.context_read.root }, .arguments = .{ .start = 0, .end = 0 }, .return_type = instruction.context_read.type_id }, &calls, gpa));
         };
         var edge_scratch_end = outgoing_size;
         for (ssa.blocks) |block| {
@@ -417,10 +411,7 @@ const LocationPlan = struct {
         }
 
         const entry_index = @backingInt(ssa.entry);
-        std.debug.assert(entry_index < ssa.blocks.len);
         for (ssa.blocks, 0..) |block, block_index| {
-            std.debug.assert(block.argument_start <= block.argument_end);
-            std.debug.assert(block.argument_end <= ssa.block_arguments.len);
             if (block_index == entry_index) continue;
             for (block.argument_start..block.argument_end) |argument_index| {
                 if (needed[argument_index] == .unused) continue;
@@ -435,6 +426,7 @@ const LocationPlan = struct {
         }
         for (ssa.instructions, locations[ssa.block_arguments.len..], 0..) |instruction, *location, instruction_index| {
             const value_index = @backingInt(ssa.instructionValue(instruction_index));
+            const value_type = instruction.resultType();
             location.* = location_blk: {
                 switch (instruction) {
                     inline .const_int, .const_byte, .const_bool => |value| if (!addressable[value_index]) {
@@ -448,7 +440,7 @@ const LocationPlan = struct {
                     },
                     .result_storage => break :location_blk .discarded,
                     .storage_projection => |operation| if (needed[value_index] != .unused)
-                        break :location_blk try storageProjectionLocation(types, operation, value_index, locations, value_types, &local_end, &stack_slots, gpa)
+                        break :location_blk try storageProjectionLocation(ssa, types, operation, value_index, locations, &local_end, &stack_slots, gpa)
                     else
                         break :location_blk .discarded,
                     .allocation_element, .array_element, .borrow_read => if (needed[value_index] != .unused) {
@@ -457,12 +449,12 @@ const LocationPlan = struct {
                     else => {},
                 }
                 if (needed[value_index] == .unused and
-                    (instruction != .call or try types.facts().argumentPassing(value_types[value_index]) != .indirect))
+                    (instruction != .call or try types.facts().argumentPassing(value_type) != .indirect))
                     break :location_blk .discarded;
-                if (try consumedSnapshot(ssa, types, instruction, value_index, locations, value_types, needed, addressable)) |shared|
+                if (try consumedSnapshot(ssa, types, instruction, value_index, locations, needed, addressable)) |shared|
                     break :location_blk shared;
-                const layout = try valueSlotLayout(types, value_types[value_index]);
-                if (needed[value_index] == .returned and value_types[value_index] == .int and !addressable[value_index]) {
+                const layout = try valueSlotLayout(types, value_type);
+                if (needed[value_index] == .returned and value_type == .int and !addressable[value_index]) {
                     break :location_blk .eax;
                 }
                 if (layout.byte_size == 0) {
@@ -483,7 +475,7 @@ const LocationPlan = struct {
                 if (needed[index] != .unused) locations[index] = .{ .indirect = try reserveLocalStack(&local_end, &stack_slots, gpa, indirect_layout) };
             }
         }
-        const spills = try promoteRegisters(ssa, types, gpa, locations, value_types, addressable, needed);
+        const spills = try promoteRegisters(ssa, types, gpa, locations, addressable, needed);
         errdefer gpa.free(spills);
         var allocation_bases: []bool = &.{};
         errdefer gpa.free(allocation_bases);
@@ -502,7 +494,6 @@ const LocationPlan = struct {
         };
         const stack_size = local_end;
         if (stack_size > std.math.maxInt(i32)) return error.FunctionTooLarge;
-        std.debug.assert(ssa.parameter_modes.len == entry.argument_end - entry.argument_start);
         const parameters = ssa.block_arguments[entry.argument_start..entry.argument_end];
         var incoming = try CallLayout.init(types, ssa.return_type, parameters, gpa);
         defer incoming.deinit(gpa);
@@ -533,7 +524,6 @@ const LocationPlan = struct {
         };
         return .{
             .locations = locations,
-            .value_types = value_types,
             .stack_size = stack_size,
             .edge_scratch_offset = outgoing_size,
             .return_buffer_offset = return_buffer_offset,
@@ -558,7 +548,7 @@ const LocationPlan = struct {
             try types.facts().boundMethod(type_id) != null;
     }
 
-    fn promoteRegisters(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator, locations: []ValueLocation, value_types: []const structures.TypeId, addressable: []const bool, uses: []const Usage) ![]u32 {
+    fn promoteRegisters(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator, locations: []ValueLocation, addressable: []const bool, uses: []const Usage) ![]u32 {
         const promote_locals = for (ssa.blocks, 0..) |block, index| {
             var terminator = block.terminator;
             for (terminator.successors()) |successor| if (successor) |target| {
@@ -569,7 +559,7 @@ const LocationPlan = struct {
         const entry = ssa.blocks[@backingInt(ssa.entry)];
         var spills: []u32 = &.{};
         errdefer gpa.free(spills);
-        for (locations, value_types, addressable, 0..) |*location, type_id, taken, index| {
+        for (locations, addressable, 0..) |*location, taken, index| {
             if (taken) continue;
             const parameter = index >= entry.argument_start and index < entry.argument_end;
             if (parameter) {
@@ -588,7 +578,7 @@ const LocationPlan = struct {
                 if (instruction == .storage_projection or instruction == .local_storage or instruction == .initializer_ref) continue;
                 if (instruction == .aggregate) continue;
             }
-            if (!try registerScalar(types, type_id)) continue;
+            if (!try registerScalar(types, ssa.valueType(@fromBackingInt(@intCast(index))))) continue;
             if (spills.len == 0) {
                 spills = try gpa.alloc(u32, locations.len);
                 @memset(spills, 0);
@@ -601,7 +591,6 @@ const LocationPlan = struct {
 
     fn deinit(self: *LocationPlan, gpa: std.mem.Allocator) void {
         gpa.free(self.locations);
-        gpa.free(self.value_types);
         deinitCallLayouts(&self.calls, gpa);
         gpa.free(self.spills);
         gpa.free(self.allocation_bases);
@@ -776,101 +765,64 @@ fn placeLoopTestsAfterBodies(ssa: *const structures.FunctionBodyAnalysis, order:
     }
 }
 
-/// An x86 condition code, which also distinguishes unsigned from signed order.
-const Condition = enum {
-    equal,
-    not_equal,
-    less,
-    greater_equal,
-    greater,
-    less_equal,
-    below,
-    above_equal,
-    above,
-    below_equal,
+/// An x86 condition code named by its mnemonic suffix; it also distinguishes unsigned from signed order.
+const Condition = enum(u4) {
+    b = 2,
+    ae = 3,
+    e = 4,
+    ne = 5,
+    be = 6,
+    a = 7,
+    l = 12,
+    ge = 13,
+    le = 14,
+    g = 15,
 
     fn of(operation: structures.PredicateOperation) Condition {
         return switch (operation) {
-            .lti => .less,
-            .gti => .greater,
-            .lei => .less_equal,
-            .gei => .greater_equal,
-            .eqi, .eqb => .equal,
-            .nei, .neb => .not_equal,
+            .lti => .l,
+            .gti => .g,
+            .lei => .le,
+            .gei => .ge,
+            .eqi, .eqb => .e,
+            .nei, .neb => .ne,
             .eqt, .net => unreachable,
         };
     }
 
     fn ofNumeric(operation: structures.numeric.Binary, signed: bool) Condition {
         return switch (operation) {
-            .eq => .equal,
-            .ne => .not_equal,
-            .lt => if (signed) .less else .below,
-            .gt => if (signed) .greater else .above,
-            .le => if (signed) .less_equal else .below_equal,
-            .ge => if (signed) .greater_equal else .above_equal,
+            .eq => .e,
+            .ne => .ne,
+            .lt => if (signed) .l else .b,
+            .gt => if (signed) .g else .a,
+            .le => if (signed) .le else .be,
+            .ge => if (signed) .ge else .ae,
             else => unreachable,
         };
     }
 
+    /// Condition codes come in pairs that differ in the lowest bit.
     fn negated(self: Condition) Condition {
-        return switch (self) {
-            .equal => .not_equal,
-            .not_equal => .equal,
-            .less => .greater_equal,
-            .greater_equal => .less,
-            .greater => .less_equal,
-            .less_equal => .greater,
-            .below => .above_equal,
-            .above_equal => .below,
-            .above => .below_equal,
-            .below_equal => .above,
-        };
+        return @fromBackingInt(@backingInt(self) ^ 1);
     }
 
     fn jump(self: Condition) x86.Operation {
         return switch (self) {
-            .equal => .je,
-            .not_equal => .jne,
-            .less => .jl,
-            .greater_equal => .jge,
-            .greater => .jg,
-            .less_equal => .jle,
-            .below => .jb,
-            .above_equal => .jae,
-            .above => .ja,
-            .below_equal => .jbe,
+            inline else => |condition| @field(x86.Operation, "j" ++ @tagName(condition)),
         };
     }
 
     fn set(self: Condition) x86.Operation {
         return switch (self) {
-            .equal => .sete_al,
-            .not_equal => .setne_al,
-            .less => .setl_al,
-            .greater_equal => .setge_al,
-            .greater => .setg_al,
-            .less_equal => .setle_al,
-            .below => .setb_al,
-            .above_equal => .setae_al,
-            .above => .seta_al,
-            .below_equal => .setbe_al,
+            inline else => |condition| @field(x86.Operation, "set" ++ @tagName(condition) ++ "_al"),
         };
     }
 
     /// Replaces eax with ecx when the condition holds.
     fn move(self: Condition) x86.Operation {
         return switch (self) {
-            .equal => .cmove_eax_ecx,
-            .not_equal => .cmovne_eax_ecx,
-            .less => .cmovl_eax_ecx,
-            .greater_equal => .cmovge_eax_ecx,
-            .greater => .cmovg_eax_ecx,
-            .less_equal => .cmovle_eax_ecx,
-            .below => .cmovb_eax_ecx,
-            .above_equal => .cmovae_eax_ecx,
-            .above => .cmova_eax_ecx,
-            .below_equal => .cmovbe_eax_ecx,
+            inline else => |condition| @field(x86.Operation, "cmov" ++ @tagName(condition) ++ "_eax_ecx"),
         };
     }
 };
@@ -951,7 +903,7 @@ fn FunctionEmitter(comptime Types: type) type {
         }
 
         fn valueType(self: *const Self, value: structures.FunctionValueId) structures.TypeId {
-            return self.plan.value_types[@backingInt(value)];
+            return self.ssa.valueType(value);
         }
 
         /// An instruction with explicit result storage writes there instead of to its own value.
@@ -1019,12 +971,10 @@ fn FunctionEmitter(comptime Types: type) type {
                 }
                 const handler = try self.encoder.position();
                 for (self.numeric_traps.items) |trap| try self.encoder.patch(trap.target_patch, handler);
-                const address = try self.encoder.patchable(.mov_rax);
                 const message = "panic: invalid numeric operation\n";
+                const address = try emitPanicText(&self.encoder, message.len);
                 const data_index = try self.dataIndex(message);
                 try self.relocations.append(self.gpa, .{ .offset = address, .reference = .{ .data = data_index }, .kind = .address_absolute_64, .addend = 0 });
-                try self.encoder.emit(.mov_rsi_rax);
-                try self.encoder.immediate(.mov_edx, message.len);
                 const write = try self.encoder.patchable(.call_relative);
                 try self.panic_trace_offsets.append(self.gpa, try self.encoder.patchable(.jmp));
                 try self.encoder.patchHere(write);
@@ -1042,8 +992,6 @@ fn FunctionEmitter(comptime Types: type) type {
             const block_index = @backingInt(block_id);
             const block = ssa.blocks[block_index];
             self.block_offsets[block_index] = try self.encoder.position();
-            std.debug.assert(block.instruction_start <= block.instruction_end);
-            std.debug.assert(block.instruction_end <= ssa.instructions.len);
             const fused_comparison = self.fusedBranchComparison(block);
             var instruction_index = block.instruction_start;
             while (instruction_index < block.instruction_end) : (instruction_index += 1) {
@@ -1085,6 +1033,16 @@ fn FunctionEmitter(comptime Types: type) type {
             } else try self.emitTerminator(block.terminator, fallthrough);
         }
 
+        /// Leaves the address an element-producing instruction designates in rax.
+        fn emitElementPointer(self: *Self, instruction: structures.FunctionInstruction) !void {
+            switch (instruction) {
+                .allocation_element => |element| try self.emitAllocationElementAddress(element),
+                .array_element => |element| try self.emitElementAddress(self.valueLocation(element.array), true, element.index, element.type_id, .element),
+                .borrow_read => |read| try self.loadAddress(self.valueLocation(read.source)),
+                else => unreachable,
+            }
+        }
+
         fn emitElementCopy(self: *Self, index: usize, end: usize) !bool {
             if (index + 1 >= end) return false;
             const value = self.ssa.instructionValue(index);
@@ -1096,12 +1054,7 @@ fn FunctionEmitter(comptime Types: type) type {
             if (!reading and copy.destination != value) return false;
             const size = (try self.types.layout(copy.type_id)).byte_size;
             if (size != 1 and size != 4) return false;
-            switch (self.ssa.instructions[index]) {
-                .allocation_element => |element| try self.emitAllocationElementAddress(element),
-                .array_element => |element| try self.emitElementAddress(self.valueLocation(element.array), true, element.index, element.type_id, .element),
-                .borrow_read => |read| try self.loadAddress(self.valueLocation(read.source)),
-                else => unreachable,
-            }
+            try self.emitElementPointer(self.ssa.instructions[index]);
             const width = Width.ofBytes(size);
             if (reading) {
                 try self.encoder.offset(width.select(&.{ .movzx_eax_rax, .movzx_eax_word_rax, .mov_eax_rax }), 0);
@@ -1144,7 +1097,7 @@ fn FunctionEmitter(comptime Types: type) type {
             }
             try self.emitCompare(comparison, .eax);
             try self.encoder.integerBinary(.addi, self.valueLocation(base));
-            try self.storeResult(self.valueLocation(self.ssa.instructionValue(index + 2)));
+            try self.storeComponent(.dword, self.valueLocation(self.ssa.instructionValue(index + 2)), 0);
             return true;
         }
 
@@ -1199,19 +1152,11 @@ fn FunctionEmitter(comptime Types: type) type {
                     self.resultLocation(operation.destination, destination),
                 ),
                 .storage_projection => |operation| try self.emitStorageProjection(operation, destination),
-                .allocation_element => |operation| if (destination != .discarded) {
-                    try self.emitAllocationElementAddress(operation);
-                    try self.bindIndirect(destination);
-                },
-                .array_element => |operation| if (destination != .discarded) {
-                    try self.emitElementAddress(self.valueLocation(operation.array), true, operation.index, operation.type_id, .element);
+                .allocation_element, .array_element, .borrow_read => if (destination != .discarded) {
+                    try self.emitElementPointer(instruction);
                     try self.bindIndirect(destination);
                 },
                 .borrow_address => |operation| try self.emitBorrowAddress(operation, destination),
-                .borrow_read => |operation| if (destination != .discarded) {
-                    try self.loadAddress(self.valueLocation(operation.source));
-                    try self.bindIndirect(destination);
-                },
                 .borrow_write => |operation| try self.emitBorrowWrite(operation),
                 .field_access => |operation| try self.emitFieldAccess(operation, destination),
                 .call => |call| try self.emitCall(call, destination),
@@ -1262,10 +1207,6 @@ fn FunctionEmitter(comptime Types: type) type {
                 .span = self.current_span,
                 .frame = self.current_frame,
             });
-        }
-
-        fn numericTrap(self: *Self) !void {
-            return self.numericTrapIf(.jmp);
         }
 
         fn numericBounds(self: *Self, kind: structures.numeric.Type, overflow: structures.numeric.Overflow) !void {
@@ -1360,7 +1301,6 @@ fn FunctionEmitter(comptime Types: type) type {
             const power: ?u6 = if (std.math.isPowerOfTwo(magnitude)) @intCast(@ctz(magnitude)) else null;
             const signed_magic = if (signed and power == null) division.Signed.of(@intCast(divisor)) else null;
             const unsigned_magic = if (!signed and power == null) division.Unsigned.of(magnitude) else null;
-            if (power == null and signed_magic == null and unsigned_magic == null) return false;
             try self.loadNumeric(operation.type_id, self.valueLocation(operation.operands.lhs));
             const encoder = &self.encoder;
             if (power) |bits| {
@@ -1380,10 +1320,8 @@ fn FunctionEmitter(comptime Types: type) type {
                         if (divisor < 0) try encoder.emit(.neg_rax);
                     }
                 }
-                return self.finishConstantDivision(kind, destination);
-            }
-            try encoder.emit(.mov_rdi_rax);
-            if (signed_magic) |magic| {
+            } else if (signed_magic) |magic| {
+                try encoder.emit(.mov_rdi_rax);
                 try encoder.absolute(.mov_rcx, @bitCast(magic.multiplier));
                 try encoder.emit(.imul_rcx_wide);
                 try encoder.emit(.mov_rax_rdx);
@@ -1395,6 +1333,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 if (divisor < 0) try encoder.emit(.neg_rax);
             } else {
                 const magic = unsigned_magic.?;
+                try encoder.emit(.mov_rdi_rax);
                 try encoder.absolute(.mov_rcx, magic.multiplier);
                 try encoder.emit(.mul_rcx);
                 try encoder.emit(.mov_rax_from_rdi);
@@ -1403,14 +1342,15 @@ fn FunctionEmitter(comptime Types: type) type {
                 try encoder.emit(.add_rax_rdx);
                 if (magic.shift != 0) try encoder.byteImmediate(.shr_rax, magic.shift);
             }
-            if (remainder) {
+            if (remainder and power == null) {
                 try encoder.absolute(.mov_rcx, @truncate(@as(u128, @bitCast(divisor))));
                 try encoder.emit(.imul_rax_rcx);
                 try encoder.emit(.mov_rcx_rax);
                 try encoder.emit(.mov_rax_from_rdi);
                 try encoder.emit(.sub_rax_rcx);
             }
-            return self.finishConstantDivision(kind, destination);
+            try self.storeNumeric(kind, destination, 0);
+            return true;
         }
 
         fn andRax(self: *Self, mask: u64) !void {
@@ -1418,21 +1358,6 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.encoder.absolute(.mov_rcx, mask);
             try self.encoder.emit(.and_rax_rcx);
         }
-
-        fn finishConstantDivision(self: *Self, kind: structures.numeric.Type, destination: ValueLocation) !bool {
-            try self.storeNumeric(kind, destination, 0);
-            return true;
-        }
-
-        const WideOperations = struct { immediate: x86.Operation, register: x86.RegisterOperation, stack: x86.Operation, indirect: x86.Operation };
-
-        const wide_add: WideOperations = .{ .immediate = .add_rax, .register = .add_rax, .stack = .add_rax_rsp, .indirect = .add_rax_mem_rcx };
-        const wide_sub: WideOperations = .{ .immediate = .sub_rax, .register = .sub_rax, .stack = .sub_rax_rsp, .indirect = .sub_rax_mem_rcx };
-        const wide_mul: WideOperations = .{ .immediate = .imul_rax, .register = .imul_rax, .stack = .imul_rax_rsp, .indirect = .imul_rax_mem_rcx };
-        const wide_and: WideOperations = .{ .immediate = .and_rax, .register = .and_rax, .stack = .and_rax_rsp, .indirect = .and_rax_mem_rcx };
-        const wide_or: WideOperations = .{ .immediate = .or_rax, .register = .or_rax, .stack = .or_rax_rsp, .indirect = .or_rax_mem_rcx };
-        const wide_xor: WideOperations = .{ .immediate = .xor_rax, .register = .xor_rax, .stack = .xor_rax_rsp, .indirect = .xor_rax_mem_rcx };
-        const wide_compare: WideOperations = .{ .immediate = .cmp_rax, .register = .cmp_rax, .stack = .cmp_rax_rsp, .indirect = .cmp_rax_mem_rcx };
 
         /// A 64-bit right operand that the accumulator forms can read in place:
         /// a constant that fits a sign-extended immediate, or a register, stack slot or pointer.
@@ -1448,40 +1373,42 @@ fn FunctionEmitter(comptime Types: type) type {
         }
 
         /// Applies a 64-bit operation of rax with `wideOperand` already established.
-        fn emitWideOperand(self: *Self, kind: structures.numeric.Type, value: structures.FunctionValueId, operations: WideOperations) !void {
-            if (self.constantOperand(value)) |constant| {
-                return self.encoder.immediate(operations.immediate, @intCast(structures.numeric.asInteger(kind, constant.bits)));
-            }
-            switch (self.valueLocation(value)) {
-                .register => |selected| try self.encoder.register(operations.register, selected),
-                .stack, .incoming_argument => |offset| try self.encoder.offset(operations.stack, offset),
-                .indirect => |offset| {
-                    try self.encoder.offset(.mov_rcx_rsp, offset);
-                    try self.encoder.emit(operations.indirect);
-                },
-                else => unreachable,
-            }
+        fn emitWideOperand(self: *Self, kind: structures.numeric.Type, value: structures.FunctionValueId, operations: Encoder.RhsOperations) !void {
+            const rhs: ValueLocation = if (self.constantOperand(value)) |constant|
+                .{ .immediate = @intCast(structures.numeric.asInteger(kind, constant.bits)) }
+            else
+                self.valueLocation(value);
+            try self.encoder.rhsOperation(rhs, operations);
         }
 
-        /// 64-bit add, subtract, multiply and bitwise operations applied in place to the accumulator.
-        fn emitCompactWideBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !bool {
+        /// 32- and 64-bit add, subtract, multiply and bitwise operations applied in place to the accumulator.
+        fn emitCompactBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !bool {
             const kind = operation.type_id.numericType().?;
-            if (kind.width() != 64 or kind.isFloat() or operation.overflow == .saturating) return false;
-            const operations = switch (operation.operation) {
-                .add => wide_add,
-                .sub => wide_sub,
+            const wide = kind.width() == 64;
+            if (!wide and kind.width() != 32) return false;
+            if (kind.isFloat() or operation.overflow == .saturating) return false;
+            const alu: Alu = switch (operation.operation) {
+                .add => .add,
+                .sub => .sub,
                 // Unsigned checked multiplication reads the high half instead of a flag.
-                .mul => if (!kind.isSigned() and operation.overflow != .wrapping) return false else wide_mul,
-                .bit_and => wide_and,
-                .bit_or => wide_or,
-                .bit_xor => wide_xor,
+                .mul => if (!kind.isSigned() and operation.overflow != .wrapping) return false else .imul,
+                .bit_and => .@"and",
+                .bit_or => .@"or",
+                .bit_xor => .xor,
                 else => return false,
             };
-            if (!self.wideOperand(kind, operation.operands.rhs)) return false;
-            try self.loadNumeric(operation.type_id, self.valueLocation(operation.operands.lhs));
-            try self.emitWideOperand(kind, operation.operands.rhs, operations);
-            switch (operation.operation) {
-                .bit_and, .bit_or, .bit_xor => {},
+            const operations = accumulatorOperations(alu, wide);
+            const lhs = self.valueLocation(operation.operands.lhs);
+            if (wide) {
+                if (!self.wideOperand(kind, operation.operands.rhs)) return false;
+                try self.loadNumeric(operation.type_id, lhs);
+                try self.emitWideOperand(kind, operation.operands.rhs, operations);
+            } else {
+                try self.loadComponent(.dword, lhs, 0);
+                try self.encoder.rhsOperation(self.valueLocation(operation.operands.rhs), operations);
+            }
+            switch (alu) {
+                .@"and", .@"or", .xor => {},
                 else => try self.numericArithmeticOverflow(kind, operation.operation, operation.overflow),
             }
             try self.storeNumeric(kind, destination, 0);
@@ -1493,7 +1420,7 @@ fn FunctionEmitter(comptime Types: type) type {
             const kind = operation.type_id.numericType().?;
             if (kind.width() == 64 and self.wideOperand(kind, operation.operands.rhs)) {
                 try self.loadNumeric(operation.type_id, self.valueLocation(operation.operands.lhs));
-                return self.emitWideOperand(kind, operation.operands.rhs, wide_compare);
+                return self.emitWideOperand(kind, operation.operands.rhs, accumulatorOperations(.cmp, true));
             }
             if (kind.width() == 32) {
                 // A 32-bit compare orders the operands exactly as the type does.
@@ -1584,8 +1511,7 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn emitNumericBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !void {
             const kind = operation.type_id.numericType().?;
-            if (try self.emitCompactNumericBinary(operation, destination)) return;
-            if (try self.emitCompactWideBinary(operation, destination)) return;
+            if (try self.emitCompactBinary(operation, destination)) return;
             if (!kind.isFloat() and operation.operation.isComparison()) {
                 try self.emitIntegerComparison(operation);
                 try self.encoder.emit(Condition.ofNumeric(operation.operation, kind.isSigned()).set());
@@ -1625,32 +1551,6 @@ fn FunctionEmitter(comptime Types: type) type {
                 else => unreachable,
             }
             try self.storeNumeric(kind, destination, 0);
-        }
-
-        fn emitCompactNumericBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !bool {
-            const kind = operation.type_id.numericType().?;
-            if (kind.width() != 32 or kind.isFloat() or operation.overflow == .saturating) return false;
-            switch (operation.operation) {
-                .add, .sub, .bit_and, .bit_or, .bit_xor => {},
-                // Unsigned checked multiplication reads the high half instead of a flag.
-                .mul => if (!kind.isSigned() and operation.overflow != .wrapping) return false,
-                else => return false,
-            }
-            const bitwise = operation.operation == .bit_and or operation.operation == .bit_or or operation.operation == .bit_xor;
-            try self.loadComponent(.dword, self.valueLocation(operation.operands.lhs), 0);
-            const right = self.valueLocation(operation.operands.rhs);
-            switch (operation.operation) {
-                .add => try self.encoder.integerBinary(.addi, right),
-                .sub => try self.encoder.integerBinary(.subi, right),
-                .mul => try self.encoder.integerBinary(.muli, right),
-                .bit_and => try self.encoder.rhsOperation(right, .{ .immediate = .and_eax, .register = .and_eax, .stack = .and_eax_rsp, .indirect = .and_eax_rcx }),
-                .bit_or => try self.encoder.rhsOperation(right, .{ .immediate = .or_eax, .register = .or_eax, .stack = .or_eax_rsp, .indirect = .or_eax_rcx }),
-                .bit_xor => try self.encoder.rhsOperation(right, .{ .immediate = .xor_eax, .register = .xor_eax, .stack = .xor_eax_rsp, .indirect = .xor_eax_rcx }),
-                else => unreachable,
-            }
-            if (!bitwise) try self.numericArithmeticOverflow(kind, operation.operation, operation.overflow);
-            try self.storeNumeric(kind, destination, 0);
-            return true;
         }
 
         fn emitNumericArithmetic(self: *Self, kind: structures.numeric.Type, operation: structures.numeric.Binary, overflow: structures.numeric.Overflow) !void {
@@ -1696,7 +1596,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 if (operation == .rem) {
                     try self.encoder.immediate(.mov_eax, 0);
                 } else switch (overflow) {
-                    .checked => try self.numericTrap(),
+                    .checked => try self.numericTrapIf(.jmp),
                     .wrapping => try self.encoder.emit(.mov_rax_rsi),
                     .saturating => try self.encoder.absolute(.mov_rax, @intCast(kind.maximum())),
                 }
@@ -1709,24 +1609,6 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.encoder.emit(if (kind.isSigned()) .idiv_rcx else .div_rcx);
             if (operation == .rem) try self.encoder.emit(.mov_rax_rdx);
             if (done) |field| try self.encoder.patchHere(field);
-        }
-
-        fn numericComparisonResult(self: *Self, operation: structures.numeric.Binary, signed: bool, destination: ValueLocation) !void {
-            const yes = try self.encoder.patchable(switch (operation) {
-                .eq => .je,
-                .ne => .jne,
-                .lt => if (signed) .jl else .jb,
-                .gt => if (signed) .jg else .ja,
-                .le => if (signed) .jle else .jbe,
-                .ge => if (signed) .jge else .jae,
-                else => unreachable,
-            });
-            try self.encoder.immediate(.mov_eax, 0);
-            const done = try self.encoder.patchable(.jmp);
-            try self.encoder.patchHere(yes);
-            try self.encoder.immediate(.mov_eax, 1);
-            try self.encoder.patchHere(done);
-            try self.storeComponent(.byte, destination, 0);
         }
 
         /// Float operands that live in stack slots feed SSE instructions directly,
@@ -1753,20 +1635,21 @@ fn FunctionEmitter(comptime Types: type) type {
             return true;
         }
 
-        /// Materializes a float comparison from the flags of an unordered compare.
-        fn emitFloatComparisonResult(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !void {
+        /// Materializes float equality from the flags of an unordered compare: unordered operands are unequal.
+        fn emitFloatEqualityResult(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !void {
+            const unequal = operation.operation == .ne;
+            try self.encoder.immediate(.mov_eax, @intFromBool(unequal));
             const unordered = try self.encoder.patchable(.jp);
-            try self.numericComparisonResult(operation.operation, false, destination);
-            const done = try self.encoder.patchable(.jmp);
+            const settled = try self.encoder.patchable(.jne);
+            try self.encoder.immediate(.mov_eax, @intFromBool(!unequal));
             try self.encoder.patchHere(unordered);
-            try self.encoder.immediate(.mov_eax, @intFromBool(operation.operation == .ne));
+            try self.encoder.patchHere(settled);
             try self.storeComponent(.byte, destination, 0);
-            try self.encoder.patchHere(done);
         }
 
         /// Sets the flags for a float comparison. Greater-than and less-than forms compare
         /// so that "above" holds and unordered operands fail it; they return that condition.
-        /// Equality forms return null and need the parity check of `emitFloatComparisonResult`.
+        /// Equality forms return null and need the parity check of `emitFloatEqualityResult`.
         fn emitFloatCompare(self: *Self, operation: structures.NumericBinary) !?Condition {
             const single = operation.type_id == .f32;
             const swap = operation.operation == .lt or operation.operation == .le;
@@ -1783,8 +1666,8 @@ fn FunctionEmitter(comptime Types: type) type {
                 try self.encoder.emit(if (single) .ucomiss_xmm0_xmm1 else .ucomisd_xmm0_xmm1);
             }
             return switch (operation.operation) {
-                .gt, .lt => .above,
-                .ge, .le => .above_equal,
+                .gt, .lt => .a,
+                .ge, .le => .ae,
                 else => null,
             };
         }
@@ -1795,7 +1678,7 @@ fn FunctionEmitter(comptime Types: type) type {
                 try self.encoder.emit(.movzx_eax_al);
                 return self.storeComponent(.byte, destination, 0);
             }
-            try self.emitFloatComparisonResult(operation, destination);
+            try self.emitFloatEqualityResult(operation, destination);
         }
 
         fn emitFloatBinary(self: *Self, operation: structures.NumericBinary, destination: ValueLocation) !void {
@@ -2010,7 +1893,7 @@ fn FunctionEmitter(comptime Types: type) type {
             const rhs = self.valueLocation(operands.rhs);
             try self.loadComponent(.dword, lhs, 0);
             try self.encoder.integerBinary(operation, rhs);
-            try self.storeResult(destination);
+            try self.storeComponent(.dword, destination, 0);
         }
 
         fn emitPredicateComparison(self: *Self, operation: structures.CompareOperation) !void {
@@ -2034,15 +1917,7 @@ fn FunctionEmitter(comptime Types: type) type {
             if (destination == .discarded) return;
             try self.emitPredicateComparison(operation);
             try self.encoder.scratchDead();
-            try self.encoder.emit(switch (operation.operation) {
-                .lti => .setl_al,
-                .gti => .setg_al,
-                .lei => .setle_al,
-                .gei => .setge_al,
-                .eqi, .eqb => .sete_al,
-                .nei, .neb => .setne_al,
-                .eqt, .net => unreachable,
-            });
+            try self.encoder.emit(Condition.of(operation.operation).set());
             try self.encoder.emit(.movzx_eax_al);
             try self.storeComponent(.byte, destination, 0);
         }
@@ -2150,7 +2025,6 @@ fn FunctionEmitter(comptime Types: type) type {
             const arguments = self.ssa.branch_arguments[branch.arguments.start..branch.arguments.end];
             const parameters = self.ssa.block_arguments[target.argument_start..target.argument_end];
             const destinations = self.plan.locations[target.argument_start..target.argument_end];
-            std.debug.assert(arguments.len == parameters.len);
             if (arguments.len == 1) return self.emitBranchArgument(arguments[0], parameters[0].type_id, destinations[0], null);
             if (self.branchCopyDirection(arguments, parameters, destinations)) |backward| {
                 for (0..arguments.len) |position| {
@@ -2247,11 +2121,9 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.encoder.emit(.mov_rsi_rax);
             try self.encoder.immediate(.mov_edx, @intCast(message.len));
             try self.encoder.immediate(.mov_edi, 2);
-            try self.encoder.immediate(.mov_eax, 1);
-            try self.encoder.emit(.syscall);
+            try self.encoder.syscall(1);
             try self.encoder.immediate(.mov_edi, 134);
-            try self.encoder.immediate(.mov_eax, linux_exit_syscall);
-            try self.encoder.emit(.syscall);
+            try self.encoder.syscall(linux_exit_syscall);
             try self.encoder.emit(.ud2);
         }
 
@@ -2262,8 +2134,7 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.encoder.offset(.mov_rax_rsp, scratch + 16);
             try self.encoder.emit(.test_rax);
             const cached = try self.encoder.patchable(.jne);
-            try self.encoder.immediate(.mov_eax, 186); // gettid
-            try self.encoder.emit(.syscall);
+            try self.encoder.syscall(186); // gettid
             try self.encoder.offset(.mov_rsp_eax, scratch + 8);
             try self.encoder.immediate(.mov_eax, 158); // arch_prctl
             try self.encoder.immediate(.mov_edi, 0x1004); // ARCH_GET_GS
@@ -2283,16 +2154,8 @@ fn FunctionEmitter(comptime Types: type) type {
             const ready = try self.encoder.patchable(.jmp);
             try self.encoder.patchHere(unattached);
             try self.encoder.patchHere(inherited);
-            try self.encoder.emit(.zero_edi);
             try self.encoder.immediate(.mov_esi, 4096);
-            try self.encoder.immediate(.mov_edx, 3);
-            try self.encoder.immediate(.mov_r10d, 0x22);
-            try self.encoder.immediate(.mov_r8d, -1);
-            try self.encoder.emit(.zero_r9d);
-            try self.encoder.immediate(.mov_eax, linux_mmap_syscall);
-            try self.encoder.emit(.syscall);
-            try self.encoder.immediate(.cmp_rax, -4095);
-            const mapping_failed = try self.encoder.patchable(.jae);
+            const mapping_failed = try self.encoder.mapPages();
             try self.encoder.offset(.mov_rsp_rax, scratch);
             try self.encoder.emit(.mov_rdi_rax);
             try self.encoder.offset(.mov_eax_rsp, scratch + 8);
@@ -2300,8 +2163,7 @@ fn FunctionEmitter(comptime Types: type) type {
             try self.encoder.offset(.mov_rax_rsp, scratch);
             try self.encoder.emit(.mov_rsi_rax);
             try self.encoder.immediate(.mov_edi, 0x1001); // ARCH_SET_GS
-            try self.encoder.immediate(.mov_eax, 158);
-            try self.encoder.emit(.syscall);
+            try self.encoder.syscall(158);
             try self.encoder.immediate(.cmp_eax, 0);
             const set_failed = try self.encoder.patchable(.jne);
             try self.encoder.offset(.mov_rax_rsp, scratch);
@@ -2716,7 +2578,7 @@ fn FunctionEmitter(comptime Types: type) type {
         fn emitUnary(self: *Self, width: Width, operand: structures.FunctionValueId, operation: ?x86.Operation, destination: ValueLocation) !void {
             try self.loadComponent(width, self.valueLocation(operand), 0);
             if (operation) |code| try self.encoder.emit(code);
-            try self.storeResult(destination);
+            try self.storeComponent(.dword, destination, 0);
         }
 
         fn loadVariantTag(self: *Self, type_id: structures.TypeId, source: ValueLocation) !void {
@@ -2731,7 +2593,7 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn emitVariantTag(self: *Self, operand: structures.FunctionValueId, destination: ValueLocation) !void {
             try self.loadVariantTag(self.valueType(operand), self.valueLocation(operand));
-            try self.storeResult(destination);
+            try self.storeComponent(.dword, destination, 0);
         }
 
         fn emitUseToMemory(self: *Self, use: structures.FunctionValueUse, offset: u32) !void {
@@ -2892,7 +2754,6 @@ fn FunctionEmitter(comptime Types: type) type {
         fn emitFieldAccess(self: *Self, operation: structures.FieldAccessOperation, destination: ValueLocation) !void {
             if (destination == .discarded) return;
             const layout = (try self.types.structLayout(self.valueType(operation.operand))) orelse return error.Unavailable;
-            std.debug.assert(operation.field_index < layout.field_offsets.len);
             const field_layout = try self.types.layout(operation.field_type);
             try self.copyRange(
                 self.valueLocation(operation.operand),
@@ -3024,15 +2885,6 @@ fn FunctionEmitter(comptime Types: type) type {
             }
         }
 
-        fn storeResult(self: *Self, location: ValueLocation) !void {
-            switch (location) {
-                .stack, .return_buffer => |offset| try self.encoder.offset(.mov_rsp_eax, offset),
-                .eax, .discarded => {},
-                .register => |register| try self.encoder.register(.store_eax, register),
-                .immediate, .incoming_argument, .indirect => unreachable,
-            }
-        }
-
         fn encodeBody(self: *Self) !void {
             const stream = if (self.encoder.stream) |*stream| stream else return;
             try stream.coalesceAccumulatorCopies(self.plan.spills.len);
@@ -3081,7 +2933,6 @@ fn FunctionEmitter(comptime Types: type) type {
 
 pub fn compileFunction(ssa: *const structures.FunctionBodyAnalysis, types: anytype, gpa: std.mem.Allocator) anyerror!structures.CompiledFunction {
     std.debug.assert(ssa.blocks.len != 0);
-    std.debug.assert(@backingInt(ssa.entry) < ssa.blocks.len);
     var plan = try LocationPlan.init(ssa, types, gpa);
     defer plan.deinit(gpa);
     var emitter = try FunctionEmitter(@TypeOf(types)).init(gpa, ssa, &plan, types);
@@ -3098,27 +2949,22 @@ pub fn compileFunction(ssa: *const structures.FunctionBodyAnalysis, types: anyty
 }
 
 pub fn attachCallableDescriptor(artifact: *structures.CompiledFunction, instance: structures.InstanceId, copy: structures.InstanceId, drop: structures.InstanceId, allocator: std.mem.Allocator) !void {
-    const code_size = std.math.add(usize, 24, artifact.code.len) catch return error.FunctionTooLarge;
-    if (code_size > std.math.maxInt(u32)) return error.FunctionTooLarge;
-    const code = try allocator.alloc(u8, code_size);
+    const descriptor_size = 24;
+    // Every code offset of the artifact, including its trace and relocation fields, then fits in 32 bits.
+    if (artifact.code.len > std.math.maxInt(u32) - descriptor_size) return error.FunctionTooLarge;
+    const code = try std.mem.concat(allocator, u8, &.{ &@as([descriptor_size]u8, @splat(0)), artifact.code });
     errdefer allocator.free(code);
-    @memset(code[0..24], 0);
-    @memcpy(code[24..][0..artifact.code.len], artifact.code);
-    const references = try allocator.alloc(structures.InstanceId, artifact.referenced_instances.len + 3);
+    const references = try std.mem.concat(allocator, structures.InstanceId, &.{ artifact.referenced_instances, &.{ instance, copy, drop } });
     errdefer allocator.free(references);
-    @memcpy(references[0..artifact.referenced_instances.len], artifact.referenced_instances);
-    @memcpy(references[artifact.referenced_instances.len..], &[_]structures.InstanceId{ instance, copy, drop });
     const relocations = try allocator.alloc(structures.CompiledFunction.Relocation, artifact.relocations.len + 3);
     errdefer allocator.free(relocations);
     for (artifact.relocations, relocations[0..artifact.relocations.len]) |source, *relocation| {
         relocation.* = source;
-        relocation.offset = std.math.add(u32, source.offset, 24) catch return error.FunctionTooLarge;
+        relocation.offset += descriptor_size;
     }
     for (relocations[artifact.relocations.len..], 0..) |*relocation, index| {
         relocation.* = .{ .offset = @intCast(index * 8), .kind = .address_absolute_64, .reference = .{ .function = @fromBackingInt(@intCast(artifact.referenced_instances.len + index)) }, .addend = 0 };
     }
-    for (artifact.trace_sites) |site| _ = std.math.add(u32, site.return_offset, 24) catch return error.FunctionTooLarge;
-    for (artifact.panic_trace_offsets) |offset| _ = std.math.add(u32, offset, 24) catch return error.FunctionTooLarge;
     allocator.free(artifact.code);
     allocator.free(artifact.relocations);
     allocator.free(artifact.referenced_instances);
@@ -3126,9 +2972,9 @@ pub fn attachCallableDescriptor(artifact: *structures.CompiledFunction, instance
     artifact.relocations = relocations;
     artifact.referenced_instances = references;
     artifact.required_alignment = @max(artifact.required_alignment, 8);
-    artifact.entry_offset = 24;
-    for (@constCast(artifact.trace_sites)) |*site| site.return_offset += 24;
-    for (@constCast(artifact.panic_trace_offsets)) |*offset| offset.* += 24;
+    artifact.entry_offset = descriptor_size;
+    for (@constCast(artifact.trace_sites)) |*site| site.return_offset += descriptor_size;
+    for (@constCast(artifact.panic_trace_offsets)) |*offset| offset.* += descriptor_size;
 }
 // External functions have no frame: incoming argument storage starts at
 // rsp + 8, past the return address.
@@ -3138,8 +2984,7 @@ pub fn compileExternalExit(gpa: std.mem.Allocator) !structures.CompiledFunction 
     defer encoder.deinit();
     try encoder.offset(.mov_eax_rsp, 8);
     try encoder.emit(.mov_edi_eax);
-    try encoder.immediate(.mov_eax, linux_exit_syscall);
-    try encoder.emit(.syscall);
+    try encoder.syscall(linux_exit_syscall);
     return externalArtifact(&encoder);
 }
 
@@ -3269,8 +3114,7 @@ fn emitPanicTrace(encoder: *Encoder) !u32 {
     try encoder.jumpBack(.jne, frame);
     try encoder.patchHere(unknown);
     try encoder.immediate(.mov_edi, 134);
-    try encoder.immediate(.mov_eax, linux_exit_syscall);
-    try encoder.emit(.syscall);
+    try encoder.syscall(linux_exit_syscall);
     try encoder.emit(.ud2);
     try encoder.patchHere(write);
     try emitPanicWriter(encoder);
@@ -3291,7 +3135,8 @@ fn compileExternalAllocateStorage(signature: structures.FunctionSignature, types
     defer encoder.deinit();
     var call = try signatureLayout(types, signature, gpa);
     defer call.deinit(gpa);
-    const result = try serviceReturn(types, signature.return_type, if (with_count or raw_layout) try types.facts().allocationError() else .none);
+    const reports_error = with_count or raw_layout;
+    const result = try serviceReturn(types, signature.return_type, if (reports_error) try types.facts().allocationError() else .none);
     const argument_offset = call.arguments[0].stack + 8;
     try encoder.offset(.mov_esi_rsp, argument_offset);
     try encoder.emit(.test_esi);
@@ -3324,15 +3169,7 @@ fn compileExternalAllocateStorage(signature: structures.FunctionSignature, types
         try encoder.immediate(.mov_esi, 1);
         try encoder.patchHere(nonzero_size);
     }
-    try encoder.emit(.zero_edi);
-    try encoder.immediate(.mov_edx, 3);
-    try encoder.immediate(.mov_r10d, 0x22);
-    try encoder.immediate(.mov_r8d, -1);
-    try encoder.emit(.zero_r9d);
-    try encoder.immediate(.mov_eax, linux_mmap_syscall);
-    try encoder.emit(.syscall);
-    try encoder.immediate(.cmp_rax, -4095);
-    const allocation_failed = try encoder.patchable(.jae);
+    const allocation_failed = try encoder.mapPages();
     try encoder.offset(.mov_rsp_eax, result.payload);
     try encoder.byteImmediate(.shr_rax, 32);
     try encoder.offset(.mov_rsp_eax, result.payload + 4);
@@ -3348,26 +3185,14 @@ fn compileExternalAllocateStorage(signature: structures.FunctionSignature, types
     }
     try emitOptionalReturn(&encoder, result, true);
     try encoder.patchHere(allocation_failed);
-    if (with_count or raw_layout) {
-        try encoder.immediate(.mov_eax, 0);
-        try encoder.offset(.mov_rsp_eax, result.payload);
-    }
-    try emitOptionalReturn(&encoder, result, false);
+    try emitAllocationFailure(&encoder, result, reports_error, 0);
     try encoder.patchHere(invalid_size);
     for (invalid_alignment) |failure| if (failure) |field| try encoder.patchHere(field);
-    if (with_count or raw_layout) {
-        try encoder.immediate(.mov_eax, 1);
-        try encoder.offset(.mov_rsp_eax, result.payload);
-    }
-    try emitOptionalReturn(&encoder, result, false);
+    try emitAllocationFailure(&encoder, result, reports_error, 1);
     for ([_]?u32{ size_overflow, oversized_element }) |failure| {
         if (failure) |field| try encoder.patchHere(field);
     }
-    if (with_count or raw_layout) {
-        try encoder.immediate(.mov_eax, 2);
-        try encoder.offset(.mov_rsp_eax, result.payload);
-    }
-    try emitOptionalReturn(&encoder, result, false);
+    try emitAllocationFailure(&encoder, result, reports_error, 2);
     return externalArtifact(&encoder);
 }
 
@@ -3404,8 +3229,7 @@ pub fn compileExternalDeallocateHostStorage(gpa: std.mem.Allocator) !structures.
     const nonempty = try encoder.patchable(.jne);
     try encoder.immediate(.mov_esi, 1);
     try encoder.patchHere(nonempty);
-    try encoder.immediate(.mov_eax, linux_munmap_syscall);
-    try encoder.emit(.syscall);
+    try encoder.syscall(linux_munmap_syscall);
     try encoder.emit(.ret);
     return externalArtifact(&encoder);
 }
@@ -3432,8 +3256,7 @@ pub fn compileExternalByteIo(read: bool, signature: structures.FunctionSignature
     try emitIncomingAddress(&encoder, arguments[1]);
     if (read) try encoder.emit(.add_rax_rcx);
     try encoder.emit(.mov_rsi_rax);
-    try encoder.immediate(.mov_eax, if (read) 0 else 1);
-    try encoder.emit(.syscall);
+    try encoder.syscall(if (read) 0 else 1);
     try encoder.immediate(.cmp_eax, -4);
     try encoder.jumpBack(.je, retry);
     try encoder.immediate(.cmp_eax, 0);
@@ -3473,6 +3296,15 @@ fn serviceReturn(types: anytype, type_id: structures.TypeId, error_type: structu
     const layout = try types.variantLayout(type_id);
     std.debug.assert(layout.tag_size == 1);
     return .{ .tag = 8, .payload = 8 + layout.payload_offset, .tag_width = variantTagWidth(layout), .present = @intCast(1 - absent), .absent = @intCast(absent) };
+}
+
+/// Returns the absent variant, which carries the allocation error `code` when the result reports one.
+fn emitAllocationFailure(encoder: *Encoder, result: OptionalReturn, reports_error: bool, code: i32) !void {
+    if (reports_error) {
+        try encoder.immediate(.mov_eax, code);
+        try encoder.offset(.mov_rsp_eax, result.payload);
+    }
+    try emitOptionalReturn(encoder, result, false);
 }
 
 fn emitOptionalReturn(encoder: *Encoder, result: OptionalReturn, present: bool) !void {
@@ -3538,8 +3370,7 @@ pub fn buildExecutableWithResultAllocator(
     };
     const entry_call = try image.patchable(.call_relative);
     try image.immediate(.mov_edi, 0);
-    try image.immediate(.mov_eax, linux_exit_syscall);
-    try image.emit(.syscall);
+    try image.syscall(linux_exit_syscall);
 
     const needs_panic_trace = for (functions) |function| {
         if (function.artifact.panic_trace_offsets.len != 0) break true;
@@ -3639,11 +3470,6 @@ fn emitIgnoreSigpipe(encoder: *Encoder) !void {
     try encoder.offset(.add_rsp, 32);
 }
 
-pub fn executableCode(executable: structures.Executable) []const u8 {
-    std.debug.assert(executable.bytes.len >= code_file_offset);
-    return executable.bytes[code_file_offset..];
-}
-
 /// Patches a call-relative-32 field so it resolves to `target_address`, per
 /// the ABI's site-relative-to-next-instruction convention: the encoded value
 /// is `target_address + addend - site_end_address`.
@@ -3698,6 +3524,25 @@ fn writeElfHeaders(image: []u8) void {
     @memcpy(image[@sizeOf(std.elf.Elf64.Ehdr)..code_file_offset], std.mem.asBytes(&segment));
 }
 
+const Alu = enum { add, sub, imul, @"and", @"or", xor, cmp };
+
+/// The accumulator forms of `alu`, one for each location of the right operand.
+fn accumulatorOperations(alu: Alu, wide: bool) Encoder.RhsOperations {
+    return switch (alu) {
+        inline else => |tag| switch (wide) {
+            inline else => |is_wide| {
+                const name = @tagName(tag) ++ if (is_wide) "_rax" else "_eax";
+                return .{
+                    .immediate = @field(x86.Operation, name),
+                    .register = @field(x86.RegisterOperation, name),
+                    .stack = @field(x86.Operation, name ++ "_rsp"),
+                    .indirect = @field(x86.Operation, name ++ "_mem_rcx"),
+                };
+            },
+        },
+    };
+}
+
 /// Encodes x86 directly, or into a machine stream when values still need
 /// register allocation.
 const Encoder = struct {
@@ -3733,6 +3578,23 @@ const Encoder = struct {
 
     fn immediate(self: *Encoder, operation: x86.Operation, value: i32) !void {
         try self.appendFixed(operation, .i32, @as(u32, @bitCast(value)));
+    }
+
+    fn syscall(self: *Encoder, number: i32) !void {
+        try self.immediate(.mov_eax, number);
+        try self.emit(.syscall);
+    }
+
+    /// Maps `esi` bytes of anonymous memory and returns the jump taken when the mapping fails.
+    fn mapPages(self: *Encoder) !u32 {
+        try self.emit(.zero_edi);
+        try self.immediate(.mov_edx, 3);
+        try self.immediate(.mov_r10d, 0x22);
+        try self.immediate(.mov_r8d, -1);
+        try self.emit(.zero_r9d);
+        try self.syscall(linux_mmap_syscall);
+        try self.immediate(.cmp_rax, -4095);
+        return self.patchable(.jae);
     }
 
     fn byteImmediate(self: *Encoder, operation: x86.Operation, value: u8) !void {
@@ -3815,18 +3677,19 @@ const Encoder = struct {
     }
 
     fn compareEax(self: *Encoder, rhs: ValueLocation) !void {
-        try self.rhsOperation(rhs, .{ .immediate = .cmp_eax, .register = .cmp_eax, .stack = .cmp_eax_rsp, .indirect = .cmp_eax_rcx });
+        try self.rhsOperation(rhs, accumulatorOperations(.cmp, false));
     }
 
     fn integerBinary(self: *Encoder, comptime operation: std.meta.Tag(structures.FunctionInstruction), rhs: ValueLocation) !void {
         if (operation == .divsi) return self.divide(rhs);
         if (operation == .shli or operation == .shrsi) return self.shift(operation, rhs);
-        try self.rhsOperation(rhs, switch (operation) {
-            .addi => .{ .immediate = .add_eax, .register = .add_eax, .stack = .add_eax_rsp, .indirect = .add_eax_rcx },
-            .subi => .{ .immediate = .sub_eax, .register = .sub_eax, .stack = .sub_eax_rsp, .indirect = .sub_eax_rcx },
-            .muli => .{ .immediate = .imul_eax, .register = .imul_eax, .stack = .imul_eax_rsp, .indirect = .imul_eax_rcx },
+        const alu: Alu = switch (operation) {
+            .addi => .add,
+            .subi => .sub,
+            .muli => .imul,
             else => comptime unreachable,
-        });
+        };
+        try self.rhsOperation(rhs, accumulatorOperations(alu, false));
     }
 
     fn loadEcx(self: *Encoder, rhs: ValueLocation) !void {

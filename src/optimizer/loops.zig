@@ -70,6 +70,17 @@ pub const Analysis = struct {
         return !loop.contains(block);
     }
 
+    /// Whether a block outside the loop uses a value defined inside it, other than `allowed`.
+    pub fn escapes(self: Analysis, loop: Loop, allowed: []const ValueId) bool {
+        var escape: Escape = .{ .analysis = &self, .loop = loop, .allowed = allowed };
+        for (self.function.blocks.items, 0..) |*block, index| {
+            if (loop.contains(@intCast(index))) continue;
+            function_ir.visitBlockOperands(self.function, block, .all, &escape, Escape.check);
+            if (escape.found) return true;
+        }
+        return false;
+    }
+
     pub fn iterationAcyclic(self: Analysis, loop: Loop) bool {
         for (loop.blocks) |block| for (self.function.blocks.items[block].terminator.branches()) |maybe_edge| if (maybe_edge) |edge| {
             const target = @backingInt(edge.target);
@@ -493,6 +504,18 @@ pub const Analysis = struct {
     }
 };
 
+const Escape = struct {
+    analysis: *const Analysis,
+    loop: Loop,
+    allowed: []const ValueId,
+    found: bool = false,
+
+    fn check(self: *Escape, operand: *ValueId) void {
+        if (self.analysis.definedOutside(self.loop, operand.*)) return;
+        if (std.mem.indexOfScalar(ValueId, self.allowed, self.analysis.function.find(operand.*)) == null) self.found = true;
+    }
+};
+
 /// Range context at one block: guards that dominate it and facts from calls
 /// that returned normally narrow what definitions alone give.
 const At = struct {
@@ -580,12 +603,12 @@ const At = struct {
 };
 
 /// Integer addition or subtraction, either modular or checked.
-const Offset = struct {
+pub const Offset = struct {
     operands: structures.BinaryOperands,
     subtract: bool,
     checked: bool = false,
 
-    fn init(instruction: structures.FunctionInstruction) ?Offset {
+    pub fn init(instruction: structures.FunctionInstruction) ?Offset {
         return switch (instruction) {
             .numeric_binary => |operation| if (operation.type_id != .int or operation.overflow == .saturating) null else switch (operation.operation) {
                 .add, .sub => .{ .operands = operation.operands, .subtract = operation.operation == .sub, .checked = operation.overflow == .checked },

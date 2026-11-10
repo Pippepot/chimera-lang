@@ -25,11 +25,7 @@ pub fn transform(function: *Function, analysis: *const loops.Analysis, loop: loo
         var cost: usize = loop.blocks.len;
         for (loop.blocks) |member| cost += function.blocks.items[member].instructions.items.len + function.blocks.items[member].parameters.items.len;
         if (cost > budget.*) return false;
-        var escape: Escape = .{ .analysis = analysis, .loop = loop };
-        for (function.blocks.items, 0..) |*outside, index| {
-            if (!loop.contains(@intCast(index))) function_ir.visitBlockReferences(function, outside, &escape, Escape.check);
-        }
-        if (escape.found) return false;
+        if (analysis.escapes(loop, &.{})) return false;
         var clone = try Clone.init(function, loop);
         const old_entry = function.blocks.items[preheader].terminator.branch;
         const new_entry = try clone.branch(old_entry);
@@ -50,16 +46,6 @@ pub fn transform(function: *Function, analysis: *const loops.Analysis, loop: loo
     }
     return false;
 }
-
-const Escape = struct {
-    analysis: *const loops.Analysis,
-    loop: loops.Loop,
-    found: bool = false,
-
-    fn check(self: *Escape, value: ValueId) void {
-        if (!self.analysis.definedOutside(self.loop, value)) self.found = true;
-    }
-};
 
 /// Every local definition and edge is copied; immutable side tables stay shared.
 /// Values leaving the loop must already travel through explicit exit arguments.

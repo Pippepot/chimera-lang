@@ -3,6 +3,7 @@ const structures = @import("../structures.zig");
 const function_ir = @import("function.zig");
 const canonicalize = @import("canonicalize.zig");
 const loops = @import("loops.zig");
+const compaction = @import("compaction.zig");
 const inlining = @import("inline.zig");
 const Graph = @import("graph.zig").Graph;
 
@@ -48,7 +49,7 @@ fn scopeValues(function: *Function, analysis: *const loops.Analysis) bool {
     var changed = false;
     for (analysis.graph.order) |block| {
         var scoped: ScopedValues = .{ .function = function, .analysis = analysis, .block = block };
-        function_ir.visitBlockOperands(function, &function.blocks.items[block], &scoped, ScopedValues.replace);
+        function_ir.visitBlockOperands(function, &function.blocks.items[block], .all, &scoped, ScopedValues.replace);
         changed = changed or scoped.changed;
     }
     return changed;
@@ -110,11 +111,9 @@ fn successfulCallArguments(function: *Function, context: anytype, callees: *inli
             const value = function.find(argument.valueId());
             if (function.valueType(value) == .int and function.plainValue(value) and !taken[@backingInt(value)]) break;
         } else continue;
-        const body = (try callees.body(function.scratch, context, call.target.direct)) orelse continue;
-        const facts = if (@hasDecl(@TypeOf(context), "inlineFacts"))
-            (try callees.instanceFacts(function.scratch, context, call.target.direct)) orelse continue
-        else
-            try callees.analyze(function.scratch, body);
+        // Only callees that inlining could consider have facts; the body itself is not needed.
+        _ = (try callees.body(function.scratch, context, call.target.direct)) orelse continue;
+        const facts = (try callees.instanceFacts(function.scratch, context, call.target.direct)) orelse continue;
         if (!facts.eligible or facts.normal_return_ranges.len == 0) continue;
         std.debug.assert(facts.normal_return_ranges.len == arguments.len);
         for (arguments, facts.normal_return_ranges) |argument, range| {
@@ -142,21 +141,6 @@ fn rewriteLoop(function: *Function, analysis: *const loops.Analysis, loop: Loop,
     }
     return boundsChecks(function, analysis, loop, preheader);
 }
-
-const LoopParameters = struct {
-    function: *Function,
-    from: []const ValueId,
-    to: []const ValueId = &.{},
-    found: bool = false,
-
-    fn check(self: *LoopParameters, operand: *ValueId) void {
-        if (std.mem.indexOfScalar(ValueId, self.from, self.function.find(operand.*)) != null) self.found = true;
-    }
-
-    fn replace(self: *LoopParameters, operand: *ValueId) void {
-        if (std.mem.indexOfScalar(ValueId, self.from, self.function.find(operand.*))) |position| operand.* = self.to[position];
-    }
-};
 
 fn selectArm(function: *const Function, value: ValueId, condition: ValueId, taken: bool) ValueId {
     const definition = function.definition(function.find(value)) orelse return value;
@@ -209,9 +193,7 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
     for (function.blocks.items, 0..) |*block, index| {
         if (index == loop.header or graph.dominates(body, @intCast(index))) continue;
         if (private_exit and graph.dominates(test_result.exit, @intCast(index))) continue;
-        var uses: LoopParameters = .{ .function = function, .from = header.parameters.items };
-        function_ir.visitBlockOperands(function, block, &uses, LoopParameters.check);
-        if (uses.found) return false;
+        if (function_ir.countUses(function, block, header.parameters.items) != 0) return false;
     }
     if (terminator != .branch) {
         // Only this selected backedge needs the flag decision. Leave the
@@ -237,16 +219,14 @@ fn rotateCarriedExit(function: *Function, graph: Graph, loop: Loop) !bool {
         try initial.append(function.scratch, .{ .value = parameter });
     }
     const active = carried.select.then_value;
-    var escaped: LoopParameters = .{ .function = function, .from = original, .to = exit_parameters };
     if (private_exit) {
         for (function.blocks.items, 0..) |*block, index| {
-            if (graph.dominates(test_result.exit, @intCast(index))) function_ir.visitBlockOperands(function, block, &escaped, LoopParameters.replace);
+            if (graph.dominates(test_result.exit, @intCast(index))) function_ir.replaceUses(function, block, original, exit_parameters);
         }
     }
-    var rewritten: LoopParameters = .{ .function = function, .from = original, .to = replacements };
     for (function.blocks.items, 0..) |*block, index| {
         if (!graph.dominates(body, @intCast(index))) continue;
-        function_ir.visitBlockOperands(function, block, &rewritten, LoopParameters.replace);
+        function_ir.replaceUses(function, block, original, replacements);
         for (block.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
             if (private_exit and @backingInt(branch.target) == test_result.exit) branch.arguments = try function.copyBranchArguments(branch.arguments, replacements);
         };
@@ -302,7 +282,7 @@ fn removeDeadLoop(function: *Function, analysis: *const loops.Analysis, loop: Lo
     for (loop.blocks) |block| {
         for (function.blocks.items[block].instructions.items) |index| {
             if (function.removed.items[index]) continue;
-            if (pure(function, function.instructions.items[index])) continue;
+            if (compaction.removableWhenUnused(function, function.instructions.items[index])) continue;
             if (function.results.items[index] != controlled.induction.next) return false;
             needs_proof = true;
         }
@@ -310,36 +290,10 @@ fn removeDeadLoop(function: *Function, analysis: *const loops.Analysis, loop: Lo
         if (terminator != .branch and terminator != .predicate_branch) return false;
     }
     if (!analysis.iterationAcyclic(loop)) return false;
-    var escape: Escape = .{ .analysis = analysis, .loop = loop };
-    for (function.blocks.items, 0..) |*block, index| {
-        if (!loop.contains(@intCast(index))) function_ir.visitBlockOperands(function, block, &escape, Escape.check);
-        if (escape.escapes) return false;
-    }
+    if (analysis.escapes(loop, &.{})) return false;
     if (needs_proof and !analysis.equalityRecurrenceSafe(preheader, controlled)) return false;
     function.blocks.items[preheader].terminator = .{ .branch = .{ .target = @fromBackingInt(test_result.exit), .arguments = .{ .start = 0, .end = 0 } } };
     return true;
-}
-
-const Escape = struct {
-    analysis: *const loops.Analysis,
-    loop: Loop,
-    allowed: []const ValueId = &.{},
-    escapes: bool = false,
-
-    fn check(self: *Escape, operand: *ValueId) void {
-        if (self.analysis.definedOutside(self.loop, operand.*)) return;
-        if (std.mem.indexOfScalar(ValueId, self.allowed, self.analysis.function.find(operand.*)) == null) self.escapes = true;
-    }
-};
-
-fn pure(function: *const Function, instruction: Instruction) bool {
-    return switch (instruction) {
-        .numeric_binary, .numeric_unary => !function_ir.numericMayTrap(function, instruction),
-        .const_numeric, .numeric_convert, .const_int, .const_bool, .const_byte, .const_unit, .const_none, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .variant_tag, .field_access, .borrow_address, .borrow_read, .storage_projection, .allocation_element, .array_element, .cursor_offset, .cursor_element, .function_ref => true,
-        .divsi, .shli, .shrsi => |operands| function_ir.validConstantRhs(function, instruction, operands.rhs),
-        inline .value_copy, .variant_extract, .variant_coerce => |operation| operation.destination == null,
-        else => false,
-    };
 }
 
 const CountedLoop = struct { parameter: ValueId, next: ValueId, start: ValueId, bound: ValueId, exit: u32 };
@@ -362,11 +316,7 @@ fn countedLoop(function: *Function, analysis: *const loops.Analysis, loop: Loop,
 }
 
 fn useCount(function: *const Function, block: u32, value: ValueId) u32 {
-    var users: Users = .{ .function = function, .value = value };
-    for (function.blocks.items[block].instructions.items) |index| {
-        if (!function.removed.items[index]) function_ir.visitInstructionReferences(function, &function.instructions.items[index], &users, Users.count);
-    }
-    return users.count_value;
+    return function_ir.countUses(function, &function.blocks.items[block], &.{value});
 }
 
 fn fill(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32) !bool {
@@ -385,7 +335,7 @@ fn fill(function: *Function, analysis: *const loops.Analysis, loop: Loop, prehea
     const first = try function.insertInstruction(filled, 1, .{ .allocation_element = .{ .allocation = target.allocation, .index = start, .type_id = target.type_id } }, span, frame);
     _ = try function.insertInstruction(filled, 2, .{ .fill = .{ .first = first, .count = count, .value = store.value, .type_id = target.type_id } }, span, frame);
 
-    replaceOutside(function, loop, parameter, bound);
+    replaceOutside(function, loop, &.{parameter}, &.{bound});
     return true;
 }
 
@@ -397,13 +347,13 @@ fn fillStore(function: *Function, analysis: *const loops.Analysis, loop: Loop, b
     var stored: ?structures.ValueCopy = null;
     for (function.blocks.items[body].instructions.items) |index| {
         if (function.removed.items[index]) continue;
-        switch (function.instructions.items[index]) {
+        const instruction = function.instructions.items[index];
+        switch (instruction) {
             .const_numeric, .const_int, .const_bool, .const_byte => {},
-            .numeric_binary => |operation| {
-                if (operation.type_id != .int or operation.operation != .add or operation.overflow == .saturating) return null;
-                if (std.mem.indexOfScalar(ValueId, updates, function.results.items[index]) == null) return null;
+            .numeric_binary, .addi => {
+                const offset = loops.Offset.init(instruction) orelse return null;
+                if (offset.subtract or std.mem.indexOfScalar(ValueId, updates, function.results.items[index]) == null) return null;
             },
-            .addi => if (std.mem.indexOfScalar(ValueId, updates, function.results.items[index]) == null) return null,
             .allocation_element => |operation| {
                 if (element != null or function.find(operation.index) != parameter) return null;
                 element = operation;
@@ -460,14 +410,10 @@ fn terminalFill(function: *Function, analysis: *const loops.Analysis, loop: Loop
         original[position * 2] = parameter;
         original[position * 2 + 1] = update;
     }
-    var escape: Escape = .{ .analysis = analysis, .loop = loop, .allowed = original };
+    if (analysis.escapes(loop, original)) return false;
     for (function.blocks.items, 0..) |*block, index| {
-        if (loop.contains(@intCast(index))) continue;
-        function_ir.visitBlockOperands(function, block, &escape, Escape.check);
-        if (escape.escapes) return false;
-        var uses: LoopParameters = .{ .function = function, .from = original };
-        function_ir.visitBlockOperands(function, block, &uses, LoopParameters.check);
-        if (uses.found and !analysis.graph.dominates(ending.exit, @intCast(index))) return false;
+        if (loop.contains(@intCast(index)) or analysis.graph.dominates(ending.exit, @intCast(index))) continue;
+        if (function_ir.countUses(function, block, original) != 0) return false;
     }
     const exit_branch = function.branchTo(loop.header, ending.exit).?.*;
     const arguments = try function.scratch.dupe(structures.FunctionValueUse, function.branchArguments(exit_branch));
@@ -491,10 +437,7 @@ fn terminalFill(function: *Function, analysis: *const loops.Analysis, loop: Loop
         try slow.append(function.scratch, .{ .value = value });
     }
     function.branchTo(loop.header, ending.exit).?.* = .{ .target = @fromBackingInt(merged), .arguments = try function.appendBranchArguments(slow.items) };
-    var outside: LoopParameters = .{ .function = function, .from = original, .to = replacements };
-    for (function.blocks.items, 0..) |*block, index| {
-        if (!loop.contains(@intCast(index))) function_ir.visitBlockOperands(function, block, &outside, LoopParameters.replace);
-    }
+    replaceOutside(function, loop, original, replacements);
     try function.placeAfter(merged, loop.header);
     const ordered = try guard(function, preheader, start, bound, merged, span, frame);
     if (start_range.lower >= 0 and start_range.upper <= bound_range.lower) {
@@ -529,10 +472,9 @@ fn terminalFill(function: *Function, analysis: *const loops.Analysis, loop: Loop
     return true;
 }
 
-fn replaceOutside(function: *Function, loop: Loop, parameter: ValueId, bound: ValueId) void {
-    var outside: Replace = .{ .from = parameter, .to = bound };
+fn replaceOutside(function: *Function, loop: Loop, from: []const ValueId, to: []const ValueId) void {
     for (function.blocks.items, 0..) |*block, index| {
-        if (!loop.contains(@intCast(index))) function_ir.visitBlockOperands(function, block, &outside, Replace.apply);
+        if (!loop.contains(@intCast(index))) function_ir.replaceUses(function, block, from, to);
     }
 }
 
@@ -610,7 +552,7 @@ fn move(function: *Function, analysis: *const loops.Analysis, loop: Loop, prehea
     const first_destination = try function.insertInstruction(moved, 1, .{ .allocation_element = .{ .allocation = to.allocation, .index = bound, .type_id = to.type_id } }, span, frame);
     const first_source = try function.insertInstruction(moved, 2, .{ .allocation_element = .{ .allocation = from.allocation, .index = bound, .type_id = from.type_id } }, span, frame);
     _ = try function.insertInstruction(moved, 3, .{ .move = .{ .destination = first_destination, .source = first_source, .count = count, .type_id = to.type_id, .backward = true } }, span, frame);
-    replaceOutside(function, loop, counted.parameter, bound);
+    replaceOutside(function, loop, &.{counted.parameter}, &.{bound});
     return true;
 }
 
@@ -644,25 +586,6 @@ fn through(function: *Function, block: u32, edge: @import("graph.zig").Incoming,
     const position = std.mem.indexOfScalar(ValueId, function.blocks.items[block].parameters.items, value) orelse return value;
     return function.find(function.branchArguments(branch.*)[position].value);
 }
-
-const Users = struct {
-    function: *const Function,
-    value: ValueId,
-    count_value: u32 = 0,
-
-    fn count(self: *Users, operand: ValueId) void {
-        if (self.function.find(operand) == self.value) self.count_value += 1;
-    }
-};
-
-const Replace = struct {
-    from: ValueId,
-    to: ValueId,
-
-    fn apply(self: *Replace, operand: *ValueId) void {
-        if (operand.* == self.from) operand.* = self.to;
-    }
-};
 
 fn boundsChecks(function: *Function, analysis: *const loops.Analysis, loop: Loop, preheader: u32) bool {
     for (function.blocks.items[loop.header].parameters.items) |parameter| {

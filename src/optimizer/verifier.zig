@@ -70,7 +70,7 @@ pub fn verifyFunction(function: *Function) !void {
     const context: FunctionCheck = .{ .function = function, .defined = defined };
     for (function.blocks.items, reachable) |*block, kept| {
         if (!kept) continue;
-        function_ir.visitBlockReferences(function, block, &context, FunctionCheck.check);
+        function_ir.visitBlockOperands(function, block, .all, &context, FunctionCheck.check);
         for (block.terminator.branches()) |maybe_branch| if (maybe_branch) |branch| {
             std.debug.assert(branch.arguments.end - branch.arguments.start == function.blocks.items[@backingInt(branch.target)].parameters.items.len);
         };

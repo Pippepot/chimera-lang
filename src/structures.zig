@@ -531,9 +531,6 @@ pub const Name = union(enum) {
         }
     };
     pub const Set = std.HashMap(Name, void, Context, std.hash_map.default_max_load_percentage);
-    pub fn clone(self: Name, allocator: std.mem.Allocator) !Name {
-        return value_operations.Owned(Name).clone(allocator, self);
-    }
     pub const deinit = value_operations.Owned(@This()).deinit;
 };
 
@@ -1037,10 +1034,6 @@ pub const FunctionBlockId = enum(u32) { _ };
 pub const FunctionValueRange = struct { start: u32, end: u32 };
 
 pub const invalid_variant_tag = std.math.maxInt(u32);
-
-pub fn functionInstructionValue(argument_count: usize, instruction_index: usize) FunctionValueId {
-    return @fromBackingInt(@intCast(argument_count + instruction_index));
-}
 
 pub const BinaryOperands = struct { lhs: FunctionValueId, rhs: FunctionValueId };
 
@@ -1791,7 +1784,7 @@ pub const FunctionBodyAnalysis = struct {
 
     pub fn instructionValue(self: @This(), instruction_index: usize) ValueId {
         std.debug.assert(instruction_index < self.instructions.len);
-        return functionInstructionValue(self.block_arguments.len, instruction_index);
+        return @fromBackingInt(@intCast(self.block_arguments.len + instruction_index));
     }
 
     pub fn valueType(self: @This(), value: ValueId) TypeId {
@@ -2132,7 +2125,6 @@ pub const Diagnostic = struct {
         .consumed_storage_in_use = "cannot overwrite storage retained by a pending `deinit` argument; replace it after the call completes",
         .borrow_outlives_source = "borrow cannot outlive the value or storage it references",
         .borrow_requires_place = "borrowing a value's storage requires a named local or parameter, or one of its fields",
-        .mutable_borrow_requires_writable_place = "a writable reference requires a mutable place or writable Ref",
         .reference_not_writable = "cannot modify a readonly reference",
         .transferred_value_not_restored_before_loop_backedge = "transferred value must be reassigned before the next loop iteration",
         .type_not_movable = TypeMessage{ .prefix = "cannot transfer value of immovable type " },

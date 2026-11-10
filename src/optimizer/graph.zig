@@ -231,7 +231,7 @@ pub fn dominatesUses(function: *Function) !bool {
     var uses: Uses = .{ .function = function, .graph = &graph, .owner = owner };
     for (graph.order) |block| {
         uses.site = block;
-        function_ir.visitBlockReferences(function, &function.blocks.items[block], &uses, Uses.check);
+        function_ir.visitBlockOperands(function, &function.blocks.items[block], .all, &uses, Uses.check);
     }
     return uses.sound;
 }

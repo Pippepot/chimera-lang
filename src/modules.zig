@@ -205,11 +205,7 @@ pub const SourceRegistry = struct {
         }
         const catalog = try gpa.dupe(structures.ModuleId, current.keys());
         defer gpa.free(catalog);
-        std.mem.sort(structures.ModuleId, catalog, {}, struct {
-            fn lessThan(_: void, a: structures.ModuleId, b: structures.ModuleId) bool {
-                return @backingInt(a) < @backingInt(b);
-            }
-        }.lessThan);
+        std.mem.sort(u32, @ptrCast(catalog), {}, std.sort.asc(u32));
         try putInput(db, queries.ModuleCatalog, {}, catalog);
         // Keep partially updated memberships until a refresh fully commits.
         self.known_modules.clearRetainingCapacity();
