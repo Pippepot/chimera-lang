@@ -17,6 +17,32 @@ pub const Obligations = struct {
     }
 };
 
+/// Checks and observable side effects do not by themselves change the contents
+/// used to resolve a later reference read. Unknown service payloads may do so.
+pub const Effects = struct {
+    validation: bool = false,
+    contents: bool = false,
+    service_mutations: bool = false,
+    context: structures.ContextEffects = .{},
+
+    pub fn mayWriteContents(self: Effects) bool {
+        return self.contents or self.service_mutations;
+    }
+
+    pub fn any(self: Effects) bool {
+        return self.validation or self.mayWriteContents() or self.context.reads != 0 or self.context.writes != 0;
+    }
+
+    fn include(self: *Effects, child: Effects) void {
+        self.validation = self.validation or child.validation;
+        self.contents = self.contents or child.contents;
+        self.service_mutations = self.service_mutations or child.service_mutations;
+        self.context.include(child.context);
+    }
+};
+
+pub const EffectsCache = std.AutoHashMapUnmanaged(*const Actions, Effects);
+
 /// An immutable selection of destruction operations, shared by provenance
 /// analysis, emission, and ownership obligations. Locations and invocation-time
 /// origins remain separate. Hook contracts are queried only by consumers of effects.
@@ -53,23 +79,38 @@ pub const Actions = struct {
         return (try analysis.functionReferenceContract(definition.ownership.drop.?.hook.?)) orelse error.Unavailable;
     }
 
-    pub fn hasReferenceEffects(self: Actions, analysis: anytype) anyerror!bool {
+    pub fn effects(self: *const Actions, allocator: std.mem.Allocator, analysis: anytype, cache: *EffectsCache) anyerror!Effects {
+        if (cache.get(self)) |cached| return cached;
+        var result: Effects = .{};
         switch (self.operation) {
-            .none, .explicit => return false,
-            .hook => {
-                const references = try hookContract(analysis, self.type_id);
-                if (references.requirements.len != 0 or references.service_mutations.len != 0) return true;
-                for (references.origins) |origin| if (origin.output_parameter != null or origin.output_contextual != null) return true;
-                return false;
+            .none, .explicit => {},
+            .hook => result = try hookEffects(analysis, self.type_id),
+            .array => |array| if (array.length != 0) {
+                result = try array.element.effects(allocator, analysis, cache);
             },
-            .array => |array| return array.length != 0 and try array.element.hasReferenceEffects(analysis),
             .parts => |parts| {
-                for (parts) |part| if (try part.actions.hasReferenceEffects(analysis)) return true;
-                return false;
+                for (parts) |part| result.include(try part.actions.effects(allocator, analysis, cache));
             },
         }
+        try cache.put(allocator, self, result);
+        return result;
     }
 };
+
+fn hookEffects(analysis: anytype, type_id: structures.TypeId) !Effects {
+    const references = try Actions.hookContract(analysis, type_id);
+    var result: Effects = .{
+        .validation = references.requirements.len != 0 or references.exclusions.len != 0,
+        .service_mutations = references.service_mutations.len != 0,
+        .context = references.context_effects,
+    };
+    for (references.requirements) |requirement| {
+        if (requirement.kind != .contents) continue;
+        const written_type = requirement.written_type orelse continue;
+        if (try analysis.facts().canStoreBorrow(written_type)) result.contents = true;
+    }
+    return result;
+}
 
 pub const Cache = std.AutoHashMapUnmanaged(structures.TypeId, *const Actions);
 

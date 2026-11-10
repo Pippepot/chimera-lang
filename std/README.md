@@ -71,6 +71,27 @@ Integer specializations remain in the precompiled standard library.
 As with other generic functions, storing a helper as a callable value requires
 a type context, for example `const lower: func(int, int) int = std.math.min`.
 
+## Strings
+
+`String` holds valid UTF-8 text and supports ordinary independent value copies,
+addition, and compound assignment:
+
+```chi
+var greeting = "Hello"
+var copied = greeting
+copied += ", world!"
+const excited = greeting + "!"
+# greeting remains "Hello".
+```
+
+Copies of literal-backed strings share permanent immutable bytes. Copies of
+allocated strings copy their bytes into a new allocation. Copying and `+` panic
+on allocation failure; `clone()` and `concat(text)` return `String | AllocationError`
+when failure must be handled. Concatenation borrows its inputs and reserves the
+combined byte length once. `+=` currently creates a new string and replaces the
+target; use fallible `append(text)` to reuse capacity when building text repeatedly.
+Lengths and slice positions count bytes; text slicing checks UTF-8 boundaries.
+
 ## Owning callables
 
 Fixed `func(...)` locals, fields, and collection elements own erased handles.
@@ -146,7 +167,7 @@ Disabled events skip backend dispatch while preserving argument evaluation.
 Backends may store lifetime-valid owned message
 copies, but cannot retain a message view. Checked service dispatch detects cycles;
 `from_unchecked` permits deliberate recursion. The native root logger writes to
-stderr at info or above; the evaluator root logger is off. Logging leaves `print`
+stderr at trace or above; the evaluator root logger is off. Logging leaves `print`
 and explicit stdout/stderr APIs on their ordinary destinations.
 Root output writes a severity prefix, message, and newline without allocation.
 An `IoError` reports the Linux errno in `cause` and the total bytes delivered for

@@ -110,9 +110,26 @@ const work_rows = [_]WorkRow{
     .{ .label = "signatures", .categories = &.{ .signatures, .conversion_matching }, .parts = &.{
         .{ .label = "conversion matching", .categories = &.{.conversion_matching} },
     } },
-    .{ .label = "body analysis", .categories = &.{ .body_overhead, .body_build, .body_typing, .body_lifetimes, .body_freeze }, .parts = &.{
+    .{ .label = "body analysis", .categories = &.{ .body_overhead, .body_build, .body_typing, .body_type_inference, .body_scalar_calls, .body_general_calls, .body_call_effects, .body_origin_expansion, .body_contents_queries, .body_pending_uses, .body_service_mutations, .body_ownership_metadata, .body_lifetime_planning, .body_cleanup_stabilization, .body_cleanup_materialization, .body_flow_validation, .body_effect_validation, .body_contract_publication, .cleanup_output_candidates, .cleanup_output_scheduling, .body_lifetimes, .body_freeze }, .parts = &.{
         .{ .label = "unresolved expressions", .categories = &.{.body_build}, .unit = .phase },
         .{ .label = "typing / SSA", .categories = &.{.body_typing}, .unit = .phase },
+        .{ .label = "type-only inference", .categories = &.{.body_type_inference}, .unit = .phase },
+        .{ .label = "scalar call preparation", .categories = &.{.body_scalar_calls}, .unit = .phase },
+        .{ .label = "general call preparation", .categories = &.{.body_general_calls}, .unit = .phase },
+        .{ .label = "call effect application", .categories = &.{.body_call_effects}, .unit = .phase },
+        .{ .label = "origin expansion", .categories = &.{.body_origin_expansion}, .unit = .phase },
+        .{ .label = "reaching contents", .categories = &.{.body_contents_queries}, .unit = .phase },
+        .{ .label = "pending reference uses", .categories = &.{.body_pending_uses}, .unit = .phase },
+        .{ .label = "service mutations", .categories = &.{.body_service_mutations}, .unit = .phase },
+        .{ .label = "ownership metadata", .categories = &.{.body_ownership_metadata}, .unit = .phase },
+        .{ .label = "lifetime planning", .categories = &.{.body_lifetime_planning}, .unit = .phase },
+        .{ .label = "cleanup stabilization", .categories = &.{.body_cleanup_stabilization}, .unit = .phase },
+        .{ .label = "cleanup materialization", .categories = &.{.body_cleanup_materialization}, .unit = .phase },
+        .{ .label = "flow proof validation", .categories = &.{.body_flow_validation}, .unit = .phase },
+        .{ .label = "effect validation", .categories = &.{.body_effect_validation}, .unit = .phase },
+        .{ .label = "contract publication", .categories = &.{.body_contract_publication}, .unit = .phase },
+        .{ .label = "cleanup output candidates", .categories = &.{.cleanup_output_candidates}, .unit = .phase },
+        .{ .label = "cleanup output scheduling", .categories = &.{.cleanup_output_scheduling}, .unit = .phase },
         .{ .label = "lifetimes / cleanup", .categories = &.{.body_lifetimes}, .unit = .phase },
         .{ .label = "IR finalization", .categories = &.{.body_freeze}, .unit = .phase },
         .{ .label = "body setup", .categories = &.{.body_overhead} },
@@ -289,6 +306,43 @@ test "timing table sorts stage work and keeps dependency coordination and the pr
     try std.testing.expect(std.mem.indexOf(u8, text, "parsing") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "signatures") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, " \n") == null);
+}
+
+test "timing table includes detailed body phases in the body analysis total" {
+    const phases = .{
+        .{ profiling.Category.body_type_inference, "type-only inference" },
+        .{ profiling.Category.body_scalar_calls, "scalar call preparation" },
+        .{ profiling.Category.body_general_calls, "general call preparation" },
+        .{ profiling.Category.body_call_effects, "call effect application" },
+        .{ profiling.Category.body_origin_expansion, "origin expansion" },
+        .{ profiling.Category.body_contents_queries, "reaching contents" },
+        .{ profiling.Category.body_pending_uses, "pending reference uses" },
+        .{ profiling.Category.body_service_mutations, "service mutations" },
+        .{ profiling.Category.body_ownership_metadata, "ownership metadata" },
+        .{ profiling.Category.body_lifetime_planning, "lifetime planning" },
+        .{ profiling.Category.body_cleanup_stabilization, "cleanup stabilization" },
+        .{ profiling.Category.body_cleanup_materialization, "cleanup materialization" },
+        .{ profiling.Category.body_flow_validation, "flow proof validation" },
+        .{ profiling.Category.body_effect_validation, "effect validation" },
+        .{ profiling.Category.body_contract_publication, "contract publication" },
+        .{ profiling.Category.cleanup_output_candidates, "cleanup output candidates" },
+        .{ profiling.Category.cleanup_output_scheduling, "cleanup output scheduling" },
+    };
+    var work: profiling.Snapshot = .{};
+    work.counters[@backingInt(profiling.Category.body_overhead)] = .{ .nanoseconds = 1_000_000, .runs = 1 };
+    work.counters[@backingInt(profiling.Category.codegen)] = .{ .nanoseconds = 1_000_000, .runs = 1 };
+    inline for (phases) |phase| work.counters[@backingInt(phase[0])] = .{ .nanoseconds = 1_000_000, .runs = 1 };
+    var timings: TimingLog = .init(std.Io.Clock.awake.now(std.testing.io));
+    timings.stages[0] = .{ .label = "analyze", .duration = .fromNanoseconds(19_000_000), .work = work };
+    timings.count = 1;
+    var output: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer output.deinit();
+    try timings.print(std.testing.io, &output.writer);
+    const text = output.writer.buffered();
+    try expectTimingRow(text, &.{ "body", "analysis", "18.000", "94.7", "1", "×", "18000.0", "µs/query" });
+    inline for (phases) |phase| {
+        try std.testing.expect(std.mem.indexOf(u8, text, phase[1]) != null);
+    }
 }
 
 pub const MemoryTracker = struct {

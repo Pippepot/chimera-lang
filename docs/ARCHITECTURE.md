@@ -96,6 +96,13 @@ waits on their effects. Their contracts are prefetched concurrently; only
 ordinary demands observe their results and diagnostics. The provisional
 discovery analysis is never reused as a validated body, and prefetch hints do
 not force revalidation of existing queries after an edit.
+`TrivialReferenceContractBody` caches proofs of empty reference/context effects
+without runtime typing. Call-free proofs reuse cached construction directly;
+only transitive proofs add query nodes. Scalar proofs can follow a single direct
+call in an unconditional single-block body. Multiple calls, branches, short-circuit
+expressions, early returns, and recursive proof cycles retain ordinary analysis
+rather than demanding dormant callees. Callee edits invalidate these proofs through
+normal query dependencies.
 Construction, typing, and cached-body reuse return views to the query engine's
 deep publication copy rather than making redundant query-local copies.
 `AnalyzeFunctionInstance` publishes typed SSA only after reference analysis and
@@ -579,6 +586,11 @@ select nominal hooks, owned fields, variant alternatives, and reverse array
 destruction once. Effect analysis, emission, and remaining drop obligations consume
 the same actions; hook contracts are queried only for effects, and invocation-time
 origins, contexts, and cleanup locations remain separate.
+Body-local effect summaries distinguish authority/exclusion checks, writes to
+reference-bearing contents, deferred service mutations, and context effects.
+Checks and scalar writes are validated during final effect collection without
+making reference contents provisional. Unknown service payloads remain possible
+contents writers until substitution determines their actual effects.
 Output-bearing cleanup
 first retains prospective referents for lifetime planning, then substitutes hook
 outputs at the scheduled boundaries and CFG edges. Fresh carrier reads resolve
@@ -620,7 +632,11 @@ the pre-scheduling symbolic state each epoch and repeats until ending locations 
 resolved scheduled writes stabilize. Superseded cleanup writes become inactive
 without changing cursor write indices. A repeated nonstable schedule is a source
 lifetime error; final validation cannot change the accepted lifetime effects.
-Cleanup output collection and deferred reads share one CFG. Reaching-content
+Cleanup output collection and deferred reads share one CFG. Cleanup scheduling
+retains its reaching-contents write index across epochs. Replacing cleanup writes
+invalidates the roots they affect; other roots retain their symbolic cached
+results, and only new reads or reads of affected roots are refreshed.
+Reaching-content
 lookups index ordered writes by root and block and memoize acyclic cursors within
 the analysis, including known-empty results. Canonical origin nodes, projections,
 transforms, and result-selection snapshots share identities. Origin guards are
@@ -744,6 +760,8 @@ Codegen consumes trusted typed IR and host layouts. It emits a private machine
 stream where scalar allocation is needed; fixed-only functions encode directly.
 Machine liveness follows expanded instructions, not a second language CFG.
 Artifacts publish only code, relocations, constant data, and call-site metadata.
+Data addresses use absolute 64-bit relocations, including cold runtime-failure
+messages, so emitted artifacts satisfy the native snapshot contract.
 The internal ABI is derived centrally, not assumed to be a platform ABI.
 
 Linking trusts validated artifact metadata and treats an incomplete reachable

@@ -2116,8 +2116,8 @@ fn FunctionEmitter(comptime Types: type) type {
 
         fn emitRuntimeFailure(self: *Self, message: []const u8) !void {
             const data = try self.dataIndex(message);
-            const offset = try self.encoder.patchable(.lea_rax_rip);
-            try self.relocations.append(self.gpa, .{ .offset = offset, .kind = .call_relative_32, .reference = .{ .data = data }, .addend = 0 });
+            const offset = try self.encoder.patchable(.mov_rax);
+            try self.relocations.append(self.gpa, .{ .offset = offset, .kind = .address_absolute_64, .reference = .{ .data = data }, .addend = 0 });
             try self.encoder.emit(.mov_rsi_rax);
             try self.encoder.immediate(.mov_edx, @intCast(message.len));
             try self.encoder.immediate(.mov_edi, 2);

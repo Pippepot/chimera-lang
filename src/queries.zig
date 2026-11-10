@@ -4729,29 +4729,76 @@ fn hasReferenceContractBody(ctx: anytype, instance: structures.InstanceId) !bool
     return true;
 }
 
-fn trivialReferenceContractBody(ctx: anytype, instance: structures.InstanceId) anyerror!bool {
+pub const TrivialReferenceContractBody = CompilerQuery("TrivialReferenceContractBody", .type_facts, proveTrivialReferenceContractBody, .{});
+
+fn trivialReferenceContractBody(ctx: anytype, instance: structures.InstanceId) !bool {
+    const proof = (try scalarReferenceProof(ctx, instance)) orelse return false;
+    // Call-free proofs already live in the cached construction. Only a
+    // transitive proof needs another query boundary and callee dependencies.
+    if (proof.callee == null) return true;
+    return (ctx.get(TrivialReferenceContractBody, instance) catch |err| switch (err) {
+        error.QueryCycle => return false,
+        else => return err,
+    }).*;
+}
+
+fn proveTrivialReferenceContractBody(ctx: anytype, instance: structures.InstanceId) anyerror!bool {
+    const proof = (try scalarReferenceProof(ctx, instance)) orelse return false;
+    return if (proof.callee) |callee| trivialReferenceContractBody(ctx, callee) else true;
+}
+
+const ScalarReferenceProof = struct { callee: ?structures.InstanceId = null };
+
+fn scalarReferenceProof(ctx: anytype, instance: structures.InstanceId) !?ScalarReferenceProof {
     const location = try ctx.lookupInterned(ItemLocations, instance.item);
-    const signature = (try bodySignature(ctx, instance, location.*)) orelse return false;
-    if (!signature.return_type.isPrimitive()) return false;
+    const signature = (try bodySignature(ctx, instance, location.*)) orelse return null;
+    if (!signature.return_type.isPrimitive()) return null;
     for (signature.parameters) |parameter| {
-        if (!parameter.type_id.isPrimitive()) return false;
-        if (parameter.mode == .ref or parameter.mode == .mut or parameter.mode == .init) return false;
+        if (!parameter.type_id.isPrimitive()) return null;
+        if (parameter.mode == .ref or parameter.mode == .mut or parameter.mode == .init) return null;
     }
-    const construction = (try ctx.get(ConstructFunctionBody, instance)).* orelse return false;
-    if (construction != .success) return false;
+    const construction = (try ctx.get(ConstructFunctionBody, instance)).* orelse return null;
+    if (construction != .success) return null;
     // This proves the absence of reference/context effects without validating
     // a context-free scalar callee's runtime typing at an otherwise lazy call.
-    for (construction.success.expressions) |expression| {
+    const body = construction.success;
+    var callee: ?structures.InstanceId = null;
+    for (body.expressions) |expression| {
         switch (expression.operation) {
             .comparison, .conjunction, .disjunction, .negation, .numeric, .numeric_conversion, .overflow_context => {},
             .integer_literal, .int_literal_value, .float_literal, .integer, .byte, .boolean, .type_value, .unit, .none => {},
             .local_read, .local_transfer, .discard, .sequence, .if_else, .loop, .scope => {},
-            .annotation => |annotation| if (!annotation.type_id.isPrimitive()) return false,
-            .assignment => |assignment| if (assignment.fields.start != assignment.fields.end) return false,
-            else => return false,
+            .annotation => |annotation| if (!annotation.type_id.isPrimitive()) return null,
+            .assignment => |assignment| if (assignment.fields.start != assignment.fields.end) return null,
+            .function_ref => {},
+            .call => |call| {
+                if (call.target != .direct or callee != null) return null;
+                callee = call.target.direct;
+            },
+            else => return null,
         }
     }
-    return true;
+    const target = callee orelse return .{};
+    // Follow one unconditional call. A previous call could diverge before a
+    // later one; branches, short-circuit expressions, and early returns can
+    // likewise leave callees dormant.
+    if (body.blocks.len != 1) return null;
+    for (body.expressions) |expression| {
+        switch (expression.operation) {
+            .conjunction, .disjunction, .if_else, .loop, .scope => return null,
+            else => {},
+        }
+    }
+    const block = body.blocks[@backingInt(body.root_block)];
+    const statements = body.statements[block.statements.start..block.statements.end];
+    for (statements, 0..) |statement, index| {
+        switch (statement) {
+            .discard, .lifetime_extend, .bind_local => {},
+            .return_nothing, .return_value => if (index + 1 != statements.len or block.result != null) return null,
+            else => return null,
+        }
+    }
+    return .{ .callee = target };
 }
 
 pub const ReferenceCalleeList = struct {

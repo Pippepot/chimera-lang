@@ -7,7 +7,7 @@ Use the callable construction, representation, ownership, and reference rules in
 Expose std.context as context through the prelude, with these initial entries:
 Entry	Handle type	Native root default
 context.allocator	Allocator	Execution environment's default heap provider
-context.logger	Logger	Static stderr logger, minimum severity info
+context.logger	Logger	Static stderr logger, minimum severity trace
 
 
 Each entry has its own storage and synthetic dependency. Rebinding one leaves the other unchanged. Compiler analysis and lowering operate on registered contextual declarations, not a single hard-coded allocator slot.

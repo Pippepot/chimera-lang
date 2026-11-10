@@ -1,0 +1,356 @@
+{
+  "environment": {
+    "commit": "f8287618d250580ca6f9d63b0c0125e0da74dfd5",
+    "zig": "0.17.0",
+    "kernel": "7.2.5-3-omarchy",
+    "machine": "x86_64",
+    "serial_affinity": [
+      4
+    ],
+    "worker_affinity": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23
+    ],
+    "protocol": "benchmarks/history_benchmark.zig; ordinary adaptive sampling; cold and leaf-edit; bundled std; fast LLVM; no disk cache or profiling",
+    "baseline_sources": {
+      "src/backend/codegen.zig": "8c94369ed09db98a7f53f1558106058559034339522b1272afb79751834fc29e",
+      "src/backend/disasm.zig": "da1120b99226c9b463e74911127d401fe8edfaef1e5e9ca9de76a3b14dcab80d",
+      "src/backend/division.zig": "d86309a54e49a4c4aef42793b8081bdc986bfca5544b3a93c9110ab21870e6b1",
+      "src/backend/machine.zig": "63e31228050b60b2634c292bae6f328a7ea7d1be43836f7e49ac509a14570f46",
+      "src/backend/registers.zig": "d9f6098e383bac8ab9b0cfcac56f3f59431fe9b776edc78424a3d8aa7788042e",
+      "src/backend/x86_encoding.zig": "56442b9828cee5dc51da4304f5deb688890bb62a9b838f33faa12abb03601fd1",
+      "src/benchmark_deps.zig": "f1a6e00ff9795e78b831c5cf0a273fddf96b81b06693b3e03e9d45c81c16dafc",
+      "src/bump_arena.zig": "9fa8e82fc6e1bb94cc606f3cee7ec30c9f3a8877ce4599bb2ddbd31f58fed285",
+      "src/cache.zig": "61d6c8a5644fe19590ccaab74bdd6289a69aaace9edcd69c6ba70c56fbb8054e",
+      "src/control_flow.zig": "5707af9fd995343d08e9e91a5b4faefe60d22e9936d07a7ed086cba55b0ae52f",
+      "src/debug.zig": "844a9f3cd96344a11499dae37c4e35cc051d9244d2f5edc0a0cd70b47e5e37fa",
+      "src/diagnostics.zig": "a19b975adfd311090716782503074dedf742352e379fac137b898a9df729ee07",
+      "src/frontend/body_graph.zig": "cd35143e56f3e12c767fa0098bcabc2d78d184a9e0a9d06364d6d36bda4bd740",
+      "src/frontend/cleanup_actions.zig": "3dc0de6f3766c55c72dac8258b389c9924b9b6a665a229e4f34b11545a1a2069",
+      "src/frontend/cleanup_shape.zig": "6a00f5a0886fe4e2ef871c53c2f1fbad196ef1a3c810da1aefb078b5ee1cd7cc",
+      "src/frontend/comptime_interpreter.zig": "ea228e1c98e6655e55eb1f938d4db25b5601a2f1e5f53d03f1128b0b8a6442c7",
+      "src/frontend/flow_snapshot.zig": "0da69b3a52d33d82d4f2ef8ac54c1004e4274de2970f854202e6f60728214d87",
+      "src/frontend/flow_types.zig": "a420fa84cba3b504a1c61a8db8c55dbcccfa5f52019df3c7b04a464430890857",
+      "src/frontend/lifetime.zig": "af5dd14a32a9f30db29ffbc2dc07d43d48558fa9ac680f9d0669f768abecaf53",
+      "src/frontend/parser.zig": "9af71e8f4e336196dea4d75009264e29fda7759a54dcd657a6e471abe67a9b83",
+      "src/frontend/reference_origins.zig": "8673fbcb63d7d5942c6f6ca7853dbd364d0f525078834221b5f30be7fb42ef17",
+      "src/frontend/semantic.zig": "6cae17549706d61774eec0eb355d8155247f234f7c0d320a0f26fc8e30d53b11",
+      "src/frontend/text_literal.zig": "1cc47d1b921690e50b34c52b222782ecb9881cd4d743e78a53642429e62a451a",
+      "src/frontend/tokenizer.zig": "679af5587d9dc79e04b6d4f238d070393029302fb14a553eef768f5ea55cccf9",
+      "src/frontend/typing.zig": "c5d3fba4a5515d46aff9d79a679b6579b4198c8faf55092d703af08e385a14c9",
+      "src/intrinsics.zig": "09c9ca79e001f48f67861903556fa07ccc42bf0e82969d175fc58c34b352532a",
+      "src/main.zig": "2373160ce8075b288ab163aa8cf9b6540a67ba3c6f7a6c9c20fb190a186ab190",
+      "src/modules.zig": "601c2c1b1c9d133a88c48efbbfd61b232a7fb5781e9a88cc6ca3be0b30d7003f",
+      "src/numeric.zig": "1b2ca3c3d1cf7293093bb558ff97b70b0d15922d7c60e0288818b56acd6a0009",
+      "src/optimizer/canonicalize.zig": "c8f1f0423b69712511b69fcb771bc2da6f40e34acdc0aa261fe8e81f50b460d3",
+      "src/optimizer/cleanup.zig": "8e9cc4e216262884cfda8c67be60bdd0b5ce2b62999712efac308637c5768bb7",
+      "src/optimizer/compaction.zig": "016c6441187977d98ddf9c075c9cf50e65a0a9f07cda6f93cb9cad0ed924d863",
+      "src/optimizer/effects.zig": "29b0ff5e49744fc043bc6596d258993ff9c9e3c71a585555c02b1778e9672c0a",
+      "src/optimizer/function.zig": "afd9717db9bceebab9ed081cde1b40fb3ffa495706651b3847d6e7cd0fa366e8",
+      "src/optimizer/graph.zig": "b099126f10d7fa99bda29c835b84fc89987f9c3f52b75a5fb27709280b078867",
+      "src/optimizer/hoisting.zig": "8d5e442b6f34d6be71589df9bdcad15897af4d61b5fe7bef226aae62873cf6a6",
+      "src/optimizer/idioms.zig": "42c8f196de6c62ab8d2b645d0b42011b9a912e2a27c011e4637071515aaa4cbf",
+      "src/optimizer/inline.zig": "5ebe11eb8c2ca07c04c3af58a93191f783a70af679e36478d079ee690b70b7f3",
+      "src/optimizer/loops.zig": "fdd9db43661fe4c90f47c3e3890bc00064fe3283d8aa35eac735e34d59ad28df",
+      "src/optimizer/numbering.zig": "002a212a52d31016d91e38988d32cb30be00e6dbdaf2f79fde78ebb7a2bffd50",
+      "src/optimizer/optimizer.zig": "6a5510269e02920bf7e4b17deccacfa8fbbe89844210340ed6b88678325da232",
+      "src/optimizer/promotion.zig": "97e938e28f0d56b76ffa369f8a8ec64331e2bed22f615f6023a30e6da0672cfe",
+      "src/optimizer/ranges.zig": "c7f4dd38852ba05be511554ed1646d0caa30f434a9d5060a54548e41e6c7f75d",
+      "src/optimizer/sroa.zig": "5c5f8cb284182a60587f94490334eb2f1290b44890c24101f21bf9615033fb88",
+      "src/optimizer/unswitch.zig": "b6f65db9dd421ae852bce5d37476f2ab5b085ad062d602001058b61ac7e2f447",
+      "src/optimizer/verifier.zig": "1a9a828c02f76f478a24980b9e8ccbb5529059bee99ddd80be208346475e54c1",
+      "src/precompile_std.zig": "d52a11f7dd011144eb4adcb6807c0428d14df26a77d50455bf9a78968823524e",
+      "src/profiling.zig": "1dfc01e72c8f43dd4dbbe5ec8cb26353ed9cce54de753c46033ad5a85b991005",
+      "src/queries.zig": "fdd8a4586222caaeaec874026b3ce24fdd5e70038171a5c406e37c81efdd2336",
+      "src/query/codec.zig": "c0f06efe6099176388f7f3561e3860a17eadf180affd0587c251264b2454ba2d",
+      "src/query/engine.zig": "de5c3cd954fe72a66270003caf9a76c3a54b2b1a737bc5d3077261160e891995",
+      "src/query_artifact.zig": "84510aabd05e0b5d751ec33d8b0c4827ed29986000f1d1a61f85d07c044a9231",
+      "src/query_disk_cache.zig": "5b00a679b2f2009f39f44262d1fdfcf4e1a30d7205c4f6ea32c146130af463ff",
+      "src/runtime.zig": "0d4ab141002f2e0d8fa92c852a682cb4b21b18beeb20d2baa9d8b205cb64c303",
+      "src/standard_artifact.zig": "9cb51ae947353d62f5def3effc93a2d783d5bd318f95036cddb0ee70bd6d0274",
+      "src/standard_bundle.zig": "b9fe296af73e0c3b6ac73a347b99d4d2e11a1724f29999e99d91d75105545c77",
+      "src/structures.zig": "d8cc654487b1a8f2bf54f555f647919bf3bcef3a2942d18542a1fe264f554d5f",
+      "src/value.zig": "b5c86f351456d79b888bff4c52aec347d1fcfdabe2391c9d49db6033d9318e4f",
+      "std/algorithms.chi": "64fe13fac3db756537fe3592f0b41baa0bbb4cc0e8d6548700f29194d37166ae",
+      "std/array.chi": "9a5b0f490745944bdf36ad9f4d700c5a631c5cd81e9d75e085b86a28380a092c",
+      "std/callables.chi": "776e091b264fdbf40e6effaaa57d8f97bcf5357160886e33a89511c8084f9b26",
+      "std/context.chi": "fdc4930d6c13acc33af27aea7675abe6556491a9eae5d1baa5ff9e7e35801dd9",
+      "std/exit.chi": "5b876cf7f4c1d34de2cabb8f5ba01c0eb217fffd1a6054414e4bb382fe9571f4",
+      "std/io.chi": "c0d2340715d1fa4ef5cca24ce3eb67a661597e5293555734cb9cb2d0f8921c7a",
+      "std/iteration.chi": "6189612dfb0a6966bb275e714b45a92fb9b09d865eea62aee41a2904e36e95fc",
+      "std/library.zig": "3f670f30ce813023a6934b83bff50d0cbc85fae64f8b2a24bbe61986ba560383",
+      "std/logging.chi": "8090b6c5e0e9ce38e690b2a602e50437efa3c6e220746e7c4484830c48595bcb",
+      "std/math.chi": "f5b61e09f86dc2b475098b0d009b5f23d28df7c2afd5ae25b08f83493cfa5558",
+      "std/memory/allocation.chi": "0f51559af9f6a24e21a9aede45beea34c5e90b94cdccf5ea65bf59dff757d4a8",
+      "std/memory/allocator.chi": "ed7ca7261cbaa7a4f63511b93d4000b33601cc0ef877ad55cefc33bc47eb6ae0",
+      "std/memory/host.chi": "f21e0b70490018d3a7acd9eae2057c405302b066b243f71968f575e69d994455",
+      "std/memory/raw.chi": "07fb58af4eb496f6112eb3dfa6573e035e2d7d40d538e807bf81d96407eebeee",
+      "std/memory/sort.chi": "2b87581ca494bc6de656f906d303ea379f8ffe87404149a5a498c851b6f3ba4e",
+      "std/ownership.chi": "13c526128fb97b63e37fe1f49b79f578a4c4f11c903195eb7942bd96980bf367",
+      "std/prelude.chi": "f481b1c38f5592373fc0b8c91fefe00cbe0e60ff8326e07ce0b386864140da9d",
+      "std/primitives.chi": "854fecaf4bab9ad582ecfd1c8ef004635b71a2195d46f4e4bfc22b584383b99e",
+      "std/range.chi": "8a7b138b4672f79a6ab2c61592296ce602ffcc9b8eb8d2609ed6f62e7e7a5dd2",
+      "std/search.chi": "d75ce4a457776b7372efb70e817b35daaaad0899919826e904322946aa775deb",
+      "std/text.chi": "862bd6804e645864041c1feeae42c75e001d0e04e1903ade4659849aaa8c3e65"
+    },
+    "candidate_sources": {
+      "src/backend/codegen.zig": "6d5146224c049132e92e346d8d47e664a160f5b215cdbf3c0c9dfce1f7ac181f",
+      "src/backend/disasm.zig": "da1120b99226c9b463e74911127d401fe8edfaef1e5e9ca9de76a3b14dcab80d",
+      "src/backend/division.zig": "d86309a54e49a4c4aef42793b8081bdc986bfca5544b3a93c9110ab21870e6b1",
+      "src/backend/machine.zig": "63e31228050b60b2634c292bae6f328a7ea7d1be43836f7e49ac509a14570f46",
+      "src/backend/registers.zig": "d9f6098e383bac8ab9b0cfcac56f3f59431fe9b776edc78424a3d8aa7788042e",
+      "src/backend/x86_encoding.zig": "56442b9828cee5dc51da4304f5deb688890bb62a9b838f33faa12abb03601fd1",
+      "src/benchmark_deps.zig": "f1a6e00ff9795e78b831c5cf0a273fddf96b81b06693b3e03e9d45c81c16dafc",
+      "src/bump_arena.zig": "9fa8e82fc6e1bb94cc606f3cee7ec30c9f3a8877ce4599bb2ddbd31f58fed285",
+      "src/cache.zig": "61d6c8a5644fe19590ccaab74bdd6289a69aaace9edcd69c6ba70c56fbb8054e",
+      "src/control_flow.zig": "5707af9fd995343d08e9e91a5b4faefe60d22e9936d07a7ed086cba55b0ae52f",
+      "src/debug.zig": "844a9f3cd96344a11499dae37c4e35cc051d9244d2f5edc0a0cd70b47e5e37fa",
+      "src/diagnostics.zig": "a19b975adfd311090716782503074dedf742352e379fac137b898a9df729ee07",
+      "src/frontend/body_graph.zig": "cd35143e56f3e12c767fa0098bcabc2d78d184a9e0a9d06364d6d36bda4bd740",
+      "src/frontend/cleanup_actions.zig": "9db178bf8b7b2955c8fd6cc594e77d0d067531069cbfa23a03dd53bc824b659a",
+      "src/frontend/cleanup_shape.zig": "6a00f5a0886fe4e2ef871c53c2f1fbad196ef1a3c810da1aefb078b5ee1cd7cc",
+      "src/frontend/comptime_interpreter.zig": "ea228e1c98e6655e55eb1f938d4db25b5601a2f1e5f53d03f1128b0b8a6442c7",
+      "src/frontend/flow_snapshot.zig": "0da69b3a52d33d82d4f2ef8ac54c1004e4274de2970f854202e6f60728214d87",
+      "src/frontend/flow_types.zig": "a420fa84cba3b504a1c61a8db8c55dbcccfa5f52019df3c7b04a464430890857",
+      "src/frontend/lifetime.zig": "af5dd14a32a9f30db29ffbc2dc07d43d48558fa9ac680f9d0669f768abecaf53",
+      "src/frontend/parser.zig": "9af71e8f4e336196dea4d75009264e29fda7759a54dcd657a6e471abe67a9b83",
+      "src/frontend/reference_origins.zig": "8673fbcb63d7d5942c6f6ca7853dbd364d0f525078834221b5f30be7fb42ef17",
+      "src/frontend/semantic.zig": "6cae17549706d61774eec0eb355d8155247f234f7c0d320a0f26fc8e30d53b11",
+      "src/frontend/text_literal.zig": "1cc47d1b921690e50b34c52b222782ecb9881cd4d743e78a53642429e62a451a",
+      "src/frontend/tokenizer.zig": "679af5587d9dc79e04b6d4f238d070393029302fb14a553eef768f5ea55cccf9",
+      "src/frontend/typing.zig": "af8b974c04e8ee6e1453e70ea8720c7747d1ce4c2fbc2662be20a999468c8784",
+      "src/intrinsics.zig": "09c9ca79e001f48f67861903556fa07ccc42bf0e82969d175fc58c34b352532a",
+      "src/main.zig": "2373160ce8075b288ab163aa8cf9b6540a67ba3c6f7a6c9c20fb190a186ab190",
+      "src/modules.zig": "601c2c1b1c9d133a88c48efbbfd61b232a7fb5781e9a88cc6ca3be0b30d7003f",
+      "src/numeric.zig": "1b2ca3c3d1cf7293093bb558ff97b70b0d15922d7c60e0288818b56acd6a0009",
+      "src/optimizer/canonicalize.zig": "c8f1f0423b69712511b69fcb771bc2da6f40e34acdc0aa261fe8e81f50b460d3",
+      "src/optimizer/cleanup.zig": "8e9cc4e216262884cfda8c67be60bdd0b5ce2b62999712efac308637c5768bb7",
+      "src/optimizer/compaction.zig": "016c6441187977d98ddf9c075c9cf50e65a0a9f07cda6f93cb9cad0ed924d863",
+      "src/optimizer/effects.zig": "29b0ff5e49744fc043bc6596d258993ff9c9e3c71a585555c02b1778e9672c0a",
+      "src/optimizer/function.zig": "afd9717db9bceebab9ed081cde1b40fb3ffa495706651b3847d6e7cd0fa366e8",
+      "src/optimizer/graph.zig": "b099126f10d7fa99bda29c835b84fc89987f9c3f52b75a5fb27709280b078867",
+      "src/optimizer/hoisting.zig": "8d5e442b6f34d6be71589df9bdcad15897af4d61b5fe7bef226aae62873cf6a6",
+      "src/optimizer/idioms.zig": "42c8f196de6c62ab8d2b645d0b42011b9a912e2a27c011e4637071515aaa4cbf",
+      "src/optimizer/inline.zig": "5ebe11eb8c2ca07c04c3af58a93191f783a70af679e36478d079ee690b70b7f3",
+      "src/optimizer/loops.zig": "fdd9db43661fe4c90f47c3e3890bc00064fe3283d8aa35eac735e34d59ad28df",
+      "src/optimizer/numbering.zig": "002a212a52d31016d91e38988d32cb30be00e6dbdaf2f79fde78ebb7a2bffd50",
+      "src/optimizer/optimizer.zig": "6a5510269e02920bf7e4b17deccacfa8fbbe89844210340ed6b88678325da232",
+      "src/optimizer/promotion.zig": "97e938e28f0d56b76ffa369f8a8ec64331e2bed22f615f6023a30e6da0672cfe",
+      "src/optimizer/ranges.zig": "c7f4dd38852ba05be511554ed1646d0caa30f434a9d5060a54548e41e6c7f75d",
+      "src/optimizer/sroa.zig": "5c5f8cb284182a60587f94490334eb2f1290b44890c24101f21bf9615033fb88",
+      "src/optimizer/unswitch.zig": "b6f65db9dd421ae852bce5d37476f2ab5b085ad062d602001058b61ac7e2f447",
+      "src/optimizer/verifier.zig": "1a9a828c02f76f478a24980b9e8ccbb5529059bee99ddd80be208346475e54c1",
+      "src/precompile_std.zig": "d52a11f7dd011144eb4adcb6807c0428d14df26a77d50455bf9a78968823524e",
+      "src/profiling.zig": "1dfc01e72c8f43dd4dbbe5ec8cb26353ed9cce54de753c46033ad5a85b991005",
+      "src/queries.zig": "cf0bb9f766526c514d20386c7553bfd33de2340b14e6caf4a4cb3e39c4a56ce4",
+      "src/query/codec.zig": "c0f06efe6099176388f7f3561e3860a17eadf180affd0587c251264b2454ba2d",
+      "src/query/engine.zig": "de5c3cd954fe72a66270003caf9a76c3a54b2b1a737bc5d3077261160e891995",
+      "src/query_artifact.zig": "84510aabd05e0b5d751ec33d8b0c4827ed29986000f1d1a61f85d07c044a9231",
+      "src/query_disk_cache.zig": "5b00a679b2f2009f39f44262d1fdfcf4e1a30d7205c4f6ea32c146130af463ff",
+      "src/runtime.zig": "0d4ab141002f2e0d8fa92c852a682cb4b21b18beeb20d2baa9d8b205cb64c303",
+      "src/standard_artifact.zig": "9cb51ae947353d62f5def3effc93a2d783d5bd318f95036cddb0ee70bd6d0274",
+      "src/standard_bundle.zig": "b9fe296af73e0c3b6ac73a347b99d4d2e11a1724f29999e99d91d75105545c77",
+      "src/structures.zig": "d8cc654487b1a8f2bf54f555f647919bf3bcef3a2942d18542a1fe264f554d5f",
+      "src/value.zig": "b5c86f351456d79b888bff4c52aec347d1fcfdabe2391c9d49db6033d9318e4f",
+      "std/algorithms.chi": "64fe13fac3db756537fe3592f0b41baa0bbb4cc0e8d6548700f29194d37166ae",
+      "std/array.chi": "9a5b0f490745944bdf36ad9f4d700c5a631c5cd81e9d75e085b86a28380a092c",
+      "std/callables.chi": "776e091b264fdbf40e6effaaa57d8f97bcf5357160886e33a89511c8084f9b26",
+      "std/context.chi": "fdc4930d6c13acc33af27aea7675abe6556491a9eae5d1baa5ff9e7e35801dd9",
+      "std/exit.chi": "5b876cf7f4c1d34de2cabb8f5ba01c0eb217fffd1a6054414e4bb382fe9571f4",
+      "std/io.chi": "c0d2340715d1fa4ef5cca24ce3eb67a661597e5293555734cb9cb2d0f8921c7a",
+      "std/iteration.chi": "6189612dfb0a6966bb275e714b45a92fb9b09d865eea62aee41a2904e36e95fc",
+      "std/library.zig": "3f670f30ce813023a6934b83bff50d0cbc85fae64f8b2a24bbe61986ba560383",
+      "std/logging.chi": "8090b6c5e0e9ce38e690b2a602e50437efa3c6e220746e7c4484830c48595bcb",
+      "std/math.chi": "f5b61e09f86dc2b475098b0d009b5f23d28df7c2afd5ae25b08f83493cfa5558",
+      "std/memory/allocation.chi": "0f51559af9f6a24e21a9aede45beea34c5e90b94cdccf5ea65bf59dff757d4a8",
+      "std/memory/allocator.chi": "ed7ca7261cbaa7a4f63511b93d4000b33601cc0ef877ad55cefc33bc47eb6ae0",
+      "std/memory/host.chi": "f21e0b70490018d3a7acd9eae2057c405302b066b243f71968f575e69d994455",
+      "std/memory/raw.chi": "07fb58af4eb496f6112eb3dfa6573e035e2d7d40d538e807bf81d96407eebeee",
+      "std/memory/sort.chi": "2b87581ca494bc6de656f906d303ea379f8ffe87404149a5a498c851b6f3ba4e",
+      "std/ownership.chi": "13c526128fb97b63e37fe1f49b79f578a4c4f11c903195eb7942bd96980bf367",
+      "std/prelude.chi": "f481b1c38f5592373fc0b8c91fefe00cbe0e60ff8326e07ce0b386864140da9d",
+      "std/primitives.chi": "854fecaf4bab9ad582ecfd1c8ef004635b71a2195d46f4e4bfc22b584383b99e",
+      "std/range.chi": "8a7b138b4672f79a6ab2c61592296ce602ffcc9b8eb8d2609ed6f62e7e7a5dd2",
+      "std/search.chi": "d75ce4a457776b7372efb70e817b35daaaad0899919826e904322946aa775deb",
+      "std/text.chi": "862bd6804e645864041c1feeae42c75e001d0e04e1903ade4659849aaa8c3e65"
+    },
+    "candidate_snapshot": "5a06d1a35f15a2c7b1fd4cd6c2901752b63e3a773ef1a6f74d3699e20df57485",
+    "suite": "7100f9e46971af2b51d1f24ce438dd035815a07d60ad0d2dc7bc1c3bb264864d",
+    "cpu": "AMD Ryzen 9 3900X 12-Core Processor"
+  },
+  "baseline": {
+    "100000/0/cold": {
+      "median_ms": 5047.749183,
+      "samples_ms": [
+        5006.356298,
+        5089.142068
+      ],
+      "stable": "true",
+      "bytes": 17214892
+    },
+    "100000/0/leaf-edit": {
+      "median_ms": 23.286929,
+      "samples_ms": [
+        23.286929,
+        22.323547,
+        24.457746
+      ],
+      "stable": "false",
+      "bytes": 17214892
+    },
+    "100000/8/cold": {
+      "median_ms": 1203.850018,
+      "samples_ms": [
+        1213.798647,
+        1193.901389
+      ],
+      "stable": "true",
+      "bytes": 17214892
+    },
+    "100000/8/leaf-edit": {
+      "median_ms": 33.401031,
+      "samples_ms": [
+        32.141307,
+        33.754484,
+        33.401031
+      ],
+      "stable": "false",
+      "bytes": 17214892
+    },
+    "1000000/0/cold": {
+      "median_ms": 48697.6762105,
+      "samples_ms": [
+        48428.053497,
+        48967.298924
+      ],
+      "stable": "true",
+      "bytes": 174607566
+    },
+    "1000000/0/leaf-edit": {
+      "median_ms": 222.761939,
+      "samples_ms": [
+        209.327757,
+        222.761939,
+        225.11169
+      ],
+      "stable": "false",
+      "bytes": 174607566
+    },
+    "1000000/8/cold": {
+      "median_ms": 10855.7364815,
+      "samples_ms": [
+        10854.302186,
+        10857.170777
+      ],
+      "stable": "true",
+      "bytes": 174607566
+    },
+    "1000000/8/leaf-edit": {
+      "median_ms": 331.4341225,
+      "samples_ms": [
+        328.25082,
+        334.617425
+      ],
+      "stable": "true",
+      "bytes": 174607566
+    }
+  },
+  "candidate": {
+    "100000/0/cold": {
+      "median_ms": 4868.729527,
+      "samples_ms": [
+        4823.952973,
+        4913.506081
+      ],
+      "stable": "true",
+      "bytes": 17220583
+    },
+    "100000/0/leaf-edit": {
+      "median_ms": 23.379231,
+      "samples_ms": [
+        23.810153,
+        23.140058,
+        23.379231
+      ],
+      "stable": "false",
+      "bytes": 17220583
+    },
+    "100000/8/cold": {
+      "median_ms": 1178.1943019999999,
+      "samples_ms": [
+        1182.409798,
+        1173.978806
+      ],
+      "stable": "true",
+      "bytes": 17220583
+    },
+    "100000/8/leaf-edit": {
+      "median_ms": 33.901474,
+      "samples_ms": [
+        36.06305,
+        33.901474,
+        33.367402
+      ],
+      "stable": "false",
+      "bytes": 17220583
+    },
+    "1000000/0/cold": {
+      "median_ms": 48238.891359999994,
+      "samples_ms": [
+        48240.410951,
+        48237.371769
+      ],
+      "stable": "true",
+      "bytes": 174665169
+    },
+    "1000000/0/leaf-edit": {
+      "median_ms": 220.37154650000002,
+      "samples_ms": [
+        220.743604,
+        219.999489
+      ],
+      "stable": "true",
+      "bytes": 174665169
+    },
+    "1000000/8/cold": {
+      "median_ms": 10782.8001925,
+      "samples_ms": [
+        10747.863805,
+        10817.73658
+      ],
+      "stable": "true",
+      "bytes": 174665169
+    },
+    "1000000/8/leaf-edit": {
+      "median_ms": 329.108304,
+      "samples_ms": [
+        328.964076,
+        329.252532
+      ],
+      "stable": "true",
+      "bytes": 174665169
+    }
+  }
+}

@@ -208,8 +208,17 @@ if not (value in collection) -> missing()
 # storage before changing literal-backed data. static evaluates at compile time;
 # literal-backed String results refer to symbolic immutable storage, never host
 # addresses. Runtime descriptors and the referenced bytes have independent
-# storage. String has move and automatic drop, but no implicit copy; clone is
-# explicit and returns String | AllocationError. Allocation-backed text also executes at compile time,
+# storage. String has move, automatic drop, and independent value copies.
+# Copying literal-backed text shares permanent immutable storage without allocating;
+# copying allocation-backed text copies its bytes, allocating as needed and
+# panicking on allocation failure. clone returns String | AllocationError.
+# String + String borrows both operands and returns a new String, panicking on
+# allocation failure. Ordinary argument conversion accepts literals and text views.
+# Compound += uses the same addition followed by replacement; append remains the
+# fallible operation for growing existing storage efficiently. concat borrows a
+# StringView and returns String | AllocationError, reserving the combined byte
+# length before copying either operand. Both operations preserve their inputs.
+# Allocation-backed text also executes at compile time,
 # subject to the evaluation-local storage publication boundary.
 # BytesView is a copyable wrapper of Span(byte) with readonly backing access.
 # get returns readonly ref byte | none; [] returns readonly ref byte and panics

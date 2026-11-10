@@ -57,6 +57,29 @@ test "portable scoped contexts remap registered entries and recompute effect-onl
     try fixture.expectExit(0, 42);
 }
 
+test "portable native allocation failure stubs round trip with writable text storage" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\var text: String = "x"
+        \\if not (text.reserve(64) is unit) -> exit(90)
+        \\exit(text.byte_length() + 41)
+    ;
+    const original = try sources.SourceFixture.init(source);
+    defer original.deinit();
+    try original.expectExit(0, 42);
+    const bytes = try artifact.encode(original.db, allocator);
+    defer allocator.free(bytes);
+    const db = try query.Database.init(allocator, .{ .worker_count = 0 });
+    defer db.deinit();
+    var registry: modules.SourceRegistry = .{ .entry_path = "restored.chi" };
+    defer registry.deinit(allocator);
+    try registry.update(db, allocator, source, &.{}, &.{});
+    const restored = try artifact.restore(db, bytes, &registry);
+    try std.testing.expect(restored.functions > 0);
+    const fixture: sources.SourceFixture = .{ .db = db };
+    try fixture.expectExit(0, 42);
+}
+
 test "portable nominal variants remap case and converter identities" {
     const allocator = std.testing.allocator;
     const source =

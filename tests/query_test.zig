@@ -9813,6 +9813,120 @@ test "reference contracts reuse acyclic bodies and recover after recursive edits
     }
 }
 
+test "scalar contract proofs follow unconditional calls and invalidate for context edits" {
+    const original =
+        \\import std.context as context
+        \\func leaf(value: int) int -> value
+        \\func selected(value: int) int -> leaf(value)
+        \\exit(selected(42))
+    ;
+    const contextual =
+        \\import std.context as context
+        \\func leaf(value: int) int
+        \\    _ = context.logger
+        \\    return value
+        \\func selected(value: int) int -> leaf(value)
+        \\exit(selected(42))
+    ;
+    for ([_]usize{ 0, 4 }) |workers| {
+        var profile: test_sources.profiling.Collector = .{ .io = testing.io };
+        const db = try Database.init(testing.allocator, .{ .worker_count = workers, .profile = &profile });
+        defer db.deinit();
+        try test_sources.modules.registerSources(db, testing.allocator, original, &.{}, &.{});
+        const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+        const selected: structures.InstanceId = .{ .item = scope.resolve("selected").? };
+        const before = profile.snapshot();
+        const contract = (try db.get(queries.InferReferenceContract, selected)).*.?;
+        try testing.expect(structures.ReferenceContract.equivalent(contract, .{}));
+        try testing.expectEqual(before.get(.body_typing).runs, profile.snapshot().get(.body_typing).runs);
+        try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 42);
+        try db.setInput(queries.SourceText, 0, contextual);
+        const changed = (try db.get(queries.InferReferenceContract, selected)).*.?;
+        try testing.expect(changed.context_effects.reads & structures.ContextEffects.bit(.logger) != 0);
+        try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 42);
+        try db.setInput(queries.SourceText, 0, original);
+        try testing.expect(structures.ReferenceContract.equivalent((try db.get(queries.InferReferenceContract, selected)).*.?, .{}));
+        try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 42);
+    }
+}
+
+test "scalar contract proofs leave conditional and early-return callees dormant" {
+    const cases = [_][]const u8{
+        \\func invalid() int -> false
+        \\func leaf(value: int) int
+        \\    if true -> return value + 1
+        \\    return invalid()
+        \\func selected(value: int) int -> leaf(value) + 1
+        \\exit(selected(40))
+        ,
+        \\func invalid() int -> false
+        \\func leaf(value: int) int
+        \\    return value + 1
+        \\    return invalid()
+        \\func selected(value: int) int -> leaf(value) + 1
+        \\exit(selected(40))
+    };
+    for (cases) |source| {
+        var fixture = try test_sources.SourceFixture.init(source);
+        defer fixture.deinit();
+        try fixture.expectExit(0, 42);
+        const diagnostics = try fixture.db.transitiveAccumulatorValues(queries.BuildExecutable, 0, structures.Diagnostic, testing.allocator);
+        defer freeDiagnostics(diagnostics);
+        try testing.expectEqual(@as(usize, 0), diagnostics.len);
+    }
+}
+
+test "cleanup scalar writes retain effects without contents scheduling across edits" {
+    const original =
+        \\struct Tracker
+        \\    ref count: int
+        \\    drop = func(deinit self: Tracker) -> self.count += 1
+        \\func selected() int
+        \\    var count = 0
+        \\    const tracker = Tracker{count = count}
+        \\    _ = tracker
+        \\    return count + 41
+        \\exit(selected())
+    ;
+    var profile: test_sources.profiling.Collector = .{ .io = testing.io };
+    const db = try Database.init(testing.allocator, .{ .worker_count = 0, .profile = &profile });
+    defer db.deinit();
+    try test_sources.modules.registerSources(db, testing.allocator, original, &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const selected: structures.InstanceId = .{ .item = scope.resolve("selected").? };
+    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, selected)).* != null);
+    try testing.expectEqual(@as(usize, 0), profile.snapshot().get(.cleanup_output_candidates).runs);
+    try testing.expectEqual(@as(usize, 0), profile.snapshot().get(.cleanup_output_scheduling).runs);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 42);
+    const changed = try std.mem.replaceOwned(u8, testing.allocator, original, "self.count += 1", "self.count += 2");
+    defer testing.allocator.free(changed);
+    try db.setInput(queries.SourceText, 0, changed);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 43);
+}
+
+test "scalar contract proof cycles recover after a recursive callee edit" {
+    const original =
+        \\func left() int -> right()
+        \\func right() int -> left()
+    ;
+    for ([_]usize{ 0, 4 }) |workers| {
+        const db = try testDatabase(workers);
+        defer db.deinit();
+        try addSource(db, 1, original);
+        const scope = (try db.get(queries.BuildModuleScope, 1)).*.?;
+        const left: structures.InstanceId = .{ .item = scope.resolve("left").? };
+        try testing.expect(!(try db.get(queries.TrivialReferenceContractBody, left)).*);
+        try testing.expect(structures.ReferenceContract.equivalent((try db.get(queries.InferReferenceContract, left)).*.?, .{}));
+        try setSource(db, 1,
+            \\func left() int -> right()
+            \\func right() int -> 42
+            \\exit(left())
+        );
+        try testing.expect((try db.get(queries.TrivialReferenceContractBody, left)).*);
+        try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 1)).*.?.bytes, 42);
+    }
+}
+
 test "reference contracts reuse cleanup-sensitive runtime bodies in either demand order" {
     const source =
         \\func selected(value: int) int

@@ -885,7 +885,7 @@ test "root native logging writes stderr independently of stdout and evaluator lo
     const std = @import("std");
     const source =
         \\import std.logging.{LogLevel, log, noop_logger}
-        \\_ = log(LogLevel.debug, "hidden")
+        \\_ = log(LogLevel.debug, "visible debug")
         \\_ = log(LogLevel.info, "visible")
         \\with context.logger = noop_logger()
         \\    print("stdout")
@@ -897,7 +897,7 @@ test "root native logging writes stderr independently of stdout and evaluator lo
     defer std.testing.allocator.free(result.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
     try std.testing.expectEqualStrings("stdout\n", result.stdout);
-    try std.testing.expectEqualStrings("info: visible\n", result.stderr);
+    try std.testing.expectEqualStrings("debug: visible debug\ninfo: visible\n", result.stderr);
     const interpreted = try Fixture.init(
         \\import std.logging.{LogLevel, log, enabled}
         \\func evaluate() int

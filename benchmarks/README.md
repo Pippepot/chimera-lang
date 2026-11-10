@@ -357,6 +357,76 @@ attribution to stderr without timing CSV, so the recorder cannot accept
 instrumented samples. Both resulting programs still pass the ordinary correctness
 checks. Use the uninstrumented measurement protocol above for acceptance.
 
+Body counters further separate scalar/general call preparation, type-only
+inference, call effects, origin expansion, reaching contents, pending reference
+uses, service mutations, ownership metadata, lifetime planning, cleanup
+stabilization/materialization, flow/effect validation, and contract publication.
+Origin expansion, reaching contents, and type-only inference count uncached work;
+the remaining typing and lifetime counters exclude these nested phases. A smaller
+`--lines=100000` probe uses the same generator, but does not replace the unchanged
+million-line acceptance workload.
+
+### Recorded typing and lifetime attribution
+
+**2026-11-10 status: investigation only, not a performance fix.** This pass added
+profiling counters, CLI timing rows, and tests. The cold-compilation regression
+remains open; no optimization was implemented or qualified by this investigation.
+
+Measurements used Zig 0.17, fast/LLVM, bundled std, no disk cache, and the unchanged
+100,000-line and million-line workloads on an AMD Ryzen 9 3900X. Serial runs were
+pinned to CPU 4; eight-worker runs could use CPUs 0-23. The source state was based
+on `f828761` plus the uncommitted compiler/std changes, not a clean commit.
+The [saved pre-instrumentation candidate](results/compiletime-regression/measurements.json)
+is the comparison below; it was not rebuilt and measured as a fresh paired baseline.
+
+Uninstrumented cold-compilation medians:
+
+| Lines | Workers | Recorded candidate (s) | With counters disabled (s) | New samples stable |
+| --- | --- | --- | --- | --- |
+| 100,000 | 0 | 4.869 | 4.903 | Yes |
+| 100,000 | 8 | 1.178 | 1.172 | Yes |
+| 1,000,000 | 0 | 48.239 | 49.135 | No |
+| 1,000,000 | 8 | 10.783 | 11.006 | Yes |
+
+Leaf-edit medians were 22.872/35.570 ms for 100,000 lines and
+224.158/342.369 ms for a million lines, with zero/eight workers respectively.
+Only the million-line serial leaf-edit samples met the repeatability criterion.
+The roughly 2% higher million-line cold medians do not establish instrumentation
+overhead or a regression: the comparison was not freshly paired, and serial
+samples were unstable. No speedup is demonstrated.
+
+The million-line serial profile took 50.177 s and attributed the following
+exclusive elapsed time:
+
+| Work | Seconds |
+| --- | --- |
+| Optimization passes, combined | 15.303 |
+| Remaining typing/SSA | 7.883 |
+| Reference-origin expansion | 7.819 |
+| General call preparation | 3.141 |
+| Type-only inference | 1.433 |
+| Effect validation | 1.411 |
+| Cleanup materialization | 1.363 |
+| Lifetime planning | 0.537 |
+| Cleanup stabilization | 0.253 |
+
+Origin expansion ran 1,824,257 uncached times. These rows exclude nested work;
+the small lifetime-planning and cleanup-stabilization self times do not include
+the separately attributed origin/contents work they demand. Remaining typing/SSA
+is residual work, not an identified individual algorithm.
+
+Eight workers increased body-typing invocations from 38,600 to 57,983 and doubled
+type-only inference from 172,811 to 345,622. Parallel phase times are summed worker
+elapsed time, not wall time. Investigate reference-origin expansion and
+opportunities to reuse parallel callee-discovery analysis before assuming more
+cleanup-solver tuning will recover the regression.
+
+All profiled and timed programs passed the driver's expected-exit checks.
+Uninstrumented executable sizes remained 17,220,583 bytes for 100,000 lines and
+174,665,169 bytes for a million lines, matching the recorded candidate. Any future
+fix still needs fresh matched cold/leaf-edit measurements at both sizes and worker
+counts, while preserving context, provider ownership, and incremental reuse.
+
 ## Focused Drivers
 
 | Command | Measures |

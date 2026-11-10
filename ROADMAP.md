@@ -64,6 +64,10 @@ user-defined contextual declarations remain outside this revision's scope.
 - `defer` for scope-exit cleanup, including failure and nonlocal exits.
 - String interpolation: `f"Value: {x}"`, potentially `{x=}`; settle formatting
   and allocation/failure behavior.
+- String copy-on-write storage and efficient mutating compound assignment;
+  define shared ownership, borrowed-view lifetimes, and allocator retention.
+- Unicode code-point and grapheme iteration, counting, and slicing; define
+  character APIs and the Unicode data/version policy.
 - Selected-branch-only analysis for `static if`, including declarations and
   dependencies in the unselected branch.
 - Further patterns: named-struct destructuring, sequence/rest patterns, extractors,
@@ -79,9 +83,13 @@ user-defined contextual declarations remain outside this revision's scope.
 
 ## Deferred or independent
 
-- Finish result-correlated mutation provenance performance qualification: remove
-  cold-compilation regressions while retaining incremental typing reuse and
-  forwarding, saved-result, later-write, loop-join, and cached-contract behavior.
+- Fix the outstanding cold-compilation regression. Use the
+  [typing/lifetime attribution](benchmarks/README.md#recorded-typing-and-lifetime-attribution)
+  to investigate reference-origin expansion and repeated parallel analysis.
+  Preserve context/provider ownership, incremental typing reuse, and forwarding,
+  saved-result, later-write, loop-join, and cached-contract behavior. Qualify fixes
+  with fresh matched cold/leaf-edit measurements on unchanged 100,000-line and
+  million-line workloads, with zero and eight workers.
 - Expected-type shorthand for struct namespace members and omitted-type struct
   initializers; define member eligibility, syntax, and ambiguity beyond nominal cases.
 - Generator suspension/yield syntax only if ordinary cursor composition proves

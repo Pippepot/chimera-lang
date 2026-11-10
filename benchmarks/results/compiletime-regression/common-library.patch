@@ -1,0 +1,102 @@
+diff --git i/std/README.md w/std/README.md
+index ec05ea9..6e1d63f 100644
+--- i/std/README.md
++++ w/std/README.md
+@@ -71,6 +71,27 @@ Integer specializations remain in the precompiled standard library.
+ As with other generic functions, storing a helper as a callable value requires
+ a type context, for example `const lower: func(int, int) int = std.math.min`.
+ 
++## Strings
++
++`String` holds valid UTF-8 text and supports ordinary independent value copies,
++addition, and compound assignment:
++
++```chi
++var greeting = "Hello"
++var copied = greeting
++copied += ", world!"
++const excited = greeting + "!"
++# greeting remains "Hello".
++```
++
++Copies of literal-backed strings share permanent immutable bytes. Copies of
++allocated strings copy their bytes into a new allocation. Copying and `+` panic
++on allocation failure; `clone()` and `concat(text)` return `String | AllocationError`
++when failure must be handled. Concatenation borrows its inputs and reserves the
++combined byte length once. `+=` currently creates a new string and replaces the
++target; use fallible `append(text)` to reuse capacity when building text repeatedly.
++Lengths and slice positions count bytes; text slicing checks UTF-8 boundaries.
++
+ ## Owning callables
+ 
+ Fixed `func(...)` locals, fields, and collection elements own erased handles.
+@@ -146,7 +167,7 @@ Disabled events skip backend dispatch while preserving argument evaluation.
+ Backends may store lifetime-valid owned message
+ copies, but cannot retain a message view. Checked service dispatch detects cycles;
+ `from_unchecked` permits deliberate recursion. The native root logger writes to
+-stderr at info or above; the evaluator root logger is off. Logging leaves `print`
++stderr at trace or above; the evaluator root logger is off. Logging leaves `print`
+ and explicit stdout/stderr APIs on their ordinary destinations.
+ Root output writes a severity prefix, message, and newline without allocation.
+ An `IoError` reports the Linux errno in `cause` and the total bytes delivered for
+diff --git i/std/logging.chi w/std/logging.chi
+index eb4571a..8ac4176 100644
+--- i/std/logging.chi
++++ w/std/logging.chi
+@@ -1,6 +1,6 @@
+ import std.memory.{AllocationError}
+ import std.io.{IoError, stderr, write_text}
+-import std.text.{StringView}
++import std.text.{String, StringView}
+ import std.context as context
+ 
+ pub struct LogLevel
+@@ -42,11 +42,9 @@ func stderr_emit(level: LogLevel, imm message: StringView) unit | AllocationErro
+         3 -> "warning: "
+         _ -> "error: "
+     _ = write_text(stderr, prefix)?
+-    const delivered = write_text(stderr, message)
++    const delivered = write_text(stderr, String(message) + "\n")
+     if delivered is IoError -> return IoError{cause = delivered.cause, progress = prefix.byte_length() + delivered.progress}
+-    const newline = write_text(stderr, "\n")
+-    if newline is IoError -> return IoError{cause = newline.cause, progress = prefix.byte_length() + message.byte_length() + newline.progress}
+     return unit
+-pub func root_logger() Logger -> Logger{emit_callback = stderr_emit, minimum_level = LogLevel.info}
++pub func root_logger() Logger -> Logger{emit_callback = stderr_emit, minimum_level = LogLevel.trace}
+ extern func logger_from(static Backend: type, ref backend: Backend, minimum: LogLevel) Logger
+ extern func logger_from_unchecked(static Backend: type, ref backend: Backend, minimum: LogLevel) Logger
+diff --git i/std/text.chi w/std/text.chi
+index a843b52..340cf5e 100644
+--- i/std/text.chi
++++ w/std/text.chi
+@@ -128,8 +128,13 @@ struct OwnedBytes
+     drop = func(deinit self: OwnedBytes) -> deallocate(byte, self.allocation^)
+ 
+ pub struct String
+-    copy = none
++    copy = func(imm self: String) String
++        if self.storage is StaticString
++            const literal: StaticString = self.storage
++            return String{storage = literal}
++        return self.clone() catch -> panic "string copy allocation failed"
+     storage: StaticString | OwnedBytes
++    pub func +(imm left: String, imm right: String) String -> left.concat(right.view()) catch -> panic "string concatenation allocation failed"
+     pub func ==(imm left: String, imm right: StringView) bool -> equal_bytes(left.as_bytes(), right.as_bytes())
+     pub func <>(imm left: String, imm right: StringView) bool -> not equal_bytes(left.as_bytes(), right.as_bytes())
+     pub func from_utf8(imm bytes: BytesView) String | AllocationError | Utf8Error
+@@ -201,6 +206,15 @@ pub struct String
+         var result = String.empty()
+         _ = result.append(self.view())?
+         return result^
++    pub func concat(imm self: String, imm text: StringView) String | AllocationError
++        const size = self.byte_length()
++        const count = text.byte_length()
++        if count > 2147483647 - size -> return AllocationError.size_limit
++        var result = String.empty()
++        _ = result.reserve(size + count)?
++        _ = result.append(self.view())?
++        _ = result.append(text)?
++        return result^
+ 
+ func equal_bytes(imm left: BytesView, imm right: BytesView) bool
+     const count = left.byte_length()

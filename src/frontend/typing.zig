@@ -1150,6 +1150,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         materializing_cleanups: bool = false,
         cleanup_actions: cleanup_actions.Cache = .empty,
         generation_cleanup_actions: std.AutoHashMapUnmanaged(GenerationId, *const cleanup_actions.Actions) = .empty,
+        cleanup_effects: cleanup_actions.EffectsCache = .empty,
         deferred_flow_writes: std.ArrayList(DeferredFlowWrite) = .empty,
         deferred_flow_proofs: std.ArrayList(DeferredFlowProof) = .empty,
         values: flow_snapshot.Buffer(?Value, null) = .{},
@@ -1551,6 +1552,13 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         };
 
         fn stabilizeCleanupReferenceContents(self: *Self, measurements: ?*BodyMeasurements) !void {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_cleanup_stabilization);
+            defer phase.end();
+            const graph = try self.controlFlowGraph();
+            var contents = try ReferenceContentsAnalysis.initUnindexed(self, graph);
+            defer contents.deinit();
+            var refreshed_reads: usize = 0;
             const baseline_state = self.state.snapshot();
             var baseline_captures = try self.capture_output_origins.clone(self.gpa);
             defer baseline_captures.deinit(self.gpa);
@@ -1581,15 +1589,17 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 errdefer self.gpa.free(scheduled);
                 try self.scheduleCleanupReferenceOutputs(scheduled);
                 {
-                    const graph = try self.controlFlowGraph();
-                    var contents = try ReferenceContentsAnalysis.init(self, graph);
-                    defer contents.deinit();
-                    for (0..self.reference_contents_reads.items.len) |index| {
+                    var changed_roots = try contents.updateWrites();
+                    defer changed_roots.deinit(self.gpa);
+                    const read_count = self.reference_contents_reads.items.len;
+                    for (0..read_count) |index| {
                         const read = self.reference_contents_reads.items[index];
+                        if (index < refreshed_reads and !changed_roots.contains(read.at.root)) continue;
                         var origins = try contents.read(read.at);
                         for (read.path) |step| origins = try self.transformReferenceOrigins(origins, .{ .select = step });
                         self.reference_contents_reads.items[index].origins = origins;
                     }
+                    refreshed_reads = read_count;
                 }
                 self.resolved_reference_origins.clearRetainingCapacity();
                 var lifetimes_changed = false;
@@ -1628,7 +1638,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             for (scheduled) |ending| {
                 const generation = self.generations.items[@backingInt(ending.generation)];
                 const actions = try self.generationCleanupActions(ending.generation);
-                if (!try actions.hasReferenceEffects(self.analysis_context)) continue;
+                if (!(try self.cleanupEffects(actions)).mayWriteContents()) continue;
                 const origins = try self.completeReferenceOrigins(try self.cleanupOriginsAt(ending, graph));
                 const site = try self.cleanupOutputSite(ending);
                 self.cleanup_contents_site = site;
@@ -1647,6 +1657,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn publishReferenceContract(self: *Self) !structures.ReferenceContract {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_contract_publication);
+            defer phase.end();
             const allocator = self.gpa;
             var contracts: std.ArrayList(structures.ReferenceOriginContract) = .empty;
             var paths: std.ArrayList(structures.ReferencePathStep) = .empty;
@@ -6317,6 +6330,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .flow_state = if (self.state.refinements.root) |root| @intFromPtr(root) else 0,
             };
             if (types.get(key)) |type_id| return type_id;
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_type_inference);
+            defer phase.end();
             if (self.options.measurements) |measurements| measurements.type_only_regions += 1;
             var region = self.initializerRegion(if (initializer_boundary) expected_type orelse .unit else self.return_type);
             region.is_initializer_region = initializer_boundary;
@@ -6728,7 +6744,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 const whole = generation.type_id == source.type_id;
                 if (try self.isNonowningCallable(source)) break :outputs;
                 const actions = try self.cleanupActions(source.type_id, if (whole) generation.cleanup_selections else &.{}, if (whole) generation.missing_fields else &.{}, whole and generation.cleanup_fields);
-                if (!try actions.hasReferenceEffects(self.analysis_context)) break :outputs;
+                if (!(try self.cleanupEffects(actions)).mayWriteContents()) break :outputs;
                 self.has_cleanup_outputs = true;
                 const block_id = self.current_block orelse break :outputs;
                 var incomplete = false;
@@ -7837,6 +7853,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn resolvePendingReferenceUses(self: *Self, lifetimes_changed: ?*bool) !void {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_pending_uses);
+            defer phase.end();
             if (!self.provisional_reference_contents) {
                 for (self.initializer_write_checks.items) |check|
                     try self.checkInitializerReferenceWrite(try self.completeReferenceOrigins(check.origins), check.owners, check.locals, check.span);
@@ -8921,6 +8940,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn validateDeferredFlowProofs(self: *Self) !void {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_flow_validation);
+            defer phase.end();
             for (self.deferred_flow_proofs.items) |proof| {
                 const write = self.deferred_flow_writes.items[proof.write];
                 const mutations = try self.flowOrigins(write.origins);
@@ -10008,6 +10030,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn resolveScalarCall(self: *Self, instance: structures.InstanceId, signature: structures.CallableType, raw_arguments: []const semantic.UnresolvedBody.ValueUse, reverse_arguments: bool) !ResolvedCall {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_scalar_calls);
+            defer phase.end();
             std.debug.assert(raw_arguments.len <= 2);
             var arguments: [2]structures.FunctionCallArgument = undefined;
             for (0..raw_arguments.len) |position| {
@@ -10167,6 +10192,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn resolveGeneralCall(self: *Self, target: CallTarget, signature: structures.CallableType, raw_arguments: []const semantic.UnresolvedBody.ValueUse, span: structures.SourceSpan, capture_owners_start: usize, reverse_arguments: bool, environment_receiver: ?Value, callee_storage: ?Value) !ResolvedCall {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_general_calls);
+            defer phase.end();
             const behavior = if (target == .direct) try self.analysis_context.callBehavior(target.direct.item) else .ordinary;
             const borrowed_return = signature.result_mode == .reference or try self.analysis_context.facts().canStoreBorrow(signature.return_type);
             const reference_contract: ?structures.ReferenceContract = if (self.type_check_only)
@@ -11152,6 +11180,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         /// Finish loop-dependent dispatch once its receiver alternatives are complete.
         /// Outputs are written at the original call site, using that site's bindings.
         fn resolveDeferredServiceMutations(self: *Self) !void {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_service_mutations);
+            defer phase.end();
             for (self.deferred_service_mutations.items) |deferred| {
                 const previous_state = self.state;
                 self.restoreState(deferred.state);
@@ -11444,6 +11475,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn finishCallEffects(self: *Self, callable: ResolvedCallable, instruction: u31) !?u32 {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_call_effects);
+            defer phase.end();
             var returned_origins = try self.transformReferenceOrigins(callable.reference_origins, .{ .read_written = instruction });
             if (callable.operation.target == .initializer)
                 try self.finishInitializerEffects(callable.operation.target.initializer, &returned_origins, callable.mut_arguments);
@@ -11815,6 +11849,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (cached.incomplete) incomplete.* = true;
                 return cached.origins;
             }
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_origin_expansion);
+            defer phase.end();
             var expansion: ReferenceExpansion = .{ .include_flow = include_flow };
             defer expansion.deinit(self.gpa);
             self.active_reference_expansion = &expansion;
@@ -14854,6 +14891,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn finishOwnershipMetadata(self: *Self) !void {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_ownership_metadata);
+            defer phase.end();
             std.debug.assert(self.ownership_forwards.items.len == 0);
             std.debug.assert(self.ownership_edges.items.len == 0);
             std.sort.block(OwnershipForwardHint, self.ownership_forward_hints.items, {}, ownershipHintLessThan);
@@ -14892,6 +14932,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn analyzeLifetimes(self: *Self, measurements: ?*BodyMeasurements) !void {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_lifetime_planning);
+            defer phase.end();
             var solver = try LifetimeSolver.init(
                 self.gpa,
                 self.generations.items,
@@ -14924,6 +14967,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn cleanupActions(self: *Self, type_id: structures.TypeId, selections: []const cleanup_shape.Selection, missing: []const []const structures.ReferencePathStep, fields_only: bool) !*const cleanup_actions.Actions {
             return cleanup_actions.build(self.gpa, self.analysis_context, &self.cleanup_actions, type_id, selections, missing, fields_only);
+        }
+
+        fn cleanupEffects(self: *Self, actions: *const cleanup_actions.Actions) !cleanup_actions.Effects {
+            return actions.effects(self.gpa, self.analysis_context, &self.cleanup_effects);
         }
 
         fn generationCleanupActions(self: *Self, generation: GenerationId) !*const cleanup_actions.Actions {
@@ -15033,7 +15080,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn collectCleanupReferenceEffects(self: *Self, source: Value, site: CleanupOutputSite, actions: *const cleanup_actions.Actions, mode: CleanupReferenceMode, effects: *ReferenceEffects) anyerror!void {
-            if (!try actions.hasReferenceEffects(self.analysis_context)) return;
+            const summary = try self.cleanupEffects(actions);
+            if (!summary.any()) return;
+            if (mode != .effects and !summary.mayWriteContents()) return;
             switch (actions.operation) {
                 .none, .explicit => {},
                 .hook => try self.collectCleanupCallEffects(source, site, try cleanup_actions.Actions.hookContract(self.analysis_context, actions.type_id), mode, effects),
@@ -15102,26 +15151,53 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             builder: *Self,
             graph: ControlFlowGraph,
             writes: std.AutoHashMapUnmanaged(WriteKey, std.ArrayList(usize)) = .empty,
-            memo: std.AutoHashMapUnmanaged(ReferenceContentsCursor, Result) = .empty,
+            memo: std.AutoArrayHashMapUnmanaged(ReferenceContentsCursor, Result) = .empty,
             active: []bool,
+            indexed_writes: usize = 0,
 
-            fn init(builder: *Self, graph: ControlFlowGraph) !@This() {
-                var result: @This() = .{
+            fn initUnindexed(builder: *Self, graph: ControlFlowGraph) !@This() {
+                const result: @This() = .{
                     .builder = builder,
                     .graph = graph,
                     .active = try builder.gpa.alloc(bool, graph.index.blocks.len),
                 };
-                errdefer result.deinit();
                 @memset(result.active, false);
-                for (builder.reference_contents_writes.items, 0..) |write, index| {
-                    if (!write.active) continue;
-                    const entry = try result.writes.getOrPut(builder.gpa, .{ .root = write.root, .block = write.block });
-                    if (!entry.found_existing) entry.value_ptr.* = .empty;
-                    try entry.value_ptr.append(builder.gpa, index);
-                }
-                var groups = result.writes.valueIterator();
-                while (groups.next()) |indices| std.sort.block(usize, indices.items, builder, writeLessThan);
                 return result;
+            }
+
+            fn init(builder: *Self, graph: ControlFlowGraph) !@This() {
+                var result = try initUnindexed(builder, graph);
+                errdefer result.deinit();
+                var changed_roots = try result.updateWrites();
+                changed_roots.deinit(builder.gpa);
+                return result;
+            }
+
+            /// The CFG, cursors, and ordinary writes are frozen during cleanup
+            /// scheduling. Only replacement cleanup writes invalidate a root's
+            /// reaching-contents results; their origin heads remain symbolic.
+            fn updateWrites(self: *@This()) !std.AutoHashMapUnmanaged(semantic.UnresolvedBody.LocalId, void) {
+                var changed_roots: std.AutoHashMapUnmanaged(semantic.UnresolvedBody.LocalId, void) = .empty;
+                errdefer changed_roots.deinit(self.builder.gpa);
+                for (self.builder.reference_contents_writes.items, 0..) |write, index| {
+                    if (write.cleanup or index >= self.indexed_writes) try changed_roots.put(self.builder.gpa, write.root, {});
+                    if (index < self.indexed_writes or !write.active) continue;
+                    const entry = try self.writes.getOrPut(self.builder.gpa, .{ .root = write.root, .block = write.block });
+                    if (!entry.found_existing) entry.value_ptr.* = .empty;
+                    try entry.value_ptr.append(self.builder.gpa, index);
+                }
+                self.indexed_writes = self.builder.reference_contents_writes.items.len;
+                var groups = self.writes.iterator();
+                while (groups.next()) |entry| {
+                    if (changed_roots.contains(entry.key_ptr.root)) std.sort.block(usize, entry.value_ptr.items, self.builder, writeLessThan);
+                }
+                var index: usize = 0;
+                while (index < self.memo.count()) {
+                    if (changed_roots.contains(self.memo.keys()[index].root)) {
+                        self.memo.swapRemoveAt(index);
+                    } else index += 1;
+                }
+                return changed_roots;
             }
 
             fn deinit(self: *@This()) void {
@@ -15151,6 +15227,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                         if (self.active[@backingInt(block_id)]) break;
                     } else return cached;
                 }
+                var phase: profiling.Scope = .{};
+                phase.beginCurrent(.body_contents_queries);
+                defer phase.end();
                 const result = try self.compute(cursor);
                 if (!result.cyclic) try self.memo.put(self.builder.gpa, cursor, result);
                 return result;
@@ -15162,6 +15241,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     var reverse = std.mem.reverseIterator(indices.items);
                     while (reverse.next()) |index| {
                         const write = builder.reference_contents_writes.items[index];
+                        if (!write.active) continue;
                         if (write.end > cursor.end) continue;
                         if (write.edge_ordinal != null and write.edge_ordinal != cursor.edge_ordinal) continue;
                         if (write.end == cursor.end and cursor.write_limit != null and index >= cursor.write_limit.? and (!write.scheduled or !cursor.include_scheduled)) continue;
@@ -15217,6 +15297,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn materializeCleanups(self: *Self, cleanups: []const PlannedEnding) !void {
             std.debug.assert(self.current_block == null);
             if (cleanups.len == 0) return;
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_cleanup_materialization);
+            defer phase.end();
             self.materializing_cleanups = true;
             defer self.materializing_cleanups = false;
             const graph = try self.controlFlowGraph();
@@ -15568,6 +15651,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         fn validateEffectReferenceUses(self: *Self) !void {
+            var phase: profiling.Scope = .{};
+            phase.beginCurrent(.body_effect_validation);
+            defer phase.end();
             if (self.reference_effects.count() == 0 or self.reference_uses.items.len == 0) return self.validateReferenceExclusions();
             try self.indexEffectLocations();
             const graph = try self.controlFlowGraph();
@@ -16409,6 +16495,46 @@ const TestMeasureBody = struct {
         return measurements;
     }
 };
+
+test "reaching contents follows replacement and retired cleanup writes" {
+    var context: TestMaterializerContext = .{ .gpa = std.testing.allocator };
+    defer context.deinit();
+    var builder = testInitMaterializerBuilder(&context);
+    const entry = try builder.newBlock(0, 0);
+    builder.enterBlock(entry);
+    builder.terminate(.return_unit);
+    const initial = try builder.addReferenceOrigin(null, .{ .parameter = 0 });
+    const replacement = try builder.addReferenceOrigin(null, .{ .parameter = 1 });
+    const other = try builder.addReferenceOrigin(null, .{ .parameter = 2 });
+    try builder.reference_contents_writes.append(builder.gpa, .{ .root = @fromBackingInt(0), .block = entry, .end = 0, .path = &.{}, .origins = initial });
+    try builder.reference_contents_writes.append(builder.gpa, .{ .root = @fromBackingInt(1), .block = entry, .end = 0, .path = &.{}, .origins = other });
+    var contents = try TestMaterializerBuilder.ReferenceContentsAnalysis.init(&builder, try builder.controlFlowGraph());
+    defer contents.deinit();
+    const first: TestMaterializerBuilder.ReferenceContentsCursor = .{ .root = @fromBackingInt(0), .block = entry, .end = 2, .initial = null };
+    const second: TestMaterializerBuilder.ReferenceContentsCursor = .{ .root = @fromBackingInt(1), .block = entry, .end = 2, .initial = null };
+    try builder.reference_contents_reads.append(builder.gpa, .{ .at = first, .path = &.{}, .origins = initial, .complete = true });
+    const deferred = try builder.addReferenceOrigin(null, .{ .contents = 0 });
+    const alias: TestMaterializerBuilder.ReferenceContentsCursor = .{ .root = @fromBackingInt(2), .block = entry, .end = 2, .initial = deferred };
+    try std.testing.expectEqual(initial, try contents.read(first));
+    try std.testing.expectEqual(other, try contents.read(second));
+    try std.testing.expectEqual(initial, try builder.completeReferenceOrigins(try contents.read(alias)));
+    try builder.reference_contents_writes.append(builder.gpa, .{ .root = first.root, .block = entry, .end = 1, .path = &.{}, .origins = replacement, .cleanup = true, .scheduled = true });
+    var changed = try contents.updateWrites();
+    changed.deinit(builder.gpa);
+    try std.testing.expectEqual(replacement, try contents.read(first));
+    try std.testing.expectEqual(other, try contents.read(second));
+    builder.reference_contents_reads.items[0].origins = try contents.read(first);
+    builder.resolved_reference_origins.clearRetainingCapacity();
+    try std.testing.expectEqual(replacement, try builder.completeReferenceOrigins(try contents.read(alias)));
+    builder.reference_contents_writes.items[2].active = false;
+    changed = try contents.updateWrites();
+    changed.deinit(builder.gpa);
+    try std.testing.expectEqual(initial, try contents.read(first));
+    try std.testing.expectEqual(other, try contents.read(second));
+    builder.reference_contents_reads.items[0].origins = try contents.read(first);
+    builder.resolved_reference_origins.clearRetainingCapacity();
+    try std.testing.expectEqual(initial, try builder.completeReferenceOrigins(try contents.read(alias)));
+}
 
 test "expression value pages isolate branch results without allocating untouched slots" {
     var context: TestMaterializerContext = .{ .gpa = std.testing.allocator };

@@ -1,0 +1,403 @@
+diff --git i/src/backend/codegen.zig w/src/backend/codegen.zig
+index bfa597b..31ae1a9 100644
+--- i/src/backend/codegen.zig
++++ w/src/backend/codegen.zig
+@@ -2116,8 +2116,8 @@ fn FunctionEmitter(comptime Types: type) type {
+ 
+         fn emitRuntimeFailure(self: *Self, message: []const u8) !void {
+             const data = try self.dataIndex(message);
+-            const offset = try self.encoder.patchable(.lea_rax_rip);
+-            try self.relocations.append(self.gpa, .{ .offset = offset, .kind = .call_relative_32, .reference = .{ .data = data }, .addend = 0 });
++            const offset = try self.encoder.patchable(.mov_rax);
++            try self.relocations.append(self.gpa, .{ .offset = offset, .kind = .address_absolute_64, .reference = .{ .data = data }, .addend = 0 });
+             try self.encoder.emit(.mov_rsi_rax);
+             try self.encoder.immediate(.mov_edx, @intCast(message.len));
+             try self.encoder.immediate(.mov_edi, 2);
+diff --git i/src/frontend/cleanup_actions.zig w/src/frontend/cleanup_actions.zig
+index 3c0829c..882e092 100644
+--- i/src/frontend/cleanup_actions.zig
++++ w/src/frontend/cleanup_actions.zig
+@@ -17,6 +17,32 @@ pub const Obligations = struct {
+     }
+ };
+ 
++/// Checks and observable side effects do not by themselves change the contents
++/// used to resolve a later reference read. Unknown service payloads may do so.
++pub const Effects = struct {
++    validation: bool = false,
++    contents: bool = false,
++    service_mutations: bool = false,
++    context: structures.ContextEffects = .{},
++
++    pub fn mayWriteContents(self: Effects) bool {
++        return self.contents or self.service_mutations;
++    }
++
++    pub fn any(self: Effects) bool {
++        return self.validation or self.mayWriteContents() or self.context.reads != 0 or self.context.writes != 0;
++    }
++
++    fn include(self: *Effects, child: Effects) void {
++        self.validation = self.validation or child.validation;
++        self.contents = self.contents or child.contents;
++        self.service_mutations = self.service_mutations or child.service_mutations;
++        self.context.include(child.context);
++    }
++};
++
++pub const EffectsCache = std.AutoHashMapUnmanaged(*const Actions, Effects);
++
+ /// An immutable selection of destruction operations, shared by provenance
+ /// analysis, emission, and ownership obligations. Locations and invocation-time
+ /// origins remain separate. Hook contracts are queried only by consumers of effects.
+@@ -53,24 +79,39 @@ pub const Actions = struct {
+         return (try analysis.functionReferenceContract(definition.ownership.drop.?.hook.?)) orelse error.Unavailable;
+     }
+ 
+-    pub fn hasReferenceEffects(self: Actions, analysis: anytype) anyerror!bool {
++    pub fn effects(self: *const Actions, allocator: std.mem.Allocator, analysis: anytype, cache: *EffectsCache) anyerror!Effects {
++        if (cache.get(self)) |cached| return cached;
++        var result: Effects = .{};
+         switch (self.operation) {
+-            .none, .explicit => return false,
+-            .hook => {
+-                const references = try hookContract(analysis, self.type_id);
+-                if (references.requirements.len != 0 or references.service_mutations.len != 0) return true;
+-                for (references.origins) |origin| if (origin.output_parameter != null or origin.output_contextual != null) return true;
+-                return false;
++            .none, .explicit => {},
++            .hook => result = try hookEffects(analysis, self.type_id),
++            .array => |array| if (array.length != 0) {
++                result = try array.element.effects(allocator, analysis, cache);
+             },
+-            .array => |array| return array.length != 0 and try array.element.hasReferenceEffects(analysis),
+             .parts => |parts| {
+-                for (parts) |part| if (try part.actions.hasReferenceEffects(analysis)) return true;
+-                return false;
++                for (parts) |part| result.include(try part.actions.effects(allocator, analysis, cache));
+             },
+         }
++        try cache.put(allocator, self, result);
++        return result;
+     }
+ };
+ 
++fn hookEffects(analysis: anytype, type_id: structures.TypeId) !Effects {
++    const references = try Actions.hookContract(analysis, type_id);
++    var result: Effects = .{
++        .validation = references.requirements.len != 0 or references.exclusions.len != 0,
++        .service_mutations = references.service_mutations.len != 0,
++        .context = references.context_effects,
++    };
++    for (references.requirements) |requirement| {
++        if (requirement.kind != .contents) continue;
++        const written_type = requirement.written_type orelse continue;
++        if (try analysis.facts().canStoreBorrow(written_type)) result.contents = true;
++    }
++    return result;
++}
++
+ pub const Cache = std.AutoHashMapUnmanaged(structures.TypeId, *const Actions);
+ 
+ pub fn build(allocator: std.mem.Allocator, analysis: anytype, cache: *Cache, type_id: structures.TypeId, selections: []const shape.Selection, missing: []const []const structures.ReferencePathStep, fields_only: bool) anyerror!*const Actions {
+diff --git i/src/frontend/typing.zig w/src/frontend/typing.zig
+index abc21eb..2c6aa7d 100644
+--- i/src/frontend/typing.zig
++++ w/src/frontend/typing.zig
+@@ -1150,6 +1150,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
+         materializing_cleanups: bool = false,
+         cleanup_actions: cleanup_actions.Cache = .empty,
+         generation_cleanup_actions: std.AutoHashMapUnmanaged(GenerationId, *const cleanup_actions.Actions) = .empty,
++        cleanup_effects: cleanup_actions.EffectsCache = .empty,
+         deferred_flow_writes: std.ArrayList(DeferredFlowWrite) = .empty,
+         deferred_flow_proofs: std.ArrayList(DeferredFlowProof) = .empty,
+         values: flow_snapshot.Buffer(?Value, null) = .{},
+@@ -1551,6 +1552,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
+         };
+ 
+         fn stabilizeCleanupReferenceContents(self: *Self, measurements: ?*BodyMeasurements) !void {
++            const graph = try self.controlFlowGraph();
++            var contents = try ReferenceContentsAnalysis.initUnindexed(self, graph);
++            defer contents.deinit();
++            var refreshed_reads: usize = 0;
+             const baseline_state = self.state.snapshot();
+             var baseline_captures = try self.capture_output_origins.clone(self.gpa);
+             defer baseline_captures.deinit(self.gpa);
+@@ -1581,15 +1586,17 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
+                 errdefer self.gpa.free(scheduled);
+                 try self.scheduleCleanupReferenceOutputs(scheduled);
+                 {
+-                    const graph = try self.controlFlowGraph();
+-                    var contents = try ReferenceContentsAnalysis.init(self, graph);
+-                    defer contents.deinit();
+-                    for (0..self.reference_contents_reads.items.len) |index| {
++                    var changed_roots = try contents.updateWrites();
++                    defer changed_roots.deinit(self.gpa);
++                    const read_count = self.reference_contents_reads.items.len;
++                    for (0..read_count) |index| {
+                         const read = self.reference_contents_reads.items[index];
++                        if (index < refreshed_reads and !changed_roots.contains(read.at.root)) continue;
+                         var origins = try contents.read(read.at);
+                         for (read.path) |step| origins = try self.transformReferenceOrigins(origins, .{ .select = step });
+                         self.reference_contents_reads.items[index].origins = origins;
+                     }
++                    refreshed_reads = read_count;
+                 }
+                 self.resolved_reference_origins.clearRetainingCapacity();
+                 var lifetimes_changed = false;
+@@ -1628,7 +1635,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
+             for (scheduled) |ending| {
+                 const generation = self.generations.items[@backingInt(ending.generation)];
+                 const actions = try self.generationCleanupActions(ending.generation);
+-                if (!try actions.hasReferenceEffects(self.analysis_context)) continue;
++                if (!(try self.cleanupEffects(actions)).mayWriteContents()) continue;
+                 const origins = try self.completeReferenceOrigins(try self.cleanupOriginsAt(ending, graph));
+                 const site = try self.cleanupOutputSite(ending);
+                 self.cleanup_contents_site = site;
+@@ -6728,7 +6735,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
+                 const whole = generation.type_id == source.type_id;
+                 if (try self.isNonowningCallable(source)) break :outputs;
+                 const actions = try self.cleanupActions(source.type_id, if (whole) generation.cleanup_selections else &.{}, if (whole) generation.missing_fields else &.{}, whole and generation.cleanup_fields);
+-                if (!try actions.hasReferenceEffects(self.analysis_context)) break :outputs;
++                if (!(try self.cleanupEffects(actions)).mayWriteContents()) break :outputs;
+                 self.has_cleanup_outputs = true;
+                 const block_id = self.current_block orelse break :outputs;
+                 var incomplete = false;
+@@ -14926,6 +14933,10 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
+             return cleanup_actions.build(self.gpa, self.analysis_context, &self.cleanup_actions, type_id, selections, missing, fields_only);
+         }
+ 
++        fn cleanupEffects(self: *Self, actions: *const cleanup_actions.Actions) !cleanup_actions.Effects {
++            return actions.effects(self.gpa, self.analysis_context, &self.cleanup_effects);
++        }
++
+         fn generationCleanupActions(self: *Self, generation: GenerationId) !*const cleanup_actions.Actions {
+             if (self.generation_cleanup_actions.get(generation)) |actions| return actions;
+             const metadata = self.generations.items[@backingInt(generation)];
+@@ -15033,7 +15044,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
+         }
+ 
+         fn collectCleanupReferenceEffects(self: *Self, source: Value, site: CleanupOutputSite, actions: *const cleanup_actions.Actions, mode: CleanupReferenceMode, effects: *ReferenceEffects) anyerror!void {
+-            if (!try actions.hasReferenceEffects(self.analysis_context)) return;
++            const summary = try self.cleanupEffects(actions);
++            if (!summary.any()) return;
++            if (mode != .effects and !summary.mayWriteContents()) return;
+             switch (actions.operation) {
+                 .none, .explicit => {},
+                 .hook => try self.collectCleanupCallEffects(source, site, try cleanup_actions.Actions.hookContract(self.analysis_context, actions.type_id), mode, effects),
+@@ -15102,28 +15115,55 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
+             builder: *Self,
+             graph: ControlFlowGraph,
+             writes: std.AutoHashMapUnmanaged(WriteKey, std.ArrayList(usize)) = .empty,
+-            memo: std.AutoHashMapUnmanaged(ReferenceContentsCursor, Result) = .empty,
++            memo: std.AutoArrayHashMapUnmanaged(ReferenceContentsCursor, Result) = .empty,
+             active: []bool,
++            indexed_writes: usize = 0,
+ 
+-            fn init(builder: *Self, graph: ControlFlowGraph) !@This() {
+-                var result: @This() = .{
++            fn initUnindexed(builder: *Self, graph: ControlFlowGraph) !@This() {
++                const result: @This() = .{
+                     .builder = builder,
+                     .graph = graph,
+                     .active = try builder.gpa.alloc(bool, graph.index.blocks.len),
+                 };
+-                errdefer result.deinit();
+                 @memset(result.active, false);
+-                for (builder.reference_contents_writes.items, 0..) |write, index| {
+-                    if (!write.active) continue;
+-                    const entry = try result.writes.getOrPut(builder.gpa, .{ .root = write.root, .block = write.block });
+-                    if (!entry.found_existing) entry.value_ptr.* = .empty;
+-                    try entry.value_ptr.append(builder.gpa, index);
+-                }
+-                var groups = result.writes.valueIterator();
+-                while (groups.next()) |indices| std.sort.block(usize, indices.items, builder, writeLessThan);
+                 return result;
+             }
+ 
++            fn init(builder: *Self, graph: ControlFlowGraph) !@This() {
++                var result = try initUnindexed(builder, graph);
++                errdefer result.deinit();
++                var changed_roots = try result.updateWrites();
++                changed_roots.deinit(builder.gpa);
++                return result;
++            }
++
++            /// The CFG, cursors, and ordinary writes are frozen during cleanup
++            /// scheduling. Only replacement cleanup writes invalidate a root's
++            /// reaching-contents results; their origin heads remain symbolic.
++            fn updateWrites(self: *@This()) !std.AutoHashMapUnmanaged(semantic.UnresolvedBody.LocalId, void) {
++                var changed_roots: std.AutoHashMapUnmanaged(semantic.UnresolvedBody.LocalId, void) = .empty;
++                errdefer changed_roots.deinit(self.builder.gpa);
++                for (self.builder.reference_contents_writes.items, 0..) |write, index| {
++                    if (write.cleanup or index >= self.indexed_writes) try changed_roots.put(self.builder.gpa, write.root, {});
++                    if (index < self.indexed_writes or !write.active) continue;
++                    const entry = try self.writes.getOrPut(self.builder.gpa, .{ .root = write.root, .block = write.block });
++                    if (!entry.found_existing) entry.value_ptr.* = .empty;
++                    try entry.value_ptr.append(self.builder.gpa, index);
++                }
++                self.indexed_writes = self.builder.reference_contents_writes.items.len;
++                var groups = self.writes.iterator();
++                while (groups.next()) |entry| {
++                    if (changed_roots.contains(entry.key_ptr.root)) std.sort.block(usize, entry.value_ptr.items, self.builder, writeLessThan);
++                }
++                var index: usize = 0;
++                while (index < self.memo.count()) {
++                    if (changed_roots.contains(self.memo.keys()[index].root)) {
++                        self.memo.swapRemoveAt(index);
++                    } else index += 1;
++                }
++                return changed_roots;
++            }
++
+             fn deinit(self: *@This()) void {
+                 const allocator = self.builder.gpa;
+                 var groups = self.writes.valueIterator();
+@@ -15162,6 +15202,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
+                     var reverse = std.mem.reverseIterator(indices.items);
+                     while (reverse.next()) |index| {
+                         const write = builder.reference_contents_writes.items[index];
++                        if (!write.active) continue;
+                         if (write.end > cursor.end) continue;
+                         if (write.edge_ordinal != null and write.edge_ordinal != cursor.edge_ordinal) continue;
+                         if (write.end == cursor.end and cursor.write_limit != null and index >= cursor.write_limit.? and (!write.scheduled or !cursor.include_scheduled)) continue;
+@@ -16410,6 +16451,46 @@ const TestMeasureBody = struct {
+     }
+ };
+ 
++test "reaching contents follows replacement and retired cleanup writes" {
++    var context: TestMaterializerContext = .{ .gpa = std.testing.allocator };
++    defer context.deinit();
++    var builder = testInitMaterializerBuilder(&context);
++    const entry = try builder.newBlock(0, 0);
++    builder.enterBlock(entry);
++    builder.terminate(.return_unit);
++    const initial = try builder.addReferenceOrigin(null, .{ .parameter = 0 });
++    const replacement = try builder.addReferenceOrigin(null, .{ .parameter = 1 });
++    const other = try builder.addReferenceOrigin(null, .{ .parameter = 2 });
++    try builder.reference_contents_writes.append(builder.gpa, .{ .root = @fromBackingInt(0), .block = entry, .end = 0, .path = &.{}, .origins = initial });
++    try builder.reference_contents_writes.append(builder.gpa, .{ .root = @fromBackingInt(1), .block = entry, .end = 0, .path = &.{}, .origins = other });
++    var contents = try TestMaterializerBuilder.ReferenceContentsAnalysis.init(&builder, try builder.controlFlowGraph());
++    defer contents.deinit();
++    const first: TestMaterializerBuilder.ReferenceContentsCursor = .{ .root = @fromBackingInt(0), .block = entry, .end = 2, .initial = null };
++    const second: TestMaterializerBuilder.ReferenceContentsCursor = .{ .root = @fromBackingInt(1), .block = entry, .end = 2, .initial = null };
++    try builder.reference_contents_reads.append(builder.gpa, .{ .at = first, .path = &.{}, .origins = initial, .complete = true });
++    const deferred = try builder.addReferenceOrigin(null, .{ .contents = 0 });
++    const alias: TestMaterializerBuilder.ReferenceContentsCursor = .{ .root = @fromBackingInt(2), .block = entry, .end = 2, .initial = deferred };
++    try std.testing.expectEqual(initial, try contents.read(first));
++    try std.testing.expectEqual(other, try contents.read(second));
++    try std.testing.expectEqual(initial, try builder.completeReferenceOrigins(try contents.read(alias)));
++    try builder.reference_contents_writes.append(builder.gpa, .{ .root = first.root, .block = entry, .end = 1, .path = &.{}, .origins = replacement, .cleanup = true, .scheduled = true });
++    var changed = try contents.updateWrites();
++    changed.deinit(builder.gpa);
++    try std.testing.expectEqual(replacement, try contents.read(first));
++    try std.testing.expectEqual(other, try contents.read(second));
++    builder.reference_contents_reads.items[0].origins = try contents.read(first);
++    builder.resolved_reference_origins.clearRetainingCapacity();
++    try std.testing.expectEqual(replacement, try builder.completeReferenceOrigins(try contents.read(alias)));
++    builder.reference_contents_writes.items[2].active = false;
++    changed = try contents.updateWrites();
++    changed.deinit(builder.gpa);
++    try std.testing.expectEqual(initial, try contents.read(first));
++    try std.testing.expectEqual(other, try contents.read(second));
++    builder.reference_contents_reads.items[0].origins = try contents.read(first);
++    builder.resolved_reference_origins.clearRetainingCapacity();
++    try std.testing.expectEqual(initial, try builder.completeReferenceOrigins(try contents.read(alias)));
++}
++
+ test "expression value pages isolate branch results without allocating untouched slots" {
+     var context: TestMaterializerContext = .{ .gpa = std.testing.allocator };
+     defer context.deinit();
+diff --git i/src/queries.zig w/src/queries.zig
+index 9756f02..30ddb72 100644
+--- i/src/queries.zig
++++ w/src/queries.zig
+@@ -4729,29 +4729,76 @@ fn hasReferenceContractBody(ctx: anytype, instance: structures.InstanceId) !bool
+     return true;
+ }
+ 
+-fn trivialReferenceContractBody(ctx: anytype, instance: structures.InstanceId) anyerror!bool {
++pub const TrivialReferenceContractBody = CompilerQuery("TrivialReferenceContractBody", .type_facts, proveTrivialReferenceContractBody, .{});
++
++fn trivialReferenceContractBody(ctx: anytype, instance: structures.InstanceId) !bool {
++    const proof = (try scalarReferenceProof(ctx, instance)) orelse return false;
++    // Call-free proofs already live in the cached construction. Only a
++    // transitive proof needs another query boundary and callee dependencies.
++    if (proof.callee == null) return true;
++    return (ctx.get(TrivialReferenceContractBody, instance) catch |err| switch (err) {
++        error.QueryCycle => return false,
++        else => return err,
++    }).*;
++}
++
++fn proveTrivialReferenceContractBody(ctx: anytype, instance: structures.InstanceId) anyerror!bool {
++    const proof = (try scalarReferenceProof(ctx, instance)) orelse return false;
++    return if (proof.callee) |callee| trivialReferenceContractBody(ctx, callee) else true;
++}
++
++const ScalarReferenceProof = struct { callee: ?structures.InstanceId = null };
++
++fn scalarReferenceProof(ctx: anytype, instance: structures.InstanceId) !?ScalarReferenceProof {
+     const location = try ctx.lookupInterned(ItemLocations, instance.item);
+-    const signature = (try bodySignature(ctx, instance, location.*)) orelse return false;
+-    if (!signature.return_type.isPrimitive()) return false;
++    const signature = (try bodySignature(ctx, instance, location.*)) orelse return null;
++    if (!signature.return_type.isPrimitive()) return null;
+     for (signature.parameters) |parameter| {
+-        if (!parameter.type_id.isPrimitive()) return false;
+-        if (parameter.mode == .ref or parameter.mode == .mut or parameter.mode == .init) return false;
++        if (!parameter.type_id.isPrimitive()) return null;
++        if (parameter.mode == .ref or parameter.mode == .mut or parameter.mode == .init) return null;
+     }
+-    const construction = (try ctx.get(ConstructFunctionBody, instance)).* orelse return false;
+-    if (construction != .success) return false;
++    const construction = (try ctx.get(ConstructFunctionBody, instance)).* orelse return null;
++    if (construction != .success) return null;
+     // This proves the absence of reference/context effects without validating
+     // a context-free scalar callee's runtime typing at an otherwise lazy call.
+-    for (construction.success.expressions) |expression| {
++    const body = construction.success;
++    var callee: ?structures.InstanceId = null;
++    for (body.expressions) |expression| {
+         switch (expression.operation) {
+             .comparison, .conjunction, .disjunction, .negation, .numeric, .numeric_conversion, .overflow_context => {},
+             .integer_literal, .int_literal_value, .float_literal, .integer, .byte, .boolean, .type_value, .unit, .none => {},
+             .local_read, .local_transfer, .discard, .sequence, .if_else, .loop, .scope => {},
+-            .annotation => |annotation| if (!annotation.type_id.isPrimitive()) return false,
+-            .assignment => |assignment| if (assignment.fields.start != assignment.fields.end) return false,
+-            else => return false,
++            .annotation => |annotation| if (!annotation.type_id.isPrimitive()) return null,
++            .assignment => |assignment| if (assignment.fields.start != assignment.fields.end) return null,
++            .function_ref => {},
++            .call => |call| {
++                if (call.target != .direct or callee != null) return null;
++                callee = call.target.direct;
++            },
++            else => return null,
+         }
+     }
+-    return true;
++    const target = callee orelse return .{};
++    // Follow one unconditional call. A previous call could diverge before a
++    // later one; branches, short-circuit expressions, and early returns can
++    // likewise leave callees dormant.
++    if (body.blocks.len != 1) return null;
++    for (body.expressions) |expression| {
++        switch (expression.operation) {
++            .conjunction, .disjunction, .if_else, .loop, .scope => return null,
++            else => {},
++        }
++    }
++    const block = body.blocks[@backingInt(body.root_block)];
++    const statements = body.statements[block.statements.start..block.statements.end];
++    for (statements, 0..) |statement, index| {
++        switch (statement) {
++            .discard, .lifetime_extend, .bind_local => {},
++            .return_nothing, .return_value => if (index + 1 != statements.len or block.result != null) return null,
++            else => return null,
++        }
++    }
++    return .{ .callee = target };
+ }
+ 
+ pub const ReferenceCalleeList = struct {

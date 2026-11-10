@@ -119,6 +119,13 @@ for invalidation and restoration details.
 - Body work separates semantic construction, typing/SSA, reference/lifetime and
   cleanup, IR finalization, and setup/publication. Cache stages appear only when
   used. Percentages use the containing stage or work total, not total CLI time.
+- Detailed body rows attribute type-only inference, scalar/general call
+  preparation, call effects, origin expansion, reaching contents, pending reference
+  uses, service mutations, ownership metadata, lifetime planning, cleanup
+  stabilization/materialization, flow/effect validation, and contract publication.
+  Origin expansion, reaching contents, and type-only inference count cache misses.
+  All rows are exclusive: nested work is subtracted from its caller, and the
+  remaining typing and lifetime rows report only unattributed work.
 
 Profiling is disabled normally and adds overhead when enabled. Use uninstrumented
 benchmarks for acceptance measurements.

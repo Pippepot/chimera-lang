@@ -1,0 +1,6 @@
+case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable
+probe-core-100000,normal,cold,0,5006356298,17214892,2,true
+probe-core-100000,normal,cold,1,5089142068,17214892,2,true
+probe-core-100000,normal,leaf-edit,0,23286929,17214892,3,false
+probe-core-100000,normal,leaf-edit,1,22323547,17214892,3,false
+probe-core-100000,normal,leaf-edit,2,24457746,17214892,3,false

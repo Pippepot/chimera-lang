@@ -2,6 +2,166 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const SourceFixture = test_sources.SourceFixture;
 
+test "string value copies preserve independent literal and allocated storage" {
+    try SourceFixture.expectParity(
+        \\struct Message
+        \\    pub text: String
+        \\    copy = fieldwise
+        \\func copied_text() String
+        \\    var original = "hé"
+        \\    if not (original.append("\0😀") is unit) -> panic "append failed"
+        \\    var copied = original
+        \\    original.clear()
+        \\    return copied
+        \\func run() int
+        \\    const literal = "hello"
+        \\    var copied_literal = literal
+        \\    if not (copied_literal.append("!") is unit) -> return 90
+        \\    if literal <> "hello" or copied_literal <> "hello!" -> return 91
+        \\    var original = copied_text()
+        \\    const original_view = original.view()
+        \\    var copied = original
+        \\    if not (copied.append("!") is unit) -> return 92
+        \\    if original_view <> "hé\0😀" or copied <> "hé\0😀!" -> return 93
+        \\    const message = Message{text = original}
+        \\    var messages = [message, message]
+        \\    messages[0].text.clear()
+        \\    if message.text <> "hé\0😀" or messages[1].text <> "hé\0😀" -> return 94
+        \\    original = copied
+        \\    copied.clear()
+        \\    if original <> "hé\0😀!" -> return 95
+        \\    return 42
+    , 42);
+}
+
+test "string addition and compound assignment preserve operands and UTF-8 bytes" {
+    try SourceFixture.expectParity(
+        \\struct Message
+        \\    pub text: String
+        \\func run() int
+        \\    const left = "hé"
+        \\    const right = "\0😀"
+        \\    const combined = left + right
+        \\    if combined <> "hé\0😀" or left <> "hé" or right <> "\0😀" -> return 90
+        \\    if "a" + "b" + "c" <> "abc" -> return 91
+        \\    if "" + left <> left or left + "" <> left or "" + "" <> "" -> return 92
+        \\    const view: StringView = "!"
+        \\    if left + view <> "hé!" -> return 93
+        \\    const add: func(imm String, imm String) String = String.+
+        \\    if add(left, right) <> combined or String.+(left, right) <> combined -> return 94
+        \\    var text = left
+        \\    text += right
+        \\    text += text
+        \\    if text <> "hé\0😀hé\0😀" -> return 95
+        \\    var message = Message{text = "hello"}
+        \\    message.text += "!"
+        \\    var messages = ["a", "b"]
+        \\    messages[0] += messages[1]
+        \\    if message.text <> "hello!" or messages[0] <> "ab" or messages[1] <> "b" -> return 96
+        \\    const joined = left.concat(right)
+        \\    if not (joined is String) -> return 97
+        \\    if joined <> combined -> return 98
+        \\    return 42
+    , 42);
+}
+
+test "string copies and concatenation reserve and release independent allocations" {
+    try SourceFixture.expectParity(
+        \\import std.memory.{Allocator, AllocationLayout, RawBlock, root_allocator}
+        \\struct Tracker
+        \\    calls: int
+        \\    releases: int
+        \\    refuse: bool
+        \\    upstream: Allocator
+        \\    pub func allocate(mut self: Tracker, layout: AllocationLayout) RawBlock | AllocationError
+        \\        self.calls += 1
+        \\        if self.refuse -> return AllocationError.budget
+        \\        return self.upstream.allocate(layout)
+        \\    pub func deallocate(mut self: Tracker, deinit block: RawBlock)
+        \\        self.releases += 1
+        \\        self.upstream.deallocate(block^)
+        \\func exercise(ref tracker: Tracker) int
+        \\    with context.allocator = Allocator.from(Tracker, tracker)
+        \\        const literal = "ab"
+        \\        const literal_copy = literal
+        \\        if literal_copy <> "ab" or tracker.calls <> 0 -> return 90
+        \\        var original = literal
+        \\        if not (original.append("é") is unit) -> return 91
+        \\        var copied = original
+        \\        const combined = original + copied
+        \\        if tracker.calls <> 3 -> return 92
+        \\        copied.clear()
+        \\        if original <> "abé" or combined <> "abéabé" -> return 93
+        \\        tracker.refuse = true
+        \\        const failed = original.concat("!")
+        \\        if not (failed is AllocationError) -> return 94
+        \\        if failed.reason <> AllocationError.budget.reason -> return 95
+        \\        if original <> "abé" or combined <> "abéabé" or tracker.calls <> 4 -> return 96
+        \\        _ = original
+        \\        _ = copied
+        \\        _ = combined
+        \\    return 42
+        \\func run() int
+        \\    var tracker = Tracker{calls = 0, releases = 0, refuse = false, upstream = root_allocator()}
+        \\    const result = exercise(tracker)
+        \\    if result <> 42 -> return result
+        \\    if tracker.releases <> 3 -> return 97
+        \\    return 42
+    , 42);
+}
+
+test "string addition and copy reuse bundled std and recompute after edits" {
+    const source =
+        \\var text = "a"
+        \\var copied = text
+        \\copied += "b"
+        \\if text <> "a" -> exit(90)
+        \\const combined = text + copied
+        \\exit(combined.byte_length() + 39)
+    ;
+    const fixture = try SourceFixture.init(source);
+    defer fixture.deinit();
+    const loader = try test_sources.standard_bundle_loader.install(fixture.db, test_sources.standard_bundle);
+    try fixture.expectExit(0, 42);
+    try std.testing.expect(loader.stats().functions > 0);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "copied += \"b\"", "copied += \"é\"");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, changed);
+    try fixture.expectExit(0, 43);
+    try fixture.db.setInput(test_sources.queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+}
+
+test "implicit string copying and addition panic on allocator refusal" {
+    for ([_][]const u8{
+        "const copied = original\n        _ = copied",
+        "const combined = original + \"!\"\n        _ = combined",
+        "original += \"!\"",
+    }) |operation| {
+        const source = try test_sources.renderTemplate(std.testing.allocator,
+            \\import std.memory.{Allocator, AllocationLayout, RawBlock}
+            \\struct Refuser
+            \\    pub func allocate(imm self: Refuser, layout: AllocationLayout) RawBlock | AllocationError -> AllocationError.budget
+            \\    pub func deallocate(imm self: Refuser, deinit block: RawBlock) unit -> block.retire()
+            \\func run() int
+            \\    var original = "hello"
+            \\    if not (original.append("!") is unit) -> return 90
+            \\    var refuser = Refuser{}
+            \\    with context.allocator = Allocator.from(Refuser, refuser)
+            \\        $operation
+            \\    _ = original
+            \\    return 91
+        , .{ .operation = operation });
+        defer std.testing.allocator.free(source);
+        const native = try std.testing.allocator.print("{s}\nexit(run())", .{source});
+        defer std.testing.allocator.free(native);
+        try SourceFixture.expectSourceExit(native, 134);
+        const interpreted = try std.testing.allocator.print("{s}\nexit(comptime -> run())", .{source});
+        defer std.testing.allocator.free(interpreted);
+        try SourceFixture.expectAnySourceDiagnostic(interpreted, .compile_time_panic);
+    }
+}
+
 test "text search accepts owned strings views static strings and direct literals" {
     try SourceFixture.expectParity(
         \\static literal = "aé\0é!"
