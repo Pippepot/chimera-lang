@@ -83,13 +83,17 @@ user-defined contextual declarations remain outside this revision's scope.
 
 ## Deferred or independent
 
-- Fix the outstanding cold-compilation regression. Use the
-  [typing/lifetime attribution](benchmarks/README.md#recorded-typing-and-lifetime-attribution)
-  to investigate reference-origin expansion and repeated parallel analysis.
-  Preserve context/provider ownership, incremental typing reuse, and forwarding,
-  saved-result, later-write, loop-join, and cached-contract behavior. Qualify fixes
-  with fresh matched cold/leaf-edit measurements on unchanged 100,000-line and
-  million-line workloads, with zero and eight workers.
+- Fix the outstanding cold-compilation regression (about 1.5x serial after the
+  kept fixes). The
+  [attribution](benchmarks/README.md#cold-compilation-regression-attribution-2026-11-11)
+  traces it to owning containers (`Allocation`, `List`, `Box`, `String`) becoming
+  borrow-bearing through the allocator provider and storage cursor, plus
+  service-mutation application at calls. Prototype tracking ambient-context
+  retention as a cheap bit that is published only in contracts. Preserve
+  context/provider ownership, incremental typing reuse, and forwarding,
+  saved-result, later-write, loop-join, and cached-contract behavior. Qualify
+  fixes with fresh matched cold/leaf-edit measurements on unchanged 100,000-line
+  and million-line workloads, with zero and eight workers.
 - Expected-type shorthand for struct namespace members and omitted-type struct
   initializers; define member eligibility, syntax, and ambiguity beyond nominal cases.
 - Generator suspension/yield syntax only if ordinary cursor composition proves

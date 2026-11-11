@@ -417,15 +417,89 @@ is residual work, not an identified individual algorithm.
 
 Eight workers increased body-typing invocations from 38,600 to 57,983 and doubled
 type-only inference from 172,811 to 345,622. Parallel phase times are summed worker
-elapsed time, not wall time. Investigate reference-origin expansion and
-opportunities to reuse parallel callee-discovery analysis before assuming more
-cleanup-solver tuning will recover the regression.
+elapsed time, not wall time. The following section supersedes this pass's
+direction: it attributes the regression by controlled intervention.
 
 All profiled and timed programs passed the driver's expected-exit checks.
 Uninstrumented executable sizes remained 17,220,583 bytes for 100,000 lines and
 174,665,169 bytes for a million lines, matching the recorded candidate. Any future
 fix still needs fresh matched cold/leaf-edit measurements at both sizes and worker
 counts, while preserving context, provider ownership, and incremental reuse.
+
+### Cold-compilation regression attribution (2026-11-11)
+
+Method: paired snapshot builds of the old tree (`b153a16`, before shared context)
+and `HEAD` (`ddac9af`) through `history_benchmark` (`git archive`, `history.prepare`,
+`.history.build.zig`), plus the compiler's own `--debug=timing` rows, marginal cost
+per generated unit from two workload sizes, and measurement-only builds that switch
+one mechanism off. Those builds are unsound and were used only for attribution.
+Serial runs were pinned to one CPU; Unity ran on the machine, so A/B runs were
+interleaved. Earlier theories (optimizer/IR volume, leaf count, protocol envelope,
+cache invalidation) were refuted by these measurements and are not repeated here.
+
+Cold compilation, `core-1000000` workload:
+
+| Lines | Workers | `b153a16` | `HEAD` | `HEAD` + uncommitted fixes |
+| --- | --- | --- | --- | --- |
+| 100,000 | 0 | 1.66 s | 2.80 s | 2.46 s |
+| 100,000 | 8 | 0.42 s | 0.71 s | 0.54 s |
+| 1,000,000 | 0 | 16.9 s | 29.3 s | 24.7 s |
+
+The ratio is the same at 100,000 and 1,000,000 lines, so the regression is linear
+cost per function, not a scaling or cache failure. The README's 48 s figure for
+`HEAD` was not reproduced on this machine. Executable size grew from 10.2 MB to
+17.2 MB.
+
+Phase split on a 4,000-unit generated CLI-style workload, serial (ms; the
+workload is not checked in):
+
+| Phase | `b153a16` | `HEAD` |
+| --- | --- | --- |
+| Analysis (typing, lifetimes, cleanup) | 1,353 | 3,681 |
+| Optimization | 1,915 | 1,935 |
+| Codegen | 180 | 267 |
+| Other | 149 | 221 |
+
+Analysis is 93% of the gap; the optimizer is unchanged. Marginal analysis cost
+per unit was 349 us (old), 908 us (`HEAD`), and 716 us with the uncommitted fixes.
+
+**Cause.** `Allocation` used to hold no borrows. It now carries an `Allocator`
+provider (a callable payload) and a `StorageCursor`, so `Allocation`, `List`,
+`Box`, and `String` are borrow-bearing. The whole borrow pipeline therefore runs
+for every owning container at every exit path: origin expansion, reaching
+contents, cleanup candidates and scheduling, effect validation, and
+service-mutation application. Per-unit analysis splits roughly as:
+
+- About 63% (about 233 us): owning containers being borrow-bearing. Treating
+  `Allocation` as non-borrow-bearing lowers analysis from 716 to 483 us per unit
+  (17% of total wall time), origin expansions from 380k to 160k, and cleanup
+  candidates from 68k to 8. Removing only the provider or only the cursor gains
+  nothing; both must go.
+- About 16% (about 57 us): applying provider-callback service mutations at calls.
+- About 21%: general typing and call preparation of views, strings, lists, and
+  arrays (a plain `Array` shows about +10 us).
+
+Codegen grew about 26 us per unit (thread-state setup in context-using functions
+and larger value copies); the two contributions are not isolated.
+
+Interventions that gave 2.5% or less: trivial `Allocator` ownership, collapsing
+contextual source paths, memoizing origin merges, and not inlining `deallocate`.
+
+**Kept fixes (uncommitted).** A fold hasher for reference-origin sets, a memo of
+the pure origin transformations, a memo of nonowning callable origins, and
+skipping the callee-discovery prefetch for bodies that conservative typing cannot
+accept (it typed each of them an extra time with workers). They are sound and pass
+the suite, and recover about 13% serial and 24% with eight workers.
+
+**Not yet established.** No sound version of the 63% fix exists. The candidate is
+to track retention of the ambient context as a cheap per-value bit and publish
+contextual origins only in contracts, so owning containers do not engage the full
+pipeline. Qualify it against the `Allocation`-not-borrow-bearing upper bound
+above, then the service-mutation cost. Soundness is gated by the shared-context,
+list, and sort tests, some of which mutate std source text. Later options: a
+single-handle `Allocator`, and a reserved context register to remove thread-state
+setup. Qualify each with matched cold and leaf-edit runs at both sizes and both
+worker counts.
 
 ## Focused Drivers
 

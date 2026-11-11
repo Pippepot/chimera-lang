@@ -1198,6 +1198,8 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         variant_coercion_tags: std.ArrayList(u32) = .empty,
         borrow_fields: std.ArrayList(structures.BorrowProjection) = .empty,
         reference_storage: origin_storage.Store(ReferenceOrigin, ReferenceProjection, ReferenceTransform) = .{ .maximum = max_reference_origins },
+        nonowning_memo: std.HashMapUnmanaged(NonowningMemoKey, ?[]const CallableStorageOrigin, NonowningMemoContext, 80) = .empty,
+        transform_memo: std.HashMapUnmanaged(TransformMemoKey, ?u32, origin_storage.FoldHashContext(TransformMemoKey), 80) = .empty,
         flow: ?*FlowData = null,
         flow_parent: ?*Self = null,
         flow_captures: []const Value = &.{},
@@ -7436,7 +7438,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (try self.analysis_context.facts().callable(source.type_id) == null) return false;
                 if (source.nonowning_callable) return true;
             }
-            const origins = (try nonowningCallableOrigins(self.gpa, self.analysis_context, CallableBuildGraph{ .builder = self }, &.{.{ .value = source.id, .fields = fields }})) orelse return false;
+            const origins = (try self.nonowningCallableStorageOrigins(source.id, fields)) orelse return false;
             return origins.len == 0;
         }
 
@@ -7457,7 +7459,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         fn conditionalOwningOrigins(self: *Self, origins: ?u32, source: Value, fields: []const u32) !?u32 {
             if (fields.len == 0 and @backingInt(source.id) < self.unresolved.parameter_count)
                 return self.transformReferenceOrigins(origins, .{ .owning_callable = .{ .parameter = @intCast(@backingInt(source.id)) } });
-            const dependencies = (try nonowningCallableOrigins(self.gpa, self.analysis_context, CallableBuildGraph{ .builder = self }, &.{.{ .value = source.id, .fields = fields }})) orelse return origins;
+            const dependencies = (try self.nonowningCallableStorageOrigins(source.id, fields)) orelse return origins;
             var result: ?u32 = null;
             for (dependencies) |dependency| {
                 var owning: OwningCallableSource = .{ .parameter = dependency.parameter };
@@ -10927,7 +10929,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         /// Guards are combined locally before nodes enter the immutable store.
-        const ReferenceOriginSet = std.AutoArrayHashMapUnmanaged(ReferenceOrigin, ?u32);
+        const ReferenceOriginSet = std.ArrayHashMapUnmanaged(ReferenceOrigin, ?u32, origin_storage.FoldContext(ReferenceOrigin), true);
 
         fn addResultOrigin(self: *Self, set: *ReferenceOriginSet, origin: ReferenceOrigin) !void {
             var key = origin;
@@ -11636,7 +11638,58 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             };
         }
 
-        fn transformReferenceOrigins(self: *Self, origins: ?u32, operation: @FieldType(ReferenceTransform, "operation")) !?u32 {
+        const ReferenceTransformOperation = @FieldType(ReferenceTransform, "operation");
+        /// A callable's storage form is fixed once the instructions and branches it reads are built.
+        const NonowningMemoKey = struct { value: structures.FunctionValueId, instructions: u32, branch_arguments: u32, fields: []const u32 };
+        const NonowningMemoContext = struct {
+            pub fn hash(_: @This(), key: NonowningMemoKey) u64 {
+                var hasher: origin_storage.FoldHasher = .{};
+                std.hash.autoHash(&hasher, key.value);
+                std.hash.autoHash(&hasher, key.instructions);
+                std.hash.autoHash(&hasher, key.branch_arguments);
+                for (key.fields) |field| std.hash.autoHash(&hasher, field);
+                return hasher.final();
+            }
+
+            pub fn eql(_: @This(), left: NonowningMemoKey, right: NonowningMemoKey) bool {
+                return left.value == right.value and left.instructions == right.instructions and left.branch_arguments == right.branch_arguments and std.mem.eql(u32, left.fields, right.fields);
+            }
+        };
+
+        fn nonowningCallableStorageOrigins(self: *Self, source: structures.FunctionValueId, fields: []const u32) !?[]const CallableStorageOrigin {
+            const key: NonowningMemoKey = .{ .value = source, .instructions = self.instruction_count, .branch_arguments = @intCast(self.branch_arguments.items.len), .fields = fields };
+            if (self.nonowning_memo.get(key)) |cached| return cached;
+            const origins = try nonowningCallableOrigins(self.gpa, self.analysis_context, CallableBuildGraph{ .builder = self }, &.{.{ .value = source, .fields = fields }});
+            var stored = key;
+            stored.fields = try self.gpa.dupe(u32, fields);
+            try self.nonowning_memo.put(self.gpa, stored, origins);
+            return origins;
+        }
+
+        const TransformMemoKey = struct { origins: u32, operation: ReferenceTransformOperation };
+
+        /// Operations whose result depends only on the origin set, the operation, and append-only
+        /// storage. State-dependent operations and `prefix(.backing)`, which records the current
+        /// instruction, are recomputed.
+        fn memoizedTransform(operation: ReferenceTransformOperation) bool {
+            return switch (operation) {
+                .select, .exclude, .source_path, .readonly, .retain, .flow_alias => true,
+                .prefix => |step| step != .backing,
+                else => false,
+            };
+        }
+
+        fn transformReferenceOrigins(self: *Self, origins: ?u32, operation: ReferenceTransformOperation) anyerror!?u32 {
+            const head = origins orelse return null;
+            if (!memoizedTransform(operation)) return self.transformReferenceOriginsUncached(origins, operation);
+            const key: TransformMemoKey = .{ .origins = head, .operation = operation };
+            if (self.transform_memo.get(key)) |cached| return cached;
+            const result = try self.transformReferenceOriginsUncached(origins, operation);
+            try self.transform_memo.put(self.gpa, key, result);
+            return result;
+        }
+
+        fn transformReferenceOriginsUncached(self: *Self, origins: ?u32, operation: ReferenceTransformOperation) !?u32 {
             std.debug.assert(operation != .read);
             if (origins == null) return null;
             if (operation == .refresh_written) {
@@ -11805,7 +11858,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
         }
 
         const OriginList = struct {
-            origins: *const std.AutoArrayHashMapUnmanaged(ReferenceOrigin, void),
+            origins: *const @FieldType(@FieldType(Self, "reference_storage"), "origins"),
             current: ?u32,
 
             fn next(self: *OriginList) ?ReferenceOrigin {

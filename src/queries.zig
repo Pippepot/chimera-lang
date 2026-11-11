@@ -4979,7 +4979,11 @@ fn analyzeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerr
 
 /// Typing without the reference fixed point is reusable whenever it succeeds.
 fn reusableTyping(ctx: anytype, instance: structures.InstanceId) !?FunctionTyping {
-    if (ctx.hasParallelWorkers()) try prefetchReferenceCallees(ctx, instance);
+    // Discovery types the body once more; skip it when conservative typing cannot apply.
+    if (ctx.hasParallelWorkers() and (typingEligible(ctx, instance) catch |err| switch (err) {
+        error.QueryCycle, error.Unavailable, error.SourceRejected => false,
+        else => return err,
+    })) try prefetchReferenceCallees(ctx, instance);
     const typed = ctx.get(TypeFunctionInstance, instance) catch |err| switch (err) {
         error.QueryCycle, error.Unavailable, error.SourceRejected => return null,
         else => return err,
@@ -5181,20 +5185,14 @@ const FunctionTyping = struct {
     pub const eql = value_operations.Owned(@This()).eql;
 };
 
-fn typeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?FunctionTyping {
-    const loc = try ctx.lookupInterned(ItemLocations, instance.item);
-    if (loc.adapter) |adapter| return .{ .body = (try callableAdapterBody(ctx, instance, loc.owner.?, adapter)) orelse return null, .precise = true };
-    const signature = (try bodySignature(ctx, instance, loc.*)) orelse return null;
+/// Conservative typing applies only to bodies whose owned values never need drops.
+fn typingCandidate(ctx: anytype, instance: structures.InstanceId, signature: structures.FunctionSignature) !?semantic.UnresolvedBody {
     const facts = TypeFacts(@TypeOf(ctx)){ .ctx = ctx };
     if (signature.return_type == .type) return null;
     for (signature.parameters) |parameter| {
         if (parameter.mode == .imm or parameter.mode == .ref or parameter.mode == .mut) continue;
         if (!try isDropFree(facts, parameter.type_id)) return null;
     }
-    const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
-    const builtin_body = try typedBuiltinBody(ctx, instance.item, loc.*);
-    var diagnostic = false;
-    const probe: ReferenceProbeContext(@TypeOf(ctx)) = .{ .ctx = ctx, .diagnostic = &diagnostic };
     const construction = (try ctx.get(ConstructFunctionBody, instance)).* orelse return null;
     if (construction != .success) return null;
     const unresolved = construction.success;
@@ -5214,6 +5212,26 @@ fn typeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!
         };
         if (!try isDropFree(facts, type_id)) return null;
     }
+    return unresolved;
+}
+
+/// Whether conservative typing can apply, decided without typing the body.
+fn typingEligible(ctx: anytype, instance: structures.InstanceId) !bool {
+    const loc = try ctx.lookupInterned(ItemLocations, instance.item);
+    if (loc.adapter != null) return true;
+    const signature = (try bodySignature(ctx, instance, loc.*)) orelse return false;
+    return (try typingCandidate(ctx, instance, signature)) != null;
+}
+
+fn typeFunctionInstance(ctx: anytype, instance: structures.InstanceId) anyerror!?FunctionTyping {
+    const loc = try ctx.lookupInterned(ItemLocations, instance.item);
+    if (loc.adapter) |adapter| return .{ .body = (try callableAdapterBody(ctx, instance, loc.owner.?, adapter)) orelse return null, .precise = true };
+    const signature = (try bodySignature(ctx, instance, loc.*)) orelse return null;
+    const unresolved = (try typingCandidate(ctx, instance, signature)) orelse return null;
+    const resolved = (try ctx.get(ResolveItem, instance.item)).* orelse return null;
+    const builtin_body = try typedBuiltinBody(ctx, instance.item, loc.*);
+    var diagnostic = false;
+    const probe: ReferenceProbeContext(@TypeOf(ctx)) = .{ .ctx = ctx, .diagnostic = &diagnostic };
     var precise = true;
     const analysis_context: AnalysisContext(@TypeOf(probe)) = .{
         .ctx = probe,

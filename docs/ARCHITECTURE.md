@@ -92,7 +92,7 @@ Recursive or unavailable body probes publish no reusable body rather than
 a failed query, so successful precise fallbacks remain eligible for persistence.
 With parallel workers, `ProbeReferenceCallees` discovers visited contract
 callees through diagnostic-isolated reference inference before body typing
-waits on their effects. Their contracts are prefetched concurrently; only
+waits on their effects. Bodies that conservative typing cannot accept (owned values needing drops) skip this discovery, since it would type them an extra time. Their contracts are prefetched concurrently; only
 ordinary demands observe their results and diagnostics. The provisional
 discovery analysis is never reused as a validated body, and prefetch hints do
 not force revalidation of existing queries after an edit.
