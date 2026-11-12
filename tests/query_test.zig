@@ -9876,6 +9876,38 @@ test "scalar contract proofs leave conditional and early-return callees dormant"
     }
 }
 
+test "ambient allocation keeps contracts without speculative contents scheduling" {
+    const source =
+        \\func warm(value: int) int
+        \\    var values: List(int) = [value]
+        \\    return values[0]
+        \\func selected(value: int) int
+        \\    var values: List(int) = [value]
+        \\    return values[0]
+        \\exit(selected(42))
+    ;
+    var profile: test_sources.profiling.Collector = .{ .io = testing.io };
+    const db = try Database.init(testing.allocator, .{ .worker_count = 0, .profile = &profile });
+    defer db.deinit();
+    try test_sources.modules.registerSources(db, testing.allocator, source, &.{}, &.{});
+    const scope = (try db.get(queries.BuildModuleScope, 0)).*.?;
+    const warm: structures.InstanceId = .{ .item = scope.resolve("warm").? };
+    const selected: structures.InstanceId = .{ .item = scope.resolve("selected").? };
+    try testing.expect((try db.get(queries.AnalyzeFunctionInstance, warm)).* != null);
+    const before = profile.snapshot();
+    const body = (try db.get(queries.AnalyzeFunctionInstance, selected)).*.?;
+    const measured = profile.snapshot().since(before);
+    try testing.expectEqual(@as(usize, 0), measured.get(.cleanup_output_candidates).runs);
+    try testing.expectEqual(@as(usize, 0), measured.get(.cleanup_output_scheduling).runs);
+    try testing.expect(body.reference_contract.context_effects.reads & structures.ContextEffects.bit(.allocator) != 0);
+    try testing.expect(body.reference_contract.service_mutations.len != 0);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 42);
+    const edited = try std.mem.replaceOwned(u8, testing.allocator, source, "exit(selected(42))", "exit(selected(43))");
+    defer testing.allocator.free(edited);
+    try db.setInput(queries.SourceText, 0, edited);
+    try test_sources.expectProgramExit((try db.get(queries.BuildExecutable, 0)).*.?.bytes, 43);
+}
+
 test "cleanup scalar writes retain effects without contents scheduling across edits" {
     const original =
         \\struct Tracker

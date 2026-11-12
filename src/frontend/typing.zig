@@ -6747,6 +6747,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 if (try self.isNonowningCallable(source)) break :outputs;
                 const actions = try self.cleanupActions(source.type_id, if (whole) generation.cleanup_selections else &.{}, if (whole) generation.missing_fields else &.{}, whole and generation.cleanup_fields);
                 if (!(try self.cleanupEffects(actions)).mayWriteContents()) break :outputs;
+                if (!try self.cleanupMayWriteContents(source, actions)) break :outputs;
                 self.has_cleanup_outputs = true;
                 const block_id = self.current_block orelse break :outputs;
                 var incomplete = false;
@@ -6760,6 +6761,41 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 try self.collectCleanupReferenceEffects(candidate, .{ .block = block_id, .end = end, .contexts = try self.contextSnapshot() }, actions, .candidates, &effects);
             }
             try self.captureCleanupOrigins(source);
+        }
+
+        fn cleanupMayWriteContents(self: *Self, source: Value, actions: *const cleanup_actions.Actions) anyerror!bool {
+            const summary = try self.cleanupEffects(actions);
+            if (summary.contents) return true;
+            if (!summary.service_mutations) return false;
+            switch (actions.operation) {
+                .none, .explicit => return false,
+                .hook => return self.cleanupHookMayWriteContents(source, actions.type_id),
+                .array => |array| return array.length != 0 and try self.cleanupMayWriteContents(try self.selectedPart(source, array.element.type_id, .element), array.element),
+                .parts => |parts| {
+                    for (parts) |part| if (try self.cleanupMayWriteContents(try self.selectedPart(source, part.actions.type_id, part.step), part.actions)) return true;
+                    return false;
+                },
+            }
+        }
+
+        fn cleanupHookMayWriteContents(self: *Self, source: Value, type_id: structures.TypeId) !bool {
+            const contract = try cleanup_actions.Actions.hookContract(self.analysis_context, type_id);
+            for (contract.service_mutations) |mutation| {
+                if (mutation.target != .receiver) return true;
+                const receiver = mutation.target.receiver;
+                if (receiver.parameter != 0 or receiver.contextual != null or receiver.kind != .contents) return true;
+                const argument: CallOriginSource = .{ .type_id = source.type_id, .contained = source.reference_origins };
+                const substituted = try self.substituteReferenceOrigin(contract, receiver, &.{argument});
+                var incomplete = false;
+                const resolved = try self.resolveReferenceOrigins(substituted, &incomplete);
+                if (incomplete) return true;
+                var origins = self.originList(resolved);
+                while (origins.next()) |origin| {
+                    if (origin.flow_only) continue;
+                    if (origin.contextual == null or origin.service_invocation != null) return true;
+                }
+            }
+            return false;
         }
 
         fn captureCleanupOrigins(self: *Self, source: Value) !void {
@@ -11081,9 +11117,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
             for (contract.service_mutations) |published| {
                 const mutation = try self.substituteServiceMutation(contract, published, sources);
                 if (mutation.target == .receiver and mutation.target.receiver == null) continue;
-                if (self.cleanup_contents_site == null and mode == null) {
-                    try self.deferServiceMutation(mutation, span);
-                } else try pending.append(self.gpa, mutation);
+                try pending.append(self.gpa, mutation);
             }
             try self.expandServiceMutationOutputs(&pending, effects, opaque_writes, span, mode);
         }

@@ -591,6 +591,14 @@ reference-bearing contents, deferred service mutations, and context effects.
 Checks and scalar writes are validated during final effect collection without
 making reference contents provisional. Unknown service payloads remain possible
 contents writers until substitution determines their actual effects.
+Scheduling refines this summary against each cleanup value. A fully resolved,
+abstract ambient receiver keeps its published service mutation but cannot write
+body-local contents until a caller installs a concrete receiver. It therefore
+does not make the body's contents provisional. Known provider invocations,
+parameter/local receivers, incomplete origins, and context selected by the hook
+itself retain conservative scheduling. Ordinary service mutations expand at
+their call site when their receivers are complete; incomplete receivers retain
+their invocation-site context snapshots for deferred expansion.
 Output-bearing cleanup
 first retains prospective referents for lifetime planning, then substitutes hook
 outputs at the scheduled boundaries and CFG edges. Fresh carrier reads resolve

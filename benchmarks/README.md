@@ -439,7 +439,7 @@ cache invalidation) were refuted by these measurements and are not repeated here
 
 Cold compilation, `core-1000000` workload:
 
-| Lines | Workers | `b153a16` | `HEAD` | `HEAD` + uncommitted fixes |
+| Lines | Workers | `b153a16` | `HEAD` | After kept fixes (`a24f955`) |
 | --- | --- | --- | --- | --- |
 | 100,000 | 0 | 1.66 s | 2.80 s | 2.46 s |
 | 100,000 | 8 | 0.42 s | 0.71 s | 0.54 s |
@@ -461,7 +461,7 @@ workload is not checked in):
 | Other | 149 | 221 |
 
 Analysis is 93% of the gap; the optimizer is unchanged. Marginal analysis cost
-per unit was 349 us (old), 908 us (`HEAD`), and 716 us with the uncommitted fixes.
+per unit was 349 us (old), 908 us (`HEAD`), and 716 us after the kept fixes.
 
 **Cause.** `Allocation` used to hold no borrows. It now carries an `Allocator`
 provider (a callable payload) and a `StorageCursor`, so `Allocation`, `List`,
@@ -485,21 +485,100 @@ and larger value copies); the two contributions are not isolated.
 Interventions that gave 2.5% or less: trivial `Allocator` ownership, collapsing
 contextual source paths, memoizing origin merges, and not inlining `deallocate`.
 
-**Kept fixes (uncommitted).** A fold hasher for reference-origin sets, a memo of
+**Kept fixes (`a24f955`).** A fold hasher for reference-origin sets, a memo of
 the pure origin transformations, a memo of nonowning callable origins, and
 skipping the callee-discovery prefetch for bodies that conservative typing cannot
 accept (it typed each of them an extra time with workers). They are sound and pass
 the suite, and recover about 13% serial and 24% with eight workers.
 
-**Not yet established.** No sound version of the 63% fix exists. The candidate is
-to track retention of the ambient context as a cheap per-value bit and publish
-contextual origins only in contracts, so owning containers do not engage the full
-pipeline. Qualify it against the `Allocation`-not-borrow-bearing upper bound
-above, then the service-mutation cost. Soundness is gated by the shared-context,
-list, and sort tests, some of which mutate std source text. Later options: a
-single-handle `Allocator`, and a reserved context register to remove thread-state
-setup. Qualify each with matched cold and leaf-edit runs at both sizes and both
-worker counts.
+**Remaining attribution.** The percentages above describe the earlier source
+state and overlap with the scheduling work removed below; they are not additive
+estimates for another optimization. Treating owning containers as non-borrow-bearing
+remains unsound. A compact provenance representation must preserve result/source
+paths, provider retention, physical aliases, captured authority, invocation
+identity, and temporal snapshots; a whole-value ambient-context bit is not enough.
+Further work must attribute the remaining typing and call-preparation costs
+before selecting a rewrite. Later options include a single-handle `Allocator`
+and removing thread-state setup. Qualify each with matched cold and leaf-edit
+runs at both sizes and both worker counts.
+
+### Demand-sensitive cleanup scheduling (2026-11-12)
+
+The implementation adds two complementary refinements to `a24f955`:
+
+- Ordinary service mutations expand immediately when their receivers are
+  complete. The existing expansion path still defers incomplete receivers and
+  preserves invocation-site context snapshots.
+- Cleanup scheduling substitutes each actual receiver before making the body's
+  reference contents provisional. Fully resolved abstract ambient receivers keep
+  their published mutations without scheduling body-local contents writes.
+  Concrete providers, local/parameter receivers, incomplete origins, initializers,
+  direct contents writes, and context selected by the hook remain conservative.
+
+Immediate service expansion alone did not demonstrate a meaningful improvement.
+Both refinements are needed. Neither removes provider or storage borrows.
+
+A qualified snapshot of this implementation used Zig 0.17, fast/LLVM, bundled std,
+no disk cache, fixed seed 0, one warm-up, and five cold/leaf-edit samples per run.
+Serial runs were pinned to CPU 4; eight-worker runs used CPUs 0-7. The unchanged
+history driver executed and checked every generated program.
+
+Representative uninstrumented cold medians:
+
+| Lines | Workers | `a24f955` (s) | Demand-sensitive scheduling (s) | Both sample sets stable |
+| --- | --- | --- | --- | --- |
+| 100,000 | 0 | 2.460 | 2.158 | Yes |
+| 100,000 | 8 | 0.550 | 0.512 | No |
+| 1,000,000 | 0 | 24.887 | 21.876 | Yes |
+| 1,000,000 | 8 | 5.184 | 4.827 | Yes |
+
+Repeated rounds gave roughly 9-12% less serial cold time and 5-7% less with eight
+workers; some additional rounds did not satisfy the 2% stability rule. Executable
+sizes remained 17,220,583 and 174,665,169 bytes. The 100,000-line cold profile reduced
+origin expansions from 180,377 to 79,821, contents queries from 96,801 to 41,
+cleanup candidates from 32,304 to 35, and cleanup scheduling from 13,278 to 6.
+The routine safe suite passed 2,682 tests with 24 skips. A profiling regression
+test checks that allocator reads and service-mutation contracts survive without
+speculative scheduling, including execution after a source edit.
+
+This is a partial recovery, not restoration of the historical 16.9-second
+million-line baseline. Incremental timings were variable and included slower
+candidate rounds; neither incremental speedup nor absence of slowdown is
+established. Remaining work includes finer attribution and a sound provenance/
+call-preparation design, not bypassing borrow validation.
+
+### Shared provenance-expression prototype (2026-11-12)
+
+A follow-up prototype represented pure unions and transformations as shared
+expressions, separated semantic origins from list links, cached materialization,
+and added a lifetime-specific existence query. Known contracts avoided constructing
+opaque fallback return provenance. Published contracts and argument evaluation
+order were unchanged; most consumers still required concrete origin sets.
+
+Fresh comparisons against the two-part scheduling fix used the same five-sample,
+uninstrumented protocol above. All generated executables passed output checks and
+had unchanged sizes.
+
+| Lines | Workers | Scheduling fix (s) | Expression prototype (s) | Both sample sets stable |
+| --- | --- | --- | --- | --- |
+| 100,000 | 0 | 2.151 | 2.249 | Yes |
+| 100,000 | 8 | 0.519 | 0.524 | No |
+| 1,000,000 | 0 | 21.619 | 22.775 | Yes |
+| 1,000,000 | 8 | 4.863 | 4.917 | Yes |
+
+The million-line serial median regressed by 1.156 s (5.35%); the eight-worker
+median increased by 0.054 s (1.11%). All paired leaf-edit samples were unstable,
+so no incremental improvement is established. The prototype passed 2,683 tests
+with 24 skips, plus formatting and whitespace checks.
+
+Relative to the scheduling fix, the source patch added 268 lines and deleted 234:
+net +34 physical lines, comprising +2 compiler lines and a 32-line behavioral
+test. Excluding blank and comment-only lines, compiler code grew by 12 lines.
+
+The prototype was not retained. Sharing expressions did not eliminate enough
+consumer-side work to offset its overhead; this is not evidence that a larger
+consumer rewrite would recover the remaining regression. Further designs must
+demonstrate reduced end-to-end time, not just fewer origin-expansion invocations.
 
 ## Focused Drivers
 

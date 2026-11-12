@@ -83,13 +83,20 @@ user-defined contextual declarations remain outside this revision's scope.
 
 ## Deferred or independent
 
-- Fix the outstanding cold-compilation regression (about 1.5x serial after the
-  kept fixes). The
+- Fix the remaining cold-compilation regression (roughly 1.3x serial against the
+  historical baseline after
+  [demand-sensitive cleanup scheduling](benchmarks/README.md#demand-sensitive-cleanup-scheduling-2026-11-12)).
+  The
   [attribution](benchmarks/README.md#cold-compilation-regression-attribution-2026-11-11)
   traces it to owning containers (`Allocation`, `List`, `Box`, `String`) becoming
   borrow-bearing through the allocator provider and storage cursor, plus
-  service-mutation application at calls. Prototype tracking ambient-context
-  retention as a cheap bit that is published only in contracts. Preserve
+  service-mutation application at calls. Further attribution and architectural
+  work must cover typing and call preparation as well as provenance. A compact
+  representation must keep provider retention, physical aliases, captured
+  references, field/result paths, and invocation-time snapshots independent;
+  a whole-value ambient-context bit is insufficient. Prefer retaining the
+  published reference-contract/query boundary while investigating body-local
+  provenance and contract-driven argument preparation. Preserve
   context/provider ownership, incremental typing reuse, and forwarding,
   saved-result, later-write, loop-join, and cached-contract behavior. Qualify
   fixes with fresh matched cold/leaf-edit measurements on unchanged 100,000-line
