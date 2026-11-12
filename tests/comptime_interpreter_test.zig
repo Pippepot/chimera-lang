@@ -26,6 +26,11 @@ test "evaluation heap empty oversized and zero sized allocations preserve native
         \\    const empty_capacity = empty.capacity()
         \\    deallocate(Array(int, 536870912), empty^)
         \\    if empty_capacity <> 0 -> return 90
+        \\    const negative = allocate(int, -1)
+        \\    if negative is Allocation(int)
+        \\        deallocate(int, negative^)
+        \\        return 95
+        \\    if negative.reason <> AllocationError.invalid_layout.reason -> return 96
         \\    match allocate(Array(int, 536870912), 1)
         \\        oversized and oversized is Allocation(Array(int, 536870912)) ->
         \\            deallocate(Array(int, 536870912), oversized^)
@@ -53,9 +58,6 @@ test "evaluation heap empty oversized and zero sized allocations preserve native
         \\        _ -> ()
         \\    return 97
     , 42);
-    try std.testing.expectEqual(@as(?u32, 0), interpreter.allocationByteSize(std.math.maxInt(u32), 0));
-    try std.testing.expectEqual(@as(?u32, null), interpreter.allocationByteSize(1, -1));
-    try std.testing.expectEqual(@as(?u32, null), interpreter.allocationByteSize(std.math.maxInt(u32), 1));
 }
 
 test "evaluation heap immovable partial failure reverse destruction and extraction use typed cleanup" {

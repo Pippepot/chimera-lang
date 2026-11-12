@@ -21,7 +21,7 @@ struct DriftRun
 func natural_order(static T: type, imm left: T, imm right: T) bool -> left < right
 
 func sort_span(static T: type, static Order: type, mut source: Span(T), imm before: Order) unit
-    if try_sort_span(T, Order, source, before) is AllocationError -> panic "sort scratch allocation failed"
+    try_sort_span(T, Order, source, before) catch -> panic "sort scratch allocation failed"
 
 func try_sort_span(static T: type, static Order: type, mut source: Span(T), imm before: Order) unit | AllocationError
     const length = source.len()
@@ -41,8 +41,7 @@ func try_sort_span(static T: type, static Order: type, mut source: Span(T), imm 
         return unit
 
     const scratch_provider = root_allocator()
-    var order_storage = allocate_with(int, scratch_provider, length)
-    if order_storage is AllocationError -> return order_storage^
+    var order_storage = allocate_with(int, scratch_provider, length)?
     var scratch_storage = allocate_with(int, scratch_provider, length)
     if scratch_storage is AllocationError
         deallocate(int, order_storage^)
@@ -69,8 +68,7 @@ func insertion_sort_slots(static T: type, static Order: type, mut source: Span(T
             current -= 1
 
 func sorted_span(static T: type, static Order: type, ref source: Span(T), imm before: Order) List(T) | AllocationError
-    var result = List(T).new(source.len())
-    if result is AllocationError -> return result^
+    var result = List(T).new(source.len())?
     for const item in source
         append_collection_moved(T, result, item^)
     var view = result.span()

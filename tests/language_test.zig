@@ -1773,34 +1773,30 @@ test "embedded memory source is registered in the std.memory module" {
     defer f.deinit();
     const module = try f.db.intern(queries.ModulePaths, .{ .path = "std.memory" });
     const declarations = (try f.db.get(queries.ModuleDeclarations, module)).*.?;
-    try testing.expect(!declarations.resolveEntry("allocate_host_storage").?.is_public);
+    try testing.expect(!declarations.resolveEntry("cursor_aligned").?.is_public);
+    try testing.expect(declarations.resolveEntry("allocate_raw").?.is_public);
     try f.expectExit(0, 42);
 }
 
-test "host storage externs allocate and release bytes and report invalid sizes" {
-    const f = try Fixture.initFiles(
-        \\import std.memory.{check_storage}
-        \\if check_storage(1) is unit -> if check_storage(4097) is unit -> if check_storage(0) is unit -> if check_storage(-1) is unit -> exit(1) else exit(42) else exit(2) else exit(3) else exit(4)
-    , &.{});
-    defer f.deinit();
-    const memory_module = try f.db.intern(queries.ModulePaths, .{ .path = "std.memory" });
-    const memory_file = (try f.db.get(queries.ModuleDeclarations, memory_module)).*.?.resolveStatic("HostStorage").?;
-    const resolved = (try f.db.get(queries.ResolveItem, memory_file)).*.?;
-    try f.db.setInput(queries.SourceText, resolved.file_id,
-        \\struct HostStorage
-        \\  address_low: int
-        \\  address_high: int
-        \\  byte_size: int
-        \\  drop = explicit
-        \\extern func allocate_host_storage(byte_size: int) HostStorage | none
-        \\extern func deallocate_host_storage(deinit storage: HostStorage)
-        \\pub func check_storage(byte_size: int) unit | none
-        \\  const storage = allocate_host_storage(byte_size)
-        \\  if not (storage is HostStorage) -> return none
-        \\  deallocate_host_storage(storage^)
-        \\  return ()
-    );
-    try f.expectExit(0, 42);
+test "raw storage externs allocate and release bytes and report invalid sizes" {
+    try Fixture.expectParity(
+        \\import std.memory.{AllocationLayout, RawBlock, AllocationError, allocate_raw, deallocate_raw}
+        \\func check_storage(byte_size: int) unit | AllocationError
+        \\    const storage = allocate_raw(AllocationLayout{byte_size = byte_size, alignment = 1})?
+        \\    if storage.size() <> byte_size
+        \\        deallocate_raw(storage^)
+        \\        return AllocationError.invalid_layout
+        \\    deallocate_raw(storage^)
+        \\    return unit
+        \\func run() int
+        \\    if not (check_storage(1) is unit) -> return 90
+        \\    if not (check_storage(4097) is unit) -> return 91
+        \\    if not (check_storage(0) is unit) -> return 92
+        \\    const invalid = check_storage(-1)
+        \\    if not (invalid is AllocationError) -> return 93
+        \\    if invalid.reason <> AllocationError.invalid_layout.reason -> return 94
+        \\    return 42
+    , 42);
 }
 
 test "typed host allocation is explicit-drop and fallible" {
@@ -10039,51 +10035,35 @@ test "typed allocation cannot be forged or have its storage metadata changed" {
     }
 }
 
-test "host storage layout edits invalidate compiler-owned extern signatures" {
+test "raw storage signature edits invalidate compiler-owned externs and recover" {
     const db = try query.Database.init(testing.allocator, .{ .worker_count = 2 });
     defer db.deinit();
     var registry: modules.SourceRegistry = .{};
     defer registry.deinit(testing.allocator);
     try registry.update(db, testing.allocator, "import std.memory.{}\nexit(42)", &.{}, &.{});
-    const host_file = registry.fileId("$std/memory/host.chi").?;
+    const raw_file = registry.fileId("$std/memory/raw.chi").?;
     const declarations = (try db.get(queries.ModuleDeclarations, try db.intern(queries.ModulePaths, .{ .path = "std.memory" }))).*.?;
-    const allocate = declarations.resolveFunction("allocate_host_storage").?;
+    const allocate = declarations.resolveFunction("allocate_raw").?;
     try testing.expect((try db.get(queries.FunctionSignature, allocate)).* != null);
 
-    const original = standard_library.source("memory/host.chi");
-    for ([_][]const u8{ "address_low", "address_high", "byte_size" }) |field| {
-        const owned = try testing.allocator.print("{s}: int", .{field});
-        defer testing.allocator.free(owned);
-        const borrowed = try testing.allocator.print("{s}: ref int", .{field});
-        defer testing.allocator.free(borrowed);
-        const changed = try std.mem.replaceOwned(u8, testing.allocator, original, owned, borrowed);
+    const original = standard_library.source("memory/raw.chi");
+    for ([_]struct { before: []const u8, after: []const u8 }{
+        .{ .before = "allocate_raw(layout: AllocationLayout)", .after = "allocate_raw(layout: int)" },
+        .{ .before = "allocate_raw(layout: AllocationLayout)", .after = "allocate_raw(ref layout: AllocationLayout)" },
+        .{ .before = ") RawBlock | AllocationError", .after = ") ref RawBlock | AllocationError" },
+        .{ .before = ") RawBlock | AllocationError", .after = ") RawBlock | none" },
+    }) |edit| {
+        const changed = try std.mem.replaceOwned(u8, testing.allocator, original, edit.before, edit.after);
         defer testing.allocator.free(changed);
-        try db.setInput(queries.SourceText, host_file, changed);
+        try db.setInput(queries.SourceText, raw_file, changed);
         try testing.expect((try db.get(queries.FunctionSignature, allocate)).* == null);
-        try db.setInput(queries.SourceText, host_file, original);
+        const diagnostics = try db.transitiveAccumulatorValues(queries.FunctionSignature, allocate, structures.Diagnostic, testing.allocator);
+        defer testing.allocator.free(diagnostics);
+        try testing.expectEqual(@as(usize, 1), diagnostics.len);
+        try testing.expectEqual(structures.Diagnostic.Kind.invalid_external_signature, diagnostics[0].kind);
+        try db.setInput(queries.SourceText, raw_file, original);
         try testing.expect((try db.get(queries.FunctionSignature, allocate)).* != null);
     }
-    const borrowed_result = try std.mem.replaceOwned(u8, testing.allocator, original, ") HostStorage", ") ref HostStorage");
-    defer testing.allocator.free(borrowed_result);
-    try db.setInput(queries.SourceText, host_file, borrowed_result);
-    try testing.expect((try db.get(queries.FunctionSignature, allocate)).* == null);
-    try db.setInput(queries.SourceText, host_file, original);
-    try testing.expect((try db.get(queries.FunctionSignature, allocate)).* != null);
-
-    try db.setInput(queries.SourceText, host_file,
-        \\struct HostStorage
-        \\  address_low: bool
-        \\  address_high: int
-        \\  byte_size: int
-        \\  drop = explicit
-        \\extern func allocate_host_storage(byte_size: int) HostStorage | none
-        \\extern func deallocate_host_storage(deinit storage: HostStorage)
-    );
-    try testing.expect((try db.get(queries.FunctionSignature, allocate)).* == null);
-    const diagnostics = try db.transitiveAccumulatorValues(queries.FunctionSignature, allocate, structures.Diagnostic, testing.allocator);
-    defer testing.allocator.free(diagnostics);
-    try testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try testing.expectEqual(structures.Diagnostic.Kind.invalid_external_signature, diagnostics[0].kind);
 
     const typed = try Fixture.initFiles(
         \\import std.memory.{Allocation, allocate, deallocate}
@@ -10095,23 +10075,14 @@ test "host storage layout edits invalidate compiler-owned extern signatures" {
     , &.{});
     defer typed.deinit();
     const typed_declarations = (try typed.db.get(queries.ModuleDeclarations, try typed.db.intern(queries.ModulePaths, .{ .path = "std.memory" }))).*.?;
-    const typed_host = typed_declarations.resolveStatic("HostStorage").?;
-    const typed_source = (try typed.db.get(queries.ResolveItem, typed_host)).*.?;
-    try typed.db.setInput(queries.SourceText, typed_source.file_id,
-        \\struct HostStorage
-        \\  address_low: bool
-        \\  address_high: int
-        \\  byte_size: int
-        \\  drop = explicit
-        \\extern func allocate_host_storage(byte_size: int) HostStorage | none
-        \\extern func deallocate_host_storage(deinit storage: HostStorage)
-    );
     try typed.expectExit(0, 42);
     const raw = (try typed.db.get(queries.ResolveItem, typed_declarations.resolveStatic("RawBlock").?)).*.?;
     const changed_raw = try std.mem.replaceOwned(u8, testing.allocator, standard_library.source("memory/raw.chi"), "allocate_raw(layout: AllocationLayout) RawBlock", "allocate_raw(layout: AllocationLayout) ref RawBlock");
     defer testing.allocator.free(changed_raw);
     try typed.db.setInput(queries.SourceText, raw.file_id, changed_raw);
     try typed.expectDiagnostic(raw.file_id, .invalid_external_signature);
+    try typed.db.setInput(queries.SourceText, raw.file_id, original);
+    try typed.expectExit(0, 42);
 }
 
 test "standard storage shapes reject reference fields and recover after edits" {

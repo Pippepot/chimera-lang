@@ -3,7 +3,6 @@ const std = @import("std");
 pub const File = enum(u32) {
     exit,
     memory_allocation,
-    memory_host,
     memory_raw,
     memory_allocator,
     logging,
@@ -26,7 +25,6 @@ pub const File = enum(u32) {
         return switch (file) {
             .exit => "exit.chi",
             .memory_allocation => "memory/allocation.chi",
-            .memory_host => "memory/host.chi",
             .memory_raw => "memory/raw.chi",
             .memory_allocator => "memory/allocator.chi",
             .logging => "logging.chi",
@@ -65,11 +63,6 @@ pub const root_module = "std";
 pub const External = enum {
     exit,
     panic_message,
-    allocate_host_storage,
-    deallocate_host_storage,
-    allocate,
-    deallocate,
-    allocation_count,
     unsafe_initialize,
     unsafe_take,
     unsafe_destroy,
@@ -91,7 +84,6 @@ pub const External = enum {
     cursor_take,
     cursor_initialize,
     cursor_destroy,
-    byte_int,
     io_read,
     io_write,
     primitive_operation,
@@ -114,14 +106,13 @@ pub const External = enum {
         return switch (symbol) {
             .exit => .exit,
             .literal_byte, .primitive_operation, .numeric_converter => .primitives,
-            .byte_int, .panic_message => .text,
+            .panic_message => .text,
             .io_read => .memory_allocation,
             .io_write => .text,
             .copy_value, .move_value => .ownership,
             .array_filled, .array_borrow => .array,
-            .allocate_host_storage, .deallocate_host_storage => .memory_host,
             .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => .memory_allocation,
-            .allocate, .deallocate, .allocation_count, .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow, .initialize_collection, .initialize_collection_element, .static_iteration_item => .memory_allocation,
+            .unsafe_initialize, .unsafe_take, .unsafe_destroy, .unsafe_borrow, .initialize_collection, .initialize_collection_element, .static_iteration_item => .memory_allocation,
             .erase, .clone, .copy_callable, .drop_callable => .callables,
             .type_layout, .layout_for, .cursor_aligned, .allocate_raw, .deallocate_raw => .memory_raw,
             .allocator_from, .allocator_from_unchecked => .memory_allocator,
@@ -131,7 +122,6 @@ pub const External = enum {
 };
 
 pub const Structure = enum {
-    HostStorage,
     Allocation,
     Box,
     Ref,

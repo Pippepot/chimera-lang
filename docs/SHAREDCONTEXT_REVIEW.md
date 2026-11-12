@@ -286,11 +286,13 @@ argument modes, and result ownership are independent facts.
 
 ### Raw storage needs a real ownership and provenance boundary
 
-The [current storage substrate](../std/memory/host.chi) provides private host
-storage; [typed allocation](../std/memory/allocation.chi) supplies element count,
-initialization, and typed access. [Intrinsic validation](../src/intrinsics.zig)
-checks exact registered shapes. `Allocation(T)` currently has exactly `storage`
-and `count`, and native allocation/deallocation know that representation.
+At review time, private host storage supplied raw bytes, while typed allocation
+supplied element count, initialization, and typed access. `Allocation(T)` then
+had exactly `storage` and `count`, and native allocation/deallocation knew that
+representation. The implemented boundaries now use
+[raw storage](../std/memory/raw.chi) and
+[provider-retaining typed allocation](../std/memory/allocation.chi), with
+[intrinsic validation](../src/intrinsics.zig) checking registered shapes.
 
 There is no general existing operation that turns arbitrary bytes into a safe
 typed allocation or lends independently owned typed subranges from an arena.

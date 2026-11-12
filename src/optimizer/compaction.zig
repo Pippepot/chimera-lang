@@ -319,7 +319,7 @@ fn liveValues(scratch: std.mem.Allocator, function: *Function, reachable: []cons
 pub inline fn removableWhenUnused(function: *const Function, instruction: Instruction) bool {
     return switch (instruction) {
         .numeric_binary, .numeric_unary => !function_ir.numericMayTrap(function, instruction),
-        .const_numeric, .numeric_convert, .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .callable_payload, .callable_invoke, .callable_allocation, .initializer_ref, .local_storage, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .variant_tag, .field_access, .borrow_address, .borrow_read, .storage_projection, .allocation_element, .array_element, .storage_cursor, .cursor_offset, .cursor_element => true,
+        .const_numeric, .numeric_convert, .const_int, .const_int_literal, .const_string_literal, .const_static_string, .const_storage_cursor, .const_byte, .const_bool, .const_type, .const_unit, .const_none, .function_ref, .callable_payload, .callable_invoke, .callable_allocation, .initializer_ref, .local_storage, .addi, .subi, .muli, .negi, .compare, .select, .aggregate, .variant_tag, .field_access, .borrow_address, .borrow_read, .storage_projection, .allocation_element, .array_element, .storage_cursor, .cursor_offset, .cursor_element => true,
         .service_enter, .service_leave, .context_read, .context_write => false,
         .erased_callable => |callable| !callable.owns_environment,
         .divsi, .shli, .shrsi => |operands| function_ir.validConstantRhs(function, instruction, operands.rhs),

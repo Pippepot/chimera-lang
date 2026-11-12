@@ -770,7 +770,7 @@ fn choose(function: *Function, block: u32, condition: ValueId, then_value: Value
 
 fn speculatable(instruction: structures.FunctionInstruction) bool {
     return switch (instruction) {
-        .const_int, .const_bool, .const_byte, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select => true,
+        .const_int, .const_bool, .const_byte, .addi, .subi, .muli, .negi, .compare, .select => true,
         else => false,
     };
 }

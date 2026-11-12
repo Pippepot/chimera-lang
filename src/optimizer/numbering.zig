@@ -194,7 +194,7 @@ const Kind = enum { pure, load, write, none };
 
 fn kind(roots: *const effects.Roots, instruction: Instruction) Kind {
     return switch (instruction) {
-        .const_numeric, .numeric_binary, .numeric_unary, .numeric_convert, .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .compare, .select, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => .pure,
+        .const_numeric, .numeric_binary, .numeric_unary, .numeric_convert, .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .compare, .select, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => .pure,
         .field_access => |operation| if (roots.fieldResource(operation.operand, operation.field_index) == .immutable) .pure else .load,
         .erased_callable => |callable| if (callable.owns_environment) .write else .pure,
         inline .callable_payload, .callable_invoke, .callable_allocation => |operation| read(roots, operation.source),

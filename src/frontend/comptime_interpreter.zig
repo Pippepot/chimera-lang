@@ -47,11 +47,6 @@ pub const Heap = struct {
         try self.records.append(self.allocator, record);
         return record;
     }
-
-    pub fn allocateValue(self: *Heap, type_id: structures.TypeId, element_type: structures.TypeId, element_size: u32, count: i32, storage: std.mem.Allocator) !?Value {
-        if (allocationByteSize(element_size, count) == null) return null;
-        return try allocationValue(type_id, try self.allocate(element_type, @intCast(count)), storage);
-    }
 };
 
 pub const Allocation = struct {
@@ -101,13 +96,6 @@ pub const Allocation = struct {
         self.released = true;
     }
 };
-
-pub fn allocationByteSize(element_size: u32, count: i32) ?u32 {
-    if (count < 0) return null;
-    const size = @as(u64, element_size) * @as(u32, @intCast(count));
-    if (size > std.math.maxInt(i32)) return null;
-    return @intCast(size);
-}
 
 pub const Value = union(enum) {
     runtime: structures.CompileTimeValue.RuntimeValue,
@@ -563,7 +551,6 @@ fn ExecutionFrame(comptime Executor: type) type {
                 .storage_cursor => |operation| return self.storageCursor(operation),
                 .cursor_offset => |operation| return .{ .returned = try offsetStorageCursor(slots[@backingInt(operation.cursor)], operation.type_id, @intCast(integer(slots, operation.index)), self.storage) },
                 .cursor_element => |operation| return .{ .returned = try storageCursorElement(slots[@backingInt(operation.cursor)], operation.type_id, @intCast(integer(slots, operation.index)), self.storage) },
-                .byte_to_int => |source| return .{ .returned = .{ .runtime = .{ .int = scalar(slots, source).byte } } },
                 .static_conversion => |conversion| return self.staticConversion(conversion, span),
                 .negi => |operand| return .{ .returned = .{ .runtime = .{ .int = -%integer(slots, operand) } } },
                 .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands| {
@@ -1392,10 +1379,6 @@ pub fn integerValue(value: Value) i32 {
 
 pub fn releaseAllocation(value: Value) void {
     allocationRecord(value).release();
-}
-
-pub fn allocationCount(value: Value) i32 {
-    return @intCast(allocationRecord(value).capacity);
 }
 
 pub fn numericBits(value: structures.CompileTimeValue.RuntimeValue) u64 {

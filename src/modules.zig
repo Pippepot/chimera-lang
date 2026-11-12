@@ -21,7 +21,7 @@ pub const StandardSource = struct {
 };
 
 test "standard file paths derive nested module identities" {
-    try std.testing.expectEqualStrings("std.memory", standard_library.File.memory_host.modulePath());
+    try std.testing.expectEqualStrings("std.memory", standard_library.File.memory_raw.modulePath());
     try std.testing.expectEqualStrings("std.device.memory", standard_library.standardModulePath("device/memory/buffer.chi"));
 }
 

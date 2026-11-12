@@ -1976,11 +1976,9 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                 .initialize_collection => self.buildCollectionInitializer(),
                 .array_filled => self.buildArrayFilled(),
                 .array_borrow => self.buildArrayBorrow(),
-                .allocation_count => self.returnValue(try self.appendInstruction(.{ .field_access = .{ .operand = self.values.get(0).?.id, .field_index = 1, .field_type = .int } }), .{ .start = 0, .end = 0 }),
                 .unsafe_borrow, .unsafe_take, .unsafe_destroy => self.buildMemoryOperation(builtin.symbol),
                 .cursor_take, .cursor_initialize, .cursor_destroy => self.buildCursorMemoryOperation(builtin.symbol),
                 .literal_byte => self.buildLiteralByte(),
-                .byte_int => self.returnValue(try self.appendInstruction(.{ .byte_to_int = self.values.get(0).?.id }), .{ .start = 0, .end = 0 }),
                 .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => self.buildCursorOperation(builtin.symbol),
                 else => unreachable,
             };
@@ -14172,7 +14170,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
 
         fn matchIntegerOperand(self: *Self, operand: Value) !Value {
             if (operand.type_id != .byte) return operand;
-            return self.callInstance(try self.analysis_context.byteIntFunction(), &.{.{ .prepared = .{ .value = operand.id } }}, .int);
+            return self.appendInstruction(.{ .numeric_convert = .{ .operand = operand.id, .destination_type = .int, .policy = .lossless, .result_type = .int } });
         }
 
         /// Appends a call to a fixed function instance whose signature is already available.

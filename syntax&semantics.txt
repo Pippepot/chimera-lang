@@ -264,8 +264,8 @@ if not (value in collection) -> missing()
 # normalization or allocation. find returns the first byte offset as int | none;
 # an empty needle matches at zero and empty prefixes/suffixes match. contains
 # also supplies ordinary substring membership through needle in text.
-# The named byte_int function widens a byte to int without failure. Numeric
-# runtime types are still not related by converters.
+# The named byte_int function is an ordinary helper equivalent to int(value).
+# Byte-to-int widening uses the lossless numeric converter in std.primitives.
 # Standard String converters format int and byte in decimal, bool as true/false,
 # unit as (), and none as none. StringView converts to an owned copy. Array,
 # List, and Span format their elements recursively as [a, b], without quoting

@@ -2,6 +2,44 @@ const std = @import("std");
 const test_sources = @import("test_sources");
 const SourceFixture = test_sources.SourceFixture;
 
+test "byte widening helper remains callable while byte patterns use numeric conversion" {
+    try SourceFixture.expectParity(
+        \\import std.text.{byte_int}
+        \\func run() int
+        \\    const widen: func(byte) int = byte_int
+        \\    const values: Array(byte, 3) = [0, 42, 255]
+        \\    if widen(values[0]) <> 0 or widen(values[2]) <> 255 -> return 90
+        \\    return match values[1]
+        \\        42 -> widen(values[1])
+        \\        _ -> 91
+    , 42);
+}
+
+test "byte helper edits recompute ordinary calls without changing literal pattern matching" {
+    const fixture = try SourceFixture.init(
+        \\func run() int
+        \\    const value: byte = 42
+        \\    return match value
+        \\        42 -> byte_int(value)
+        \\        _ -> 90
+        \\exit(run())
+    );
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const queries = test_sources.queries;
+    const text_module = try fixture.db.intern(queries.ModulePaths, .{ .path = "std.text" });
+    const declarations = (try fixture.db.get(queries.ModuleDeclarations, text_module)).*.?;
+    const helper = declarations.resolveFunction("byte_int").?;
+    const resolved = (try fixture.db.get(queries.ResolveItem, helper)).*.?;
+    const original = @import("standard_library").source("text.chi");
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "pub func byte_int(value: byte) int -> int(value)", "pub func byte_int(value: byte) int -> int(value) + 1");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, resolved.file_id, changed);
+    try fixture.expectExit(0, 43);
+    try fixture.db.setInput(queries.SourceText, resolved.file_id, original);
+    try fixture.expectExit(0, 42);
+}
+
 test "string value copies preserve independent literal and allocated storage" {
     try SourceFixture.expectParity(
         \\struct Message

@@ -134,7 +134,7 @@ fn renderInstruction(db: *query.Database, ssa: *const structures.FunctionBodyAna
     const instruction = ssa.instructions[instruction_index];
     try writer.print("    %{d} = {s}", .{ @backingInt(ssa.instructionValue(instruction_index)), @tagName(instruction) });
     switch (instruction) {
-        .type_union, .storage_cursor, .borrow_read, .callable_payload, .callable_allocation, .cursor_offset, .cursor_element, .byte_to_int, .variant_tag, .negi, .borrow_write, .addi, .subi, .muli, .divsi, .shli, .shrsi, .select, .fill => {
+        .type_union, .storage_cursor, .borrow_read, .callable_payload, .callable_allocation, .cursor_offset, .cursor_element, .variant_tag, .negi, .borrow_write, .addi, .subi, .muli, .divsi, .shli, .shrsi, .select, .fill => {
             for ((&instruction).operands(), 0..) |operand, index| {
                 if (operand) |value| try writer.print("{s}%{d}", .{ if (index == 0) " " else ", ", @backingInt(value.*) });
             }

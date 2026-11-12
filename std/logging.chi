@@ -1,6 +1,6 @@
 import std.memory.{AllocationError}
 import std.io.{IoError, stderr, write_text}
-import std.text.{String, StringView}
+import std.text.{StringView}
 import std.context as context
 
 pub struct LogLevel
@@ -42,8 +42,10 @@ func stderr_emit(level: LogLevel, imm message: StringView) unit | AllocationErro
         3 -> "warning: "
         _ -> "error: "
     _ = write_text(stderr, prefix)?
-    const delivered = write_text(stderr, String(message) + "\n")
+    const delivered = write_text(stderr, message)
     if delivered is IoError -> return IoError{cause = delivered.cause, progress = prefix.byte_length() + delivered.progress}
+    const terminated = write_text(stderr, "\n")
+    if terminated is IoError -> return IoError{cause = terminated.cause, progress = prefix.byte_length() + message.byte_length() + terminated.progress}
     return unit
 pub func root_logger() Logger -> Logger{emit_callback = stderr_emit, minimum_level = LogLevel.trace}
 extern func logger_from(static Backend: type, ref backend: Backend, minimum: LogLevel) Logger

@@ -1,4 +1,24 @@
-# Standard library algorithms
+# Standard library
+
+The prelude exposes common collection and text types, `print`, `exit`, and
+`context`. Import the defining modules for the rest of the API:
+
+| Module | Purpose |
+| --- | --- |
+| `std.array` | Fixed-size `Array` values and collection literals |
+| `std.memory` | `List`, `Box`, `Ref`, `Span`, typed/raw allocation, and allocator handles |
+| `std.text` | UTF-8 strings, borrowed text/byte views, and formatting |
+| `std.io` | Standard stream handles and fallible byte/text I/O |
+| `std.range`, `std.iteration` | Ranges, cursors, and the `End` marker |
+| `std.algorithms`, `std.search`, `std.math` | Cursor algorithms, span searches, and ordered numerical helpers |
+| `std.callables`, `std.ownership` | Fallible callable erasure/cloning and ownership capability queries |
+| `std.context`, `std.logging` | Scoped service selection and logging |
+
+Lossless numeric conversion uses ordinary constructors, such as `int(value)` for
+a byte. The prelude's `byte_int(value)` helper remains an ordinary function with
+the same behavior; it has no separate compiler implementation.
+
+## Cursor algorithms
 
 `std.algorithms` provides adapters and algorithms for ordinary pull cursors. Call `.iter()` on a range,
 Array, List, or Span to obtain a borrowed cursor; transfer a List through
@@ -48,14 +68,14 @@ var transformed = map(RangeIterator, int, int, (1..=3).iter(), double)
 for value in transformed -> print(value) # 2, 4, 6
 
 var cursor = (1..=6).iter()
-print(any(RangeIterator, int, cursor, even)) # true; cursor resumes at 3
+print(any(cursor, even)) # true; cursor resumes at 3
 ```
 
-Existing explicit Map/Filter type applications now include the callback type.
+Explicit Map/Filter type applications include the callback type.
 For a named `func(imm int) int`, use `Map(S, int, int, func(imm int) int)`.
 Inferred bindings keep anonymous concrete callback types without naming them.
 
-Array, List, and Span already provide stable `sorted()` methods, with optional
+Array, List, and Span provide stable `sorted()` methods, with optional
 runtime or static comparators. They return a copied `List(T) | AllocationError` and retain
 the input. `sort()` instead orders mutable storage in place, including
 noncopyable movable elements. Use a comprehension and `List(T).collect` to
@@ -169,7 +189,8 @@ copies, but cannot retain a message view. Checked service dispatch detects cycle
 `from_unchecked` permits deliberate recursion. The native root logger writes to
 stderr at trace or above; the evaluator root logger is off. Logging leaves `print`
 and explicit stdout/stderr APIs on their ordinary destinations.
-Root output writes a severity prefix, message, and newline without allocation.
+Root output writes a severity prefix, borrowed message, and newline separately
+without allocation. Message/newline output is not atomic.
 An `IoError` reports the Linux errno in `cause` and the total bytes delivered for
 that event in `progress`, including any prefix and message bytes before failure.
 Output is not transactional: a broken pipe returns cause 32 without terminating

@@ -34,6 +34,6 @@ pub func write_all(stream: Stream, imm bytes: BytesView) unit | IoError
 pub func write_text(stream: Stream, imm text: StringView) unit | IoError -> write_all(stream, text.as_bytes())
 pub overload print(print_value)
 func print_value(static T: type, imm value: T)
-    if not (write_text(stdout, String(value)) is unit) -> panic "standard output write failed"
-    if not (write_text(stdout, "\n") is unit) -> panic "standard output newline write failed"
+    write_text(stdout, String(value)) catch -> panic "standard output write failed"
+    write_text(stdout, "\n") catch -> panic "standard output newline write failed"
 pub func read_bytes(stream: Stream, mut bytes: List(byte), count: int) int | AllocationError | IoError -> bytes.read_bytes(stream.descriptor, count)

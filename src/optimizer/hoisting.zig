@@ -117,7 +117,7 @@ const Motion = struct {
         const roots = &self.memory.roots;
         switch (instruction) {
             .numeric_binary, .numeric_unary => return if (function_ir.numericMayTrap(self.function, instruction)) null else .pure,
-            .const_numeric, .numeric_convert, .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .negi, .byte_to_int, .compare, .select, .aggregate, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => return .pure,
+            .const_numeric, .numeric_convert, .const_int, .const_byte, .const_bool, .const_unit, .const_none, .function_ref, .addi, .subi, .muli, .negi, .compare, .select, .aggregate, .borrow_address, .storage_projection, .array_element, .borrow_read, .cursor_offset, .cursor_element => return .pure,
             .divsi, .shli, .shrsi => |operands| return if (function_ir.validConstantRhs(self.function, instruction, operands.rhs)) .pure else null,
             .field_access => |operation| return .{ .read = roots.fieldResource(operation.operand, operation.field_index) },
             .value_copy => |copy| return if (copy.destination == null) .{ .read = roots.root(copy.source) } else null,

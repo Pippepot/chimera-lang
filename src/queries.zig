@@ -774,13 +774,6 @@ pub fn TypeFacts(comptime Context: type) type {
             return instance.element_type;
         }
 
-        pub fn hostStorage(self: @This()) !?structures.TypeId {
-            const item = (try standardDeclaration(self.ctx, .memory_host, @tagName(standard_library.Structure.HostStorage), structures.ModuleScope.resolveStatic)) orelse return null;
-            const definition = (try getStructDefinition(self.ctx, .{ .declared = item })) orelse return null;
-            if (!intrinsics.validHostStorage(definition)) return null;
-            return try internStructType(self.ctx, item);
-        }
-
         pub fn serviceCallableField(self: @This(), type_id: structures.TypeId, index: u32) !bool {
             if (type_id.isPrimitive()) return false;
             return (type_id == try self.allocatorType() and index < 2) or (type_id == try self.loggerType() and index == 0);
@@ -918,7 +911,6 @@ pub fn TypeFacts(comptime Context: type) type {
             if (type_id.isPrimitive()) return false;
             if (try self.borrowElement(type_id) != null or try self.storageAccess(type_id) != null or try self.allocationElement(type_id) != null or try self.boxElement(type_id) != null) return true;
             var components_iterator = try self.components(type_id);
-            if ((components_iterator.shape == .structure or components_iterator.shape == .tuple) and try self.hostStorage() == type_id) return true;
             while (components_iterator.next()) |component| {
                 if (component.count == 0) continue;
                 if (component.kind == .reference or try self.mayContainStorage(component.type_id)) return true;
@@ -1753,10 +1745,6 @@ pub fn AnalysisContext(comptime Context: type) type {
             const item = (try standardFunction(self.ctx, .text, "match_literal")) orelse return error.Unavailable;
             const argument = try self.internCompileTimeValue(.{ .type = type_id });
             return self.specializeFunction(.{ .item = item }, &.{argument});
-        }
-
-        pub fn byteIntFunction(self: @This()) !structures.InstanceId {
-            return .{ .item = (try standardFunction(self.ctx, .text, "byte_int")) orelse return error.Unavailable };
         }
 
         pub fn internCompileTimeValue(self: @This(), value: structures.CompileTimeValue) !structures.CompileTimeValueId {
@@ -4351,19 +4339,13 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             if (external) |symbol| {
                 switch (symbol) {
                     .static_iteration_item => return self.captureStaticItem(signature.parameters[0].type_id, arguments[0], call_span),
-                    .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout, .layout_for, .primitive_operation, .numeric_converter, .copy_value, .move_value, .erase, .clone, .copy_callable, .drop_callable, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => {},
+                    .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout, .layout_for, .primitive_operation, .numeric_converter, .copy_value, .move_value, .erase, .clone, .copy_callable, .drop_callable, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => {},
                     .allocate_raw => return self.allocateRaw(signature.return_type, arguments[0], storage),
                     .cursor_aligned => return .{ .returned = .{ .runtime = .{ .bool = comptime_interpreter.cursorAligned(arguments[0], comptime_interpreter.integerValue(arguments[1])) } } },
                     .deallocate_raw => {
                         comptime_interpreter.releaseAllocation(arguments[0]);
                         return .{ .returned = .{ .runtime = .unit } };
                     },
-                    .allocate, .allocate_host_storage => return self.allocateStorage(symbol, signature.return_type, arguments, storage),
-                    .deallocate, .deallocate_host_storage => {
-                        comptime_interpreter.releaseAllocation(arguments[0]);
-                        return .{ .returned = .{ .runtime = .unit } };
-                    },
-                    .allocation_count => return .{ .returned = .{ .runtime = .{ .int = comptime_interpreter.allocationCount(arguments[0]) } } },
                     .exit => return .{ .exit = comptime_interpreter.integerValue(arguments[0]) },
                     .panic_message => return .{ .execution_error = .{
                         .reason = .{ .panic = try comptime_interpreter.panicMessage(arguments[0], self, self.ctx.allocator()) },
@@ -4425,17 +4407,6 @@ fn ComptimeCallExecutor(comptime Context: type) type {
             const reason = try self.internRuntime(.int, .{ .int = reason_code });
             const failure: comptime_interpreter.Value = .{ .runtime = .{ .structure = try self.internTuple(&.{reason}) } };
             return .{ .returned = try comptime_interpreter.storedVariantValue(return_type, try self.facts().allocationError(), failure, self) };
-        }
-
-        fn allocateStorage(self: *@This(), symbol: standard_library.External, return_type: structures.TypeId, arguments: []comptime_interpreter.Value, storage: std.mem.Allocator) !comptime_interpreter.Result {
-            const payload = (try (if (symbol == .allocate) intrinsics.errorPayload(self.facts(), return_type, try self.facts().allocationError()) else intrinsics.errorPayload(self.facts(), return_type, .none))) orelse unreachable;
-            const element_type = if (symbol == .allocate) (try self.facts().allocationElement(payload)) orelse unreachable else structures.TypeId.byte;
-            const layout = (try self.ctx.get(HostTypeLayout, element_type)).*;
-            const count = comptime_interpreter.integerValue(arguments[0]);
-            const value = try self.heap.allocateValue(payload, element_type, layout.byte_size, count, storage);
-            if (value) |allocated| return .{ .returned = try comptime_interpreter.storedVariantValue(return_type, payload, allocated, self) };
-            if (symbol == .allocate) return self.allocationFailure(return_type, if (count < 0) 1 else 2);
-            return .{ .returned = try comptime_interpreter.storedVariantValue(return_type, .none, .{ .runtime = .none }, self) };
         }
 
         pub fn byteString(self: *@This(), id: structures.ByteStringId) ![]const u8 {
@@ -5611,23 +5582,13 @@ fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?s
     if (intrinsics.hasTypedBody(symbol)) return compileTypedFunction(ctx, instance_id);
     return switch (symbol) {
         .allocate_raw => try codegen.compileExternalAllocateRaw(signature, types, ctx.allocator()),
-        .deallocate_raw => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
+        .deallocate_raw => try codegen.compileExternalDeallocateRaw(ctx.allocator()),
         .cursor_aligned => try codegen.compileExternalCursorAligned(signature, types, ctx.allocator()),
         .static_iteration_item => null,
-        .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout, .layout_for, .primitive_operation, .numeric_converter, .copy_value, .move_value, .erase, .clone, .copy_callable, .drop_callable, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .byte_int, .initialize_collection, .initialize_collection_element, .allocation_count, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => unreachable,
+        .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout, .layout_for, .primitive_operation, .numeric_converter, .copy_value, .move_value, .erase, .clone, .copy_callable, .drop_callable, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => unreachable,
         .io_read, .io_write => try codegen.compileExternalByteIo(symbol == .io_read, signature, types, ctx.allocator()),
         .exit => try codegen.compileExternalExit(ctx.allocator()),
         .panic_message => try codegen.compileExternalPanic(signature, types, ctx.allocator()),
-        .allocate_host_storage => try codegen.compileExternalAllocateHostStorage(signature, types, ctx.allocator()),
-        .deallocate_host_storage, .deallocate => try codegen.compileExternalDeallocateHostStorage(ctx.allocator()),
-        .allocate => blk: {
-            const payload = (try intrinsics.errorPayload(types.facts(), signature.return_type, try types.facts().allocationError())).?;
-            const element_type = (try types.facts().allocationElement(payload)).?;
-            const resolved = (try ctx.get(ResolveItem, instance_id.item)).* orelse return null;
-            if (!try validateRuntimeType(ctx, types.facts(), element_type, resolved.file_id, null, instance_id)) return null;
-            const layout = (try ctx.get(HostTypeLayout, element_type)).*;
-            break :blk try codegen.compileExternalAllocateHostTypedStorage(signature, types, ctx.allocator(), layout);
-        },
     };
 }
 

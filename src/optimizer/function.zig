@@ -233,7 +233,7 @@ pub const Function = struct {
             .argument => |argument| argument.data.representation == .value and (argument.block == self.entry or self.direct(argument.data.type_id)),
             .instruction => |index| switch (self.instructions.items[index]) {
                 // Cursor operations snapshot an address, not the contents it points to.
-                .const_numeric, .numeric_binary, .numeric_unary, .numeric_convert, .const_int, .const_bool, .const_byte, .const_unit, .const_none, .const_static_string, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .byte_to_int, .variant_tag, .field_access, .compare, .select, .aggregate, .function_ref, .erased_callable, .callable_payload, .callable_invoke, .callable_allocation, .borrow_address, .const_storage_cursor, .storage_cursor, .cursor_offset, .cursor_element => true,
+                .const_numeric, .numeric_binary, .numeric_unary, .numeric_convert, .const_int, .const_bool, .const_byte, .const_unit, .const_none, .const_static_string, .addi, .subi, .muli, .divsi, .shli, .shrsi, .negi, .variant_tag, .field_access, .compare, .select, .aggregate, .function_ref, .erased_callable, .callable_payload, .callable_invoke, .callable_allocation, .borrow_address, .const_storage_cursor, .storage_cursor, .cursor_offset, .cursor_element => true,
                 inline .value_copy, .call, .variant_coerce, .variant_extract => |operation| operation.destination == null,
                 else => false,
             },

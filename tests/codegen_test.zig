@@ -1367,7 +1367,7 @@ test "native byte fills and directed moves preserve exact byte storage" {
                 .{ .fill = .{ .first = @fromBackingInt(0), .count = @fromBackingInt(4), .value = @fromBackingInt(2), .type_id = .byte } },
                 .{ .fill = .{ .first = @fromBackingInt(1), .count = @fromBackingInt(4), .value = @fromBackingInt(3), .type_id = .byte } },
                 .{ .move = .{ .destination = @fromBackingInt(1), .source = @fromBackingInt(0), .count = @fromBackingInt(if (empty) 5 else 4), .type_id = .byte, .backward = backward } },
-                .{ .byte_to_int = @fromBackingInt(1) },
+                .{ .numeric_convert = .{ .operand = @fromBackingInt(1), .destination_type = .int, .policy = .lossless, .result_type = .int } },
                 .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
             };
             var blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = instructions.len, .terminator = .diverge }};
@@ -2528,7 +2528,7 @@ test "native cursor addressing sign extends a negative dynamic index" {
         integerNegate(1),
         .{ .cursor_element = .{ .cursor = @fromBackingInt(0), .index = @fromBackingInt(2), .type_id = byte_reference_type } },
         .{ .borrow_read = .{ .source = @fromBackingInt(3), .type_id = .byte } },
-        .{ .byte_to_int = @fromBackingInt(4) },
+        .{ .numeric_convert = .{ .operand = @fromBackingInt(4), .destination_type = .int, .policy = .lossless, .result_type = .int } },
         .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
     };
     var blocks = [_]structures.FunctionBlock{.{ .instruction_start = 0, .instruction_end = instructions.len, .terminator = .diverge }};
@@ -2554,7 +2554,7 @@ test "loop cursor addressing sign extends a negative register index" {
         integerConstant(1),
         .{ .cursor_element = .{ .cursor = @fromBackingInt(2), .index = @fromBackingInt(0), .type_id = byte_reference_type } },
         .{ .borrow_read = .{ .source = @fromBackingInt(6), .type_id = .byte } },
-        .{ .byte_to_int = @fromBackingInt(7) },
+        .{ .numeric_convert = .{ .operand = @fromBackingInt(7), .destination_type = .int, .policy = .lossless, .result_type = .int } },
         integerBinary(.add, 0, 5),
         .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
     };
@@ -2587,8 +2587,8 @@ test "data relocations own deduplicated bytes and preserve cursor offsets" {
         .{ .const_storage_cursor = .{ .type_id = byte_reference_type, .data = @fromBackingInt(1), .offset = 1 } },
         .{ .borrow_read = .{ .source = @fromBackingInt(0), .type_id = .byte } },
         .{ .borrow_read = .{ .source = @fromBackingInt(1), .type_id = .byte } },
-        .{ .byte_to_int = @fromBackingInt(2) },
-        .{ .byte_to_int = @fromBackingInt(3) },
+        .{ .numeric_convert = .{ .operand = @fromBackingInt(2), .destination_type = .int, .policy = .lossless, .result_type = .int } },
+        .{ .numeric_convert = .{ .operand = @fromBackingInt(3), .destination_type = .int, .policy = .lossless, .result_type = .int } },
         .{ .addi = .{ .lhs = @fromBackingInt(4), .rhs = @fromBackingInt(5) } },
         .{ .call = .{ .target = .{ .direct = .{ .item = @fromBackingInt(1) } }, .arguments = .{ .start = 0, .end = 1 }, .return_type = .never } },
     };

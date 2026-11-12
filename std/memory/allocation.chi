@@ -67,23 +67,20 @@ pub struct List(T: type)
         deallocate(T, self.storage^)
 
     pub func from(static N: int, init values: collection_literal(T, N)) List(T) | AllocationError
-        const storage = allocate(T, N)
-        if storage is AllocationError -> return storage^
+        const storage = allocate(T, N)?
         var result = List(T){storage = storage^, initialized = 0}
         initialize_collection(T, N, result.storage, values)
         result.initialized = N
         return result^
     pub func collect(init values: collection_sequence(T)) List(T) | AllocationError -> values
     pub func new(reserved: int) List(T) | AllocationError
-        const storage = allocate(T, reserved)
-        if storage is AllocationError -> return storage^
+        const storage = allocate(T, reserved)?
         return List(T){storage = storage^, initialized = 0}
     pub func new_with(imm provider: Allocator, reserved: int) List(T) | AllocationError
         const storage = allocate_with(T, provider, reserved)?
         return List(T){storage = storage^, initialized = 0}
     pub func filled(imm value: T, count: int) List(T) | AllocationError where copyable(T)
-        const storage = allocate(T, count)
-        if storage is AllocationError -> return storage^
+        const storage = allocate(T, count)?
         var result = List(T){storage = storage^, initialized = 0}
         for index in 0..count
             initialize_collection_element(T, result.storage, index, value)
@@ -142,8 +139,7 @@ pub struct List(T: type)
     pub func reserve(mut self: List(T), minimum_capacity: int) unit | AllocationError
         if minimum_capacity < 0 -> return AllocationError.invalid_layout
         if minimum_capacity <= self.capacity() -> return unit
-        var replacement = allocate_with(T, self.storage.provider, minimum_capacity)
-        if replacement is AllocationError -> return replacement^
+        var replacement = allocate_with(T, self.storage.provider, minimum_capacity)?
         for index in (0..self.initialized).reversed()
             const item = unsafe_take(T, self.storage, index)
             initialize_collection_element(T, replacement, index, item^)
@@ -211,7 +207,7 @@ pub struct ListIterator(T: type)
 
 func allocate_literal(static T: type, count: int) Allocation(T)
     const storage = allocate(T, count)
-    if not (storage is Allocation(T)) -> panic "List literal allocation failed"
+    if storage is AllocationError -> panic "List literal allocation failed"
     return storage^
 extern func initialize_collection(static T: type, static N: int, mut storage: Allocation(T), init values: collection_literal(T, N))
 pub converter(static T: type, static N: int, init values: collection_literal(T, N)) List(T)
@@ -242,7 +238,7 @@ func append_collection_moved(static T: type, mut result: List(T), deinit item: T
     cursor_initialize(T, cursor, result.initialized, item^)
     result.initialized += 1
 func append_collection_growing(static T: type, mut result: List(T), init item: T)
-    if not (append_collection_optional(T, result, item) is unit) -> panic "List literal allocation failed"
+    append_collection_optional(T, result, item) catch -> panic "List literal allocation failed"
 func reserve_collection_element(static T: type, mut result: List(T)) unit | AllocationError
     if result.initialized == result.capacity() -> return grow_collection(T, result)
     return unit
@@ -266,8 +262,7 @@ pub struct Box(T: type)
         unsafe_destroy(T, self.allocation, 0)
         deallocate(T, self.allocation^)
     pub func new(init item: T) Box(T) | AllocationError
-        var storage = allocate(T, 1)
-        if storage is AllocationError -> return storage^
+        var storage = allocate(T, 1)?
         unsafe_initialize(T, storage, 0, item)
         return Box(T){allocation = storage^}
     pub func new_with(imm provider: Allocator, init item: T) Box(T) | AllocationError

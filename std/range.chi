@@ -1,7 +1,6 @@
 import std.memory.{AllocationError}
-import std.text.{integer_text}
+import std.text.{String, integer_text}
 import std.iteration.{End}
-import std.text.{String}
 
 pub struct FromEnd
     copy = trivial
@@ -119,10 +118,7 @@ pub func exclusive(first: int | FromEnd | none, limit: int | FromEnd | none) Ran
 pub func inclusive(first: int | FromEnd | none, limit: int | FromEnd | none) Range
     return Range{first = first, limit = limit, inclusive = true}
 
-pub converter(imm value: Range) String
-    const result = format_range(value)
-    if not (result is String) -> panic "string conversion allocation failed"
-    return result^
+pub converter(imm value: Range) String -> format_range(value) catch -> panic "string conversion allocation failed"
 func format_range(imm value: Range) String | AllocationError
     var result = String.empty()
     _ = append_bound(result, value.first)?
@@ -147,7 +143,7 @@ func append_bound(mut result: String, bound: int | FromEnd | none) unit | Alloca
 func has_steps(first: int, last: int, stride: int, count: int) bool
     const low = if first < last -> first else last
     const high = if first < last -> last else first
-    if low >= 0 or high < 0 -> return bool((high - low) / stride >= count)
+    if low >= 0 or high < 0 -> return (high - low) / stride >= count
     const left = -(low + 1)
     const right = high
     const left_steps = left / stride
@@ -156,7 +152,7 @@ func has_steps(first: int, last: int, stride: int, count: int) bool
     const right_steps = right / stride
     if right_steps >= remaining -> return true
     if remaining - right_steps <> 1 -> return false
-    return bool(left % stride >= stride - 1 - right % stride)
+    return left % stride >= stride - 1 - right % stride
 
 func aligned_last(first: int, last: int, stride: int, descending: bool) int
     var first_remainder = first % stride

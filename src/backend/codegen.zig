@@ -1122,7 +1122,6 @@ fn FunctionEmitter(comptime Types: type) type {
                 },
                 .storage_cursor => |operation| try self.emitStorageCursor(operation, destination),
                 .cursor_offset, .cursor_element => |operation| try self.emitCursorElement(operation, destination),
-                .byte_to_int => |operand| try self.emitUnary(.byte, operand, null, destination),
                 .variant_tag => |operand| try self.emitVariantTag(operand, destination),
                 .negi => |operand| try self.emitUnary(.dword, operand, .neg_eax, destination),
                 inline .addi, .subi, .muli, .divsi, .shli, .shrsi => |operands, operation| try self.emitIntegerBinary(operation, operands, destination),
@@ -3121,83 +3120,47 @@ fn emitPanicTrace(encoder: *Encoder) !u32 {
     return table_address;
 }
 
-pub fn compileExternalAllocateHostStorage(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
-    return compileExternalAllocateStorage(signature, types, gpa, 1, false, false);
-}
-
-pub fn compileExternalAllocateHostTypedStorage(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator, element: structures.TypeLayout) !structures.CompiledFunction {
-    if (element.byte_alignment > 4096) return error.UnsupportedAllocationAlignment;
-    return compileExternalAllocateStorage(signature, types, gpa, element.byte_size, true, false);
-}
-
-fn compileExternalAllocateStorage(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator, element_size: u32, with_count: bool, raw_layout: bool) !structures.CompiledFunction {
+pub fn compileExternalAllocateRaw(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
     var encoder: Encoder = .{ .gpa = gpa };
     defer encoder.deinit();
     var call = try signatureLayout(types, signature, gpa);
     defer call.deinit(gpa);
-    const reports_error = with_count or raw_layout;
-    const result = try serviceReturn(types, signature.return_type, if (reports_error) try types.facts().allocationError() else .none);
+    const result = try serviceReturn(types, signature.return_type, try types.facts().allocationError());
     const argument_offset = call.arguments[0].stack + 8;
     try encoder.offset(.mov_esi_rsp, argument_offset);
     try encoder.emit(.test_esi);
     const invalid_size = try encoder.patchable(.jl);
-    var invalid_alignment: [3]?u32 = .{ null, null, null };
-    if (raw_layout) {
-        try encoder.offset(.mov_eax_rsp, argument_offset + 4);
-        try encoder.immediate(.cmp_eax, 0);
-        invalid_alignment[0] = try encoder.patchable(.jle);
-        try encoder.immediate(.cmp_eax, 4096);
-        invalid_alignment[1] = try encoder.patchable(.ja);
-        try encoder.emit(.mov_ecx_eax);
-        try encoder.immediate(.sub_eax, 1);
-        try encoder.emit(.and_eax_ecx);
-        try encoder.immediate(.cmp_eax, 0);
-        invalid_alignment[2] = try encoder.patchable(.jne);
-    }
-    const oversized_element = if (element_size > std.math.maxInt(i32)) try encoder.patchable(.jne) else null;
-    const multiply_size = element_size > 1 and element_size <= std.math.maxInt(i32);
-    if (multiply_size) {
-        try encoder.immediate(.imul_rsi, @intCast(element_size));
-        try encoder.immediate(.cmp_rsi, std.math.maxInt(i32));
-    }
-    const size_overflow = if (multiply_size) try encoder.patchable(.ja) else null;
-    if (element_size == 0 or oversized_element != null) {
-        try encoder.immediate(.mov_esi, 1);
-    } else {
-        try encoder.emit(.test_esi);
-        const nonzero_size = try encoder.patchable(.jne);
-        try encoder.immediate(.mov_esi, 1);
-        try encoder.patchHere(nonzero_size);
-    }
+    try encoder.offset(.mov_eax_rsp, argument_offset + 4);
+    try encoder.immediate(.cmp_eax, 0);
+    const invalid_alignment = try encoder.patchable(.jle);
+    try encoder.immediate(.cmp_eax, 4096);
+    const unsupported_alignment = try encoder.patchable(.ja);
+    try encoder.emit(.mov_ecx_eax);
+    try encoder.immediate(.sub_eax, 1);
+    try encoder.emit(.and_eax_ecx);
+    try encoder.immediate(.cmp_eax, 0);
+    const unaligned = try encoder.patchable(.jne);
+    try encoder.emit(.test_esi);
+    const nonzero_size = try encoder.patchable(.jne);
+    try encoder.immediate(.mov_esi, 1);
+    try encoder.patchHere(nonzero_size);
     const allocation_failed = try encoder.mapPages();
     try encoder.offset(.mov_rsp_eax, result.payload);
     try encoder.byteImmediate(.shr_rax, 32);
     try encoder.offset(.mov_rsp_eax, result.payload + 4);
-    if (raw_layout) try encoder.offset(.mov_eax_rsp, argument_offset) else try encoder.emit(.mov_eax_esi);
+    try encoder.offset(.mov_eax_rsp, argument_offset);
     try encoder.offset(.mov_rsp_eax, result.payload + 8);
-    if (raw_layout) {
-        try encoder.offset(.mov_eax_rsp, argument_offset + 4);
-        try encoder.offset(.mov_rsp_eax, result.payload + 12);
-    }
-    if (with_count) {
-        try encoder.offset(.mov_eax_rsp, argument_offset);
-        try encoder.offset(.mov_rsp_eax, result.payload + 12);
-    }
+    try encoder.offset(.mov_eax_rsp, argument_offset + 4);
+    try encoder.offset(.mov_rsp_eax, result.payload + 12);
     try emitOptionalReturn(&encoder, result, true);
     try encoder.patchHere(allocation_failed);
-    try emitAllocationFailure(&encoder, result, reports_error, 0);
+    try emitAllocationFailure(&encoder, result, 0);
     try encoder.patchHere(invalid_size);
-    for (invalid_alignment) |failure| if (failure) |field| try encoder.patchHere(field);
-    try emitAllocationFailure(&encoder, result, reports_error, 1);
-    for ([_]?u32{ size_overflow, oversized_element }) |failure| {
-        if (failure) |field| try encoder.patchHere(field);
-    }
-    try emitAllocationFailure(&encoder, result, reports_error, 2);
+    try encoder.patchHere(invalid_alignment);
+    try encoder.patchHere(unsupported_alignment);
+    try encoder.patchHere(unaligned);
+    try emitAllocationFailure(&encoder, result, 1);
     return externalArtifact(&encoder);
-}
-
-pub fn compileExternalAllocateRaw(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
-    return compileExternalAllocateStorage(signature, types, gpa, 1, false, true);
 }
 
 pub fn compileExternalCursorAligned(signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
@@ -3216,7 +3179,7 @@ pub fn compileExternalCursorAligned(signature: structures.FunctionSignature, typ
     return externalArtifact(&encoder);
 }
 
-pub fn compileExternalDeallocateHostStorage(gpa: std.mem.Allocator) !structures.CompiledFunction {
+pub fn compileExternalDeallocateRaw(gpa: std.mem.Allocator) !structures.CompiledFunction {
     var encoder: Encoder = .{ .gpa = gpa };
     defer encoder.deinit();
     // The only argument refers to the storage's address and byte size.
@@ -3298,12 +3261,9 @@ fn serviceReturn(types: anytype, type_id: structures.TypeId, error_type: structu
     return .{ .tag = 8, .payload = 8 + layout.payload_offset, .tag_width = variantTagWidth(layout), .present = @intCast(1 - absent), .absent = @intCast(absent) };
 }
 
-/// Returns the absent variant, which carries the allocation error `code` when the result reports one.
-fn emitAllocationFailure(encoder: *Encoder, result: OptionalReturn, reports_error: bool, code: i32) !void {
-    if (reports_error) {
-        try encoder.immediate(.mov_eax, code);
-        try encoder.offset(.mov_rsp_eax, result.payload);
-    }
+fn emitAllocationFailure(encoder: *Encoder, result: OptionalReturn, code: i32) !void {
+    try encoder.immediate(.mov_eax, code);
+    try encoder.offset(.mov_rsp_eax, result.payload);
     try emitOptionalReturn(encoder, result, false);
 }
 

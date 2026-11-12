@@ -362,7 +362,6 @@ fn validStorageOperations(db: *query.Database, body: structures.FunctionBodyAnal
                 const target = if (instruction == .cursor_element) try types.borrowElement(operation.type_id) else try types.storageCursorAccess(operation.type_id);
                 if (source != (target orelse return false)) return false;
             },
-            .byte_to_int => |source| if (body.valueType(source) != .byte) return false,
             .variant_extract => |operation| if (operation.tag_mapping == null and try types.variantMembers(operation.target_type) != null) return false,
             .initializer_ref => |reference| if (!try validInitializerResult(db, types, body, reference)) return false,
             .const_type => |type_id| if (!try validArrayStorageType(db, types, type_id)) return false,

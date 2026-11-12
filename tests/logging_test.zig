@@ -148,6 +148,39 @@ fn runWithStderr(source: []const u8, stderr: std.Io.File) !std.process.Child.Ter
     return child.wait(std.testing.io);
 }
 
+test "root logging borrows allocated messages without calling a refusing allocator" {
+    const source =
+        \\import std.logging as logging
+        \\import std.memory.{Allocator, AllocationLayout, RawBlock, AllocationError}
+        \\struct Refusal
+        \\    calls: int
+        \\    pub func allocate(mut self: Refusal, layout: AllocationLayout) RawBlock | AllocationError
+        \\        self.calls += 1
+        \\        return AllocationError.budget
+        \\    pub func deallocate(imm self: Refusal, deinit block: RawBlock)
+        \\        panic "refusing allocator has no storage to release"
+        \\func run() int
+        \\    var message = "borrowed\0text"
+        \\    message.append("!") catch -> return 90
+        \\    var refusal = Refusal{calls = 0}
+        \\    with context.allocator = Allocator.from(Refusal, refusal)
+        \\        if not (logging.info(message.view()) is unit) -> return 91
+        \\    return refusal.calls + 42
+    ;
+    for ([_][]const u8{ "exit(run())", "exit(comptime -> run())" }, 0..) |entry, index| {
+        const program_source = try std.testing.allocator.print("{s}\n{s}", .{ source, entry });
+        defer std.testing.allocator.free(program_source);
+        const fixture = try SourceFixture.init(program_source);
+        defer fixture.deinit();
+        const result = try fixture.runIo("");
+        defer std.testing.allocator.free(result.stdout);
+        defer std.testing.allocator.free(result.stderr);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, result.term);
+        try std.testing.expectEqualStrings("", result.stdout);
+        try std.testing.expectEqualStrings(if (index == 0) "info: borrowed\x00text!\n" else "", result.stderr);
+    }
+}
+
 test "root logging returns IoError for a real broken stderr pipe without SIGPIPE termination" {
     var descriptors: [2]std.os.linux.fd_t = undefined;
     try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(std.os.linux.pipe2(&descriptors, .{ .CLOEXEC = true })));
@@ -170,7 +203,7 @@ test "root logging returns IoError for a real broken stderr pipe without SIGPIPE
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, term);
 }
 
-test "root logging nonblocking stderr errors count prefix partial message and atomic line progress" {
+test "root logging nonblocking stderr errors count prefix partial message and newline progress" {
     const prefix = "info: ";
     const Stage = enum { prefix, message, newline };
     for ([_]Stage{ .prefix, .message, .newline }) |stage| {
@@ -180,21 +213,20 @@ test "root logging nonblocking stderr errors count prefix partial message and at
         defer reader.close(std.testing.io);
         const stderr: std.Io.File = .{ .handle = descriptors[1], .flags = .{ .nonblocking = true } };
         defer stderr.close(std.testing.io);
-        // A single pipe page makes partial delivery deterministic. A combined
-        // message/newline no larger than PIPE_BUF is refused atomically when
-        // the prefix leaves one byte less space than the line needs.
+        // A single pipe page makes partial delivery deterministic. The newline
+        // fails after the prefix and message exactly fill the pipe.
         const capacity = std.os.linux.fcntl(stderr.handle, std.os.linux.F.SETPIPE_SZ, 1);
         try std.testing.expectEqual(std.os.linux.E.SUCCESS, std.os.linux.errno(capacity));
         try std.testing.expect(capacity > prefix.len);
         const message_length: usize = switch (stage) {
             .prefix => 1,
-            .message => 3 * capacity - prefix.len - 1,
+            .message => 3 * capacity - prefix.len,
             .newline => capacity - prefix.len,
         };
         const message = try std.testing.allocator.alloc(u8, message_length);
         defer std.testing.allocator.free(message);
         @memset(message, 'm');
-        const expected = try std.testing.allocator.alloc(u8, if (stage == .newline) prefix.len else capacity);
+        const expected = try std.testing.allocator.alloc(u8, capacity);
         defer std.testing.allocator.free(expected);
         if (stage == .prefix) {
             @memset(expected, 'x');
@@ -218,7 +250,7 @@ test "root logging nonblocking stderr errors count prefix partial message and at
         , .{ message, switch (stage) {
             .prefix => @as(usize, 0),
             .message => capacity,
-            .newline => prefix.len,
+            .newline => capacity,
         } });
         defer std.testing.allocator.free(source);
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 42 }, try runWithStderr(source, stderr));

@@ -99,11 +99,6 @@ const Rules = struct {
             .addi, .subi, .muli, .shli, .shrsi => return self.simplifyBinary(instruction, result),
             .divsi => return self.simplifyDivision(instruction, result),
             .negi => |operand| return self.simplifyNegation(instruction, result, operand),
-            .byte_to_int => |operand| {
-                const folded = self.function.constantInt(operand) orelse return false;
-                instruction.* = .{ .const_int = folded };
-                return true;
-            },
             .value_copy => |copy| return self.simplifyCopy(copy, result),
             .borrow_read => |operation| return self.simplifyBorrowRead(instruction, operation, result),
             .borrow_address => |operation| return self.simplifyBorrowAddress(operation, result),

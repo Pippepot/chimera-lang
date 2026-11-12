@@ -1,10 +1,10 @@
-import std.memory.{AllocationError, Allocation, Span, List, Box, Ref, allocate, allocate_with, deallocate, unsafe_initialize}
+import std.memory.{AllocationError, Allocation, Span, List, Box, Ref, allocate, deallocate, unsafe_initialize}
 import std.array.{Array, collection_literal}
 import std.range.{Range, FromEnd}
 import std.search
 import std.io.{IoError}
 
-pub extern func byte_int(value: byte) int
+pub func byte_int(value: byte) int -> int(value)
 extern func io_write(descriptor: int, imm data: Span(byte)) int | IoError
 extern func panic_message(imm message: StringView) never
 
@@ -29,14 +29,14 @@ pub struct BytesView
     func get_from_end(imm self: BytesView, index: FromEnd) ref byte | none -> self.data.get(index)
     pub overload get(get_at, get_from_end)
     func at(imm self: BytesView, index: int) ref byte
-        const selected_item_2 = self.get(index)
-        if not (selected_item_2 is byte) -> panic "BytesView index out of bounds"
-        ref item = selected_item_2
+        const result = self.get(index)
+        if not (result is byte) -> panic "BytesView index out of bounds"
+        ref item = result
         return item
     func at_from_end(imm self: BytesView, index: FromEnd) ref byte
-        const selected_item_3 = self.get(index)
-        if not (selected_item_3 is byte) -> panic "BytesView index out of bounds"
-        ref item = selected_item_3
+        const result = self.get(index)
+        if not (result is byte) -> panic "BytesView index out of bounds"
+        ref item = result
         return item
     func slice_at(imm self: BytesView, bounds: Range) BytesView
         const view = self.slice(bounds)
@@ -52,7 +52,7 @@ pub struct BytesView
         loop
             if index == self.byte_length() -> break
             const sequence_start = index
-            const first = byte_int(self[index])
+            const first = int(self[index])
             index += 1
             if first >= 128
                 var continuation = 0
@@ -70,11 +70,11 @@ pub struct BytesView
                         if first == 244 -> maximum = 143
                     _ -> return Utf8Error{index = sequence_start}
                 if continuation > self.byte_length() - index -> return Utf8Error{index = sequence_start}
-                const second = byte_int(self[index])
+                const second = int(self[index])
                 if second < minimum or second > maximum -> return Utf8Error{index = sequence_start}
                 index += 1
                 for _ in 1..continuation
-                    const next = byte_int(self[index])
+                    const next = int(self[index])
                     if next < 128 or next > 191 -> return Utf8Error{index = sequence_start}
                     index += 1
         return StringView{bytes = self}
@@ -101,10 +101,10 @@ pub struct StringView
         const start = offsets.0
         const end = offsets.1
         if start < self.byte_length()
-            const first = byte_int(self.bytes[start])
+            const first = int(self.bytes[start])
             if first >= 128 and first < 192 -> return none
         if end < self.byte_length()
-            const last = byte_int(self.bytes[end])
+            const last = int(self.bytes[end])
             if last >= 128 and last < 192 -> return none
         const view = self.bytes.slice(bounds)
         if not (view is BytesView) -> return none
@@ -170,8 +170,7 @@ pub struct String
         const size = self.byte_length()
         var capacity = minimum_capacity
         if capacity < size -> capacity = size
-        const storage = if self.storage is OwnedBytes -> self.storage.allocation.allocate_replacement(capacity) else allocate(byte, capacity)
-        if storage is AllocationError -> return storage^
+        const storage = (if self.storage is OwnedBytes -> self.storage.allocation.allocate_replacement(capacity) else allocate(byte, capacity))?
         var replacement = OwnedBytes{allocation = storage^, size = 0}
         const bytes = self.as_bytes()
         for index in 0..size
@@ -220,7 +219,7 @@ func equal_bytes(imm left: BytesView, imm right: BytesView) bool
     const count = left.byte_length()
     if count <> right.byte_length() -> return false
     for index in 0..count
-        if byte_int(left[index]) <> byte_int(right[index]) -> return false
+        if left[index] <> right[index] -> return false
     return true
 func match_literal(static T: type, imm value: T, imm literal: StaticString) bool -> equal_bytes(value.as_bytes(), literal.as_bytes())
 
@@ -231,10 +230,10 @@ pub converter(imm value: String) StringView -> value.view()
 pub converter(imm value: String) BytesView -> value.as_bytes()
 pub converter(imm value: StringView) String
     var result = String.empty()
-    if not (result.append(value) is unit) -> panic "string conversion allocation failed"
+    result.append(value) catch -> panic "string conversion allocation failed"
     return result^
 pub converter(value: int) String -> require_string(format_integer(value))
-pub converter(value: byte) String -> String(byte_int(value))
+pub converter(value: byte) String -> String(int(value))
 pub converter(value: bool) String -> if value -> "true" else "false"
 pub converter(value: unit) String -> "()"
 pub converter(value: none) String -> "none"
@@ -248,10 +247,7 @@ pub converter(imm value: BytesView) String -> String(value.as_span())
 pub converter(static T: type, imm value: Box(T)) String -> require_string(format_wrapped_using(T, "Box(", value.borrow(), format_converted))
 pub converter(static T: type, imm value: Ref(T)) String -> require_string(format_wrapped_using(T, "Ref(", value.value, format_converted))
 
-func require_string(deinit result: String | AllocationError) String
-    match result
-        String -> return result^
-        AllocationError -> panic "string conversion allocation failed"
+func require_string(deinit result: String | AllocationError) String -> result^ catch -> panic "string conversion allocation failed"
 
 # Decimal formatting has bounded stack storage, including -2147483648.
 pub struct IntegerText
@@ -293,7 +289,7 @@ pub overload format(format_integer, format_byte, format_bool, format_unit, forma
 func format_converted(static T: type, imm value: T) String | AllocationError
     if value is String -> return require_string(value.clone())
     return String(value)
-func format_byte(value: byte) String | AllocationError -> format_integer(byte_int(value))
+func format_byte(value: byte) String | AllocationError -> format_integer(int(value))
 func format_bool(value: bool) String | AllocationError -> if value -> "true" else "false"
 func format_unit(value: unit) String | AllocationError -> "()"
 func format_none(value: none) String | AllocationError -> "none"

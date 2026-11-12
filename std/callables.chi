@@ -1,4 +1,4 @@
-import std.memory.{Allocation, AllocationError, allocate_layout_with, root_allocator, type_layout, AllocationLayout, deallocate, unsafe_initialize, unsafe_destroy}
+import std.memory.{Allocation, AllocationError, allocate_layout_with, type_layout, AllocationLayout, deallocate, unsafe_initialize, unsafe_destroy}
 import std.context as context
 
 pub extern func erase(static Signature: type, init callback: Signature) Signature | AllocationError
@@ -6,10 +6,7 @@ pub extern func clone(static Signature: type, imm callback: Signature) Signature
 extern func copy_callable(static Signature: type, imm callback: Signature) Signature
 extern func drop_callable(static Signature: type, deinit callback: Signature) unit
 
-func copy_or_panic(static Signature: type, imm callback: Signature) Signature
-    const copied = clone(Signature, callback)
-    if copied is AllocationError -> panic "Callable environment allocation failed"
-    return copied^
+func copy_or_panic(static Signature: type, imm callback: Signature) Signature -> clone(Signature, callback) catch -> panic "Callable environment allocation failed"
 
 struct EnvironmentReservation(Environment: type)
     allocation: Allocation(Environment)
@@ -21,14 +18,10 @@ func reserve_environment(static Environment: type) EnvironmentReservation(Enviro
     const owner = type_layout(Allocation(Environment))
     const trailer = ((environment.byte_size + owner.alignment - 1) / owner.alignment) * owner.alignment
     const layout = AllocationLayout{byte_size = trailer + owner.byte_size, alignment = if environment.alignment > owner.alignment -> environment.alignment else owner.alignment}
-    const storage = allocate_layout_with(Environment, context.allocator, 1, layout)
-    if storage is AllocationError -> return storage^
+    const storage = allocate_layout_with(Environment, context.allocator, 1, layout)?
     return EnvironmentReservation(Environment){allocation = storage^}
 
-func reserve_environment_or_panic(static Environment: type) EnvironmentReservation(Environment)
-    const storage = reserve_environment(Environment)
-    if storage is AllocationError -> panic "Callable environment allocation failed"
-    return storage^
+func reserve_environment_or_panic(static Environment: type) EnvironmentReservation(Environment) -> reserve_environment(Environment) catch -> panic "Callable environment allocation failed"
 
 func copy_environment(static Environment: type, imm source: Environment) EnvironmentReservation(Environment) | AllocationError
     var storage = reserve_environment(Environment)?

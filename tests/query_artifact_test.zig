@@ -334,6 +334,10 @@ test "bundled std preserves text IO ownership and new generic specializations" {
         \\print(values[0] + values[1])
         \\print(String(values))
         \\for value in 0..3 -> print(value)
+        \\const value: byte = 42
+        \\match value
+        \\    42 -> print(byte_int(value))
+        \\    _ -> exit(90)
     , &.{}, &.{});
     _ = try bundle.install(db, sources.standard_bundle);
     const fixture: sources.SourceFixture = .{ .db = db };
@@ -341,7 +345,7 @@ test "bundled std preserves text IO ownership and new generic specializations" {
     defer allocator.free(result.stdout);
     defer allocator.free(result.stderr);
     try std.testing.expectEqual(std.process.Child.Term{ .exited = 0 }, result.term);
-    try std.testing.expectEqualStrings("42\n[20, 22]\n0\n1\n2\n", result.stdout);
+    try std.testing.expectEqualStrings("42\n[20, 22]\n0\n1\n2\n42\n", result.stdout);
     try std.testing.expectEqualStrings("", result.stderr);
 }
 

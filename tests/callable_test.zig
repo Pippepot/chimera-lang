@@ -12,7 +12,9 @@ fn refusingFixture(source: []const u8) !Fixture {
     const original = (try fixture.db.input(queries.SourceText, file)).*;
     const renamed = try std.mem.replaceOwned(u8, std.testing.allocator, original, "func reserve_environment(", "func reserve_initial_environment(");
     defer std.testing.allocator.free(renamed);
-    const initial = try std.mem.replaceOwned(u8, std.testing.allocator, renamed, "const storage = reserve_environment(Environment)", "const storage = reserve_initial_environment(Environment)");
+    const infallible_call = "EnvironmentReservation(Environment) -> reserve_environment(Environment)";
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, renamed, infallible_call));
+    const initial = try std.mem.replaceOwned(u8, std.testing.allocator, renamed, infallible_call, "EnvironmentReservation(Environment) -> reserve_initial_environment(Environment)");
     defer std.testing.allocator.free(initial);
     const refusing = try std.testing.allocator.print(
         "{s}\nfunc reserve_environment(static Environment: type) EnvironmentReservation(Environment) | AllocationError -> AllocationError.refused\n",

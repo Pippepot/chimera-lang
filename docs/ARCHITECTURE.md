@@ -757,6 +757,10 @@ scratch uses an explicit root provider and exposes marked failures through its
 recoverable implementation. Zero-byte host allocations reserve a distinct
 stable address without changing logical count or layout.
 
+Typed allocation construction, provider selection, and release are ordinary
+library code over `RawBlock` and `AllocationLayout`. The native allocation
+backend reserves and releases raw bytes; it does not construct `Allocation(T)`.
+
 Span holds a typed cursor and length. Checked views retain permissions and
 content dependencies; mutable handles cannot upgrade readonly captures. Static
 bytes use symbolic interner identities and offsets. UTF-8 validation cannot

@@ -2,12 +2,6 @@ const std = @import("std");
 const structures = @import("structures.zig");
 const standard_library = @import("standard_library");
 
-pub fn validHostStorage(definition: *const structures.StructDefinition) bool {
-    if (!ownedResource(definition, &.{ "address_low", "address_high", "byte_size" }, .explicit)) return false;
-    for (definition.fields) |field| if (field.type_id != .int) return false;
-    return true;
-}
-
 pub fn validAllocation(definition: *const structures.StructDefinition, storage_type: structures.TypeId, provider_type: structures.TypeId) bool {
     return ownedResource(definition, &.{ "storage", "count", "provider" }, .explicit) and
         definition.fields[0].type_id == storage_type and definition.fields[1].type_id == .int and definition.fields[2].type_id == provider_type;
@@ -58,10 +52,6 @@ pub fn hasTypedBody(symbol: standard_library.External) bool {
         .allocate_raw,
         .deallocate_raw,
         .cursor_aligned,
-        .allocate,
-        .allocate_host_storage,
-        .deallocate,
-        .deallocate_host_storage,
         .io_read,
         .io_write,
         .exit,
@@ -158,7 +148,6 @@ pub fn validExternalSignature(facts: anytype, symbol: standard_library.External,
         .initialize_collection => return validCollectionInitializerSignature(facts, signature),
         .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate => return validCursorSignature(facts, symbol, signature),
         .array_filled => return validArrayFilledSignature(facts, signature),
-        .byte_int => return hasShape(signature, &.{.imm}) and signature.parameters[0].type_id == .byte and signature.return_type == .int,
         .io_write => return validByteOutputSignature(facts, signature),
         .io_read => return (try errorPayload(facts, signature.return_type, try facts.ioError())) == .int and signature.parameters.len == 4 and
             signature.parameters[0].type_id == .int and (try facts.allocationElement(signature.parameters[1].type_id)) == structures.TypeId.byte and
@@ -168,10 +157,6 @@ pub fn validExternalSignature(facts: anytype, symbol: standard_library.External,
         .exit => return hasShape(signature, &.{.imm}) and signature.return_type == .never and signature.parameters[0].type_id == .int,
         .panic_message => return hasShape(signature, &.{.imm}) and signature.return_type == .never and
             signature.parameters[0].type_id == try facts.panicMessageType(),
-        .allocate_host_storage, .deallocate_host_storage => return validHostStorageSignature(facts, symbol, signature),
-        .allocate, .deallocate => return validAllocationSignature(facts, symbol, signature),
-        .allocation_count => return hasShape(signature, &.{.imm}) and signature.return_type == .int and
-            (try facts.allocationElement(signature.parameters[0].type_id)) != null,
         .unsafe_initialize, .initialize_collection_element, .unsafe_take, .unsafe_destroy, .unsafe_borrow => return validAllocationAccessSignature(facts, symbol, signature),
         .cursor_take, .cursor_initialize, .cursor_destroy => return validCursorAccessSignature(facts, symbol, signature),
     }
@@ -194,27 +179,6 @@ fn validCallableSignature(facts: anytype, signature: structures.FunctionSignatur
 fn validByteOutputSignature(facts: anytype, signature: structures.FunctionSignature) !bool {
     if (!hasShape(signature, &.{ .imm, .imm }) or (try errorPayload(facts, signature.return_type, try facts.ioError())) != .int or signature.parameters[0].type_id != .int) return false;
     return (try facts.spanAccess(signature.parameters[1].type_id)) == structures.TypeId.byte;
-}
-
-fn validHostStorageSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
-    const storage_type = (try facts.hostStorage()) orelse return false;
-    switch (symbol) {
-        .allocate_host_storage => return hasShape(signature, &.{.imm}) and (try errorPayload(facts, signature.return_type, .none)) == storage_type and
-            signature.parameters[0].type_id == .int,
-        .deallocate_host_storage => return hasShape(signature, &.{.deinit}) and signature.return_type == .unit and
-            signature.parameters[0].type_id == storage_type,
-        else => unreachable,
-    }
-}
-
-fn validAllocationSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
-    if (signature.parameters.len != 1) return false;
-    const type_id = if (symbol == .allocate) (try errorPayload(facts, signature.return_type, try facts.allocationError())) orelse return false else signature.parameters[0].type_id;
-    if (try facts.allocationElement(type_id) == null) return false;
-    return if (symbol == .allocate)
-        hasShape(signature, &.{.imm}) and signature.parameters[0].type_id == .int
-    else
-        hasShape(signature, &.{.deinit}) and signature.return_type == .unit;
 }
 
 fn validAllocationAccessSignature(facts: anytype, symbol: standard_library.External, signature: structures.FunctionSignature) !bool {
