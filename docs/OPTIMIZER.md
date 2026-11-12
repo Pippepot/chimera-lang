@@ -123,7 +123,9 @@ Dead parameters invalidate storage passes only when their incoming arguments
 change surviving uses or eligibility. Numbering visits dominating definitions
 before uses, so its substitutions need no extra numbering/liveness round.
 
-Storage-free bodies skip scalar replacement and promotion. Type classification
+Storage-free bodies skip scalar replacement and promotion. Both passes record
+every operand reference, but skip read-use classification for instructions and
+terminators that reference no candidate slot. Type classification
 visits newly added values. Numbering reuses table capacity, not candidates;
 aggregate lookup allocates only for inserted owned keys. Normalize replacements
 at consuming boundaries rather than on both producer exit and consumer entry.

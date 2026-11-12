@@ -68,6 +68,7 @@ const Uses = struct {
     /// Blocks that mention a candidate slot; every other block is left untouched.
     touched: []bool,
     block: u32 = 0,
+    hit: bool = false,
 
     fn index(self: *Uses, value: ValueId) ?u32 {
         return self.mapping[@backingInt(value)];
@@ -75,6 +76,7 @@ const Uses = struct {
 
     fn reference(self: *Uses, value: ValueId) void {
         const slot = self.index(value) orelse return;
+        self.hit = true;
         self.slots.items[slot].references += 1;
         self.touched[self.block] = true;
     }
@@ -128,7 +130,9 @@ fn splitSlots(function: *Function, context: anytype, order: []const u32, layouts
         for (block.instructions.items) |index| {
             if (function.removed.items[index]) continue;
             const instruction = &function.instructions.items[index];
+            uses.hit = false;
             function_ir.visitOperands(function, instruction, .all, &uses, Uses.reference);
+            if (!uses.hit) continue;
             switch (instruction.*) {
                 .storage_projection => |projection| if (uses.index(projection.owner)) |owner| {
                     try analyzeProjection(function, context, layouts, &uses, owner, projection, function.results.items[index]);
@@ -149,8 +153,9 @@ fn splitSlots(function: *Function, context: anytype, order: []const u32, layouts
             }
             function_ir.visitOperands(function, instruction, .reads, &uses, Uses.accept);
         }
+        uses.hit = false;
         function_ir.visitTerminatorOperands(function, &block.terminator, .all, &uses, Uses.reference);
-        function_ir.visitTerminatorOperands(function, &block.terminator, .reads, &uses, Uses.accept);
+        if (uses.hit) function_ir.visitTerminatorOperands(function, &block.terminator, .reads, &uses, Uses.accept);
     }
     var changed = false;
     for (uses.slots.items[0..root_count]) |*slot| {
