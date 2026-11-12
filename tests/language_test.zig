@@ -1021,6 +1021,118 @@ test "error handlers specialize infallible and all error inputs without implicit
     , 42);
 }
 
+test "error handlers commit owned carriers before return break and continue" {
+    try Fixture.expectParity(
+        \\struct Failure
+        \\    error = true
+        \\    copy = none
+        \\    ref drops: int
+        \\    code: int
+        \\    drop = func(deinit self: Failure) -> self.drops += 10
+        \\struct Value
+        \\    copy = none
+        \\    ref drops: int
+        \\    value: int
+        \\    drop = func(deinit self: Value) -> self.drops += 1
+        \\func make(mut drops: int, mode: int) Value | Failure
+        \\    if mode == 0 -> return Value{drops = drops, value = 20}
+        \\    return Failure{drops = drops, code = mode}
+        \\func finish(deinit result: Value | Failure) int
+        \\    const value = result^ catch failure -> return failure.code
+        \\    return value.value
+        \\func iterate(mut drops: int) int
+        \\    var total = 0
+        \\    for mode in 0..3
+        \\        const result = make(drops, mode)
+        \\        const value = result^ catch failure ->
+        \\            if failure.code == 1 -> continue
+        \\            break
+        \\        total += value.value
+        \\    return total
+        \\func run() int
+        \\    var drops = 0
+        \\    if finish(make(drops, 0)) <> 20 -> return 91
+        \\    if finish(make(drops, 1)) <> 1 -> return 92
+        \\    if drops <> 11 -> return 93
+        \\    if iterate(drops) <> 20 -> return 94
+        \\    if drops <> 32 -> return 95
+        \\    return drops + 10
+    , 42);
+}
+
+test "error handlers transfer owned fields out of recovering failure bindings" {
+    try Fixture.expectParity(
+        \\struct Payload
+        \\    copy = none
+        \\    ref drops: int
+        \\    value: int
+        \\    drop = func(deinit self: Payload) -> self.drops += self.value
+        \\struct Failure
+        \\    error = true
+        \\    copy = none
+        \\    payload: Payload
+        \\func make(mut drops: int, fail: bool) Payload | Failure
+        \\    if fail -> return Failure{payload = Payload{drops = drops, value = 22}}
+        \\    return Payload{drops = drops, value = 20}
+        \\func recover(deinit result: Payload | Failure) Payload -> result^ catch failure -> failure.payload^
+        \\func read(imm value: Payload) int -> value.value
+        \\func run() int
+        \\    var drops = 0
+        \\    var total = read(recover(make(drops, false)))
+        \\    total += read(recover(make(drops, true)))
+        \\    if drops <> 42 -> return 91
+        \\    return total
+    , 42);
+}
+
+test "error handlers forward explicit drop successes through panicking handlers" {
+    const source =
+        \\import std.memory.{Allocation, allocate, deallocate}
+        \\func require_allocation(deinit result: Allocation(int) | AllocationError) Allocation(int)
+        \\    return result^ catch -> panic "allocation failed"
+        \\func run() int
+        \\    const storage = require_allocation(allocate(int, 1))
+        \\    deallocate(int, storage^)
+        \\    return 42
+    ;
+    try Fixture.expectParity(source, 42);
+    const fixture = try Fixture.init(source ++ "\nexit(run())");
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const failed = try std.mem.replaceOwned(u8, testing.allocator, source ++ "\nexit(run())", "allocate(int, 1)", "allocate(int, -1)");
+    defer testing.allocator.free(failed);
+    try fixture.db.setInput(queries.SourceText, 0, failed);
+    const result = try fixture.runIo("");
+    defer testing.allocator.free(result.stdout);
+    defer testing.allocator.free(result.stderr);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 134 }, result.term);
+    try testing.expect(std.mem.indexOf(u8, result.stderr, "allocation failed") != null);
+}
+
+test "error handlers recompute between returning and recovering owned failures" {
+    const source =
+        \\func recover(deinit result: String | AllocationError) String -> result^ catch -> return "bad"
+        \\func make(fail: bool) String | AllocationError
+        \\    if fail -> return AllocationError.invalid_layout
+        \\    const value: String = "ok"
+        \\    return value^
+        \\func run() int
+        \\    const first = recover(make(false))
+        \\    const second = recover(make(true))
+        \\    return first.byte_length() + second.byte_length() + 37
+        \\exit(run())
+    ;
+    const fixture = try Fixture.init(source);
+    defer fixture.deinit();
+    try fixture.expectExit(0, 42);
+    const recovered = try std.mem.replaceOwned(u8, testing.allocator, source, "return \"bad\"", "\"oops\"");
+    defer testing.allocator.free(recovered);
+    try fixture.db.setInput(queries.SourceText, 0, recovered);
+    try fixture.expectExit(0, 43);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(0, 42);
+}
+
 test "error handlers reject propagation through init or incompatible return contracts" {
     try Fixture.expectSourceDiagnostic(
         \\struct Failure

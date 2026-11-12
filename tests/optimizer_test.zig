@@ -67,6 +67,25 @@ const guarded_call =
     \\    return value
 ;
 
+test "diverging error handlers forward owned results without speculative cleanup" {
+    const fixture = try Fixture.init(
+        \\func handled(deinit result: String | AllocationError) String -> result^ catch -> panic "format failed"
+        \\func matched(deinit result: String | AllocationError) String
+        \\    match result^
+        \\        AllocationError -> panic "format failed"
+        \\        success -> return success^
+    );
+    defer fixture.deinit();
+    const handled = (try optimizedBody(fixture, "handled")).*.?;
+    const matched = (try optimizedBody(fixture, "matched")).*.?;
+    try testing.expectEqual(countCalls(matched), countCalls(handled));
+    const scope = (try fixture.db.get(queries.BuildModuleScope, 0)).*.?;
+    const handled_code = (try fixture.db.get(queries.CompileFunction, .{ .item = scope.resolveFunction("handled").? })).*.?;
+    const matched_code = (try fixture.db.get(queries.CompileFunction, .{ .item = scope.resolveFunction("matched").? })).*.?;
+    try testing.expectEqual(matched_code.trace_sites.len, handled_code.trace_sites.len);
+    try testing.expect(handled_code.code.len <= matched_code.code.len);
+}
+
 test "call-boundary ranges require guards on every normal return and recompute" {
     const program = guarded_call ++ "\n" ++
         \\func scan(limit: int) int

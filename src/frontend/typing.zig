@@ -14601,12 +14601,17 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     const binding = source.binding.?;
                     const reference = try self.analysis_context.facts().borrowElement(selected.type_id) != null;
                     try self.installLocal(binding.local, selected, reference, false);
+                    // The handler may diverge before its result boundary is reached.
+                    try self.closeBoundary(scope.boundary);
+                    self.current_boundary = scope.parent;
                     var result = try self.blockWithResult(handler, request);
                     if (self.current_block != null) {
+                        const result_scope = try self.openBoundary(source.operand.span);
+                        defer self.current_boundary = result_scope.parent;
                         if (result) |value_on_edge| result = try self.ownValueEscapingSince(value_on_edge, baseline, source.operand.span);
                         try self.unbindLocal(@backingInt(binding.local));
                         try self.unbindLocal(@backingInt(source.carrier));
-                        try self.closeBoundary(scope.boundary);
+                        try self.closeBoundary(result_scope.boundary);
                     }
                     if (try self.valueExit(result)) |exit| try exits.append(self.gpa, exit);
                 } else {

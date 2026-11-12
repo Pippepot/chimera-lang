@@ -586,6 +586,9 @@ select nominal hooks, owned fields, variant alternatives, and reverse array
 destruction once. Effect analysis, emission, and remaining drop obligations consume
 the same actions; hook contracts are queried only for effects, and invocation-time
 origins, contexts, and cleanup locations remain separate.
+Error handlers commit carrier selection and ownership transfer before executing
+the handler body, so those effects remain attached when it returns, breaks,
+continues, or diverges. Recovering results have a separate completion checkpoint.
 Body-local effect summaries distinguish authority/exclusion checks, writes to
 reference-bearing contents, deferred service mutations, and context effects.
 Checks and scalar writes are validated during final effect collection without
