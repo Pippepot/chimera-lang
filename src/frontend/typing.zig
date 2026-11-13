@@ -1369,11 +1369,7 @@ fn BodyBuilder(comptime Context: type, comptime AnalysisServices: type) type {
                     },
                     .static => unreachable,
                 }
-                self.block_arguments.appendAssumeCapacity(.{ .type_id = parameter.type_id, .representation = switch (parameter.mode) {
-                    .init => .initializer,
-                    .ref, .mut, .deinit => .storage,
-                    else => .value,
-                } });
+                self.block_arguments.appendAssumeCapacity(parameter.blockArgument());
                 self.parameter_modes.appendAssumeCapacity(parameter.mode);
                 self.block_argument_generations.appendAssumeCapacity(entry_value.owned_generation);
             }

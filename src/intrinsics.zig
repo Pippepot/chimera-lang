@@ -48,6 +48,7 @@ fn trivialView(definition: *const structures.StructDefinition, names: []const []
 }
 
 pub fn hasTypedBody(symbol: standard_library.External) bool {
+    if (fileCall(symbol) != null) return false;
     switch (symbol) {
         .allocate_raw,
         .deallocate_raw,
@@ -122,6 +123,7 @@ pub fn validExternalSignature(facts: anytype, symbol: standard_library.External,
         else => .owned,
     };
     if (signature.result_mode != expected_result) return false;
+    if (fileCall(symbol)) |call| return validFileSignature(facts, call, signature);
     switch (symbol) {
         .allocator_from, .allocator_from_unchecked => return hasShape(signature, &.{.ref}) and signature.return_type == try facts.allocatorType(),
         .logger_from, .logger_from_unchecked => return hasShape(signature, &.{ .ref, .imm }) and signature.return_type == try facts.loggerType(),
@@ -159,6 +161,7 @@ pub fn validExternalSignature(facts: anytype, symbol: standard_library.External,
             signature.parameters[0].type_id == try facts.panicMessageType(),
         .unsafe_initialize, .initialize_collection_element, .unsafe_take, .unsafe_destroy, .unsafe_borrow => return validAllocationAccessSignature(facts, symbol, signature),
         .cursor_take, .cursor_initialize, .cursor_destroy => return validCursorAccessSignature(facts, symbol, signature),
+        else => unreachable,
     }
 }
 
@@ -279,4 +282,53 @@ pub fn errorPayload(facts: anytype, type_id: structures.TypeId, error_type: stru
     if (members[0] == error_type) return members[1];
     if (members[1] == error_type) return members[0];
     return null;
+}
+
+/// Closed, typed Linux calls available only to compiler-owned std.files externs.
+/// Library code owns path validation, error policy, and buffer initialization.
+pub const FileCall = struct {
+    pub const Type = enum { int, i64, u32, u64, bytes, stat };
+    pub const Parameter = struct { type: Type, mode: structures.ParameterMode = .imm };
+    pub const Argument = union(enum) { value: usize, address: usize, length: usize, storage: usize, constant: i32 };
+
+    number: std.os.linux.syscalls.X64,
+    parameters: []const Parameter,
+    arguments: []const Argument,
+    retry_interrupted: bool = true,
+};
+
+pub fn fileCall(symbol: standard_library.External) ?FileCall {
+    switch (symbol) {
+        .files_open => return .{ .number = .open, .parameters = &.{ .{ .type = .bytes }, .{ .type = .int }, .{ .type = .u32 } }, .arguments = &.{ .{ .address = 0 }, .{ .value = 1 }, .{ .value = 2 } } },
+        .files_close => return .{ .number = .close, .parameters = &.{.{ .type = .int }}, .arguments = &.{.{ .value = 0 }}, .retry_interrupted = false },
+        .files_seek => return .{ .number = .lseek, .parameters = &.{ .{ .type = .int }, .{ .type = .i64 }, .{ .type = .int } }, .arguments = &.{ .{ .value = 0 }, .{ .value = 1 }, .{ .value = 2 } } },
+        .files_set_length => return .{ .number = .ftruncate, .parameters = &.{ .{ .type = .int }, .{ .type = .u64 } }, .arguments = &.{ .{ .value = 0 }, .{ .value = 1 } } },
+        .files_sync => return .{ .number = .fsync, .parameters = &.{.{ .type = .int }}, .arguments = &.{.{ .value = 0 }} },
+        .files_stat => return .{ .number = .newfstatat, .parameters = &.{ .{ .type = .int }, .{ .type = .bytes }, .{ .type = .stat, .mode = .mut }, .{ .type = .int } }, .arguments = &.{ .{ .value = 0 }, .{ .address = 1 }, .{ .storage = 2 }, .{ .value = 3 } } },
+        .files_mkdir => return .{ .number = .mkdir, .parameters = &.{ .{ .type = .bytes }, .{ .type = .u32 } }, .arguments = &.{ .{ .address = 0 }, .{ .value = 1 } } },
+        .files_unlink => return .{ .number = .unlinkat, .parameters = &.{ .{ .type = .bytes }, .{ .type = .int } }, .arguments = &.{ .{ .constant = -100 }, .{ .address = 0 }, .{ .value = 1 } } },
+        .files_rename => return .{ .number = .rename, .parameters = &.{ .{ .type = .bytes }, .{ .type = .bytes } }, .arguments = &.{ .{ .address = 0 }, .{ .address = 1 } } },
+        .files_getcwd => return .{ .number = .getcwd, .parameters = &.{.{ .type = .bytes, .mode = .mut }}, .arguments = &.{ .{ .address = 0 }, .{ .length = 0 } } },
+        .files_getdents => return .{ .number = .getdents64, .parameters = &.{ .{ .type = .int }, .{ .type = .bytes, .mode = .mut } }, .arguments = &.{ .{ .value = 0 }, .{ .address = 1 }, .{ .length = 1 } } },
+        else => return null,
+    }
+}
+
+fn validFileSignature(facts: anytype, call: FileCall, signature: structures.FunctionSignature) !bool {
+    if (signature.return_type != .i64 or signature.parameters.len != call.parameters.len) return false;
+    for (signature.parameters, call.parameters) |parameter, expected| {
+        if (parameter.mode != expected.mode) return false;
+        switch (expected.type) {
+            .int => if (parameter.type_id != .int) return false,
+            .i64 => if (parameter.type_id != .i64) return false,
+            .u32 => if (parameter.type_id != .u32) return false,
+            .u64 => if (parameter.type_id != .u64) return false,
+            .bytes => if (try facts.spanAccess(parameter.type_id) != .byte) return false,
+            .stat => {
+                const array = (try facts.arrayType(parameter.type_id)) orelse return false;
+                if (array.element_type != .u64 or array.length != 18) return false;
+            },
+        }
+    }
+    return true;
 }

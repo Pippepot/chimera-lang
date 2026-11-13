@@ -2861,6 +2861,8 @@ fn logicalTypeNode(ast: *const structures.Ast, node_index: structures.Node.Index
 pub const StaticInitializerPlan = union(enum) { type_value: structures.TypeId, interpret: ?structures.TypeId };
 
 pub fn validateStructNamespace(ast: *const structures.Ast, source: []const u8, struct_index: structures.Node.Index, gpa: std.mem.Allocator) !?Issue {
+    var fields = structures.Name.Set.init(gpa);
+    defer fields.deinit();
     var names = structures.Name.Set.init(gpa);
     defer names.deinit();
     const node = ast.nodes[struct_index.index()];
@@ -2875,7 +2877,8 @@ pub fn validateStructNamespace(ast: *const structures.Ast, source: []const u8, s
         const span = ast.tokenSpan(member.token_index);
         if (std.meta.stringToEnum(structures.OwnershipMember, source[span.start..span.end]) != null)
             return .{ .span = span, .kind = .reserved_ownership_member };
-        if ((try names.getOrPut(declarationName(ast, source[span.start..span.end], member_index.index()))).found_existing)
+        const namespace = if (member.tag == .struct_field) &fields else &names;
+        if ((try namespace.getOrPut(declarationName(ast, source[span.start..span.end], member_index.index()))).found_existing)
             return .{ .span = span, .kind = .duplicate_struct_member };
     }
     return null;

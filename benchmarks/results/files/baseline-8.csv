@@ -1,0 +1,7 @@
+case,lane,phase,sample,nanoseconds,executable_bytes,sample_count,stable
+core-1000000,workers-8,cold,0,4847787973,174665126,3,true
+core-1000000,workers-8,cold,1,4845500487,174665126,3,true
+core-1000000,workers-8,cold,2,4861549538,174665126,3,true
+core-1000000,workers-8,leaf-edit,0,205909653,174665126,3,false
+core-1000000,workers-8,leaf-edit,1,198663646,174665126,3,false
+core-1000000,workers-8,leaf-edit,2,205982496,174665126,3,false

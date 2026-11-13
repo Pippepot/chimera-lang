@@ -81,15 +81,6 @@ user-defined contextual declarations remain outside this revision's scope.
 - Build floating-point library math on the concrete arithmetic and conversion
   policies in [docs/NUMERICS.md](docs/NUMERICS.md).
 
-## Independent filesystem library work
-
-- Implement the proposed `std.files` API in [docs/FILES.md](docs/FILES.md):
-  path values/views, whole-file helpers, typed opening settings, owned file
-  handles with strict automatic cleanup, streaming I/O, and filesystem queries
-  and operations. Settle the proposed filesystem semantics in the language
-  reference before implementation; qualify ownership, failure paths,
-  native/evaluator behavior, and incremental reuse.
-
 ## Deferred or independent
 
 - Fix the remaining cold-compilation regression (roughly 1.3x serial against the

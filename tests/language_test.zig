@@ -10900,15 +10900,15 @@ test "where member type tests inspect static struct fields" {
     try missing.expectDiagnostic(0, .where_condition_failed);
 }
 
-test "qualified namespace declarations share the struct member scope" {
-    try Fixture.expectSourceDiagnostic(
+test "qualified namespace declarations and callable instance fields have independent names" {
+    try Fixture.expectSourceExit(
         \\struct S
         \\  id: func() int
         \\static S.id = func(imm self: S) int -> return 42
         \\func answer() int -> return 1
         \\const s = S{id = answer}
-        \\exit(s.id())
-    , .duplicate_struct_member);
+        \\exit(s.id() + S.id(s) - 1)
+    , 42);
 }
 
 test "nested instance and callable field calls retain contiguous arguments" {
@@ -11009,7 +11009,7 @@ test "qualified owner validation invalidates and recovers after owner edits" {
     }
 }
 
-test "struct field access validates qualified member collisions across edits" {
+test "struct field access remains independent of qualified static members across edits" {
     const f = try Fixture.initFiles(
         \\struct S
         \\  i: int
@@ -11019,7 +11019,7 @@ test "struct field access validates qualified member collisions across edits" {
     defer f.deinit();
     try f.expectExit(0, 42);
     try f.db.setInput(queries.SourceText, 1, "static S.i = 7");
-    try f.expectDiagnostic(1, .duplicate_struct_member);
+    try f.expectExit(0, 42);
     try f.db.setInput(queries.SourceText, 1, "static S.other = 7");
     try f.expectExit(0, 42);
 }
@@ -11303,6 +11303,8 @@ test "struct namespaces validate duplicates and keep ownership hooks separate" {
     defer f.deinit();
     try f.expectExit(0, 42);
     try f.db.setInput(queries.SourceText, 1, "pub struct S\n  value: int\n  func value() int -> return 42\n  pub func read() int -> return 42");
+    try f.expectExit(0, 42);
+    try f.db.setInput(queries.SourceText, 1, "pub struct S\n  value: int\n  func value() int -> return 42\n  func value() int -> return 43\n  pub func read() int -> return 42");
     try f.expectDiagnostic(1, .duplicate_struct_member);
     try f.db.setInput(queries.SourceText, 1, "pub struct S\n  value: int");
     try f.expectDiagnostic(0, .unknown_namespace_member);

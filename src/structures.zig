@@ -891,7 +891,19 @@ pub const VariantType = struct { members: []const TypeId };
 
 pub const ParameterMode = enum { imm, ref, static, mut, @"var", deinit, init };
 
-pub const CallableParameter = struct { mode: ParameterMode, type_id: TypeId };
+pub const CallableParameter = struct {
+    mode: ParameterMode,
+    type_id: TypeId,
+
+    pub fn blockArgument(self: CallableParameter) FunctionBlockArgument {
+        return .{ .type_id = self.type_id, .representation = switch (self.mode) {
+            .init => .initializer,
+            .ref, .mut, .deinit => .storage,
+            .imm, .@"var" => .value,
+            .static => unreachable,
+        } };
+    }
+};
 
 pub const ResultMode = enum { owned, reference };
 

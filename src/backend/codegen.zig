@@ -4,6 +4,7 @@ const division = @import("division.zig");
 const registers = @import("registers.zig");
 const machine = @import("machine.zig");
 const structures = @import("../structures.zig");
+const intrinsics = @import("../intrinsics.zig");
 
 const image_base: u64 = 0x400000;
 const linux_exit_syscall: i32 = 60;
@@ -3238,10 +3239,57 @@ pub fn compileExternalByteIo(read: bool, signature: structures.FunctionSignature
     return artifact;
 }
 
+pub fn compileExternalFileCall(call: intrinsics.FileCall, signature: structures.FunctionSignature, types: anytype, gpa: std.mem.Allocator) !structures.CompiledFunction {
+    var layout = try signatureLayout(types, signature, gpa);
+    defer layout.deinit(gpa);
+    var encoder: Encoder = .{ .gpa = gpa };
+    defer encoder.deinit();
+    const retry = try encoder.position();
+    for (call.arguments, 0..) |argument, index| {
+        try emitFileArgument(&encoder, argument, signature, layout.arguments);
+        switch (index) {
+            0...2 => try encoder.emit(([_]x86.Operation{ .mov_rdi_rax, .mov_rsi_rax, .mov_rdx_rax })[index]),
+            3...5 => try x86.appendRegister(&encoder.code, gpa, .store_rax, ([_]x86.Register{ .r10, .r8, .r9 })[index - 3], 0),
+            else => unreachable,
+        }
+    }
+    try encoder.syscall(@intCast(@backingInt(call.number)));
+    if (call.retry_interrupted) {
+        try encoder.immediate(.cmp_rax, -4);
+        try encoder.jumpBack(.je, retry);
+    }
+    try encoder.offset(.mov_rsp_rax, 8);
+    try encoder.emit(.ret);
+    return externalArtifact(&encoder);
+}
+
+fn emitFileArgument(encoder: *Encoder, argument: intrinsics.FileCall.Argument, signature: structures.FunctionSignature, locations: []const ValueLocation) !void {
+    switch (argument) {
+        .constant => |value| {
+            try encoder.immediate(.mov_eax, value);
+            try encoder.emit(.movsxd_rax_eax);
+        },
+        .value => |index| {
+            const type_id = signature.parameters[index].type_id;
+            try encoder.offset(if (type_id == .i64 or type_id == .u64) .mov_rax_rsp else .mov_eax_rsp, 8 + locations[index].stack);
+            if (type_id == .int) try encoder.emit(.movsxd_rax_eax);
+        },
+        .address => |index| try emitIncomingAddress(encoder, locations[index]),
+        .length => |index| try emitIncomingSize(encoder, locations[index]),
+        .storage => |index| {
+            switch (locations[index]) {
+                .stack => |offset| try encoder.offset(.lea_rax_rsp, 8 + offset),
+                .indirect => |offset| try encoder.offset(.mov_rax_rsp, 8 + offset),
+                else => unreachable,
+            }
+        },
+    }
+}
+
 fn signatureLayout(types: anytype, signature: structures.FunctionSignature, gpa: std.mem.Allocator) !CallLayout {
     const parameters = try gpa.alloc(structures.FunctionBlockArgument, signature.parameters.len);
     defer gpa.free(parameters);
-    for (parameters, signature.parameters) |*argument, parameter| argument.* = .{ .type_id = parameter.type_id };
+    for (parameters, signature.parameters) |*argument, parameter| argument.* = parameter.blockArgument();
     return CallLayout.init(types, signature.return_type, parameters, gpa);
 }
 

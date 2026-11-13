@@ -9,6 +9,7 @@ The prelude exposes common collection and text types, `print`, `exit`, and
 | `std.memory` | `List`, `Box`, `Ref`, `Span`, typed/raw allocation, and allocator handles |
 | `std.text` | UTF-8 strings, borrowed text/byte views, and formatting |
 | `std.io` | Standard stream handles and fallible byte/text I/O |
+| `std.files` | Owned file handles, native paths, metadata, and filesystem operations |
 | `std.range`, `std.iteration` | Ranges, cursors, and the `End` marker |
 | `std.algorithms`, `std.search`, `std.math` | Cursor algorithms, span searches, and ordered numerical helpers |
 | `std.callables`, `std.ownership` | Fallible callable erasure/cloning and ownership capability queries |
@@ -112,6 +113,16 @@ combined byte length once. `+=` currently creates a new string and replaces the
 target; use fallible `append(text)` to reuse capacity when building text repeatedly.
 Lengths and slice positions count bytes; text slicing checks UTF-8 boundaries.
 
+## Files and paths
+
+[std.files](../docs/FILES.md) provides whole-file text/byte helpers, streaming
+`File` handles, and owned `Path` and borrowed `PathView` values. File handles move
+without copying, close automatically, and ignore automatic close errors; consuming
+`close()` reports failures. Paths preserve native bytes and provide text views
+when valid UTF-8. Filesystem errors and allocation failures are ordinary marked
+error values. Filesystem effects are unavailable during compile-time execution;
+lexical path operations can run in either engine.
+
 ## Owning callables
 
 Fixed `func(...)` locals, fields, and collection elements own erased handles.
@@ -141,7 +152,6 @@ Implicit erasure and ordinary copying panic on reservation failure. These
 operations use the current allocator for new environments and retain that provider
 for release. Collection constructors and recoverable growth return `AllocationError`. See
 [CLOSURES.md](../docs/CLOSURES.md) for capture, lifetime, and deferred-syntax rules.
-
 
 ## Scoped allocation and logging
 

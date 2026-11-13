@@ -16,6 +16,8 @@ pub struct Utf8Error
 pub struct BytesView
     copy = trivial
     data: Span(byte)
+    pub func ==(imm left: BytesView, imm right: BytesView) bool -> equal_bytes(left, right)
+    pub func <>(imm left: BytesView, imm right: BytesView) bool -> not equal_bytes(left, right)
     pub func from_array(static N: int, ref value: Array(byte, N)) BytesView -> BytesView{data = Span(byte).from_array(N, value).as_imm()}
     pub func unsafe_from_allocation(ref value: Allocation(byte), initialized: int) BytesView | none
         const view = Span(byte).unsafe_from_allocation(value, initialized)
@@ -228,6 +230,7 @@ pub converter(imm value: StaticString) StringView -> value.view()
 pub converter(imm value: StaticString) BytesView -> value.as_bytes()
 pub converter(imm value: String) StringView -> value.view()
 pub converter(imm value: String) BytesView -> value.as_bytes()
+pub converter(imm value: StringView) BytesView -> value.as_bytes()
 pub converter(imm value: StringView) String
     var result = String.empty()
     result.append(value) catch -> panic "string conversion allocation failed"

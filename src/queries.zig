@@ -4560,7 +4560,7 @@ fn typeNamespace(ctx: anytype, identity: NamespaceIdentity) anyerror!?structures
     defer scope.deinit();
     var names = structures.Name.Set.init(ctx.allocator());
     defer names.deinit();
-    if (identity != .primitive and !try reserveStructNamespaceFields(ctx, identity, &names)) return null;
+    if (identity != .primitive and !try validateStructNamespace(ctx, identity)) return null;
     const module = try itemModule(ctx, owner_loc.*);
     if ((try ctx.get(IndexModuleItems, module)).* == null) return null;
     const files = (try ctx.input(ModuleMembers, module)).*;
@@ -4588,7 +4588,7 @@ fn typeNamespace(ctx: anytype, identity: NamespaceIdentity) anyerror!?structures
     return try scope.finish();
 }
 
-fn reserveStructNamespaceFields(ctx: anytype, identity: NamespaceIdentity, names: *structures.Name.Set) !bool {
+fn validateStructNamespace(ctx: anytype, identity: NamespaceIdentity) !bool {
     const item_source = (try itemSource(ctx, identity.owner())) orelse return false;
     const source = (try ctx.input(SourceText, item_source.resolved.file_id)).*;
     const struct_index: structures.Node.Index = if (identity == .generated) generated: {
@@ -4608,14 +4608,6 @@ fn reserveStructNamespaceFields(ctx: anytype, identity: NamespaceIdentity, names
     if (try semantic.validateStructNamespace(&item_source.parsed, source, struct_index, ctx.allocator())) |issue| {
         try typing.emitSemanticIssue(ctx, item_source.resolved.file_id, issue);
         return false;
-    }
-    const struct_node = item_source.parsed.nodes[struct_index.index()];
-    for (item_source.parsed.node_refs[struct_node.data.ref.start..struct_node.data.ref.end]) |member_index| {
-        const item = item_source.parsed.nodes[member_index.index()];
-        const member = if (item.tag == .@"pub") item_source.parsed.nodes[item.data.node.index()] else item;
-        if (member.tag != .struct_field) continue;
-        const token = item_source.parsed.tokens[member.token_index];
-        try names.put(.{ .identifier = source[token.loc.start..token.loc.end] }, {});
     }
     return true;
 }
@@ -5580,12 +5572,13 @@ fn compileFunction(ctx: anytype, instance_id: structures.InstanceId) anyerror!?s
     const signature = (try lookupFunctionSignature(ctx, instance_id)) orelse return null;
     const types: HostTypes(@TypeOf(ctx)) = .{ .ctx = ctx };
     if (intrinsics.hasTypedBody(symbol)) return compileTypedFunction(ctx, instance_id);
+    if (intrinsics.fileCall(symbol)) |call| return try codegen.compileExternalFileCall(call, signature, types, ctx.allocator());
     return switch (symbol) {
         .allocate_raw => try codegen.compileExternalAllocateRaw(signature, types, ctx.allocator()),
         .deallocate_raw => try codegen.compileExternalDeallocateRaw(ctx.allocator()),
         .cursor_aligned => try codegen.compileExternalCursorAligned(signature, types, ctx.allocator()),
         .static_iteration_item => null,
-        .allocator_from, .allocator_from_unchecked, .logger_from, .logger_from_unchecked, .type_layout, .layout_for, .primitive_operation, .numeric_converter, .copy_value, .move_value, .erase, .clone, .copy_callable, .drop_callable, .array_filled, .array_borrow, .unsafe_borrow, .unsafe_take, .unsafe_destroy, .unsafe_initialize, .literal_byte, .initialize_collection, .initialize_collection_element, .empty_cursor, .array_cursor, .allocation_cursor, .cursor_offset, .cursor_element, .cursor_attenuate, .cursor_take, .cursor_initialize, .cursor_destroy => unreachable,
+        else => unreachable,
         .io_read, .io_write => try codegen.compileExternalByteIo(symbol == .io_read, signature, types, ctx.allocator()),
         .exit => try codegen.compileExternalExit(ctx.allocator()),
         .panic_message => try codegen.compileExternalPanic(signature, types, ctx.allocator()),
@@ -5970,7 +5963,7 @@ test "struct private field access uses defining module and definitions recompute
     try std.testing.expect((try db.get(StructDefinition, item)).*.?.fields[0].is_public);
 }
 
-test "struct namespace reserves pub wrapped field names for qualified members" {
+test "struct namespace keeps qualified declarations independent of pub wrapped fields" {
     const query = @import("query/engine.zig");
     const modules = @import("modules.zig");
     const db = try query.Database.init(std.testing.allocator, .{ .worker_count = 1 });
@@ -5979,11 +5972,11 @@ test "struct namespace reserves pub wrapped field names for qualified members" {
     const module = (try db.input(FileModule, 0)).*;
     const item = (try db.get(ModuleDeclarations, module)).*.?.resolve("Visible").?;
     const identity: NamespaceIdentity = .{ .declared = item };
-    try std.testing.expect((try db.get(TypeNamespace, identity)).* == null);
+    const namespace = (try db.get(TypeNamespace, identity)).*.?;
+    try std.testing.expect(namespace.resolveFunction("value") != null);
     const diagnostics = try db.transitiveAccumulatorValues(TypeNamespace, identity, structures.Diagnostic, std.testing.allocator);
     defer std.testing.allocator.free(diagnostics);
-    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try std.testing.expectEqual(structures.Diagnostic.Kind.duplicate_struct_member, diagnostics[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.len);
 }
 
 test "inline array canonical identity and namespace do not depend on filled availability" {

@@ -264,6 +264,22 @@ numeric converters. The prelude imports this module without declaring operations
 Primitive namespace lookup and converter discovery use that registered defining
 module, independently of a user file's prelude imports.
 
+Instance fields and type-namespace declarations have separate name scopes.
+Definition validation rejects duplicates within each scope; field access takes
+precedence on instances, while type-qualified access resolves declarations.
+The compiler uses the same parameter-to-block-argument construction for ordinary
+functions and native externs, including storage passing for mutable, reference,
+and consuming parameters.
+
+`std.files` owns paths, file ownership, options, and error policy in ordinary
+library code. Private externs expose a closed set of typed Linux operations.
+`src/intrinsics.zig` describes each signature and native argument role; signature
+validation checks these at the declaration boundary, and native emission trusts
+those facts. Filesystem operations remain unavailable in the evaluator. Native
+calls retry interruption except close, which is attempted once. File cleanup and
+consuming close use ordinary ownership rules without compiler file-specific
+lifetime or effect machinery.
+
 `AnalysisContext` owns source-dependent lookup, visibility, and specialization.
 `TypeFacts` supplies structural type and ownership facts; `HostTypes` adds host
 layout. Copy/move/drop capabilities, runtime eligibility, logical type, member

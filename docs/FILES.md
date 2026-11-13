@@ -1,4 +1,4 @@
-# `std.files` API plan
+# `std.files` API
 
 File and path operations for Linux x86-64. Whole-file helpers handle everyday
 tasks; `File` supports incremental I/O; `Path` supports composing and reusing paths.
@@ -126,6 +126,10 @@ OS writes and fail on zero progress. Multi-transfer methods accumulate
 `IoError.progress` across the call. Failure preserves initialized destination
 bytes and completed external effects.
 
+At the result size limit, an unbounded read probes EOF before succeeding. If
+another byte is present, it consumes that byte and returns
+`AllocationError.size_limit`.
+
 Seeking uses a typed value with the appropriate numeric payload:
 
 ```chi
@@ -167,45 +171,50 @@ created with `0o777` filtered by umask.
 `.` and `..` and reflects filesystem order and concurrent changes. The returned
 list can be traversed with ordinary collection iteration.
 
-`Metadata` contains kind, byte size, permissions, access time, and modification
-time. Times use signed Unix seconds and normalized nanoseconds.
+`Metadata` exposes `kind: FileKind`, `byte_size: u64`, `permissions: u32`,
+`access_time: Timestamp`, and `modification_time: Timestamp`. `Timestamp` has
+`seconds: i64` and `nanoseconds: u32`, with normalized nanoseconds. `FileKind`
+distinguishes regular files, directories, symbolic links, block and character
+devices, FIFOs, sockets, and other entries.
 
 ## Errors and cleanup
 
 Functions return ordinary marked-error alternatives: `FileError` for filesystem
 operations, existing `IoError` for byte transfers, `AllocationError` for storage,
 and `Utf8Error` for text decoding. `FileError` carries a stable kind and optional
-native cause; `IoError` retains completed-byte progress. For example,
+native cause (`int | none`); validation errors have no native cause. Temporary
+native-path storage also returns `AllocationError`. `IoError` retains completed-byte
+progress. For example,
 `read_text(path)` returns
 `String | FileError | IoError | AllocationError | Utf8Error`.
 
 `File` is movable and single-owner, with atomic close-on-exec acquisition.
-Automatic destruction closes it and panics on failure. Explicit
+Automatic destruction closes it and ignores close errors. Explicit
 `close(deinit self) unit | FileError` consumes the file on either outcome.
 Linux close is attempted once. Whole-file helpers return a close error after a
-successful operation; simultaneous operation and close failures panic.
+successful operation; if the operation fails, they return that error and ignore
+any close error during cleanup.
 
-## Implementation sequence
+## Compiler integration and verification
 
-1. **Foundation:** path values/views, converters and byte-view comparisons,
-   typed opening settings, source registration, errors, closing, and
-   language-reference contracts.
-2. **File I/O:** whole-file helpers, counted reads, reusable-buffer reads, complete
-   writes, positioning, resizing, and synchronization.
-3. **Paths and directories:** lexical helpers, queries, namespace changes, and
-   directory listing.
-4. **Qualification:** ownership, failure paths, evaluator diagnostics, incremental
-   recomputation, persistent reuse, and source/bundled-library parity.
+The implementation lives in [std/files.chi](../std/files.chi). Library policy uses
+ordinary variants, converters, borrows, and cleanup. A closed set of private,
+signature-checked Linux externs supplies OS operations; no user-facing syscall
+primitive or special file type is required. Native operations retry interruption
+except close, which is attempted once. Reached compile-time I/O produces an
+unavailable-execution diagnostic; lexical path operations work in the evaluator.
 
-Tests exercise the examples above, EOF and short I/O, UTF-8 boundaries, path
-conversions and borrowed-view lifetimes, arbitrary filename bytes, missing and
-inaccessible entries, creation races, directory listing, close failures, and
-ordinary allocation failures. Runtime tests use isolated temporary directories.
-
-Library policy lives in Chimera; private externs provide OS operations through
-the existing [compiler boundaries](ARCHITECTURE.md). Reached compile-time I/O
-produces an unavailable-execution diagnostic. Verification follows
+[Filesystem tests](../tests/files_test.zig) cover native bytes and UTF-8, path
+views and copying, opening modes, streaming and whole-file I/O, metadata,
+symlinks, directories, cleanup, allocation refusal, and bundled-library edits.
+[Persistent query tests](../tests/query_disk_cache_test.zig) cover restoration
+and incremental recomputation. Runtime filesystem tests use isolated temporary
+directories or standard Linux device/proc entries. Verification follows
 [COMPILER.md](COMPILER.md#verify).
+
+The [qualification record](../benchmarks/results/files/README.md) contains
+matched million-line cold/incremental compilation and generated-runtime
+measurements, raw samples, source identities, and verification commands.
 
 The two module-level `open` overloads use generic path-argument wrappers
 constrained to `PathView`-compatible inputs. Each forwards to one `PathView`

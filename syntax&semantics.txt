@@ -304,6 +304,36 @@ if not (value in collection) -> missing()
 # print is an ordinary declaration and may be shadowed or used as a callable.
 # Reached compile-time I/O is an unavailable execution operation, even inside a
 # error handler; an unexecuted branch performs no I/O and causes no error.
+# std.files supplies owned, single-owner File handles, owned copyable Path values,
+# and borrowed PathView values. Path construction preserves native filename bytes;
+# as_text validates UTF-8, and printing escapes invalid UTF-8 bytes. Path equality
+# and BytesView equality compare bytes. Direct PathView conversions accept Path,
+# StaticString, String, StringView, and BytesView. StringView also converts directly
+# to BytesView. Path copies and joins follow ordinary panic-on-allocation-failure
+# policy; clone returns AllocationError instead. Views retain their backing owner.
+# Empty paths and embedded NUL are accepted as values and rejected with FileError
+# at the filesystem boundary. Relative paths resolve when an operation runs.
+# Typed OpenMode settings independently select access, creation, append,
+# truncation, and permissions. append and truncation require write access;
+# permissions must fit 0o7777. Presets create files with 0o666 filtered by umask.
+# File acquisition atomically sets close-on-exec. File is movable but not copyable;
+# its descriptor does not borrow the input path. Automatic destruction attempts
+# close once and ignores errors. Explicit consuming close returns unit | FileError
+# and consumes the owner on success or failure. Whole-file helpers report close
+# errors after success; operation errors take precedence over cleanup errors.
+# Reads/writes retry interrupted transfers, preserve completed effects, and report
+# accumulated IoError.progress. EOF is a zero read; complete writes fail on zero
+# progress. Negative read counts return AllocationError.invalid_layout. Counts use
+# int; positions and lengths use u64 within the OS signed 64-bit offset range.
+# Filesystem operations return ordinary FileError, IoError, AllocationError, and
+# Utf8Error alternatives as appropriate, including temporary native-path storage.
+# Existence/kind queries follow links and return false for missing targets or
+# non-directory intermediate components. symlink_metadata observes the entry.
+# Directory enumeration returns owned joined paths, skips . and .., and reflects
+# concurrent namespace changes. mkdir_all accepts existing directories; rename
+# replaces a compatible destination atomically and rejects cross-filesystem moves.
+# Reached filesystem I/O is unavailable in the evaluator; lexical path operations
+# remain ordinary evaluable library code. docs/FILES.md describes the complete API.
 # StaticString represents immutable literal storage. Only literal
 # materialization creates one; its bytes are permanent and readonly, so views of
 # them may outlive every binding. Ref and Span use one private StorageCursor(T)
@@ -1832,8 +1862,10 @@ func S.read_a(imm value: S) int -> value.a
 # callable instance fields are called directly without inserting the receiver.
 # Forming a bound value with place.method, without a call, is specified in the
 # planned closures and bound methods section above; it is not implemented yet.
-# Fields and ordinary namespace declarations share one name scope; duplicate
-# names are errors. Struct properties use a separate scope. Within a
+# Instance fields and ordinary type-namespace declarations have independent
+# name scopes. Instance access selects a field when one exists; qualified type
+# access selects the namespace declaration. Duplicate names within either scope
+# are errors. Struct properties use a separate scope. Within a
 # namespace declaration, unqualified names search its enclosing struct
 # namespaces before module declarations and the defining file's imports.
 # A public struct exports its type, not its namespace members. Functions,

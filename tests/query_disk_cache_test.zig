@@ -2882,3 +2882,29 @@ test "collection sorting snapshots track comparator library and captured permiss
         try fixture.expectExit(42);
     }
 }
+
+test "filesystem snapshots preserve native calls ownership and incremental path operations" {
+    const source =
+        \\import std.files as files
+        \\func run() int | files.FileError | AllocationError | IoError
+        \\    const path = files.Path("/dev/null")
+        \\    var file = path.open()?
+        \\    const bytes = file.read_bytes()?
+        \\    _ = file.close()?
+        \\    if bytes.len() <> 0 -> return 1
+        \\    if not (path.metadata()?.kind is files.FileKind.character_device) -> return 2
+        \\    return 42
+        \\const result = run()
+        \\if result is int -> exit(result)
+        \\exit(90)
+    ;
+    const fixture = try Fixture.restore(source);
+    defer fixture.db.deinit();
+    try fixture.expectExit(42);
+    const changed = try std.mem.replaceOwned(u8, std.testing.allocator, source, "    return 42", "    return 43");
+    defer std.testing.allocator.free(changed);
+    try fixture.db.setInput(queries.SourceText, 0, changed);
+    try fixture.expectExit(43);
+    try fixture.db.setInput(queries.SourceText, 0, source);
+    try fixture.expectExit(42);
+}

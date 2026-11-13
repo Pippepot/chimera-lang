@@ -191,7 +191,7 @@ The compiler produces a native executable, runs it, and reports its exit code.
 The current target is **Linux x86-64**.
 
 Chimera is experimental. These examples work today, but the language is still
-evolving and the standard library is small. UTF-8 strings and views, byte I/O,
+evolving and the standard library is small. UTF-8 strings and views, byte and filesystem I/O,
 Arrays, Lists, borrowed spans, iteration, and comprehensions work today.
 More collection types and language features remain ahead. The [roadmap](ROADMAP.md) records upcoming work
 and priorities.

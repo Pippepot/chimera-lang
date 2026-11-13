@@ -20,6 +20,7 @@ pub const File = enum(u32) {
     algorithms,
     callables,
     context,
+    files,
 
     pub fn path(file: File) []const u8 {
         return switch (file) {
@@ -42,6 +43,7 @@ pub const File = enum(u32) {
             .algorithms => "algorithms.chi",
             .callables => "callables.chi",
             .context => "context.chi",
+            .files => "files.chi",
         };
     }
 
@@ -101,6 +103,17 @@ pub const External = enum {
     allocator_from_unchecked,
     logger_from,
     logger_from_unchecked,
+    files_open,
+    files_close,
+    files_seek,
+    files_set_length,
+    files_sync,
+    files_stat,
+    files_mkdir,
+    files_unlink,
+    files_rename,
+    files_getcwd,
+    files_getdents,
 
     pub fn file(symbol: External) File {
         return switch (symbol) {
@@ -117,6 +130,7 @@ pub const External = enum {
             .type_layout, .layout_for, .cursor_aligned, .allocate_raw, .deallocate_raw => .memory_raw,
             .allocator_from, .allocator_from_unchecked => .memory_allocator,
             .logger_from, .logger_from_unchecked => .logging,
+            .files_open, .files_close, .files_seek, .files_set_length, .files_sync, .files_stat, .files_mkdir, .files_unlink, .files_rename, .files_getcwd, .files_getdents => .files,
         };
     }
 };

@@ -22,12 +22,14 @@ pub func unhandled_error() never
 
 pub func write_once(stream: Stream, imm bytes: BytesView) int | IoError -> bytes.write_to(stream.descriptor)
 pub func write_all(stream: Stream, imm bytes: BytesView) unit | IoError
+    return write_all_to(stream.descriptor, bytes)
+pub func write_all_to(descriptor: int, imm bytes: BytesView) unit | IoError
     var offset = 0
     loop
         if offset == bytes.byte_length() -> return unit
         const remaining = bytes.slice(offset..)
         if not (remaining is BytesView) -> panic "invalid write cursor"
-        const written = write_once(stream, remaining)
+        const written = remaining.write_to(descriptor)
         if written is IoError -> return IoError{cause = written.cause, progress = offset + written.progress}
         if written <= 0 -> return IoError{cause = 5, progress = offset}
         offset += written

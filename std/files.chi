@@ -1,0 +1,469 @@
+import std.files
+import std.memory.{List, Span, AllocationError}
+import std.array.{Array}
+import std.text.{BytesView, StaticString, String, StringView, Utf8Error}
+import std.io.{IoError, write_all_to}
+
+pub static FileAccess = .read | .write | .read_write
+pub static CreationPolicy = .existing | .create_if_missing | .create_new
+pub static FileErrorKind = .invalid_path | .invalid_options | .invalid_argument | .not_found | .permission_denied | .already_exists | .not_directory | .is_directory | .directory_not_empty | .name_too_long | .too_many_links | .too_many_files | .no_space | .read_only | .cross_device | .not_seekable | .invalid_offset | .io | .other
+pub static FileKind = .file | .directory | .symlink | .block_device | .character_device | .fifo | .socket | .other
+pub static SeekFrom = .Start: u64 | .Current: i64 | .End: i64
+
+pub struct FileError
+    error = true
+    copy = fieldwise
+    pub kind: FileErrorKind
+    pub cause: int | none
+
+pub struct Timestamp
+    copy = fieldwise
+    pub seconds: i64
+    pub nanoseconds: u32
+
+pub struct Metadata
+    copy = fieldwise
+    pub kind: FileKind
+    pub byte_size: u64
+    pub permissions: u32
+    pub access_time: Timestamp
+    pub modification_time: Timestamp
+
+pub struct OpenMode
+    copy = fieldwise
+    pub access: FileAccess
+    pub creation: CreationPolicy
+    pub append: bool
+    pub truncate: bool
+    pub permissions: u32
+    pub static read = OpenMode{access = FileAccess.read, creation = CreationPolicy.existing, append = false, truncate = false, permissions = 0o666}
+    pub static write = OpenMode{access = FileAccess.write, creation = CreationPolicy.create_if_missing, append = false, truncate = true, permissions = 0o666}
+    pub static append = OpenMode{access = FileAccess.write, creation = CreationPolicy.create_if_missing, append = true, truncate = false, permissions = 0o666}
+    pub static read_write = OpenMode{access = FileAccess.read_write, creation = CreationPolicy.existing, append = false, truncate = false, permissions = 0o666}
+    pub static create_new = OpenMode{access = FileAccess.write, creation = CreationPolicy.create_new, append = false, truncate = false, permissions = 0o666}
+
+pub struct Path
+    copy = func(imm self: Path) Path -> self.clone() catch -> panic "path copy allocation failed"
+    data: List(byte)
+    pub func view(imm self: Path) PathView -> PathView{data = self.data.bytes()}
+    pub func as_bytes(imm self: Path) BytesView -> self.data.bytes()
+    pub func as_text(imm self: Path) StringView | Utf8Error -> self.as_bytes().validate_utf8()
+    pub func clone(imm self: Path) Path | AllocationError -> copy_path(self.as_bytes())
+    pub func join(imm self: Path, imm child: PathView) Path -> self.view().join(child)
+    pub func parent(imm self: Path) PathView -> self.view().parent()
+    pub func name(imm self: Path) BytesView -> self.view().name()
+    pub func suffix(imm self: Path) BytesView -> self.view().suffix()
+    pub func ==(imm left: Path, imm right: PathView) bool -> left.as_bytes() == right.as_bytes()
+    pub func <>(imm left: Path, imm right: PathView) bool -> left.as_bytes() <> right.as_bytes()
+
+    func open_default(imm self: Path) File | FileError | AllocationError -> open_path(self.view(), OpenMode.read)
+    func open_mode(imm self: Path, mode: OpenMode) File | FileError | AllocationError -> open_path(self.view(), mode)
+    pub overload open(open_default, open_mode)
+    pub func read_bytes(imm self: Path) List(byte) | FileError | AllocationError | IoError -> std.files.read_bytes(self.view())
+    pub func read_text(imm self: Path) String | FileError | AllocationError | IoError | Utf8Error -> std.files.read_text(self.view())
+    pub func write_bytes(imm self: Path, imm bytes: BytesView) unit | FileError | AllocationError | IoError -> std.files.write_bytes(self.view(), bytes)
+    pub func write_text(imm self: Path, imm text: StringView) unit | FileError | AllocationError | IoError -> std.files.write_text(self.view(), text)
+    pub func metadata(imm self: Path) Metadata | FileError | AllocationError -> std.files.metadata(self.view())
+    pub func symlink_metadata(imm self: Path) Metadata | FileError | AllocationError -> std.files.symlink_metadata(self.view())
+    pub func exists(imm self: Path) bool | FileError | AllocationError -> std.files.exists(self.view())
+    pub func is_file(imm self: Path) bool | FileError | AllocationError -> std.files.is_file(self.view())
+    pub func is_dir(imm self: Path) bool | FileError | AllocationError -> std.files.is_dir(self.view())
+    pub func list_dir(imm self: Path) List(Path) | FileError | AllocationError -> std.files.list_dir(self.view())
+    pub func mkdir(imm self: Path) unit | FileError | AllocationError -> std.files.mkdir(self.view())
+    pub func mkdir_all(imm self: Path) unit | FileError | AllocationError -> std.files.mkdir_all(self.view())
+    pub func remove_file(imm self: Path) unit | FileError | AllocationError -> std.files.remove_file(self.view())
+    pub func remove_dir(imm self: Path) unit | FileError | AllocationError -> std.files.remove_dir(self.view())
+    pub func rename(imm self: Path, imm destination: PathView) unit | FileError | AllocationError -> std.files.rename(self.view(), destination)
+
+pub struct PathView
+    copy = trivial
+    data: BytesView
+    pub func as_bytes(imm self: PathView) BytesView -> self.data
+    pub func as_text(imm self: PathView) StringView | Utf8Error -> self.data.validate_utf8()
+    pub func clone(imm self: PathView) Path | AllocationError -> copy_path(self.data)
+    pub func ==(imm left: PathView, imm right: PathView) bool -> left.data == right.data
+    pub func <>(imm left: PathView, imm right: PathView) bool -> left.data <> right.data
+    pub func join(imm self: PathView, imm child: PathView) Path -> join_paths(self, child) catch -> panic "path join allocation failed"
+    pub func parent(imm self: PathView) PathView
+        const bytes = self.data
+        var end = component_end(bytes)
+        loop
+            if end == 0 -> return PathView(".")
+            if bytes[end - 1] == 47 -> break
+            end -= 1
+        loop
+            if end <= 1 or bytes[end - 1] <> 47 -> break
+            end -= 1
+        return PathView{data = bytes[0..end]}
+    pub func name(imm self: PathView) BytesView
+        const end = component_end(self.data)
+        var start = end
+        loop
+            if start == 0 or self.data[start - 1] == 47 -> break
+            start -= 1
+        return self.data[start..end]
+    pub func suffix(imm self: PathView) BytesView
+        const name = self.name()
+        if name == BytesView("..") -> return name[0..0]
+        var index = name.byte_length()
+        loop
+            if index <= 1 -> return name[0..0]
+            index -= 1
+            if name[index] == 46 -> return name[index..]
+
+    func open_default(imm self: PathView) File | FileError | AllocationError -> open_path(self, OpenMode.read)
+    func open_mode(imm self: PathView, mode: OpenMode) File | FileError | AllocationError -> open_path(self, mode)
+    pub overload open(open_default, open_mode)
+    pub func read_bytes(imm self: PathView) List(byte) | FileError | AllocationError | IoError -> std.files.read_bytes(self)
+    pub func read_text(imm self: PathView) String | FileError | AllocationError | IoError | Utf8Error -> std.files.read_text(self)
+    pub func write_bytes(imm self: PathView, imm bytes: BytesView) unit | FileError | AllocationError | IoError -> std.files.write_bytes(self, bytes)
+    pub func write_text(imm self: PathView, imm text: StringView) unit | FileError | AllocationError | IoError -> std.files.write_text(self, text)
+    pub func metadata(imm self: PathView) Metadata | FileError | AllocationError -> std.files.metadata(self)
+    pub func symlink_metadata(imm self: PathView) Metadata | FileError | AllocationError -> std.files.symlink_metadata(self)
+    pub func exists(imm self: PathView) bool | FileError | AllocationError -> std.files.exists(self)
+    pub func is_file(imm self: PathView) bool | FileError | AllocationError -> std.files.is_file(self)
+    pub func is_dir(imm self: PathView) bool | FileError | AllocationError -> std.files.is_dir(self)
+    pub func list_dir(imm self: PathView) List(Path) | FileError | AllocationError -> std.files.list_dir(self)
+    pub func mkdir(imm self: PathView) unit | FileError | AllocationError -> std.files.mkdir(self)
+    pub func mkdir_all(imm self: PathView) unit | FileError | AllocationError -> std.files.mkdir_all(self)
+    pub func remove_file(imm self: PathView) unit | FileError | AllocationError -> std.files.remove_file(self)
+    pub func remove_dir(imm self: PathView) unit | FileError | AllocationError -> std.files.remove_dir(self)
+    pub func rename(imm self: PathView, imm destination: PathView) unit | FileError | AllocationError -> std.files.rename(self, destination)
+
+func component_end(imm bytes: BytesView) int
+    var end = bytes.byte_length()
+    loop
+        if end <= 1 or bytes[end - 1] <> 47 -> return end
+        end -= 1
+
+func copy_path(imm bytes: BytesView) Path | AllocationError
+    var result = List(byte).new(bytes.byte_length())?
+    for value in bytes.as_span() -> _ = result.append(value)?
+    return Path{data = result^}
+
+func join_paths(imm parent: PathView, imm child: PathView) Path | AllocationError
+    const right = child.as_bytes()
+    if right.byte_length() > 0 and right[0] == 47 -> return child.clone()
+    const left = parent.as_bytes()
+    if left.byte_length() == 0 -> return child.clone()
+    if right.byte_length() == 0 -> return parent.clone()
+    const separator = if left[left.byte_length() - 1] == 47 -> 0 else 1
+    if right.byte_length() > 2147483647 - left.byte_length() - separator -> return AllocationError.size_limit
+    var bytes = List(byte).new(left.byte_length() + separator + right.byte_length())?
+    for value in left.as_span() -> _ = bytes.append(value)?
+    if separator == 1 -> _ = bytes.append(47)?
+    for value in right.as_span() -> _ = bytes.append(value)?
+    return Path{data = bytes^}
+
+pub converter(imm value: Path) PathView -> value.view()
+pub converter(imm value: StaticString) PathView -> PathView{data = value.as_bytes()}
+pub converter(imm value: String) PathView -> PathView{data = value.as_bytes()}
+pub converter(imm value: StringView) PathView -> PathView{data = value.as_bytes()}
+pub converter(imm value: BytesView) PathView -> PathView{data = value}
+pub converter(imm value: PathView) Path -> value.clone() catch -> panic "path construction allocation failed"
+pub converter(imm value: StaticString) Path -> copy_path(value.as_bytes()) catch -> panic "path construction allocation failed"
+pub converter(imm value: String) Path -> copy_path(value.as_bytes()) catch -> panic "path construction allocation failed"
+pub converter(imm value: StringView) Path -> copy_path(value.as_bytes()) catch -> panic "path construction allocation failed"
+pub converter(imm value: BytesView) Path -> copy_path(value) catch -> panic "path construction allocation failed"
+pub converter(imm value: Path) String -> render_path(value.as_bytes()) catch -> panic "path formatting allocation failed"
+pub converter(imm value: PathView) String -> render_path(value.as_bytes()) catch -> panic "path formatting allocation failed"
+
+func render_path(imm bytes: BytesView) String | AllocationError
+    var result = String.empty()
+    var offset = 0
+    const hex: StringView = "0123456789abcdef"
+    loop
+        const remaining = bytes[offset..]
+        const text = remaining.validate_utf8()
+        if text is StringView
+            _ = result.append(text)?
+            return result^
+        if text.index > 0
+            const prefix = remaining[0..text.index].validate_utf8()
+            if not (prefix is StringView) -> panic "invalid UTF-8 prefix"
+            _ = result.append(prefix)?
+        offset += text.index
+        const value = int(bytes[offset])
+        _ = result.append("\\x")?
+        _ = result.append(hex[(value / 16)..(value / 16 + 1)])?
+        _ = result.append(hex[(value % 16)..(value % 16 + 1)])?
+        offset += 1
+
+func native_path(imm path: PathView) List(byte) | FileError | AllocationError
+    const bytes = path.as_bytes()
+    if bytes.byte_length() == 0 -> return FileError{kind = FileErrorKind.invalid_path, cause = none}
+    for value in bytes.as_span()
+        if value == 0 -> return FileError{kind = FileErrorKind.invalid_path, cause = none}
+    if bytes.byte_length() == 2147483647 -> return AllocationError.size_limit
+    var result = List(byte).new(bytes.byte_length() + 1)?
+    for value in bytes.as_span() -> _ = result.append(value)?
+    _ = result.append(0)?
+    return result^
+
+func system_error(result: i64) FileError
+    const cause = wrap(int, -result)
+    const kind: FileErrorKind = match cause
+        2 -> FileErrorKind.not_found
+        1 -> FileErrorKind.permission_denied
+        13 -> FileErrorKind.permission_denied
+        17 -> FileErrorKind.already_exists
+        20 -> FileErrorKind.not_directory
+        21 -> FileErrorKind.is_directory
+        39 -> FileErrorKind.directory_not_empty
+        36 -> FileErrorKind.name_too_long
+        40 -> FileErrorKind.too_many_links
+        23 -> FileErrorKind.too_many_files
+        24 -> FileErrorKind.too_many_files
+        28 -> FileErrorKind.no_space
+        122 -> FileErrorKind.no_space
+        30 -> FileErrorKind.read_only
+        18 -> FileErrorKind.cross_device
+        29 -> FileErrorKind.not_seekable
+        22 -> FileErrorKind.invalid_argument
+        75 -> FileErrorKind.invalid_offset
+        5 -> FileErrorKind.io
+        _ -> FileErrorKind.other
+    return FileError{kind = kind, cause = cause}
+
+func check_system(result: i64) unit | FileError
+    if result < 0 -> return system_error(result)
+    return unit
+
+func open_path(imm path: PathView, mode: OpenMode) File | FileError | AllocationError
+    if mode.permissions > 0o7777 or ((mode.access is FileAccess.read) and (mode.append or mode.truncate)) -> return FileError{kind = FileErrorKind.invalid_options, cause = none}
+    var flags = 0x80000
+    match mode.access
+        FileAccess.read -> flags |= 0
+        FileAccess.write -> flags |= 1
+        FileAccess.read_write -> flags |= 2
+    match mode.creation
+        CreationPolicy.existing -> flags |= 0
+        CreationPolicy.create_if_missing -> flags |= 0x40
+        CreationPolicy.create_new -> flags |= 0xc0
+    if mode.append -> flags |= 0x400
+    if mode.truncate -> flags |= 0x200
+    const native = native_path(path)?
+    const result = files_open(native.span(), flags, mode.permissions)
+    if result < 0 -> return system_error(result)
+    return File{descriptor = wrap(int, result)}
+
+func open_default(static P: type, imm path: P) File | FileError | AllocationError where P is Path or P is PathView or P is StaticString or P is String or P is StringView or P is BytesView -> open_path(PathView(path), OpenMode.read)
+func open_mode(static P: type, imm path: P, mode: OpenMode) File | FileError | AllocationError where P is Path or P is PathView or P is StaticString or P is String or P is StringView or P is BytesView -> open_path(PathView(path), mode)
+pub overload open(open_default, open_mode)
+
+pub struct File
+    copy = none
+    descriptor: int
+    drop = func(deinit self: File)
+        _ = files_close(self.descriptor)
+    pub func close(deinit self: File) unit | FileError -> check_system(files_close(self.descriptor))
+    func read_remaining(mut self: File) List(byte) | AllocationError | IoError -> read_file(self.descriptor, 2147483647, false)
+    func read_count(mut self: File, count: int) List(byte) | AllocationError | IoError -> read_file(self.descriptor, count, true)
+    func read_into(mut self: File, mut destination: List(byte), count: int) int | AllocationError | IoError -> destination.read_bytes(self.descriptor, count)
+    pub overload read_bytes(read_remaining, read_count, read_into)
+    pub func read_text(mut self: File) String | AllocationError | IoError | Utf8Error
+        const bytes = self.read_bytes()?
+        return String.from_utf8(bytes.bytes())
+    pub func write_once(mut self: File, imm bytes: BytesView) int | IoError -> bytes.write_to(self.descriptor)
+    pub func write_bytes(mut self: File, imm bytes: BytesView) unit | IoError -> write_all_to(self.descriptor, bytes)
+    pub func write_text(mut self: File, imm text: StringView) unit | IoError -> self.write_bytes(text.as_bytes())
+    pub func seek(mut self: File, from: SeekFrom) u64 | FileError
+        var offset: i64 = 0
+        var origin = 0
+        match from
+            SeekFrom.Start ->
+                const absolute: u64 = from
+                if absolute > 9223372036854775807 -> return FileError{kind = FileErrorKind.invalid_offset, cause = none}
+                offset = wrap(i64, absolute)
+            SeekFrom.Current ->
+                offset = from
+                origin = 1
+            SeekFrom.End ->
+                offset = from
+                origin = 2
+        const result = files_seek(self.descriptor, offset, origin)
+        if result == -22 -> return FileError{kind = FileErrorKind.invalid_offset, cause = 22}
+        if result < 0 -> return system_error(result)
+        return wrap(u64, result)
+    pub func position(imm self: File) u64 | FileError
+        const result = files_seek(self.descriptor, 0, 1)
+        if result < 0 -> return system_error(result)
+        return wrap(u64, result)
+    pub func set_length(mut self: File, length: u64) unit | FileError
+        if length > 9223372036854775807 -> return FileError{kind = FileErrorKind.invalid_offset, cause = none}
+        return check_system(files_set_length(self.descriptor, length))
+    pub func sync(imm self: File) unit | FileError -> check_system(files_sync(self.descriptor))
+    pub func metadata(imm self: File) Metadata | FileError -> stat_file(self.descriptor, "\0", 0x1000)
+
+func read_file(descriptor: int, count: int, bounded: bool) List(byte) | AllocationError | IoError
+    if count < 0 -> return AllocationError.invalid_layout
+    var result = List(byte).new(0)?
+    loop
+        const size = result.len()
+        if size == count
+            if not bounded -> _ = check_read_limit(descriptor, size)?
+            return result^
+        var transfer = result.capacity() - size
+        if transfer == 0
+            transfer = if size < 4096 -> 4096 else size
+            if transfer > 2147483647 - size -> transfer = 2147483647 - size
+        if transfer > count - size -> transfer = count - size
+        const received = result.read_bytes(descriptor, transfer)
+        if received is IoError -> return IoError{cause = received.cause, progress = size + received.progress}
+        if received is AllocationError -> return received
+        if received == 0 -> return result^
+
+# Distinguish EOF at the maximum result length from an oversized stream. A byte
+# beyond that boundary is consumed before returning size_limit, as other failed
+# reads also preserve their completed external effects.
+func check_read_limit(descriptor: int, progress: int) unit | AllocationError | IoError
+    var probe = List(byte).new(1)?
+    const received = probe.read_bytes(descriptor, 1)
+    if received is IoError -> return IoError{cause = received.cause, progress = progress + received.progress}
+    if received is AllocationError -> return received
+    if received == 0 -> return unit
+    return AllocationError.size_limit
+
+pub func read_bytes(imm path: PathView) List(byte) | FileError | AllocationError | IoError
+    var file = open_path(path, OpenMode.read)?
+    const result = file.read_bytes()?
+    _ = file.close()?
+    return result^
+pub func read_text(imm path: PathView) String | FileError | AllocationError | IoError | Utf8Error
+    var file = open_path(path, OpenMode.read)?
+    const result = file.read_text()?
+    _ = file.close()?
+    return result^
+pub func write_bytes(imm path: PathView, imm bytes: BytesView) unit | FileError | AllocationError | IoError
+    var file = open_path(path, OpenMode.write)?
+    _ = file.write_bytes(bytes)?
+    return file.close()
+pub func write_text(imm path: PathView, imm text: StringView) unit | FileError | AllocationError | IoError -> write_bytes(path, text.as_bytes())
+
+# Private Linux x86-64 ABI. Path spans include their terminating NUL. The library
+# owns validation and error policy; native calls retry interruption except close.
+extern func files_open(imm path: Span(byte), flags: int, permissions: u32) i64
+extern func files_close(descriptor: int) i64
+extern func files_seek(descriptor: int, offset: i64, origin: int) i64
+extern func files_set_length(descriptor: int, length: u64) i64
+extern func files_sync(descriptor: int) i64
+extern func files_stat(descriptor: int, imm path: Span(byte), mut buffer: Array(u64, 18), flags: int) i64
+extern func files_mkdir(imm path: Span(byte), permissions: u32) i64
+extern func files_unlink(imm path: Span(byte), flags: int) i64
+extern func files_rename(imm source: Span(byte), imm destination: Span(byte)) i64
+extern func files_getcwd(mut buffer: Span(byte)) i64
+extern func files_getdents(descriptor: int, mut buffer: Span(byte)) i64
+
+func stat_file(descriptor: int, imm native: BytesView, flags: int) Metadata | FileError
+    var buffer = Array(u64, 18).filled(0)
+    _ = check_system(files_stat(descriptor, native.as_span(), buffer, flags))?
+    const mode = wrap(u32, buffer[3])
+    const kind: FileKind = match wrap(int, mode & 0xf000)
+        0x8000 -> FileKind.file
+        0x4000 -> FileKind.directory
+        0xa000 -> FileKind.symlink
+        0x6000 -> FileKind.block_device
+        0x2000 -> FileKind.character_device
+        0x1000 -> FileKind.fifo
+        0xc000 -> FileKind.socket
+        _ -> FileKind.other
+    return Metadata{kind = kind, byte_size = buffer[6], permissions = mode & 0o7777, access_time = Timestamp{seconds = wrap(i64, buffer[9]), nanoseconds = wrap(u32, buffer[10])}, modification_time = Timestamp{seconds = wrap(i64, buffer[11]), nanoseconds = wrap(u32, buffer[12])}}
+
+func path_metadata(imm path: PathView, flags: int) Metadata | FileError | AllocationError
+    const native = native_path(path)?
+    return stat_file(-100, native.bytes(), flags)
+pub func metadata(imm path: PathView) Metadata | FileError | AllocationError -> path_metadata(path, 0)
+pub func symlink_metadata(imm path: PathView) Metadata | FileError | AllocationError -> path_metadata(path, 0x100)
+pub func exists(imm path: PathView) bool | FileError | AllocationError
+    const result = metadata(path)
+    if result is FileError
+        if result.kind is FileErrorKind.not_found or result.kind is FileErrorKind.not_directory -> return false
+        return result
+    if result is AllocationError -> return result
+    return true
+pub func is_file(imm path: PathView) bool | FileError | AllocationError -> has_kind(path, FileKind.file)
+pub func is_dir(imm path: PathView) bool | FileError | AllocationError -> has_kind(path, FileKind.directory)
+func has_kind(imm path: PathView, kind: FileKind) bool | FileError | AllocationError
+    const result = metadata(path)
+    if result is FileError
+        if result.kind is FileErrorKind.not_found or result.kind is FileErrorKind.not_directory -> return false
+        return result
+    if result is AllocationError -> return result
+    return match kind
+        FileKind.file -> result.kind is FileKind.file
+        FileKind.directory -> result.kind is FileKind.directory
+        _ -> false
+
+pub func mkdir(imm path: PathView) unit | FileError | AllocationError
+    const native = native_path(path)?
+    return check_system(files_mkdir(native.span(), 0o777))
+pub func mkdir_all(imm path: PathView) unit | FileError | AllocationError
+    # Validate the whole path before causing any namespace changes.
+    var native = native_path(path)?
+    const bytes = path.as_bytes()
+    for end in 1..(bytes.byte_length() + 1)
+        if end == bytes.byte_length() or bytes[end] == 47
+            const saved = native[end]
+            native[end] = 0
+            const result = files_mkdir(native.span(), 0o777)
+            if result < 0
+                if result <> -17 -> return system_error(result)
+                const directory = stat_file(-100, native.bytes(), 0)?
+                if not (directory.kind is FileKind.directory) -> return system_error(result)
+            native[end] = saved
+    return unit
+pub func remove_file(imm path: PathView) unit | FileError | AllocationError -> unlink_path(path, 0)
+pub func remove_dir(imm path: PathView) unit | FileError | AllocationError -> unlink_path(path, 0x200)
+func unlink_path(imm path: PathView, flags: int) unit | FileError | AllocationError
+    const native = native_path(path)?
+    return check_system(files_unlink(native.span(), flags))
+pub func rename(imm source: PathView, imm destination: PathView) unit | FileError | AllocationError
+    const source_native = native_path(source)?
+    const destination_native = native_path(destination)?
+    return check_system(files_rename(source_native.span(), destination_native.span()))
+
+pub func cwd() Path | FileError | AllocationError
+    var capacity = 256
+    loop
+        var buffer = List(byte).filled(0, capacity)?
+        var view = buffer.span()
+        const result = files_getcwd(view)
+        if result == -34
+            if capacity > 1073741823 -> return AllocationError.size_limit
+            capacity *= 2
+            continue
+        if result < 0 -> return system_error(result)
+        return copy_path(buffer.bytes()[0..(wrap(int, result) - 1)])
+
+pub func list_dir(imm path: PathView) List(Path) | FileError | AllocationError
+    const native = native_path(path)?
+    const descriptor = files_open(native.span(), 0x90000, 0)
+    if descriptor < 0 -> return system_error(descriptor)
+    const directory = File{descriptor = wrap(int, descriptor)}
+    var result = List(Path).new(0)?
+    var buffer = Array(byte, 4096).filled(0)
+    loop
+        var span = buffer.span()
+        const received = files_getdents(directory.descriptor, span)
+        if received < 0 -> return system_error(received)
+        if received == 0 -> break
+        const count = wrap(int, received)
+        var position = 0
+        loop
+            if position == count -> break
+            if count - position < 20 -> panic "invalid directory record"
+            const length = int(buffer[position + 16]) + 256 * int(buffer[position + 17])
+            if length < 20 or length > count - position -> panic "invalid directory record length"
+            const start = position + 19
+            var end = start
+            loop
+                if end == position + length -> panic "unterminated directory record"
+                if buffer[end] == 0 -> break
+                end += 1
+            const bytes = BytesView.from_array(4096, buffer)[start..end]
+            if bytes <> BytesView(".") and bytes <> BytesView("..")
+                const child = join_paths(path, PathView(bytes))?
+                _ = result.append(child^)?
+            position += length
+    _ = directory.close()?
+    return result^

@@ -110,6 +110,7 @@ pub fn build(b: *std.Build) void {
         "tests/tuple_test.zig",
         "tests/reference_test.zig",
         "tests/text_test.zig",
+        "tests/files_test.zig",
         "tests/panic_test.zig",
         "tests/converter_test.zig",
         "tests/nominal_variant_test.zig",

@@ -31,6 +31,12 @@ evaluation and cannot become canonical static constants. See the
 [compiler boundaries](ARCHITECTURE.md#closures-and-bound-methods)
 and [callable design](CLOSURES.md) for the contracts and deferred syntax.
 
+[Filesystem APIs](FILES.md) are implemented in `std.files`, including native-byte
+paths, owned handles, streaming and whole-file I/O, metadata, and directories.
+Filesystem effects produce unavailable-execution diagnostics in the evaluator;
+lexical path operations retain native/evaluator parity. Automatic close errors
+are ignored; explicit consuming close reports them.
+
 ## Build and Run
 
 ```sh
